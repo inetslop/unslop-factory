@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Maze Racer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+function playSound(type, freq, dur, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq || 440;
+    gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + (dur || 0.1));
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + (dur || 0.1));
+}
+
+// Game State
+const STATE = { MENU: 0, PLAYING: 1, LEVEL_COMPLETE: 2, GAME_OVER: 3 };
+let gameState = STATE.MENU;
+let level = 1;
+let maxLevel = 5;
+let timeLeft = 0;
+let totalTime = 0;
+let score = 0;
+
+// Maze
+const CELL_SIZE = 60;
+let mazeW, mazeH;
+let maze = []; // grid of cells with walls: [top, right, bottom, left]
+let exitX, exitY;
+
+function generateMaze(cols, rows) {
+    mazeW = cols;
+    mazeH = rows;
+    maze = [];
+    for (let y = 0; y < rows; y++) {
+        for (let x = 0; x < cols; x++) {
+            maze.push({ x, y, top: true, right: true, bottom: true, left: true });
+        }
+    }
+    // Recursive backtracker
+    const visited = new Array(rows * cols).fill(false);
+    const stack = [];
+    let cx = 0, cy = 0;
+    visited[0] = true;
+    stack.push({ x: 0, y: 0 });
+
+    while (stack.length > 0) {
+        const idx = stack.length - 1;
+        const cell = { x: maze[cx * 1 + 0].x, y: 0 }; // dummy
+        const curX = maze[cy * cols + cx].x;
+        const curY = maze[cy * cols + cx].y;
+
+        const neighbors = [];
+        if (curY > 0 && !visited[(curY - 1) * cols + curX]) neighbors.push({ dx: 0, dy: -1 });
+        if (curX < cols - 1 && !visited[curY * cols + curX + 1]) neighbors.push({ dx: 1, dy: 0 });
+        if (curY < rows - 1 && !visited[(curY + 1) * cols + curX]) neighbors.push({ dx: 0, dy: 1 });
+        if (curX > 0 && !visited[curY * cols + curX - 1]) neighbors.push({ dx: -1, dy: 0 });
+
+        if (neighbors.length === 0) {
+            stack.pop();
+            if (stack.length > 0) {
+                cx = stack[stack.length - 1].x;
+                cy = stack[stack.length - 1].y;
+            }
+        } else {
+            const n = neighbors[Math.floor(Math.random() * neighbors.length)];
+            const nx = curX + n.dx;
+            const ny = curY + n.dy;
+            // Remove walls between current and neighbor
+            if (n.dx === 1) { maze[cy * cols + curX].right = false; maze[ny * cols + nx].left = false; }
+            else if (n.dx === -1) { maze[cy * cols + curX].left = false; maze[ny * cols + nx].right = false; }
+            else if (n.dy === 1) { maze[cy * cols + curX].bottom = false; maze[ny * cols + nx].top = false; }
+            else if (n.dy === -1) { maze[cy * cols + curX].top = false; maze[ny * cols + nx].bottom = false; }
+
+            visited[ny * cols + nx] = true;
+            stack.push({ x: nx, y: ny });
+            cx = nx;
+            cy = ny;
+        }
+    }
+    // Add some extra openings for loops (makes it more interesting)
+    const extraOpenings = Math.floor(cols * rows * 0.1);
+    for (let i = 0; i < extraOpenings; i++) {
+        const x = Math.floor(Math.random() * cols);
+        const y = Math.floor(Math.random() * rows);
+        if (x < cols - 1 && Math.random() < 0.5) { maze[y * cols + x].right = false; maze[y * cols + x + 1].left = false; }
+        else if (y < rows - 1) { maze[y * cols + x].bottom = false; maze[(y + 1) * cols + x].top = false; }
+    }
+
+    exitX = (cols - 1) * CELL_SIZE + CELL_SIZE / 2;
+    exitY = (rows - 1) * CELL_SIZE + CELL_SIZE / 2;
+}
+
+// Car physics
+let car = { x: 0, y: 0, angle: 0, speed: 0 };
+const CAR_RADIUS = 10;
+const MAX_SPEED = 5;
+const ACCEL = 0.15;
+const FRICTION = 0.97;
+const TURN_SPEED = 0.06;
+
+function resetCar() {
+    car.x = CELL_SIZE / 2;
+    car.y = CELL_SIZE / 2;
+    car.angle = 0; // facing right (toward +x)
+    car.speed = 0;
+}
+
+// Particles
+let particles = [];
+function spawnParticle(x, y, vx, vy, color, life) {
+    particles.push({ x, y, vx, vy, color, life, maxLife: life });
+}
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === STATE.MENU) {
+        initAudio();
+        startGame();
+    } else if (gameState === STATE.LEVEL_COMPLETE) {
+        nextLevel();
+    } else if (gameState === STATE.GAME_OVER) {
+        restartGame();
+    }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Game functions
+function startGame() {
+    level = 1;
+    score = 0;
+    startLevel();
+}
+
+function startLevel() {
+    const cols = 6 + level * 2;
+    const rows = 6 + level * 2;
+    generateMaze(cols, rows);
+    resetCar();
+    totalTime = 15 + level * 8;
+    timeLeft = totalTime;
+    gameState = STATE.PLAYING;
+    particles = [];
+}
+
+function nextLevel() {
+    level++;
+    if (level > maxLevel) {
+        gameState = STATE.GAME_OVER; // Win!
+    } else {
+        startLevel();
+    }
+}
+
+function restartGame() {
+    level = 1;
+    score = 0;
+    startLevel();
+}
+
+function checkCollision(px, py) {
+    const r = CAR_RADIUS;
+    // Check against maze walls
+    for (let y = 0; y < mazeH; y++) {
+        for (let x = 0; x < mazeW; x++) {
+            const cell = maze[y * mazeW + x];
+            const cx = x * CELL_SIZE;
+            const cy = y * CELL_SIZE;
+
+            // Top wall
+            if (cell.top) {
+                if (circleLine(px, py, r, cx, cy, cx + CELL_SIZE, cy)) return true;
+            }
+            // Bottom wall
+            if (cell.bottom) {
+                if (circleLine(px, py, r, cx, cy + CELL_SIZE, cx + CELL_SIZE, cy + CELL_SIZE)) return true;
+            }
+            // Left wall
+            if (cell.left) {
+                if (circleLine(px, py, r, cx, cy, cx, cy + CELL_SIZE)) return true;
+            }
+            // Right wall
+            if (cell.right) {
+                if (circleLine(px, py, r, cx + CELL_SIZE, cy, cx + CELL_SIZE, cy + CELL_SIZE)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+function circleLine(cx, cy, r, x1, y1, x2, y2) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq === 0) return Math.hypot(cx - x1, cy - y1) < r;
+
+    let t = ((cx - x1) * dx + (cy - y1) * dy) / lenSq;
+    t = Math.max(0, Math.min(1, t));
+    const px = x1 + t * dx;
+    const py = y1 + t * dy;
+    return Math.hypot(cx - px, cy - py) < r;
+}
+
+function update(dt) {
+    if (gameState !== STATE.PLAYING) return;
+
+    timeLeft -= dt;
+    if (timeLeft <= 0) {
+        gameState = STATE.GAME_OVER;
+        playSound('sawtooth', 100, 0.5, 0.2);
+        return;
+    }
+
+    // Car physics
+    if (keys['ArrowUp'] || keys['KeyW']) {
+        car.speed += ACCEL;
+        if (car.speed > MAX_SPEED) car.speed = MAX_SPEED;
+    }
+    if (keys['ArrowDown'] || keys['KeyS']) {
+        car.speed -= ACCEL * 0.8;
+        if (car.speed < -MAX_SPEED * 0.5) car.speed = -MAX_SPEED * 0.5;
+    }
+
+    car.speed *= FRICTION;
+    if (Math.abs(car.speed) < 0.01) car.speed = 0;
+
+    // Steering
+    const speedFactor = Math.min(Math.abs(car.speed) / MAX_SPEED, 1);
+    if (keys['ArrowLeft'] || keys['KeyA']) {
+        car.angle -= TURN_SPEED * speedFactor;
+    }
+    if (keys['ArrowRight'] || keys['KeyD']) {
+        car.angle += TURN_SPEED * speedFactor;
+    }
+
+    // Move
+    const nx = car.x + Math.cos(car.angle) * car.speed;
+    const ny = car.y + Math.sin(car.angle) * car.speed;
+
+    if (!checkCollision(nx, ny)) {
+        car.x = nx;
+        car.y = ny;
+    } else {
+        // Bounce off
+        car.speed *= -0.3;
+        playSound('square', 80, 0.1, 0.1);
+    }
+
+    // Clamp position
+    car.x = Math.max(CAR_RADIUS, Math.min(mazeW * CELL_SIZE - CAR_RADIUS, car.x));
+    car.y = Math.max(CAR_RADIUS, Math.min(mazeH * CELL_SIZE - CAR_RADIUS, car.y));
+
+    // Particles (exhaust)
+    if (Math.abs(car.speed) > 1) {
+        const px = car.x - Math.cos(car.angle) * CAR_RADIUS;
+        const py = car.y - Math.sin(car.angle) * CAR_RADIUS;
+        spawnParticle(px, py, -Math.cos(car.angle) * car.speed * 0.3 + (Math.random() - 0.5),
+            -Math.sin(car.angle) * car.speed * 0.3 + (Math.random() - 0.5),
+            `hsl(${200 + Math.random() * 40}, 100%, 60%)`, 15);
+    }
+
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life--;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    // Check win
+    const distToExit = Math.hypot(car.x - exitX, car.y - exitY);
+    if (distToExit < CELL_SIZE * 0.4) {
+        gameState = STATE.LEVEL_COMPLETE;
+        score += Math.floor(timeLeft * 10);
+        playSound('sine', 880, 0.3, 0.2);
+        setTimeout(() => playSound('sine', 1100, 0.3, 0.2), 100);
+        setTimeout(() => playSound('sine', 1320, 0.4, 0.2), 200);
+    }
+
+    // Engine sound (subtle)
+    if (Math.abs(car.speed) > 0.5 && Math.random() < 0.1) {
+        playSound('sawtooth', 60 + Math.abs(car.speed) * 15, 0.05, 0.02);
+    }
+}
+
+// Rendering
+function drawMaze() {
+    // Background
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    const offsetX = (W - mazeW * CELL_SIZE) / 2;
+    const offsetY = (H - mazeH * CELL_SIZE) / 2;
+
+    // Draw cells (subtle grid)
+    for (let y = 0; y < mazeH; y++) {
+        for (let x = 0; x < mazeW; x++) {
+            ctx.fillStyle = (x + y) % 2 === 0 ? '#111125' : '#0d0d1c';
+            ctx.fillRect(offsetX + x * CELL_SIZE, offsetY + y * CELL_SIZE, CELL_SIZE, CELL_SIZE);
+        }
+    }
+
+    // Draw walls
+    ctx.strokeStyle = '#4a9eff';
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.shadowColor = '#4a9eff';
+    ctx.shadowBlur = 8;
+
+    for (let y = 0; y < mazeH; y++) {
+        for (let x = 0; x < mazeW; x++) {
+            const cell = maze[y * mazeW + x];
+            const cx = offsetX + x * CELL_SIZE;
+            const cy = offsetY + y * CELL_SIZE;
+
+            if (cell.top) {
+                ctx.beginPath();
+                ctx.moveTo(cx, cy);
+                ctx.lineTo(cx + CELL_SIZE, cy);
+                ctx.stroke();
+            }
+            if (cell.left) {
+                ctx.beginPath();
+                ctx.moveTo(cx, cy);
+                ctx.lineTo(cx, cy + CELL_SIZE);
+                ctx.stroke();
+            }
+            // Only draw right and bottom for last row/col to avoid double-draw issues (we draw all, overlaps are fine visually)
+            if (cell.right && x === mazeW - 1) {
+                ctx.beginPath();
+                ctx.moveTo(cx + CELL_SIZE, cy);
+                ctx.lineTo(cx + CELL_SIZE, cy + CELL_SIZE);
+                ctx.stroke();
+            }
+            if (cell.bottom && y === mazeH - 1) {
+                ctx.beginPath();
+                ctx.moveTo(cx, cy + CELL_SIZE);
+                ctx.lineTo(cx + CELL_SIZE, cy + CELL_SIZE);
+                ctx.stroke();
+            }
+        }
+    }
+
+    // Also draw internal right/bottom walls that connect to next cell
+    for (let y = 0; y < mazeH; y++) {
+        for (let x = 0; x < mazeW - 1; x++) {
+            if (maze[y * mazeW + x].right) {
+                const cx = offsetX + (x + 1) * CELL_SIZE;
+                const cy = offsetY + y * CELL_SIZE;
+                ctx.beginPath();
+                ctx.moveTo(cx, cy);
+                ctx.lineTo(cx, cy + CELL_SIZE);
+                ctx.stroke();
+            }
+        }
+    }
+    for (let y = 0; y < mazeH - 1; y++) {
+        for (let x = 0; x < mazeW; x++) {
+            if (maze[y * mazeW + x].bottom) {
+                const cx = offsetX + x * CELL_SIZE;
+                const cy = offsetY + (y + 1) * CELL_SIZE;
+                ctx.beginPath();
+                ctx.moveTo(cx, cy);
+                ctx.lineTo(cx + CELL_SIZE, cy);
+                ctx.stroke();
+            }
+        }
+    }
+
+    ctx.shadowBlur = 0;
+
+    // Draw exit
+    const ex = offsetX + exitX;
+    const ey = offsetY + exitY;
+    const pulse = 1 + Math.sin(Date.now() * 0.005) * 0.2;
+    ctx.fillStyle = '#00ff88';
+    ctx.shadowColor = '#00ff88';
+    ctx.shadowBlur = 15;
+    ctx.beginPath();
+    ctx.arc(ex, ey, CELL_SIZE * 0.3 * pulse, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Draw particles
+    for (const p of particles) {
+        const alpha = p.life / p.maxLife;
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = alpha;
+        ctx.beginPath();
+        ctx.arc(offsetX + p.x, offsetY + p.y, 3 * alpha, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Draw car
+    const carScreenX = offsetX + car.x;
+    const carScreenY = offsetY + car.y;
+
+    ctx.save();
+    ctx.translate(carScreenX, carScreenY);
+    ctx.rotate(car.angle);
+
+    // Car body
+    ctx.fillStyle = '#ff4444';
+    ctx.shadowColor = '#ff4444';
+    ctx.shadowBlur = 10;
+    ctx.beginPath();
+    ctx.moveTo(CAR_RADIUS + 2, 0);
+    ctx.lineTo(-CAR_RADIUS, -CAR_RADIUS * 0.7);
+    ctx.lineTo(-CAR_RADIUS * 0.5, 0);
+    ctx.lineTo(-CAR_RADIUS, CAR_RADIUS * 0.7);
+    ctx.closePath();
+    ctx.fill();
+
+    // Windshield
+    ctx.fillStyle = '#88ccff';
+    ctx.shadowBlur = 0;
+    ctx.beginPath();
+    ctx.arc(2, 0, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+
+    // HUD
+    drawHUD(offsetX, offsetY);
+}
+
+function drawHUD(offsetX, offsetY) {
+    // Timer
+    const timerColor = timeLeft < 5 ? '#ff4444' : '#ffffff';
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(10, 10, 200, 80);
+    ctx.strokeStyle = '#4a9eff';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(10, 10, 200, 80);
+
+    ctx.fillStyle = timerColor;
+    ctx.font = 'bold 24px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`⏱ ${timeLeft.toFixed(1)}s`, 20, 35);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '16px monospace';
+    ctx.fillText(`Level: ${level}/${maxLevel}`, 20, 60);
+    ctx.fillText(`Score: ${score}`, 20, 80);
+
+    // Speed bar
+    const speedPct = Math.abs(car.speed) / MAX_SPEED;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W - 160, 10, 150, 30);
+    ctx.strokeStyle = '#4a9eff';
+    ctx.strokeRect(W - 160, 10, 150, 30);
+    ctx.fillStyle = speedPct > 0.7 ? '#ff4444' : '#00ff88';
+    ctx.fillRect(W - 155, 15, 140 * speedPct, 20);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`SPEED ${Math.round(speedPct * 100)}%`, W - 85, 30);
+
+    // Minimap
+    const mmSize = Math.min(120, (W - 40) * 0.2);
+    const mmX = W - mmSize - 20;
+    const mmY = H - mmSize - 20;
+    const mmScale = mmSize / (mazeW * CELL_SIZE);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(mmX - 5, mmY - 5, mmSize + 10, mmSize + 10);
+    ctx.strokeStyle = '#4a9eff';
+    ctx.strokeRect(mmX - 5, mmY - 5, mmSize + 10, mmSize + 10);
+
+    // Minimap maze (simplified)
+    ctx.fillStyle = 'rgba(74,158,255,0.3)';
+    for (let y = 0; y < mazeH; y++) {
+        for (let x = 0; x < mazeW; x++) {
+            const cell = maze[y * mazeW + x];
+            const mx = mmX + x * CELL_SIZE * mmScale;
+            const my = mmY + y * CELL_SIZE * mmScale;
+            if (cell.top) ctx.fillRect(mx, my, CELL_SIZE * mmScale, 1);
+            if (cell.bottom) ctx.fillRect(mx, my + CELL_SIZE * mmScale, CELL_SIZE * mmScale, 1);
+        }
+    }
+
+    // Minimap car
+    ctx.fillStyle = '#ff4444';
+    ctx.beginPath();
+    ctx.arc(mmX + car.x * mmScale, mmY + car.y * mmScale, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Minimap exit
+    ctx.fillStyle = '#00ff88';
+    ctx.beginPath();
+    ctx.arc(mmX + exitX * mmScale, mmY + exitY * mmScale, 4, 0, Math.PI * 2);
+    ctx.fill();
+}
+
+function drawMenu() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title
+    const titleSize = Math.min(W * 0.1, 72);
+    ctx.font = `bold ${titleSize}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#4a9eff';
+    ctx.shadowColor = '#4a9eff';
+    ctx.shadowBlur = 20;
+    ctx.fillText('MAZE RACER', W / 2, H * 0.25);
+    ctx.shadowBlur = 0;
+
+    // Car icon
+    const carY = H * 0.4;
+    const pulse = Math.sin(Date.now() * 0.003) * 5;
+    ctx.save();
+    ctx.translate(W / 2, carY + pulse);
+    ctx.scale(3, 3);
+    ctx.fillStyle = '#ff4444';
+    ctx.beginPath();
+    ctx.moveTo(CAR_RADIUS + 2, 0);
+    ctx.lineTo(-CAR_RADIUS, -CAR_RADIUS * 0.7);
+    ctx.lineTo(-CAR_RADIUS * 0.5, 0);
+    ctx.lineTo(-CAR_RADIUS, CAR_RADIUS * 0.7);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    // Instructions
+    ctx.font = '18px monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('Race through the maze to reach the exit!', W / 2, H * 0.55);
+    ctx.fillText('Beat the clock on each level', W / 2, H * 0.62);
+
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#aaaaaa';
+    ctx.fillText('↑/W - Accelerate    ↓/S - Brake', W / 2, H * 0.72);
+    ctx.fillText('←/A & →/D - Steer', W / 2, H * 0.77);
+
+    // Start prompt
+    const blink = Math.sin(Date.now() * 0.005) > 0;
+    if (blink) {
+        ctx.fillStyle = '#00ff88';
+        ctx.font = 'bold 22px monospace';
+        ctx.fillText('Press any key to start', W / 2, H * 0.88);
+    }
+}
+
+function drawLevelComplete() {
+    drawMaze();
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.min(W * 0.08, 60)}px monospace`;
+    ctx.fillStyle = '#00ff88';
+    ctx.shadowColor = '#00ff88';
+    ctx.shadowBlur = 20;
+    ctx.fillText('LEVEL COMPLETE!', W / 2, H * 0.35);
+    ctx.shadowBlur = 0;
+
+    ctx.font = '24px monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(`Time remaining: ${timeLeft.toFixed(1)}s`, W / 2, H * 0.48);
+    ctx.fillText(`Score: ${score}`, W / 2, H * 0.56);
+
+    const blink = Math.sin(Date.now() * 0.005) > 0;
+    if (blink) {
+        ctx.fillStyle = '#00ff88';
+        ctx.font = '20px monospace';
+        ctx.fillText('Press any key to continue', W / 2, H * 0.7);
+    }
+}
+
+function drawGameOver() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    const won = level > maxLevel;
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.min(W * 0.08, 60)}px monospace`;
+
+    if (won) {
+        ctx.fillStyle = '#00ff88';
+        ctx.shadowColor = '#00ff88';
+        ctx.shadowBlur = 20;
+        ctx.fillText('YOU WIN!', W / 2, H * 0.3);
+    } else {
+        ctx.fillStyle = '#ff4444';
+        ctx.shadowColor = '#ff4444';
+        ctx.shadowBlur = 20;
+        ctx.fillText("TIME'S UP!", W / 2, H * 0.3);
+    }
+    ctx.shadowBlur = 0;
+
+    ctx.font = '24px monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(`Final Score: ${score}`, W / 2, H * 0.45);
+    ctx.fillText(`Reached Level: ${level}/${maxLevel}`, W / 2, H * 0.53);
+
+    const blink = Math.sin(Date.now() * 0.005) > 0;
+    if (blink) {
+        ctx.fillStyle = '#4a9eff';
+        ctx.font = '20px monospace';
+        ctx.fillText('Press any key to play again', W / 2, H * 0.7);
+    }
+}
+
+// Main loop
+let lastTime = 0;
+function gameLoop(timestamp) {
+    const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+    lastTime = timestamp;
+
+    if (gameState === STATE.MENU) {
+        drawMenu();
+    } else if (gameState === STATE.PLAYING) {
+        update(dt);
+        drawMaze();
+    } else if (gameState === STATE.LEVEL_COMPLETE) {
+        drawLevelComplete();
+    } else if (gameState === STATE.GAME_OVER) {
+        drawGameOver();
+    }
+
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
