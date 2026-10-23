@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NEON STRIKE - 3D Shooter</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; width: 100vw; height: 100vh; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    
+    if (type === 'shoot') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(100, audioCtx.currentTime + 0.1);
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.15);
+    } else if (type === 'hit') {
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+    } else if (type === 'explode') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.3);
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+    } else if (type === 'hurt') {
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(80, audioCtx.currentTime + 0.2);
+        gain.gain.setValueAtTime(0.4, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.25);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.25);
+    } else if (type === 'wave') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(440, audioCtx.currentTime);
+        osc.frequency.setValueAtTime(660, audioCtx.currentTime + 0.1);
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.4);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.4);
+    }
+}
+
+// Game State
+let gameState = 'start'; // start, playing, gameover
+let score = 0;
+let wave = 0;
+let health = 100;
+let maxHealth = 100;
+let ammo = 30;
+let maxAmmo = 30;
+let reloadTime = 0;
+let reloading = false;
+
+// Player
+let playerX = 0, playerY = 0; // world position (y is depth/forward)
+let playerZ = 1.7; // eye height
+let yaw = 0; // horizontal rotation
+let pitch = 0; // vertical rotation
+let keys = {};
+let mouseDown = false;
+
+// 3D Math
+const FOV = Math.PI / 3;
+const NEAR = 0.1, FAR = 200;
+
+function project(x, y, z) {
+    // Transform to camera space
+    let dx = x - playerX;
+    let dy = y - playerY;
+    let dz = z - playerZ;
+    
+    // Rotate by yaw (camera looks in +z direction at yaw=0)
+    let cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+    let rx = dx * cosY - dz * sinY;
+    let rz = dx * sinY + dz * cosY;
+    
+    // Actually let's use a simpler convention: yaw rotates around Y axis
+    // Camera faces -Z at yaw=0, so we rotate world by -yaw
+    rx = dx * Math.cos(-yaw) - dz * Math.sin(-yaw);
+    rz = dx * Math.sin(-yaw) + dz * Math.cos(-yaw);
+    
+    let ry = dy;
+    
+    // Pitch rotation (around X axis)
+    let cosP = Math.cos(pitch), sinP = Math.sin(pitch);
+    let finalY = ry * cosP - rz * sinP;
+    let finalZ = ry * sinP + rz * cosP;
+    
+    if (finalZ < NEAR) return null;
+    
+    let sx = (rx / finalZ) * (H / Math.tan(FOV / 2)) + W / 2;
+    let sy = -(finalY / finalZ) * (H / Math.tan(FOV / 2)) + H / 2;
+    
+    return { x: sx, y: sy, z: finalZ, scale: H / Math.tan(FOV / 2) / finalZ };
+}
+
+// Enemies
+let enemies = [];
+let particles = [];
+let muzzleFlash = 0;
+let shakeTime = 0;
+let hitMarker = 0;
+
+class Enemy {
+    constructor(x, y, type) {
+        this.x = x;
+        this.y = y;
+        this.z = 1.0 + Math.random() * 2; // float height
+        this.type = type || 'drone'; // drone, tank, fast
+        this.health = type === 'tank' ? 5 : (type === 'fast' ? 1 : 3);
+        this.maxHealth = this.health;
+        this.speed = type === 'fast' ? 4 : (type === 'tank' ? 0.8 : 1.5);
+        this.size = type === 'tank' ? 0.8 : (type === 'fast' ? 0.3 : 0.5);
+        this.color = type === 'tank' ? '#ff4444' : (type === 'fast' ? '#ffff44' : '#ff8800');
+        this.hitTimer = 0;
+        this.bobPhase = Math.random() * Math.PI * 2;
+        this.alive = true;
+    }
+    
+    update(dt) {
+        if (!this.alive) return;
+        let dx = -this.x; // move toward player at (0,0)
+        let dy = -this.y;
+        let dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > 0.5) {
+            this.x += (dx / dist) * this.speed * dt;
+            this.y += (dy / dist) * this.speed * dt;
+        } else {
+            // Attack player
+            health -= 20 * dt;
+            shakeTime = 0.2;
+            if (Math.random() < dt * 3) playSound('hurt');
+        }
+        this.bobPhase += dt * 3;
+        this.z = 1.0 + Math.sin(this.bobPhase) * 0.3;
+        if (this.hitTimer > 0) this.hitTimer -= dt;
+    }
+    
+    hit() {
+        this.health--;
+        this.hitTimer = 0.2;
+        playSound('hit');
+        if (this.health <= 0) {
+            this.alive = false;
+            score += this.type === 'tank' ? 50 : (this.type === 'fast' ? 30 : 10);
+            playSound('explode');
+            // Spawn particles
+            for (let i = 0; i < 8; i++) {
+                let angle = Math.random() * Math.PI * 2;
+                let speed = 2 + Math.random() * 3;
+                particles.push({
+                    x: this.x, y: this.y, z: this.z,
+                    vx: Math.cos(angle) * speed,
+                    vy: Math.sin(angle) * speed,
+                    vz: (Math.random() - 0.5) * 2,
+                    life: 1,
+                    color: this.color
+                });
+            }
+        }
+    }
+}
+
+// Wave system
+let waveTimer = 0;
+let enemiesToSpawn = 0;
+let spawnTimer = 0;
+
+function startWave() {
+    wave++;
+    playSound('wave');
+    enemiesToSpawn = 3 + wave * 2;
+    spawnTimer = 0;
+}
+
+function spawnEnemy() {
+    let angle = Math.random() * Math.PI * 2;
+    let dist = 40 + Math.random() * 20;
+    let x = Math.cos(angle) * dist;
+    let y = Math.sin(angle) * dist;
+    let type = 'drone';
+    if (wave >= 3 && Math.random() < 0.3) type = 'tank';
+    if (wave >= 2 && Math.random() < 0.4) type = 'fast';
+    enemies.push(new Enemy(x, y, type));
+}
+
+// Input
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'start' && (e.code === 'Enter' || e.code === 'Space')) {
+        initAudio();
+        startGame();
+    }
+    if (gameState === 'gameover' && (e.code === 'Enter' || e.code === 'KeyR')) {
+        startGame();
+    }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+document.addEventListener('mousedown', e => {
+    if (e.button === 0) mouseDown = true;
+});
+document.addEventListener('mouseup', e => {
+    if (e.button === 0) mouseDown = false;
+});
+
+document.addEventListener('mousemove', e => {
+    if (gameState !== 'playing') return;
+    // We'll handle this with a simple approach - track mouse position for aiming
+});
+
+// Use pointer lock for proper FPS controls
+let lastMouseX = 0, lastMouseY = 0;
+document.addEventListener('mousemove', e => {
+    if (gameState !== 'playing') return;
+    let dx = e.movementX || (e.clientX - lastMouseX);
+    let dy = e.movementY || (e.clientY - lastMouseY);
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+    yaw -= dx * 0.003;
+    pitch += dy * 0.002;
+    pitch = Math.max(-1.2, Math.min(1.2, pitch));
+});
+
+function startGame() {
+    gameState = 'playing';
+    score = 0;
+    wave = 0;
+    health = 100;
+    ammo = 30;
+    reloading = false;
+    enemies = [];
+    particles = [];
+    playerX = 0; playerY = 0;
+    yaw = 0; pitch = 0;
+    waveTimer = 2;
+    enemiesToSpawn = 0;
+}
+
+// Shooting
+let shootCooldown = 0;
+
+function shoot() {
+    if (reloading || ammo <= 0) return;
+    ammo--;
+    muzzleFlash = 0.1;
+    playSound('shoot');
+    
+    // Hitscan: check each enemy, see if it's in the crosshair area
+    let bestDist = Infinity;
+    let hitEnemy = null;
+    
+    for (let e of enemies) {
+        if (!e.alive) continue;
+        let p = project(e.x, e.y, e.z);
+        if (!p) continue;
+        
+        // Check if enemy is near crosshair center
+        let dx = p.x - W / 2;
+        let dy = p.y - H / 2;
+        let distSq = dx * dx + dy * dy;
+        let hitRadius = e.size * p.scale * 0.5;
+        
+        if (distSq < hitRadius * hitRadius && p.z < bestDist) {
+            bestDist = p.z;
+            hitEnemy = e;
+        }
+    }
+    
+    if (hitEnemy) {
+        hitMarker = 0.3;
+        hitEnemy.hit();
+    }
+    
+    if (ammo <= 0) {
+        reloading = true;
+        reloadTime = 1.5;
+    }
+}
+
+// Update
+let lastTime = 0;
+function update(dt) {
+    if (gameState !== 'playing') return;
+    
+    // Movement
+    let moveSpeed = 8 * dt;
+    let cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+    
+    if (keys['KeyW']) { playerX -= sinY * moveSpeed; playerY += cosY * moveSpeed; }
+    if (keys['KeyS']) { playerX += sinY * moveSpeed; playerY -= cosY * moveSpeed; }
+    if (keys['KeyA']) { playerX += cosY * moveSpeed; playerY += sinY * moveSpeed; }
+    if (keys['KeyD']) { playerX -= cosY * moveSpeed; playerY -= sinY * moveSpeed; }
+    
+    // Shooting
+    shootCooldown -= dt;
+    if (mouseDown && shootCooldown <= 0) {
+        shoot();
+        shootCooldown = 0.15;
+    }
+    
+    // Reload
+    if (reloading) {
+        reloadTime -= dt;
+        if (reloadTime <= 0) {
+            reloading = false;
+            ammo = maxAmmo;
+        }
+    }
+    if (keys['KeyR'] && !reloading && ammo < maxAmmo) {
+        reloading = true;
+        reloadTime = 1.5;
+    }
+    
+    // Wave management
+    waveTimer -= dt;
+    if (waveTimer <= 0 && enemiesToSpawn === 0 && enemies.filter(e => e.alive).length === 0) {
+        startWave();
+    }
+    
+    if (enemiesToSpawn > 0) {
+        spawnTimer -= dt;
+        if (spawnTimer <= 0) {
+            spawnEnemy();
+            enemiesToSpawn--;
+            spawnTimer = Math.max(0.3, 1.5 - wave * 0.1);
+        }
+    }
+    
+    // Update enemies
+    for (let e of enemies) e.update(dt);
+    enemies = enemies.filter(e => e.alive);
+    
+    // Update particles
+    for (let p of particles) {
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.z += p.vz * dt;
+        p.life -= dt * 2;
+    }
+    particles = particles.filter(p => p.life > 0);
+    
+    // Timers
+    if (muzzleFlash > 0) muzzleFlash -= dt;
+    if (shakeTime > 0) shakeTime -= dt;
+    if (hitMarker > 0) hitMarker -= dt;
+    
+    // Check game over
+    if (health <= 0) {
+        health = 0;
+        gameState = 'gameover';
+    }
+}
+
+// Render
+function render() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+    
+    if (gameState === 'start') {
+        renderStartScreen();
+        return;
+    }
+    
+    if (gameState === 'gameover') {
+        renderGameWorld();
+        renderGameOver();
+        return;
+    }
+    
+    renderGameWorld();
+    renderHUD();
+}
+
+function renderGameWorld() {
+    // Screen shake
+    ctx.save();
+    if (shakeTime > 0) {
+        let s = shakeTime * 10;
+        ctx.translate((Math.random() - 0.5) * s, (Math.random() - 0.5) * s);
+    }
+    
+    // Sky gradient
+    let skyGrad = ctx.createLinearGradient(0, 0, 0, H / 2);
+    skyGrad.addColorStop(0, '#0a0a2e');
+    skyGrad.addColorStop(1, '#1a1a3e');
+    ctx.fillStyle = skyGrad;
+    ctx.fillRect(0, 0, W, H / 2);
+    
+    // Floor grid
+    drawFloor();
+    
+    // Draw enemies (sorted by depth)
+    let projected = [];
+    for (let e of enemies) {
+        if (!e.alive) continue;
+        let p = project(e.x, e.y, e.z);
+        if (!p || p.z < NEAR) continue;
+        projected.push({ enemy: e, proj: p });
+    }
+    projected.sort((a, b) => b.proj.z - a.proj.z);
+    
+    for (let item of projected) {
+        drawEnemy(item.enemy, item.proj);
+    }
+    
+    // Particles
+    for (let p of particles) {
+        let proj = project(p.x, p.y, p.z);
+        if (!proj) continue;
+        let size = Math.max(2, 10 / proj.z * proj.scale * 0.01);
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(proj.x, proj.y, size, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    
+    // Muzzle flash
+    if (muzzleFlash > 0) {
+        let intensity = muzzleFlash / 0.1;
+        let grad = ctx.createRadialGradient(W/2, H*0.7, 0, W/2, H*0.7, 100 * intensity);
+        grad.addColorStop(0, `rgba(255, 200, 50, ${intensity * 0.8})`);
+        grad.addColorStop(0.3, `rgba(255, 150, 0, ${intensity * 0.4})`);
+        grad.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, W, H);
+    }
+    
+    // Hit marker
+    if (hitMarker > 0) {
+        let a = hitMarker / 0.3;
+        ctx.strokeStyle = `rgba(255, 255, 255, ${a})`;
+        ctx.lineWidth = 2;
+        let cx = W / 2, cy = H / 2, s = 15;
+        ctx.beginPath();
+        ctx.moveTo(cx - s, cy); ctx.lineTo(cx - s/3, cy);
+        ctx.moveTo(cx + s, cy); ctx.lineTo(cx + s/3, cy);
+        ctx.moveTo(cx, cy - s); ctx.lineTo(cx, cy - s/3);
+        ctx.moveTo(cx, cy + s); ctx.lineTo(cx, cy + s/3);
+        ctx.stroke();
+    }
+    
+    // Crosshair
+    ctx.strokeStyle = 'rgba(0, 255, 100, 0.8)';
+    ctx.lineWidth = 1.5;
+    let cs = 12, cg = 5;
+    ctx.beginPath();
+    ctx.moveTo(W/2 - cs, H/2); ctx.lineTo(W/2 - cg, H/2);
+    ctx.moveTo(W/2 + cg, H/2); ctx.lineTo(W/2 + cs, H/2);
+    ctx.moveTo(W/2, H/2 - cs); ctx.lineTo(W/2, H/2 - cg);
+    ctx.moveTo(W/2, H/2 + cg); ctx.lineTo(W/2, H/2 + cs);
+    ctx.stroke();
+    
+    // Gun
+    drawGun();
+    
+    ctx.restore();
+}
+
+function drawFloor() {
+    let floorY = H / 2;
+    let gridSize = 5;
+    let maxDist = 100;
+    
+    // Draw grid lines on the floor
+    ctx.strokeStyle = 'rgba(0, 255, 150, 0.15)';
+    ctx.lineWidth = 1;
+    
+    // Horizontal lines (depth)
+    for (let d = 5; d < maxDist; d += gridSize) {
+        let p1 = project(-maxDist, 0, -d);
+        let p2 = project(maxDist, 0, -d);
+        if (p1 && p2) {
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.stroke();
+        }
+    }
+    
+    // Vertical lines (lateral)
+    for (let x = -maxDist; x <= maxDist; x += gridSize) {
+        let p1 = project(x, 0, 5);
+        let p2 = project(x, 0, -maxDist);
+        if (p1 && p2) {
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.stroke();
+        }
+    }
+    
+    // Floor base color
+    let floorGrad = ctx.createLinearGradient(0, H * 0.5, 0, H);
+    floorGrad.addColorStop(0, 'rgba(10, 10, 40, 0)');
+    floorGrad.addColorStop(1, 'rgba(10, 20, 40, 0.5)');
+    // We already drew the grid over this, so just add a subtle glow at horizon
+}
+
+function drawEnemy(enemy, proj) {
+    let size = enemy.size * proj.scale * 0.08;
+    if (size < 1) return;
+    
+    let x = proj.x, y = proj.y;
+    let flash = enemy.hitTimer > 0;
+    
+    ctx.save();
+    ctx.translate(x, y);
+    
+    // Body
+    ctx.fillStyle = flash ? '#ffffff' : enemy.color;
+    ctx.shadowColor = enemy.color;
+    ctx.shadowBlur = 15;
+    
+    if (enemy.type === 'drone') {
+        // Diamond shape
+        ctx.beginPath();
+        ctx.moveTo(0, -size);
+        ctx.lineTo(size * 0.7, 0);
+        ctx.lineTo(0, size);
+        ctx.lineTo(-size * 0.7, 0);
+        ctx.closePath();
+        ctx.fill();
+        
+        // Eye
+        ctx.fillStyle = flash ? '#fff' : '#ff0';
+        ctx.beginPath();
+        ctx.arc(0, -size * 0.2, size * 0.25, 0, Math.PI * 2);
+        ctx.fill();
+    } else if (enemy.type === 'tank') {
+        // Large hexagon
+        ctx.beginPath();
+        for (let i = 0; i < 6; i++) {
+            let a = (i / 6) * Math.PI * 2 - Math.PI / 2;
+            let px = Math.cos(a) * size * 0.8;
+            let py = Math.sin(a) * size * 0.8;
+            if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+        
+        // Core
+        ctx.fillStyle = flash ? '#fff' : '#ff2200';
+        ctx.beginPath();
+        ctx.arc(0, 0, size * 0.3, 0, Math.PI * 2);
+        ctx.fill();
+    } else if (enemy.type === 'fast') {
+        // Arrow/triangle
+        ctx.beginPath();
+        ctx.moveTo(0, -size);
+        ctx.lineTo(size * 0.6, size * 0.5);
+        ctx.lineTo(-size * 0.6, size * 0.5);
+        ctx.closePath();
+        ctx.fill();
+    }
+    
+    // Health bar
+    if (enemy.health < enemy.maxHealth) {
+        let bw = size;
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(-bw/2, -size * 1.4, bw, 3);
+        ctx.fillStyle = '#0f0';
+        ctx.fillRect(-bw/2, -size * 1.4, bw * (enemy.health / enemy.maxHealth), 3);
+    }
+    
+    ctx.restore();
+}
+
+function drawGun() {
+    let gx = W / 2 + (mouseDown ? 3 : 0) + (Math.random() - 0.5) * 2;
+    let gy = H * 0.85;
+    
+    // Gun barrel
+    ctx.fillStyle = '#333';
+    ctx.strokeStyle = '#555';
+    ctx.lineWidth = 2;
+    
+    // Main body
+    ctx.beginPath();
+    ctx.moveTo(gx - 15, gy + 50);
+    ctx.lineTo(gx - 8, gy);
+    ctx.lineTo(gx + 8, gy);
+    ctx.lineTo(gx + 15, gy + 50);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    
+    // Barrel highlight
+    ctx.fillStyle = '#444';
+    ctx.fillRect(gx - 5, gy - 20, 10, 25);
+    ctx.strokeRect(gx - 5, gy - 20, 10, 25);
+    
+    // Muzzle glow when shooting
+    if (muzzleFlash > 0) {
+        let a = muzzleFlash / 0.1;
+        ctx.fillStyle = `rgba(255, 200, 50, ${a})`;
+        ctx.beginPath();
+        ctx.arc(gx, gy - 20, 8 + Math.random() * 4, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
+function renderHUD() {
+    // Health bar
+    let hbX = 30, hbY = H - 50, hbW = 200, hbH = 20;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(hbX - 2, hbY - 2, hbW + 4, hbH + 4);
+    let hColor = health > 50 ? '#0f0' : (health > 25 ? '#ff0' : '#f00');
+    ctx.fillStyle = hColor;
+    ctx.fillRect(hbX, hbY, hbW * (health / maxHealth), hbH);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(hbX, hbY, hbW, hbH);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px monospace';
+    ctx.fillText(`HP: ${Math.ceil(health)}`, hbX + 5, hbY - 8);
+    
+    // Ammo
+    ctx.font = 'bold 24px monospace';
+    ctx.fillStyle = reloading ? '#ff0' : '#fff';
+    let ammoText = reloading ? 'RELOADING...' : `${ammo} / ${maxAmmo}`;
+    ctx.fillText(ammoText, W - 180, H - 35);
+    
+    // Score & Wave
+    ctx.font = 'bold 18px monospace';
+    ctx.fillStyle = '#0ff';
+    ctx.textAlign = 'center';
+    ctx.fillText(`WAVE ${wave}`, W / 2, 40);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`SCORE: ${score}`, W / 2, 65);
+    ctx.textAlign = 'left';
+    
+    // Enemy count
+    let aliveCount = enemies.filter(e => e.alive).length;
+    if (aliveCount > 0) {
+        ctx.fillStyle = '#f80';
+        ctx.font = '14px monospace';
+        ctx.fillText(`Enemies: ${aliveCount}`, W / 2, 85);
+    }
+}
+
+function renderStartScreen() {
+    // Background effect
+    let t = Date.now() * 0.001;
+    for (let i = 0; i < 50; i++) {
+        let x = (Math.sin(t + i * 0.7) * 0.5 + 0.5) * W;
+        let y = (Math.cos(t * 0.7 + i * 1.3) * 0.5 + 0.5) * H;
+        ctx.fillStyle = `rgba(0, 255, 150, ${0.1 + Math.sin(t + i) * 0.05})`;
+        ctx.beginPath();
+        ctx.arc(x, y, 2, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    // Title
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 64px monospace';
+    ctx.fillStyle = '#0ff';
+    ctx.shadowColor = '#0ff';
+    ctx.shadowBlur = 20;
+    ctx.fillText('NEON STRIKE', W / 2, H * 0.3);
+    ctx.shadowBlur = 0;
+    
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('A 3D Arena Shooter', W / 2, H * 0.4);
+    
+    // Controls
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#aaa';
+    let y = H * 0.52;
+    let lines = [
+        'WASD - Move',
+        'MOUSE - Aim',
+        'CLICK - Shoot',
+        'R - Reload'
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, W / 2, y + i * 25);
+    });
+    
+    // Start prompt
+    let blink = Math.sin(t * 3) > 0;
+    if (blink) {
+        ctx.font = 'bold 24px monospace';
+        ctx.fillStyle = '#0f0';
+        ctx.fillText('PRESS ENTER TO START', W / 2, H * 0.8);
+    }
+    
+    ctx.textAlign = 'left';
+}
+
+function renderGameOver() {
+    // Dark overlay
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 56px monospace';
+    ctx.fillStyle = '#f00';
+    ctx.shadowColor = '#f00';
+    ctx.shadowBlur = 15;
+    ctx.fillText('GAME OVER', W / 2, H * 0.35);
+    ctx.shadowBlur = 0;
+    
+    ctx.font = '24px monospace';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`Final Score: ${score}`, W / 2, H * 0.48);
+    ctx.fillText(`Waves Survived: ${wave}`, W / 2, H * 0.55);
+    
+    let t = Date.now() * 0.001;
+    if (Math.sin(t * 3) > 0) {
+        ctx.font = '20px monospace';
+        ctx.fillStyle = '#0f0';
+        ctx.fillText('PRESS R OR ENTER TO RESTART', W / 2, H * 0.7);
+    }
+    ctx.textAlign = 'left';
+}
+
+// Main loop
+function gameLoop(timestamp) {
+    let dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+    lastTime = timestamp;
+    
+    update(dt);
+    render();
+    
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
