@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Gravity Sokoban</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#14162a;font-family:'Courier New',monospace;}
+  #wrap{position:fixed;inset:0;}
+  canvas{display:block;width:100%;height:100%;}
+  .overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(10,12,26,.86);color:#dfe3ff;text-align:center;z-index:5;}
+  .hidden{display:none !important;}
+  h1{font-size:min(9vw,54px);letter-spacing:4px;margin:0 0 10px;color:#ffd76a;text-shadow:0 0 26px rgba(255,200,80,.5);}
+  .sub{color:#8f97c9;margin-bottom:20px;font-size:min(3.4vw,17px);max-width:80%;}
+  .controls{line-height:2;font-size:min(3.1vw,15px);color:#b9c1ee;background:rgba(255,255,255,.05);padding:14px 26px;border-radius:10px;border:1px solid rgba(255,255,255,.12);}
+  .key{display:inline-block;min-width:24px;padding:1px 7px;margin:0 3px;border:1px solid #5a6398;border-bottom-width:3px;border-radius:6px;background:#232746;color:#ffd76a;font-weight:bold;}
+  .prompt{margin-top:24px;font-size:min(4vw,19px);color:#ffd76a;animation:pulse 1.2s infinite;}
+  @keyframes pulse{50%{opacity:.35}}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+
+  <div id="start" class="overlay">
+    <h1>GRAVITY SOKOBAN</h1>
+    <div class="sub">Crates fall. You don't — your boots defy gravity.<br>Flip the world and park every crate on a glowing pad.</div>
+    <div class="controls">
+      <span class="key">&#8593;&#8595;&#8592;&#8594;</span>/<span class="key">WASD</span> move &amp; push crates<br>
+      <span class="key">SPACE</span> rotate gravity (or <span class="key">G</span>)<br>
+      <span class="key">R</span> restart level &nbsp;&nbsp;<span class="key">ESC</span> menu
+    </div>
+    <div class="prompt">PRESS ENTER TO START</div>
+  </div>
+
+  <div id="clear" class="overlay hidden">
+    <h1 id="winTitle">LEVEL COMPLETE</h1>
+    <div class="sub" id="winInfo"></div>
+    <div class="prompt" id="nextPrompt">PRESS N FOR NEXT LEVEL</div>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* ---------- Levels ---------- */
+const LEVELS=[
+  {name:"First Fall",map:[
+    "#########",
+    "#   .   #",
+    "#   $   #",
+    "#   @   #",
+    "#       #",
+    "#########"]},
+  {name:"Double Slide",map:[
+    "#########",
+    "#     ..#",
+    "#       #",
+    "# $  $  #",
+    "#   @   #",
+    "#       #",
+    "#########"]},
+  {name:"Triple Stack",map:[
+    "##########",
+    "#...     #",
+    "#   ##   #",
+    "# $  $   #",
+    "#    @   #",
+    "# $      #",
+    "##########"]}
+];
+
+/* Gravity cycle: down -> left -> up -> right */
+const DIRS=[{x:0,y:1},{x:-1,y:0},{x:0,y:-1},{x:1,y:0}];
+
+/* ---------- DOM / canvas ---------- */
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+const startEl=document.getElementById('start'), clearEl=document.getElementById('clear');
+const winTitle=document.getElementById('winTitle'), winInfo=document.getElementById('winInfo'), nextPrompt=document.getElementById('nextPrompt');
+
+let W=0,H=0,DPR=1;
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1,2);
+  W=window.innerWidth; H=window.innerHeight;
+  cv.width=W*DPR; cv.height=H*DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize',resize); resize();
+
+/* ---------- Audio (Web Audio, starts on first input) ---------- */
+let AC=null;
+function audio(){
+  if(!AC){ try{ AC=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+  if(AC && AC.state==='suspended') AC.resume();
+}
+function tone(f,d,type,v,f2){
+  if(!AC) return;
+  const t=AC.currentTime, o=AC.createOscillator(), g=AC.createGain();
+  o.type=type||'square'; o.frequency.setValueAtTime(f,t);
+  if(f2) o.frequency.exponentialRampToValueAtTime(f2,t+d);
+  g.gain.setValueAtTime(v||0.15,t);
+  g.gain.exponentialRampToValueAtTime(0.001,t+d);
+  o.connect(g); g.connect(AC.destination);
+  o.start(t); o.stop(t+d+0.03);
+}
+const sMove  =()=>tone(320,.06,'square',.07);
+const sPush  =()=>tone(180,.09,'square',.11);
+const sBlock =()=>tone(90,.07,'square',.08);
+const sRotate=()=>tone(280,.2,'triangle',.16,880);
+const sThud  =()=>tone(120,.13,'sine',.28,55);
+function sWin(){ [523,659,784,1047].forEach((f,i)=>setTimeout(()=>tone(f,.2,'triangle',.14),i*110)); }
+
+/* ---------- State ---------- */
+let levelIdx=0, cols=0, rows=0;
+let walls=new Set(), targets=new Set();
+let boxes=[], player={x:0,y:0,fx:0,fy:-1};
+let gravIdx=0, moves=0, state='menu';
+let rotFlash=0, lastMoveT=0, particles=[];
+
+const K=(x,y)=>x+','+y;
+function isWall(x,y){ return x<0||y<0||x>=cols||y>=rows||walls.has(K(x,y)); }
+function boxAt(x,y){ for(const b of boxes) if(b.x===x&&b.y===y) return b; return null; }
+
+function getBest(i){ try{ const v=localStorage.getItem('gsv-best-'+i); return v?parseInt(v,10):null; }catch(e){ return null; } }
+function setBest(i,m){ if(getBest(i)==null||m<getBest(i)){ try{ localStorage.setItem('gsv-best-'+i,m); }catch(e){} } }
+
+function parse(i){
+  const L=LEVELS[i];
+  rows=L.map.length; cols=L.map[0].length;
+  walls=new Set(); targets=new Set(); boxes=[];
+  for(let y=0;y<rows;y++) for(let x=0;x<cols;x++){
+    const c=L.map[y][x];
+    if(c==='#') walls.add(K(x,y));
+    if(c==='.'||c==='*'||c==='+') targets.add(K(x,y));
+    if(c==='$'||c==='*') boxes.push({x:x,y:y});
+    if(c==='@'||c==='+'){ player.x=x; player.y=y; }
+  }
+  player.fx=0; player.fy=-1;
+  gravIdx=0; moves=0; rotFlash=0; particles=[];
+}
+
+/* ---------- Physics: settle crates under gravity ---------- */
+function spawnDust(b){
+  const g=DIRS[gravIdx];
+  for(let i=0;i<5;i++){
+    particles.push({
+      x:b.x+0.2+Math.random()*0.6, y:b.y+0.7,
+      vx:(Math.random()-0.5)*1.4 - g.x*0.3, vy:(Math.random()-0.5)*1.4 - g.y*0.3,
+      life:0.4+Math.random()*0.3, max:0.7
+    });
+  }
+}
+function settle(){
+  const g=DIRS[gravIdx];
+  let movedAny=false;
+  for(;;){
+    const order=boxes.slice().sort((a,b)=>(b.x*g.x+b.y*g.y)-(a.x*g.x+a.y*g.y));
+    let changed=false;
+    for(const b of order){
+      const nx=b.x+g.x, ny=b.y+g.y;
+      if(!isWall(nx,ny) && !boxAt(nx,ny) && !(player.x===nx&&player.y===ny)){
+        b.x=nx; b.y=ny; changed=true; movedAny=true; spawnDust(b);
+      }
+    }
+    if(!changed) break;
+  }
+  if(movedAny){ sThud(); checkWin(); }
+}
+
+function rotateG(){
+  gravIdx=(gravIdx+1)%4;
+  rotFlash=1;
+  sRotate();
+  settle();
+}
+
+function movePlayer(dx,dy){
+  if(state!=='play') return;
+  player.fx=dx; player.fy=dy;
+  const nx=player.x+dx, ny=player.y+dy;
+  if(isWall(nx,ny)){ sBlock(); return; }
+  const b=boxAt(nx,ny);
+  if(b){
+    const px=nx+dx, py=ny+dy;
+    if(!isWall(px,py) && !boxAt(px,py)){
+      b.x=px; b.y=py; moves++; sPush(); settle();
+    } else { sBlock(); }
+  } else {
+    player.x=nx; player.y=ny; moves++; sMove(); settle();
+  }
+}
+
+/* ---------- Win handling ---------- */
+function checkWin(){
+  if(state!=='play') return;
+  let ok=boxes.length===targets.size;
+  if(ok) for(const b of boxes) if(!targets.has(K(b.x,b.y))) { ok=false; break; }
+  if(!ok) return;
+  setBest(levelIdx,moves);
+  sWin();
+  if(levelIdx+1<LEVELS.length){
+    state='clear';
+    winTitle.textContent='LEVEL COMPLETE';
+    const best=getBest(levelIdx);
+    winInfo.innerHTML='Moves: <b style="color:#ffd76a">'+moves+'</b> &nbsp;&middot;&nbsp; Best: <b style="color:#ffd76a">'+best+'</b>';
+    nextPrompt.textContent='PRESS N FOR NEXT LEVEL';
+    clearEl.classList.remove('hidden');
+  } else {
+    state='done';
+    winTitle.textContent='YOU WIN!';
+    const all=LEVELS.map((_,i)=>getBest(i)).join(' + ');
+    winInfo.innerHTML='All levels cleared!<br>Best moves per level: <b style="color:#ffd76a">'+all+'</b>';
+    nextPrompt.textContent='PRESS ENTER TO PLAY AGAIN';
+    clearEl.classList.remove('hidden');
+  }
+}
+
+function startGame(){
+  parse(levelIdx);
+  state='play';
+  startEl.classList.add('hidden');
+  clearEl.classList.add('hidden');
+}
+function nextLevel(){
+  levelIdx++;
+  if(levelIdx>=LEVELS.length){ levelIdx=0; }
+  startGame();
+}
+function showMenu(){
+  state='menu';
+  clearEl.classList.add('hidden');
+  startEl.classList.remove('hidden');
+}
+
+/* ---------- Input ---------- */
+const DIRKEYS={ArrowUp:[0,-1],KeyW:[0,-1],ArrowDown:[0,1],KeyS:[0,1],ArrowLeft:[-1,0],KeyA:[-1,0],ArrowRight:[1,0],KeyD:[1,0]};
+const held=new Set(); let lastDirCode=null;
+
+window.addEventListener('keydown',function(e){
+  audio();
+  const code=e.code, k=e.key;
+  if(code==='Space'||code.indexOf('Arrow')===0) e.preventDefault();
+
+  switch(state){
+    case 'menu':
+      if(k==='Enter') startGame();
+      break;
+    case 'play':
+      if(DIRKEYS[code]){ held.add(code); lastDirCode=code; }
+      else if(k===' '||k==='g'||k==='G') rotateG();
+      else if(k==='r'||k==='R'){ parse(levelIdx); sRotate(); }
+      else if(k==='Escape') showMenu();
+      break;
+    case 'clear':
+      if(k==='n'||k==='N'||k==='Enter') nextLevel();
+      else if(k==='r'||k==='R'){ parse(levelIdx); state='play'; clearEl.classList.add('hidden'); }
+      else if(k==='Escape') showMenu();
+      break;
+    case 'done':
+      if(k==='Enter'||k==='n'||k==='N'){ levelIdx=0; startGame(); }
+      else if(k==='Escape') showMenu();
+      break;
+  }
+});
+window.addEventListener('keyup',function(e){ held.delete(e.code); });
+window.addEventListener('pointerdown',audio);
+
+/* ---------- Rendering ---------- */
+function layout(){
+  const cell=Math.floor(Math.min(W/(cols+2),(H-78)/(rows+1)));
+  const ox=(W-cell*cols)/2, oy=78+(H-78-cell*rows)/2;
+  return {cell:cell,ox:ox,oy:oy};
+}
+
+function drawArrow(cx,cy,len,g,alpha){
+  ctx.save();
+  ctx.globalAlpha=alpha;
+  ctx.strokeStyle='#ffd76a'; ctx.fillStyle='#ffd76a';
+  ctx.lineWidth=Math.max(3,len*0.22); ctx.lineCap='round';
+  const hx=-g.y*g.x, hy=-g.x*g.y; // perpendicular
+  ctx.beginPath();
+  ctx.moveTo(cx-g.x*len*0.5,cy-g.y*len*0.5);
+  ctx.lineTo(cx+g.x*len*0.35,cy+g.y*len*0.35);
+  ctx.stroke();
+  const tx=cx+g.x*len*0.5, ty=cy+g.y*len*0.5;
+  ctx.beginPath();
+  ctx.moveTo(tx,ty);
+  ctx.lineTo(tx-g.x*len*0.28+hx*len*0.3, ty-g.y*len*0.28+hy*len*0.3);
+  ctx.lineTo(tx-g.x*len*0.28-hx*len*0.3, ty-g.y*len*0.28-hy*len*0.3);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+function draw(t,dt){
+  const g=DIRS[gravIdx], L=layout();
+  const cs=L.cell, ox=L.ox, oy=L.oy;
+
+  /* background */
+  const bg=ctx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0,'#181b34'); bg.addColorStop(1,'#101226');
+  ctx.fillStyle=bg; ctx.fillRect(0,0,W,H);
+
+  /* HUD */
+  ctx.textBaseline='middle';
+  ctx.font='bold '+Math.max(13,Math.min(18,W*0.018))+'px "Courier New",monospace';
+  ctx.fillStyle='#dfe3ff'; ctx.textAlign='left';
+  ctx.fillText('LEVEL '+(levelIdx+1)+'/'+LEVELS.length+' \u2014 '+LEVELS[levelIdx].name,16,26);
+  ctx.textAlign='center';
+  ctx.fillStyle='#8f97c9';
+  const best=getBest(levelIdx);
+  ctx.fillText('MOVES: '+moves+(best!=null?'   BEST: '+best:''),W/2,48);
+
+  /* gravity badge */
+  const bx=W-52, by=34;
+  ctx.beginPath(); ctx.arc(bx,by,26,0,Math.PI*2);
+  ctx.fillStyle='rgba(255,215,106,0.1)'; ctx.fill();
+  ctx.strokeStyle='#ffd76a'; ctx.lineWidth=2; ctx.stroke();
+  drawArrow(bx,by,30,g,0.9);
+  ctx.textAlign='right'; ctx.fillStyle='#8f97c9';
+  ctx.fillText('GRAVITY',bx-34,by);
+
+  /* board shadow */
+  ctx.fillStyle='rgba(0,0,0,0.35)';
+  roundRect(ox-6,oy-6,cs*cols+12,cs*rows+12,10); ctx.fill();
+
+  /* tiles */
+  for(let y=0;y<rows;y++) for(let x=0;x<cols;x++){
+    const px=ox+x*cs, py=oy+y*cs;
+    if(walls.has(K(x,y))){
+      ctx.fillStyle=((x+y)%2)?'#454b74':'#3f4569';
+      ctx.fillRect(px,py,cs,cs);
+      ctx.strokeStyle='rgba(0,0,0,0.3)'; ctx.lineWidth=1;
+      ctx.strokeRect(px+0.5,py+0.5,cs-1,cs-1);
+    } else {
+      ctx.fillStyle=((x*7+y*13)%2)?'#262a48':'#232743';
+      ctx.fillRect(px,py,cs,cs);
+    }
+  }
+
+  /* targets */
+  const pulse=0.5+0.5*Math.sin(t*4);
+  for(const tk of targets){
+    const p=tk.split(','), x=+p[0], y=+p[1];
+    const px=ox+x*cs, py=oy+y*cs;
+    ctx.strokeStyle='rgba(255,184,77,'+(0.55+0.4*pulse)+')';
+    ctx.lineWidth=3;
+    roundRect(px+cs*0.18,py+cs*0.18,cs*0.64,cs*0.64,6); ctx.stroke();
+    ctx.beginPath(); ctx.arc(px+cs/2,py+cs/2,cs*(0.1+0.05*pulse),0,Math.PI*2);
+    ctx.fillStyle='rgba(255,184,77,'+(0.6+0.4*pulse)+')'; ctx.fill();
+  }
+
+  /* particles */
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i];
+    p.life-=dt; if(p.life<=0){ particles.splice(i,1); continue; }
+    p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy+=2.5*dt;
+    ctx.globalAlpha=Math.max(0,p.life/p.max)*0.7;
+    ctx.fillStyle='#c9b48a';
+    const s=cs*0.08;
+    ctx.fillRect(ox+p.x*cs,oy+p.y*cs,s,s);
+  }
+  ctx.globalAlpha=1;
+
+  /* boxes */
+  for(const b of boxes){
+    const px=ox+b.x*cs, py=oy+b.y*cs;
+    const onT=targets.has(K(b.x,b.y));
+    const m=cs*0.12;
+    ctx.fillStyle=onT?'#7a5c2e':'#8a6a35';
+    roundRect(px+m,py+m,cs-2*m,cs-2*m,cs*0.1); ctx.fill();
+    ctx.strokeStyle=onT?'#7dff9e':'#5c441f'; ctx.lineWidth=Math.max(2,cs*0.06);
+    roundRect(px+m,py+m,cs-2*m,cs-2*m,cs*0.1); ctx.stroke();
+    /* X brace */
+    ctx.strokeStyle='rgba(60,40,15,0.8)'; ctx.lineWidth=Math.max(1.5,cs*0.05);
+    ctx.beginPath();
+    ctx.moveTo(px+m*1.6,py+m*1.6); ctx.lineTo(px+cs-m*1.6,py+cs-m*1.6);
+    ctx.moveTo(px+cs-m*1.6,py+m*1.6); ctx.lineTo(px+m*1.6,py+cs-m*1.6);
+    ctx.stroke();
+    if(onT){
+      ctx.strokeStyle='rgba(125,255,158,'+(0.4+0.4*pulse)+')';
+      ctx.lineWidth=3;
+      roundRect(px+m-3,py+m-3,cs-2*m+6,cs-2*m+6,cs*0.12); ctx.stroke();
+    }
+  }
+
+  /* player (anti-grav astronaut) */
+  {
+    const px=ox+player.x*cs, py=oy+player.y*cs;
+    const bob=Math.sin(t*3)*cs*0.04;
+    const m=cs*0.18, s=cs-2*m;
+    /* boot glow */
+    ctx.beginPath(); ctx.arc(px+cs/2,py+cs-m*0.6,s*0.42,0,Math.PI*2);
+    ctx.fillStyle='rgba(110,231,255,'+(0.12+0.08*pulse)+')'; ctx.fill();
+    /* body */
+    ctx.fillStyle='#7ad0ff';
+    roundRect(px+m,py+m+bob,s,s,cs*0.2); ctx.fill();
+    ctx.strokeStyle='#3a9fd4'; ctx.lineWidth=Math.max(2,cs*0.06);
+    roundRect(px+m,py+m+bob,s,s,cs*0.2); ctx.stroke();
+    /* visor */
+    ctx.fillStyle='#1b2547';
+    const vx=px+cs/2+player.fx*s*0.18, vy=py+cs/2+bob+player.fy*s*0.1;
+    ctx.beginPath(); ctx.arc(vx,vy,s*0.3,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#bfeaff';
+    ctx.beginPath(); ctx.arc(vx+s*0.09,vy-s*0.1,s*0.08,0,Math.PI*2); ctx.fill();
+  }
+
+  /* gravity rotation flash: big translucent arrow across the board */
+  if(rotFlash>0){
+    rotFlash=Math.max(0,rotFlash-dt*2.2);
+    const cx=ox+cs*cols/2, cy=oy+cs*rows/2;
+    drawArrow(cx,cy,Math.min(cs*cols,cs*rows)*0.5,g,rotFlash*0.3);
+  }
+}
+
+/* ---------- Main loop ---------- */
+parse(0);
+let prevT=performance.now();
+function frame(now){
+  const dt=Math.min(0.05,(now-prevT)/1000); prevT=now;
+  if(state==='play' && lastDirCode && held.has(lastDirCode) && now-lastMoveT>135){
+    const d=DIRKEYS[lastDirCode];
+    movePlayer(d[0],d[1]);
+    lastMoveT=now;
+  }
+  draw(now/1000,dt);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
