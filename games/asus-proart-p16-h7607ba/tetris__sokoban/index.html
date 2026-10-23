@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sokoban Tetris</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0b0e1a;}
+  #wrap{position:absolute;inset:0;}
+  canvas{display:block;}
+  .screen{
+    position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    background:rgba(10,13,28,.94);border:2px solid #3a4a7a;border-radius:14px;
+    padding:28px 40px;text-align:center;color:#dfe6ff;font-family:Courier New,monospace;
+    box-shadow:0 0 40px rgba(80,120,255,.35);z-index:10;max-width:90%;
+  }
+  .screen h1{margin:0 0 6px;font-size:34px;color:#ffd75e;letter-spacing:2px;text-shadow:0 0 12px rgba(255,215,94,.5);}
+  .screen h2{margin:0 0 8px;font-size:22px;color:#ff6b6b;}
+  .screen p{font-size:14px;line-height:1.7;margin:10px 0;}
+  .key{display:inline-block;background:#1c2340;border:1px solid #4a5a9a;border-radius:5px;padding:1px 8px;margin:0 2px;font-size:13px;color:#9fd0ff;}
+  .btn{
+    font-family:inherit;font-size:17px;background:#2a3a6e;color:#fff;border:1px solid #5a7acc;
+    border-radius:8px;padding:10px 26px;margin-top:14px;cursor:pointer;letter-spacing:1px;
+  }
+  .btn:hover{background:#3a5aae;}
+  .hidden{display:none;}
+  .hint{color:#7f8fc0;font-size:12px;}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv"></canvas></div>
+
+<div class="screen" id="startScreen">
+  <h1>SOKOBAN TETRIS</h1>
+  <p class="hint">Tetris pieces fall. Wooden crates must be pushed onto glowing targets.</p>
+  <p>
+    <span class="key">&larr;</span><span class="key">&rarr;</span> move / push crates<br>
+    <span class="key">&darr;</span> soft drop &nbsp; <span class="key">Space</span> hard drop (pushes crates down)<br>
+    <span class="key">&uarr;</span>/<span class="key">X</span> rotate &nbsp; <span class="key">Z</span> rotate ccw<br>
+    <span class="key">P</span> pause &nbsp; <span class="key">R</span> restart
+  </p>
+  <p class="hint">Fill a whole row (no crate on it) to clear it.<br>Get every crate onto a target to finish the level!</p>
+  <button class="btn" id="startBtn">START (Enter)</button>
+</div>
+
+<div class="screen hidden" id="overScreen">
+  <h2>GAME OVER</h2>
+  <p id="finalScore"></p>
+  <p class="hint" id="bestScore"></p>
+  <button class="btn" id="restartBtn">RESTART (Enter / R)</button>
+</div>
+
+<script>
+(function(){
+"use strict";
+const W=10, H=14;
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+let cell=32, ox=0, oy=0;
+
+function resize(){
+  const w=window.innerWidth, h=window.innerHeight;
+  cv.width=w; cv.height=h;
+  cell=Math.floor(Math.min(w/(W+1), h/(H+1)));
+  if(cell<8)cell=8;
+  ox=Math.floor((w-cell*W)/2);
+  oy=Math.floor((h-cell*H)/2);
+}
+window.addEventListener('resize',resize); resize();
+
+/* ---------- audio ---------- */
+let AC=null;
+function initAudio(){ if(!AC){ try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){} } if(AC&&AC.state==='suspended')AC.resume(); }
+function beep(f,d,type,v){
+  if(!AC)return;
+  d=d||0.07; type=type||'square'; v=v||0.12;
+  const o=AC.createOscillator(), g=AC.createGain();
+  o.type=type; o.frequency.value=f;
+  g.gain.setValueAtTime(v,AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001,AC.currentTime+d);
+  o.connect(g); g.connect(AC.destination);
+  o.start(); o.stop(AC.currentTime+d);
+}
+function sfx(n){
+  switch(n){
+    case 'move': beep(220,0.04,'square',0.06); break;
+    case 'rotate': beep(330,0.05,'square',0.08); break;
+    case 'push': beep(140,0.1,'triangle',0.2); break;
+    case 'lock': beep(90,0.12,'sawtooth',0.15); break;
+    case 'drop': beep(500,0.06,'square',0.1); break;
+    case 'clear':[440,660,880].forEach((f,i)=>setTimeout(()=>beep(f,0.12,'triangle',0.15),i*70)); break;
+    case 'win':[523,659,784,1047].forEach((f,i)=>setTimeout(()=>beep(f,0.18,'triangle',0.18),i*110)); break;
+    case 'lose':[300,220,150,90].forEach((f,i)=>setTimeout(()=>beep(f,0.22,'sawtooth',0.15),i*140)); break;
+  }
+}
+
+/* ---------- pieces ---------- */
+const SHAPES=[
+  {m:[[1,1,1,1]], col:'#3fd8ff'},
+  {m:[[1,1],[1,1]], col:'#ffe14d'},
+  {m:[[0,1,0],[1,1,1]], col:'#b06bff'},
+  {m:[[0,1,1],[1,1,0]], col:'#5dff7c'},
+  {m:[[1,1,0],[0,1,1]], col:'#ff5d5d'},
+  {m:[[1,0,0],[1,1,1]], col:'#4d7bff'},
+  {m:[[0,0,1],[1,1,1]], col:'#ff9f3f'}
+];
+
+/* ---------- levels ---------- */
+const LEVELS=[
+  {crates:[[3,7],[6,7]], goals:[[1,7],[8,7]]},
+  {crates:[[4,5],[5,8],[6,5]], goals:[[2,6],[5,11],[8,5]]},
+  {crates:[[3,4],[6,4],[4,9],[5,9]], goals:[[1,7],[8,6],[2,11],[7,11]]},
+  {crates:[[2,5],[5,3],[7,7],[4,10]], goals:[[8,5],[1,11],[9,7],[2,12]]}
+];
+
+/* ---------- state ---------- */
+let board, crates, goals, cur, level, score, best=0, state='start';
+let gravTimer=0, paused=false, flashTime=0, flashText='', softDrop=false;
+
+try{ best=parseInt(localStorage.getItem('sokotet_best')||'0',10)||0; }catch(e){}
+
+function key(c,r){ return c+','+r; }
+function emptyBoard(){ return Array.from({length:H},()=>Array(W).fill(null)); }
+
+function loadLevel(n){
+  const L=LEVELS[n%LEVELS.length];
+  board=emptyBoard();
+  crates=L.crates.map(p=>({c:p[0],r:p[1]}));
+  goals=new Set(L.goals.map(p=>key(p[0],p[1])));
+}
+
+function spawn(){
+  const s=SHAPES[Math.floor(Math.random()*SHAPES.length)];
+  const m=s.m.map(r=>r.slice());
+  const c=Math.floor((W-m[0].length)/2);
+  cur={m:m, col:s.col, c:c, r:0};
+  // if spawn overlaps a crate, fail
+  for(const [cc,rr] of cellsOf(cur)) if(rr>=0 && crates.some(k=>k.c===cc&&k.r===rr)){ gameOver(); return; }
+}
+
+function cellsOf(p){
+  const out=[];
+  for(let r=0;r<p.m.length;r++)for(let c=0;c<p.m[r].length;c++)
+    if(p.m[r][c]) out.push([p.c+c, p.r+r]);
+  return out;
+}
+
+function inBounds(c,r){ return c>=0&&c<W&&r>=0&&r<H; }
+function boardAt(c,r){ return inBounds(c,r)?board[r][c]:null; }
+
+/* try to move piece by (dx,dy); pushes crates Sokoban-style. Mutates p and crateArr. */
+function tryMove(p,dx,dy,crateArr){
+  const targets=cellsOf(p).map(([c,r])=>[c+dx,r+dy]);
+  // bounds
+  for(const [c,r] of targets) if(c<0||c>=W||r>H) return false;
+
+  // crates hit
+  const pushed=[];
+  for(const [c,r] of targets){
+    if(r<0) continue;
+    const idx=crateArr.findIndex(k=>k.c===c&&k.r===r);
+    if(idx>=0) pushed.push({idx, oc:c, or:r, dc:c+dx, dr:r+dy});
+  }
+
+  if(pushed.length){
+    // verify each push destination
+    for(const q of pushed){
+      if(!inBounds(q.dc,q.dr)) return false;
+      if(board[q.dr][q.dc]) return false;
+      if(crateArr.some((k,i)=>i!==q.idx && k.c===q.dc && k.r===q.dr)) return false;
+    }
+    // no two pushes into same cell
+    for(let i=0;i<pushed.length;i++)for(let j=i+1;j<pushed.length;j++)
+      if(pushed[i].dc===pushed[j].dc && pushed[i].dr===pushed[j].dr) return false;
+
+    // remaining target cells must be free (old crate cells become free)
+    for(const [c,r] of targets){
+      if(r<0) continue;
+      const isOldCrate=pushed.some(q=>q.oc===c&&q.or===r);
+      if(isOldCrate) continue;
+      if(board[r][c]) return false;
+      if(crateArr.some((k,i)=>i!==-1 && k.c===c && k.r===r)) return false;
+    }
+
+    for(const q of pushed){ const k=crateArr[q.idx]; k.c=q.dc; k.r=q.dr; }
+    p.c+=dx; p.r+=dy;
+    sfx('push'); score+=10;
+    checkWin();
+    return true;
+  }
+
+  // plain move: no crate involved
+  for(const [c,r] of targets){
+    if(r<0) continue;
+    if(board[r][c]) return false;
+    if(crateArr.some(k=>k.c===c&&k.r===r)) return false;
+  }
+  p.c+=dx; p.r+=dy;
+  return true;
+}
+
+function rotate(dir){
+  const m=cur.m, n=m.length;
+  const nm=[];
+  for(let r=0;r<n;r++){ nm.push([]); for(let c=0;c<n;c++)
+    nm[r].push(dir>0 ? m[n-1-c][r] : m[c][n-1-r]); }
+  // trim empty rows/cols to keep footprint tight (only matters for asymmetric shapes)
+  const old=m; cur.m=nm;
+  for(const kick of [0,-1,1,-2,2]){
+    if(cellsOf(cur).every(([c,r])=> r<0 ? true : (!boardAt(c,r) && !crates.some(k=>k.c===c&&k.r===r)))){
+      cur.c+=kick; sfx('rotate'); return;
+    }
+  }
+  cur.m=old;
+}
+
+function hardDrop(){
+  let d=0;
+  while(tryMove(cur,0,1)) d++;
+  if(d>0) score+=2*d;
+  sfx('drop');
+  lock();
+}
+
+function lock(){
+  let anyAbove=false;
+  for(const [c,r] of cellsOf(cur)){
+    if(r<0){ anyAbove=true; continue; }
+    board[r][c]=cur.col;
+  }
+  if(anyAbove){ gameOver(); return; }
+  sfx('lock');
+
+  // line clears (rows without crates)
+  let cleared=0;
+  for(let r=H-1;r>=0;r--){
+    const hasCrate=crates.some(k=>k.r===r);
+    if(hasCrate) continue;
+    if(board[r].every(v=>v)){
+      board.splice(r,1); board.unshift(Array(W).fill(null));
+      crates.forEach(k=>{ if(k.r>r) k.r--; });
+      cleared++; r++;
+    }
+  }
+  if(cleared){ score+=[0,40,100,300,1200][cleared]*Math.max(1,level); sfx('clear'); flash('CLEAR! x'+cleared); }
+
+  checkWin();
+  if(state==='play') spawn();
+}
+
+function checkWin(){
+  if(state!=='play') return;
+  if(crates.length && crates.every(k=>goals.has(key(k.c,k.r)))){
+    state='levelup'; flashTime=1.4; flashText='LEVEL '+level+' COMPLETE! +500';
+    score+=500; sfx('win');
+  }
+}
+
+function flash(t){ flashText=t; flashTime=1.0; }
+
+function startGame(){
+  level=1; score=0; paused=false;
+  loadLevel(0); spawn();
+  state='play'; gravTimer=0;
+  document.getElementById('startScreen').classList.add('hidden');
+  document.getElementById('overScreen').classList.add('hidden');
+}
+
+function gameOver(){
+  state='over'; sfx('lose');
+  if(score>best){ best=score; try{localStorage.setItem('sokotet_best',''+best);}catch(e){} }
+  document.getElementById('finalScore').innerHTML='Score: <b style="color:#ffd75e">'+score+'</b><br>Level reached: '+level;
+  document.getElementById('bestScore').textContent='Best: '+best;
+  document.getElementById('overScreen').classList.remove('hidden');
+}
+
+/* ---------- input ---------- */
+window.addEventListener('keydown',function(e){
+  initAudio();
+  const k=e.key;
+  if(['ArrowLeft','ArrowRight','ArrowDown','ArrowUp',' '].includes(k)) e.preventDefault();
+
+  if(state==='start' && (k==='Enter'||k===' ')){ startGame(); return; }
+  if(state==='over' && (k==='Enter'||k.toLowerCase()==='r')){ startGame(); return; }
+  if(state!=='play') return;
+  if(k.toLowerCase()==='p'){ paused=!paused; return; }
+  if(paused) return;
+  if(k.toLowerCase()==='r'){ startGame(); return; }
+
+  switch(k){
+    case 'ArrowLeft':  if(tryMove(cur,-1,0)) sfx('move'); break;
+    case 'ArrowRight': if(tryMove(cur, 1,0)) sfx('move'); break;
+    case 'ArrowDown':  softDrop=true; if(tryMove(cur,0,1)){ score+=1; } break;
+    case 'ArrowUp': case 'x': case 'X': rotate(1); break;
+    case 'z': case 'Z': rotate(-1); break;
+    case ' ': hardDrop(); break;
+  }
+});
+window.addEventListener('keyup',function(e){ if(e.key==='ArrowDown') softDrop=false; });
+document.getElementById('startBtn').addEventListener('click',function(){ initAudio(); startGame(); });
+document.getElementById('restartBtn').addEventListener('click',function(){ initAudio(); startGame(); });
+
+/* ---------- drawing ---------- */
+function drawCell(c,r,color,alpha,ghost){
+  const x=ox+c*cell, y=oy+r*cell;
+  ctx.save(); ctx.globalAlpha=alpha==null?1:alpha;
+  if(ghost){
+    ctx.strokeStyle=color; ctx.lineWidth=2;
+    ctx.strokeRect(x+3,y+3,cell-6,cell-6);
+  }else{
+    ctx.fillStyle=color;
+    roundRect(x+1.5,y+1.5,cell-3,cell-3,4); ctx.fill();
+    ctx.fillStyle='rgba(255,255,255,.25)';
+    roundRect(x+1.5,y+1.5,cell-3,(cell-3)*0.35,4); ctx.fill();
+  }
+  ctx.restore();
+}
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+function drawCrate(k){
+  const x=ox+k.c*cell, y=oy+k.r*cell;
+  const onGoal=goals.has(key(k.c,k.r));
+  ctx.save();
+  if(onGoal){ ctx.shadowColor='#5dff7c'; ctx.shadowBlur=14; }
+  ctx.fillStyle=onGoal?'#3f9e52':'#8a5a2b';
+  roundRect(x+2,y+2,cell-4,cell-4,4); ctx.fill();
+  ctx.shadowBlur=0;
+  ctx.strokeStyle=onGoal?'#a7ffc4':'#c98f4d'; ctx.lineWidth=2;
+  ctx.strokeRect(x+3.5,y+3.5,cell-7,cell-7);
+  ctx.beginPath();
+  ctx.moveTo(x+3.5,y+3.5); ctx.lineTo(x+cell-3.5,y+cell-3.5);
+  ctx.moveTo(x+cell-3.5,y+3.5); ctx.lineTo(x+3.5,y+cell-3.5);
+  ctx.stroke();
+  if(onGoal){
+    ctx.fillStyle='#eaffea'; ctx.font='bold '+(cell*0.4)+'px monospace';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText('\u2713',x+cell/2,y+cell/2+1);
+  }
+  ctx.restore();
+}
+
+function draw(){
+  const w=cv.width, h=cv.height;
+  ctx.fillStyle='#0b0e1a'; ctx.fillRect(0,0,w,h);
+  if(!board) return;
+
+  // board bg + grid
+  ctx.fillStyle='#141a30'; ctx.fillRect(ox-2,oy-2,cell*W+4,cell*H+4);
+  ctx.strokeStyle='#232c4d'; ctx.lineWidth=1;
+  for(let c=0;c<=W;c++){ ctx.beginPath(); ctx.moveTo(ox+c*cell+.5,oy); ctx.lineTo(ox+c*cell+.5,oy+cell*H); ctx.stroke(); }
+  for(let r=0;r<=H;r++){ ctx.beginPath(); ctx.moveTo(ox,oy+r*cell+.5); ctx.lineTo(ox+cell*W,oy+r*cell+.5); ctx.stroke(); }
+
+  // goals
+  for(const g of goals){
+    const [c,r]=g.split(',').map(Number);
+    const x=ox+c*cell, y=oy+r*cell;
+    ctx.save();
+    ctx.translate(x+cell/2,y+cell/2); ctx.rotate(Math.PI/4);
+    ctx.strokeStyle='#3fd8ff'; ctx.lineWidth=2.5;
+    ctx.shadowColor='#3fd8ff'; ctx.shadowBlur=10;
+    const s=cell*0.26;
+    ctx.strokeRect(-s,-s,s*2,s*2);
+    ctx.restore();
+  }
+
+  // board cells
+  for(let r=0;r<H;r++)for(let c=0;c<W;c++) if(board[r][c]) drawCell(c,r,board[r][c]);
+
+  // crates
+  crates.forEach(drawCrate);
+
+  // ghost + current piece
+  if(cur && state==='play'){
+    const ghost={m:cur.m,c:cur.c,r:cur.r};
+    const gCrates=crates.map(k=>({c:k.c,r:k.r}));
+    while(tryMove(ghost,0,1,gCrates)){}
+    for(const [c,r] of cellsOf(ghost)) if(r>=0 && r!==cur.r) drawCell(c,r,cur.col,0.35,true);
+    for(const [c,r] of cellsOf(cur)) if(r>=0) drawCell(c,r,cur.col);
+  }
+
+  // HUD
+  ctx.fillStyle='#dfe6ff'; ctx.font='bold '+Math.max(12,cell*0.42)+'px monospace';
+  ctx.textAlign='left'; ctx.textBaseline='top';
+  ctx.fillText('SCORE '+score, ox, oy-cell*0.95);
+  ctx.textAlign='right';
+  ctx.fillStyle='#ffd75e';
+  ctx.fillText('LEVEL '+level, ox+cell*W, oy-cell*0.95);
+
+  // flash text
+  if(flashTime>0){
+    ctx.save();
+    ctx.globalAlpha=Math.min(1,flashTime*2);
+    ctx.fillStyle='#ffd75e';
+    ctx.font='bold '+Math.max(16,cell*0.7)+'px monospace';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.shadowColor='#ffd75e'; ctx.shadowBlur=18;
+    ctx.fillText(flashText, ox+cell*W/2, oy+cell*H/2);
+    ctx.restore();
+  }
+
+  if(paused){
+    ctx.fillStyle='rgba(10,13,28,.6)'; ctx.fillRect(ox,oy,cell*W,cell*H);
+    ctx.fillStyle='#fff'; ctx.font='bold '+Math.max(18,cell*0.8)+'px monospace';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText('PAUSED', ox+cell*W/2, oy+cell*H/2);
+  }
+}
+
+/* ---------- main loop ---------- */
+let last=performance.now();
+function loop(now){
+  const dt=Math.min(100, now-last); last=now;
+  if(state==='play' && !paused){
+    gravTimer+=dt;
+    const interval=softDrop?55:Math.max(200,520-(level-1)*45);
+    while(gravTimer>=interval && state==='play'){
+      gravTimer-=interval;
+      if(!tryMove(cur,0,1)) lock();
+    }
+  }
+  if(state==='levelup'){
+    flashTime-=dt/1000;
+    if(flashTime<=0){ level++; loadLevel(level-1); spawn(); state='play'; gravTimer=0; }
+  } else if(flashTime>0 && state==='play'){
+    flashTime-=dt/1000;
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// initial empty board so background renders before start
+board=emptyBoard(); crates=[]; goals=new Set(); cur=null; level=1; score=0;
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
