@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Gravity Racer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    
+    if (type === 'checkpoint') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(600, audioCtx.currentTime);
+        osc.frequency.linearRampToValueAtTime(1200, audioCtx.currentTime + 0.15);
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.3);
+    } else if (type === 'finish') {
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+        osc.frequency.linearRampToValueAtTime(800, audioCtx.currentTime + 0.2);
+        gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.5);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.5);
+    } else if (type === 'crash') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+        osc.frequency.linearRampToValueAtTime(80, audioCtx.currentTime + 0.3);
+        gain.gain.setValueAtTime(0.4, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.4);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.4);
+    } else if (type === 'boost') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(300, audioCtx.currentTime);
+        osc.frequency.linearRampToValueAtTime(900, audioCtx.currentTime + 0.1);
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.2);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.2);
+    } else if (type === 'tick') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.05);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.05);
+    }
+}
+
+// Game State
+let gameState = 'start'; // start, playing, finished
+let keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'start' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+    if (gameState === 'finished' && (e.code === 'KeyR' || e.code === 'Enter')) startGame();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Particles
+let particles = [];
+function spawnParticles(x, y, color, count, speed) {
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const spd = Math.random() * speed;
+        particles.push({
+            x, y,
+            vx: Math.cos(angle) * spd,
+            vy: Math.sin(angle) * spd,
+            life: 1,
+            decay: 0.02 + Math.random() * 0.03,
+            color,
+            size: 2 + Math.random() * 4
+        });
+    }
+}
+
+// Gravity Wells
+let gravityWells = [];
+function generateLevel() {
+    gravityWells = [];
+    const trackLength = 8000;
+    for (let i = 0; i < 35; i++) {
+        const x = 400 + Math.random() * (trackLength - 600);
+        const y = 100 + Math.random() * (H - 200);
+        const strength = 80 + Math.random() * 150;
+        const radius = 80 + Math.random() * 120;
+        gravityWells.push({ x, y, strength, radius, phase: Math.random() * Math.PI * 2 });
+    }
+    // Add some in patterns
+    for (let i = 0; i < 5; i++) {
+        const baseX = 1500 + i * 1400;
+        const baseY = H / 2;
+        gravityWells.push({ x: baseX, y: baseY - 100, strength: 120, radius: 100, phase: 0 });
+        gravityWells.push({ x: baseX + 100, y: baseY + 100, strength: 120, radius: 100, phase: Math.PI });
+    }
+}
+
+// Checkpoints
+let checkpoints = [];
+function generateCheckpoints() {
+    checkpoints = [];
+    const trackLength = 8000;
+    for (let i = 0; i < 6; i++) {
+        checkpoints.push({ x: 1200 + i * (trackLength / 6), passed: false });
+    }
+}
+
+// Car
+let car = {};
+function resetCar() {
+    car = {
+        x: 150,
+        y: H / 2,
+        vx: 0,
+        vy: 0,
+        speed: 0,
+        angle: 0,
+        width: 40,
+        height: 22,
+        trail: []
+    };
+}
+
+// Game variables
+let cameraX = 0;
+let startTime = 0;
+let elapsedTime = 0;
+let currentCheckpoint = 0;
+let trackLength = 8000;
+let finishLineX = 7800;
+let bestTime = null;
+
+try {
+    const saved = localStorage.getItem('gravityRacerBest');
+    if (saved) bestTime = parseFloat(saved);
+} catch(e) {}
+
+function startGame() {
+    initAudio();
+    gameState = 'playing';
+    resetCar();
+    generateLevel();
+    generateCheckpoints();
+    cameraX = 0;
+    startTime = performance.now();
+    elapsedTime = 0;
+    currentCheckpoint = 0;
+    particles = [];
+}
+
+function formatTime(t) {
+    const mins = Math.floor(t / 60);
+    const secs = Math.floor(t % 60);
+    const ms = Math.floor((t % 1) * 100);
+    return `${mins}:${secs.toString().padStart(2,'0')}.${ms.toString().padStart(2,'0')}`;
+}
+
+// Stars background
+let stars = [];
+for (let i = 0; i < 200; i++) {
+    stars.push({ x: Math.random() * 3000, y: Math.random(), size: Math.random() * 2 + 0.5, speed: 0.2 + Math.random() * 0.5 });
+}
+
+let lastTime = 0;
+function update(dt) {
+    if (gameState !== 'playing') return;
+    
+    dt = Math.min(dt, 0.033);
+    elapsedTime = (performance.now() - startTime) / 1000;
+    
+    // Input
+    const accel = 400;
+    const friction = 0.985;
+    const maxSpeed = 500;
+    
+    if (keys['ArrowUp'] || keys['KeyW']) {
+        car.speed += accel * dt;
+    } else if (keys['ArrowDown'] || keys['KeyS']) {
+        car.speed -= accel * 1.5 * dt;
+    }
+    
+    car.speed *= friction;
+    car.speed = Math.max(0, Math.min(car.speed, maxSpeed));
+    
+    // Lateral movement
+    const lateralAccel = 350;
+    if (keys['ArrowLeft'] || keys['KeyA']) {
+        car.vy -= lateralAccel * dt;
+    } else if (keys['ArrowRight'] || keys['KeyD']) {
+        car.vy += lateralAccel * dt;
+    }
+    
+    // Gravity wells effect
+    for (const well of gravityWells) {
+        const dx = well.x - (car.x + cameraX);
+        const dy = well.y - car.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < well.radius && dist > 5) {
+            const force = well.strength / (dist * 0.3);
+            const fx = (dx / dist) * force;
+            const fy = (dy / dist) * force;
+            car.vy += fy * dt;
+        }
+    }
+    
+    // Apply velocity
+    car.x += car.speed * dt;
+    car.y += car.vy * dt;
+    car.vy *= 0.96;
+    
+    // Bounds
+    if (car.y < 30) { car.y = 30; car.vy = Math.abs(car.vy) * 0.5; }
+    if (car.y > H - 30) { car.y = H - 30; car.vy = -Math.abs(car.vy) * 0.5; }
+    
+    // Trail
+    car.trail.push({ x: car.x, y: car.y, life: 1 });
+    if (car.trail.length > 30) car.trail.shift();
+    for (let t of car.trail) t.life -= 0.03;
+    
+    // Particles from speed
+    if (car.speed > 100) {
+        if (Math.random() < 0.3) {
+            spawnParticles(car.x - 20, car.y + (Math.random()-0.5)*10, '#4af', 1, 2);
+        }
+    }
+    
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life -= p.decay;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+    
+    // Camera
+    cameraX = car.x - W * 0.3;
+    
+    // Checkpoints
+    for (let i = currentCheckpoint; i < checkpoints.length; i++) {
+        if (car.x >= checkpoints[i].x) {
+            checkpoints[i].passed = true;
+            currentCheckpoint = i + 1;
+            playSound('checkpoint');
+            spawnParticles(car.x, car.y, '#4f8', 20, 5);
+        }
+    }
+    
+    // Finish
+    if (car.x >= finishLineX) {
+        gameState = 'finished';
+        playSound('finish');
+        spawnParticles(car.x, car.y, '#ff0', 40, 8);
+        try {
+            if (!bestTime || elapsedTime < bestTime) {
+                bestTime = elapsedTime;
+                localStorage.setItem('gravityRacerBest', bestTime.toString());
+            }
+        } catch(e) {}
+    }
+}
+
+function drawBackground() {
+    // Space gradient
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, '#0a0a2e');
+    grad.addColorStop(1, '#1a0a3e');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+    
+    // Stars (parallax)
+    for (const s of stars) {
+        const sx = ((s.x - cameraX * s.speed * 0.1) % W + W) % W;
+        const sy = s.y * H;
+        ctx.fillStyle = `rgba(255,255,255,${0.3 + s.size * 0.3})`;
+        ctx.beginPath();
+        ctx.arc(sx, sy, s.size, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
+function drawGravityWell(well) {
+    const sx = well.x - cameraX;
+    if (sx < -200 || sx > W + 200) return;
+    
+    const time = performance.now() * 0.001;
+    const pulse = Math.sin(time * 2 + well.phase) * 0.2 + 1;
+    const r = well.radius * pulse;
+    
+    // Outer glow
+    const grad = ctx.createRadialGradient(sx, well.y, 0, sx, well.y, r);
+    grad.addColorStop(0, 'rgba(150, 80, 255, 0.6)');
+    grad.addColorStop(0.4, 'rgba(100, 50, 200, 0.3)');
+    grad.addColorStop(1, 'rgba(50, 20, 100, 0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(sx, well.y, r, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Core
+    const coreGrad = ctx.createRadialGradient(sx, well.y, 0, sx, well.y, 15);
+    coreGrad.addColorStop(0, 'rgba(255, 200, 255, 0.9)');
+    coreGrad.addColorStop(1, 'rgba(150, 80, 255, 0)');
+    ctx.fillStyle = coreGrad;
+    ctx.beginPath();
+    ctx.arc(sx, well.y, 15, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Spinning rings
+    for (let i = 0; i < 3; i++) {
+        const angle = time * (1.5 + i * 0.5) + well.phase + i * 2;
+        const ringR = 25 + i * 15;
+        ctx.strokeStyle = `rgba(180, 120, 255, ${0.4 - i * 0.1})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(sx, well.y, ringR, angle, angle + Math.PI * 1.2);
+        ctx.stroke();
+    }
+}
+
+function drawCar() {
+    const sx = car.x - cameraX;
+    const sy = car.y;
+    
+    // Trail
+    for (let i = 0; i < car.trail.length; i++) {
+        const t = car.trail[i];
+        if (t.life <= 0) continue;
+        const tx = t.x - cameraX;
+        ctx.fillStyle = `rgba(68, 170, 255, ${t.life * 0.4})`;
+        ctx.beginPath();
+        ctx.arc(tx, t.y, 3 * t.life, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    // Car body
+    ctx.save();
+    ctx.translate(sx, sy);
+    
+    const tilt = car.vy * 0.003;
+    ctx.rotate(tilt);
+    
+    // Glow
+    ctx.shadowColor = '#4af';
+    ctx.shadowBlur = 15;
+    
+    // Body
+    const bodyGrad = ctx.createLinearGradient(-20, 0, 20, 0);
+    bodyGrad.addColorStop(0, '#2a6aff');
+    bodyGrad.addColorStop(1, '#4af');
+    ctx.fillStyle = bodyGrad;
+    
+    // Car shape
+    ctx.beginPath();
+    ctx.moveTo(-20, -8);
+    ctx.lineTo(20, -5);
+    ctx.lineTo(25, 0);
+    ctx.lineTo(20, 5);
+    ctx.lineTo(-20, 8);
+    ctx.closePath();
+    ctx.fill();
+    
+    // Windshield
+    ctx.fillStyle = 'rgba(200, 240, 255, 0.7)';
+    ctx.beginPath();
+    ctx.moveTo(5, -4);
+    ctx.lineTo(15, -3);
+    ctx.lineTo(15, 3);
+    ctx.lineTo(5, 4);
+    ctx.closePath();
+    ctx.fill();
+    
+    // Engine glow
+    if (car.speed > 50) {
+        const engSize = Math.min(car.speed / 50, 1) * 8;
+        const engGrad = ctx.createRadialGradient(-22, 0, 0, -22, 0, engSize);
+        engGrad.addColorStop(0, 'rgba(255, 200, 100, 0.9)');
+        engGrad.addColorStop(1, 'rgba(255, 100, 50, 0)');
+        ctx.fillStyle = engGrad;
+        ctx.beginPath();
+        ctx.arc(-22, 0, engSize, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    ctx.restore();
+}
+
+function drawCheckpoints() {
+    for (let i = 0; i < checkpoints.length; i++) {
+        const cp = checkpoints[i];
+        const sx = cp.x - cameraX;
+        if (sx < -50 || sx > W + 50) continue;
+        
+        ctx.strokeStyle = cp.passed ? 'rgba(100, 255, 150, 0.3)' : 'rgba(255, 255, 100, 0.7)';
+        ctx.lineWidth = 3;
+        ctx.setLineDash([10, 8]);
+        ctx.beginPath();
+        ctx.moveTo(sx, 0);
+        ctx.lineTo(sx, H);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        
+        if (!cp.passed) {
+            ctx.fillStyle = 'rgba(255, 255, 100, 0.8)';
+            ctx.font = 'bold 14px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(`CP ${i + 1}`, sx, 25);
+        }
+    }
+    
+    // Finish line
+    const fx = finishLineX - cameraX;
+    if (fx > -50 && fx < W + 50) {
+        for (let y = 0; y < H; y += 20) {
+            ctx.fillStyle = ((y / 20) % 2 === 0) ? '#fff' : '#333';
+            ctx.fillRect(fx, y, 12, 20);
+        }
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 16px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('FINISH', fx + 6, 25);
+    }
+}
+
+function drawHUD() {
+    // Speed
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(10, 10, 180, 80);
+    ctx.strokeStyle = 'rgba(68,170,255,0.5)';
+    ctx.strokeRect(10, 10, 180, 80);
+    
+    ctx.fillStyle = '#4af';
+    ctx.font = 'bold 14px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`SPEED: ${Math.round(car.speed)}`, 20, 35);
+    ctx.fillText(`TIME: ${formatTime(elapsedTime)}`, 20, 58);
+    
+    // Speed bar
+    const speedPct = car.speed / 500;
+    ctx.fillStyle = 'rgba(68,170,255,0.3)';
+    ctx.fillRect(20, 68, 140, 12);
+    ctx.fillStyle = speedPct > 0.8 ? '#f44' : '#4af';
+    ctx.fillRect(20, 68, 140 * speedPct, 12);
+    
+    // Checkpoints
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W - 130, 10, 120, 40);
+    ctx.fillStyle = '#4f8';
+    ctx.font = 'bold 14px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(`CP: ${currentCheckpoint}/${checkpoints.length}`, W - 20, 35);
+}
+
+function drawStartScreen() {
+    drawBackground();
+    
+    // Title
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.min(W * 0.08, 64)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('GRAVITY RACER', W / 2, H * 0.25);
+    
+    // Subtitle
+    ctx.fillStyle = '#a78';
+    ctx.font = `${Math.min(W * 0.03, 24)}px monospace`;
+    ctx.fillText('Race through gravitational fields!', W / 2, H * 0.35);
+    
+    // Controls box
+    const boxW = Math.min(400, W * 0.8);
+    const boxH = 160;
+    const boxX = (W - boxW) / 2;
+    const boxY = H * 0.42;
+    
+    ctx.fillStyle = 'rgba(20, 20, 50, 0.8)';
+    ctx.fillRect(boxX, boxY, boxW, boxH);
+    ctx.strokeStyle = 'rgba(150, 100, 255, 0.5)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(boxX, boxY, boxW, boxH);
+    
+    ctx.fillStyle = '#cde';
+    ctx.font = `${Math.min(W * 0.025, 18)}px monospace`;
+    const lines = [
+        '↑ / W — Accelerate',
+        '↓ / S — Brake',
+        '← → / A D — Steer Up/Down',
+        '',
+        'Avoid gravity wells or use them!',
+        'Reach the finish line to win!'
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, W / 2, boxY + 30 + i * 24);
+    });
+    
+    // Start prompt
+    const pulse = Math.sin(performance.now() * 0.005) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(100, 255, 200, ${pulse})`;
+    ctx.font = `bold ${Math.min(W * 0.03, 28)}px monospace`;
+    ctx.fillText('PRESS SPACE TO START', W / 2, H * 0.85);
+    
+    // Best time
+    if (bestTime) {
+        ctx.fillStyle = '#ff0';
+        ctx.font = `${Math.min(W * 0.02, 16)}px monospace`;
+        ctx.fillText(`Best: ${formatTime(bestTime)}`, W / 2, H * 0.92);
+    }
+}
+
+function drawFinishScreen() {
+    drawBackground();
+    drawCar();
+    
+    // Overlay
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.fillStyle = '#4f8';
+    ctx.font = `bold ${Math.min(W * 0.07, 56)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('FINISH!', W / 2, H * 0.3);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.min(W * 0.04, 32)}px monospace`;
+    ctx.fillText(`Time: ${formatTime(elapsedTime)}`, W / 2, H * 0.45);
+    
+    if (bestTime && Math.abs(elapsedTime - bestTime) < 0.01) {
+        ctx.fillStyle = '#ff0';
+        ctx.font = `bold ${Math.min(W * 0.035, 28)}px monospace`;
+        ctx.fillText('★ NEW BEST TIME! ★', W / 2, H * 0.55);
+    } else if (bestTime) {
+        ctx.fillStyle = '#aaa';
+        ctx.font = `${Math.min(W * 0.03, 22)}px monospace`;
+        ctx.fillText(`Best: ${formatTime(bestTime)}`, W / 2, H * 0.55);
+    }
+    
+    const pulse = Math.sin(performance.now() * 0.005) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(100, 255, 200, ${pulse})`;
+    ctx.font = `${Math.min(W * 0.03, 24)}px monospace`;
+    ctx.fillText('PRESS R TO RACE AGAIN', W / 2, H * 0.75);
+}
+
+function render() {
+    if (gameState === 'start') {
+        drawStartScreen();
+        return;
+    }
+    
+    drawBackground();
+    
+    // Draw gravity wells
+    for (const well of gravityWells) {
+        drawGravityWell(well);
+    }
+    
+    drawCheckpoints();
+    drawCar();
+    
+    // Particles
+    for (const p of particles) {
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.life;
+        ctx.beginPath();
+        ctx.arc(p.x - cameraX, p.y, p.size * p.life, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    
+    drawHUD();
+    
+    if (gameState === 'finished') {
+        drawFinishScreen();
+    }
+}
+
+function gameLoop(timestamp) {
+    const dt = (timestamp - lastTime) / 1000;
+    lastTime = timestamp;
+    
+    update(dt);
+    render();
+    
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
