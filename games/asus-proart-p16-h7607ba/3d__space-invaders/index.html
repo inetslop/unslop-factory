@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>3D Space Invaders</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000;}
+  #c{display:block;width:100vw;height:100vh;cursor:crosshair;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let W=0,H=0,CX=0,CY=0;
+function resize(){ W=cv.width=window.innerWidth; H=cv.height=window.innerHeight; CX=W/2; CY=H*0.55; }
+window.addEventListener('resize',resize); resize();
+
+// ---------- Audio ----------
+let AC=null, masterGain=null;
+function initAudio(){
+  if(AC) return;
+  try{
+    AC = new (window.AudioContext||window.webkitAudioContext)();
+    masterGain = AC.createGain(); masterGain.gain.value=0.25; masterGain.connect(AC.destination);
+  }catch(e){}
+}
+function beep(freq,dur,type,vol,slide){
+  if(!AC) return;
+  try{
+    const o=AC.createOscillator(), g=AC.createGain();
+    o.type=type||'square'; o.frequency.value=freq;
+    if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(30,freq+slide), AC.currentTime+dur);
+    g.gain.setValueAtTime(vol||0.5,AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001,AC.currentTime+dur);
+    o.connect(g); g.connect(masterGain);
+    o.start(); o.stop(AC.currentTime+dur);
+  }catch(e){}
+}
+function noiseBurst(dur,vol){
+  if(!AC) return;
+  try{
+    const n=Math.floor(AC.sampleRate*dur), buf=AC.createBuffer(1,n,AC.sampleRate), d=buf.getChannelData(0);
+    for(let i=0;i<n;i++) d[i]=(Math.random()*2-1)*(1-i/n);
+    const s=AC.createBufferSource(), g=AC.createGain();
+    s.buffer=buf; g.gain.value=vol||0.4;
+    s.connect(g); g.connect(masterGain); s.start();
+  }catch(e){}
+}
+
+// ---------- Projection ----------
+const FOCAL=320, CAMY=-60; // camera looks along +z
+function project(x,y,z){
+  if(z<2) z=2;
+  const s = FOCAL/z;
+  return { x: CX + x*s, y: CY + (y-CAMY)*s, s:s };
+}
+
+// ---------- Game state ----------
+const STATE={MENU:0,PLAY:1,OVER:2,WAVE:3};
+let state=STATE.MENU;
+let score=0, lives=3, wave=1, hiScore=0;
+try{ hiScore = parseInt(localStorage.getItem('sinv3d_hi')||'0',10)||0; }catch(e){}
+
+const keys={};
+window.addEventListener('keydown',e=>{
+  if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+  keys[e.code]=true;
+  initAudio();
+  if(AC && AC.state==='suspended') AC.resume();
+  if(state===STATE.MENU && (e.code==='Enter'||e.code==='Space')) startGame();
+  else if(state===STATE.OVER && (e.code==='KeyR'||e.code==='Enter')) startGame();
+  else if(state===STATE.PLAY && e.code==='Space') shoot();
+});
+window.addEventListener('keyup',e=>{ keys[e.code]=false; });
+
+let player, bullets, invBullets, invaders, particles, stars, waveTimer, shootCd, shake;
+function makeStars(){
+  stars=[];
+  for(let i=0;i<140;i++) stars.push({x:(Math.random()-0.5)*2, y:(Math.random()-0.5)*1.2, z:10+Math.random()*500});
+}
+function startGame(){
+  score=0; lives=3; wave=1;
+  startWave();
+  state=STATE.PLAY;
+}
+function startWave(){
+  player={x:0,z:26,w:26};
+  bullets=[]; invBullets=[]; particles=[]; shootCd=0; shake=0;
+  invaders=[];
+  const cols=5, rows=4;
+  const baseZ = Math.max(120, 260 - (wave-1)*22);
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<cols;c++){
+      invaders.push({
+        x:(c-(cols-1)/2)*46,
+        y:20+r*0 + Math.sin(r)*2,
+        z: baseZ + r*38,
+        hp: (r===0&&wave>1)?2:1,
+        type:(r%2), dead:false, wob:Math.random()*6.28
+      });
+    }
+  }
+  invDir=1; invSpeed=(14+wave*4); invAdvance=0;
+  shootTimer=1.2;
+}
+let invDir=1, invSpeed=15, invAdvance=0, shootTimer=1;
+
+function shoot(){
+  if(state!==STATE.PLAY||shootCd>0) return;
+  shootCd=0.28;
+  bullets.push({x:player.x,y:CAMY+40,z:player.z+8});
+  beep(880,0.12,'square',0.35,-500);
+}
+
+// ---------- Update ----------
+function update(dt){
+  // stars always drift
+  for(const s of stars){
+    s.z -= dt*(60+s.z*0.15);
+    if(s.z<5){ s.z=480; s.x=(Math.random()-0.5)*2; s.y=(Math.random()-0.5)*1.2; }
+  }
+  // particles
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i];
+    p.life-=dt; if(p.life<=0){particles.splice(i,1);continue;}
+    p.x+=p.vx*dt; p.y+=p.vy*dt; p.z+=p.vz*dt;
+  }
+  if(shake>0) shake=Math.max(0,shake-dt*30);
+
+  if(state===STATE.WAVE){
+    waveTimer-=dt;
+    if(waveTimer<=0){ state=STATE.PLAY; }
+    return;
+  }
+  if(state!==STATE.PLAY) return;
+
+  // player
+  const spd=120;
+  if(keys['ArrowLeft']||keys['KeyA']) player.x-=spd*dt;
+  if(keys['ArrowRight']||keys['KeyD']) player.x+=spd*dt;
+  player.x=Math.max(-140,Math.min(140,player.x));
+  shootCd=Math.max(0,shootCd-dt);
+  if(keys['Space']) shoot();
+
+  // invaders march
+  invAdvance+=dt*invSpeed;
+  const maxX=150;
+  let minZ=Infinity;
+  for(const iv of invaders){
+    if(iv.dead) continue;
+    iv.x += invDir*Math.cos(invAdvance*0.05)*invSpeed*dt;
+    iv.wob+=dt*3;
+    if(iv.z<minZ) minZ=iv.z;
+  }
+  const alive=invaders.filter(iv=>!iv.dead);
+  let edge=false;
+  for(const iv of alive){
+    if((invDir>0&&iv.x>maxX)||(invDir<0&&iv.x<-maxX)) edge=true;
+  }
+  if(edge){ invDir*=-1; invAdvance+=alive.length*2.2; beep(160,0.1,'triangle',0.3); }
+
+  // invader shooting
+  shootTimer-=dt;
+  if(shootTimer<=0 && alive.length){
+    shootTimer=Math.max(0.5, 1.6 - wave*0.12) * (0.6+Math.random()*0.8);
+    const shooter = alive[Math.floor(Math.random()*alive.length)];
+    invBullets.push({x:shooter.x, y:shooter.y-6, z:shooter.z, vx:(player.x-shooter.x)*0.35});
+    beep(240,0.15,'sawtooth',0.2,-120);
+  }
+
+  // player bullets
+  for(let i=bullets.length-1;i>=0;i--){
+    const b=bullets[i];
+    b.z+=dt*520;
+    let hit=false;
+    for(const iv of invaders){
+      if(iv.dead) continue;
+      if(Math.abs(b.x-iv.x)<14 && Math.abs(b.z-iv.z)<12 && Math.abs(b.y-CAMY-40-(iv.y-60))<300){
+        iv.hp--; hit=true;
+        if(iv.hp<=0){
+          iv.dead=true;
+          score+= (5 - Math.floor(iv.z/120)) * 10 + wave*5;
+          explode(iv.x,iv.y,iv.z, iv.type? '#ff5b3a':'#4dff88');
+          noiseBurst(0.25,0.5); beep(90,0.2,'square',0.4,-60);
+        } else {
+          explode(b.x,b.y,b.z,'#ffffff',6);
+          beep(400,0.08,'square',0.2);
+        }
+        break;
+      }
+    }
+    if(hit||b.z>700) bullets.splice(i,1);
+  }
+
+  // invader bullets
+  for(let i=invBullets.length-1;i>=0;i--){
+    const b=invBullets[i];
+    b.z-=dt*380;
+    b.x+=b.vx*dt;
+    if(b.z<=player.z+6 && Math.abs(b.x-player.x)<14){
+      invBullets.splice(i,1);
+      loseLife();
+      continue;
+    }
+    if(b.z<5) invBullets.splice(i,1);
+  }
+
+  // invaders reaching player plane
+  for(const iv of alive){
+    if(iv.z < 42){
+      iv.dead=true;
+      explode(iv.x,iv.y,iv.z,'#ff3355');
+      loseLife();
+    }
+  }
+
+  // wave cleared?
+  if(invaders.every(iv=>iv.dead)){
+    score+=100*wave;
+    wave++;
+    startWave();
+    state=STATE.WAVE; waveTimer=2.0;
+    beep(523,0.15,'square',0.4); setTimeout(()=>beep(659,0.15,'square',0.4),150); setTimeout(()=>beep(784,0.3,'square',0.4),300);
+  }
+}
+
+function loseLife(){
+  lives--; shake=12;
+  explode(player.x,CAMY+40,player.z,'#ffd23a');
+  noiseBurst(0.5,0.7); beep(60,0.5,'sawtooth',0.5,-30);
+  if(lives<=0){
+    state=STATE.OVER;
+    try{
+      if(score>hiScore){ hiScore=score; localStorage.setItem('sinv3d_hi',''+hiScore); }
+    }catch(e){}
+  } else {
+    player.x=0;
+  }
+}
+
+function explode(x,y,z,color,count){
+  count=count||26;
+  for(let i=0;i<count;i++){
+    const a=Math.random()*6.28, sp=40+Math.random()*120;
+    particles.push({x:x,y:y,z:z,vx:Math.cos(a)*sp,vy:(Math.random()-0.5)*sp*0.8,vz:(Math.random()-0.5)*sp,life:0.5+Math.random()*0.4,color:color});
+  }
+}
+
+// ---------- Draw helpers ----------
+function drawAlien(px,py,s,type,hp){
+  const u=Math.max(1,s*2.6); // pixel unit
+  ctx.save();
+  ctx.translate(px,py);
+  const col = type? '#ff5b3a':'#4dff88';
+  const col2 = hp>1 ? '#ffffff' : col;
+  ctx.fillStyle=col2;
+  if(type===0){ // squid
+    const m=[
+      [0,1],[1,1],[0,2],[1,2],[2,2],[3,2],[4,2],[5,2],[6,2],[7,2],
+      [-1,3],[8,3],[-1,4],[8,4],[-2,4],[9,4],
+      [0,5],[1,5],[6,5],[7,5],[2,6],[5,6],[3,7],[4,7]
+    ];
+    // eyes
+    const eyes=[[2,3],[5,3]];
+    for(const[cx,cy]of m){ ctx.fillRect(cx*u-u/2,(cy-4)*u,u+0.5,u+0.5); }
+    ctx.fillStyle='#001a0d';
+    for(const[cx,cy]of eyes){ ctx.fillRect(cx*u-u/2,(cy-4)*u,u,u); }
+  } else { // crab
+    const m=[
+      [0,3],[7,3],
+      [-1,4],[8,4],[-2,5],[9,5],[-3,6],[10,6],
+      [0,4],[1,4],[2,4],[3,4],[4,4],[5,4],[6,4],[7,4],
+      [0,5],[7,5],[0,6],[7,6],[1,6],[2,6],[5,6],[6,6],
+      [1,7],[2,7],[5,7],[6,7]
+    ];
+    const eyes=[[2,4],[5,4]];
+    for(const[cx,cy]of m){ ctx.fillRect(cx*u-u/2,(cy-4)*u,u+0.5,u+0.5); }
+    ctx.fillStyle='#1a0000';
+    for(const[cx,cy]of eyes){ ctx.fillRect(cx*u-u/2,(cy-4)*u,u,u); }
+  }
+  ctx.restore();
+}
+
+function drawShip(px,py,s){
+  const u=Math.max(1.5,s*3);
+  ctx.save();
+  ctx.translate(px,py);
+  ctx.fillStyle='#38c7ff';
+  ctx.beginPath();
+  ctx.moveTo(0,-4*u);
+  ctx.lineTo(2.6*u,2.4*u);
+  ctx.lineTo(1.1*u,1.2*u);
+  ctx.lineTo(-1.1*u,1.2*u);
+  ctx.lineTo(-2.6*u,2.4*u);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle='#aef';
+  ctx.fillRect(-0.5*u,-3*u,u,2.5*u);
+  // engine glow
+  const g=ctx.createRadialGradient(0,2.6*u,0,0,2.6*u,2*u*(1+Math.random()*0.4));
+  g.addColorStop(0,'rgba(255,200,80,0.9)');
+  g.addColorStop(1,'rgba(255,120,0,0)');
+  ctx.fillStyle=g;
+  ctx.beginPath(); ctx.arc(0,2.6*u,2.4*u,0,6.29); ctx.fill();
+  ctx.restore();
+}
+
+// ---------- Render ----------
+function render(){
+  ctx.setTransform(1,0,0,1,0,0);
+  // background
+  const bg=ctx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0,'#02030f');
+  bg.addColorStop(0.55,'#070b26');
+  bg.addColorStop(1,'#0d0416');
+  ctx.fillStyle=bg; ctx.fillRect(0,0,W,H);
+
+  if(shake>0){ ctx.translate((Math.random()-0.5)*shake,(Math.random()-0.5)*shake); }
+
+  // stars
+  for(const s of stars){
+    const p=project(s.x*400,s.y*300+CAMY,s.z);
+    if(p.s<0) continue;
+    const sz=Math.max(0.5,1.6*p.s);
+    ctx.fillStyle=`rgba(255,255,255,${Math.min(1,0.9-s.z/700)})`;
+    ctx.fillRect(p.x,p.y,sz,sz);
+  }
+
+  // ground grid
+  ctx.strokeStyle='rgba(80,60,200,0.35)';
+  ctx.lineWidth=1;
+  for(let z=20;z<700;z+=40){
+    const a=project(-600,-CAMY+?=-60,z); // placeholder (fixed below)
+  }
+  drawGrid();
+
+  // collect drawable entities sorted far->near
+  const items=[];
+  for(const iv of invaders) if(!iv.dead) items.push({z:iv.z,draw:()=>{const p=project(iv.x,iv.y+Math.sin(iv.wob)*3,iv.z); drawAlien(p.x,p.y,p.s,iv.type,iv.hp);}});
+  for(const b of bullets) items.push({z:b.z,draw:()=>{const p=project(b.x,b.y,b.z); ctx.fillStyle='#fff7ae'; const r=Math.max(1.5,p.s*6); ctx.beginPath(); ctx.arc(p.x,p.y,r,0,6.29); ctx.fill();}});
+  for(const b of invBullets) items.push({z:b.z,draw:()=>{const p=project(b.x,b.y,b.z); ctx.fillStyle='#ff4455'; const r=Math.max(1.5,p.s*7); ctx.beginPath(); ctx.arc(p.x,p.y,r,0,6.29); ctx.fill();}});
+  for(const p of particles) items.push({z:p.z,draw:()=>{const q=project(p.x,p.y,p.z); ctx.globalAlpha=Math.max(0,p.life*1.5); ctx.fillStyle=p.color; const r=Math.max(1,q.s*p.size||q.s*4); ctx.fillRect(q.x-r/2,q.y-r/2,r,r); ctx.globalAlpha=1;}});
+  if(state===STATE.PLAY||state===STATE.WAVE) items.push({z:player.z,draw:()=>{const p=project(player.x,CAMY+40,player.z); drawShip(p.x,p.y,p.s);}});
+
+  items.sort((a,b)=>b.z-a.z);
+  for(const it of items) it.draw();
+
+  // HUD
+  if(state===STATE.PLAY||state===STATE.WAVE){
+    ctx.textAlign='left';
+    ctx.font='bold 20px monospace';
+    ctx.fillStyle='#8ef';
+    ctx.fillText('SCORE '+score,16,30);
+    ctx.fillText('WAVE '+wave,16,54);
+    ctx.textAlign='right';
+    ctx.fillStyle='#ffd23a';
+    ctx.fillText('LIVES '+'♥'.repeat(Math.max(0,lives)),W-16,30);
+    ctx.fillStyle='#889';
+    ctx.font='14px monospace';
+    ctx.fillText('HI '+hiScore,W-16,52);
+  }
+
+  if(state===STATE.WAVE){
+    centerText('WAVE '+wave+' INCOMING',H*0.3,'#4dff88',40);
+  }
+  if(state===STATE.MENU) drawMenu();
+  if(state===STATE.OVER){
+    ctx.fillStyle='rgba(0,0,10,0.6)'; ctx.fillRect(0,0,W,H);
+    centerText('GAME OVER',H*0.32,'#ff4455',56);
+    centerText('SCORE  '+score,H*0.44,'#fff',28);
+    if(score>=hiScore&&score>0) centerText('★ NEW HIGH SCORE ★',H*0.51,'#ffd23a',22);
+    centerText('PRESS R OR ENTER TO RESTART',H*0.62,'#8ef',20, 0.5+0.5*Math.sin(performance.now()/300));
+  }
+}
+
+function drawGrid(){
+  ctx.lineWidth=1;
+  const groundY=-CAMY+?;// handled inside
+}
+// (grid implemented properly below)
+function gridDraw(){
+  // horizontal lines across the floor at y = +60 (below player plane)
+  for(let z=24;z<720;z+=36){
+    const a=project(-520,90,z), b=project(520,90,z);
+    const alpha=Math.max(0,0.45 - z/1600);
+    ctx.strokeStyle=`rgba(90,70,220,${alpha})`;
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+  }
+  // vertical (converging) lines
+  for(let x=-480;x<=480;x+=60){
+    const a=project(x,90,24), b=project(x,90,700);
+    ctx.strokeStyle='rgba(90,70,220,0.25)';
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+  }
+  // horizon glow
+  const hg=ctx.createLinearGradient(0,CY-40,0,CY+60);
+  hg.addColorStop(0,'rgba(120,80,255,0)');
+  hg.addColorStop(0.5,'rgba(120,80,255,0.18)');
+  hg.addColorStop(1,'rgba(120,80,255,0)');
+  ctx.fillStyle=hg;
+  ctx.fillRect(0,CY-40,W,100);
+}
+
+function centerText(txt,y,color,size,alpha){
+  ctx.save();
+  if(alpha!==undefined) ctx.globalAlpha=alpha;
+  ctx.textAlign='center';
+  ctx.font='bold '+size+'px monospace';
+  ctx.fillStyle=color;
+  ctx.shadowColor=color; ctx.shadowBlur=18;
+  ctx.fillText(txt,CX,y);
+  ctx.restore();
+}
+
+function drawMenu(){
+  ctx.fillStyle='rgba(0,0,15,0.72)'; ctx.fillRect(0,0,W,H);
+  centerText('3D SPACE INVADERS',H*0.28,'#4dff88',Math.min(64,W/12));
+  ctx.textAlign='center';
+  ctx.font='18px monospace';
+  ctx.fillStyle='#cde';
+  const lines=[
+    '← / →  or  A / D   —  MOVE SHIP',
+    'SPACE                  —  FIRE',
+    '',
+    'Destroy the alien armada before it reaches you.',
+    'Aliens closer to you are worth more points.'
+  ];
+  lines.forEach((l,i)=>ctx.fillText(l,CX,H*0.42+i*28));
+  ctx.fillStyle='#ffd23a';
+  ctx.font='16px monospace';
+  ctx.fillText('HIGH SCORE: '+hiScore,CX,H*0.75);
+  centerText('PRESS ENTER OR SPACE TO START',H*0.84,'#8ef',22,0.5+0.5*Math.sin(performance.now()/300));
+}
+
+// fix: replace broken grid stubs
+function drawGrid(){ gridDraw(); }
+
+// ---------- Main loop ----------
+makeStars();
+startWave(); // prepopulate for background on menu
+let last=performance.now();
+function loop(t){
+  const dt=Math.min(0.05,(t-last)/1000); last=t;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
