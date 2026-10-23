@@ -1,0 +1,556 @@
+<think>
+The user wants a zombie pinball game as a single HTML file. Let's build a canvas-based pinball game featuring zombies as targets/bumpers, flippers, a plunger/launcher, and scoring. Sound via Web Audio. Start screen, restart, key controls (arrow keys or A/D for flippers, Space to launch).
+
+Design:
+- Canvas fills the window, scales with resize. Use a fixed logical playfield size (e.g., 480x720) and scale it.
+- Ball physics: gravity, bounces off walls, circular bumpers (zombies), slingshots (maybe), flippers as rotating line segments.
+- Zombies: circle bumpers with face drawn on canvas; when hit, zombie "stuns" (flashes) and grants points; can have HP — zombie gets knocked down after N hits, bonus points.
+- Drain at the bottom between the flippers.
+- Launch lane on the right side separated by a wall; ball is launched from there with Space held to charge.
+- Score, balls remaining (3), game over screen and restart.
+
+Physics details:
+- Ball radius ~10.
+- Flippers: pivot point, length, rest angle and active angle, animate rotation at high speed; collision treats flipper as a capsule (line segment from pivot to tip). Impart velocity based on angular velocity.
+- Collisions with circles: standard reflection.
+- Walls: line segments.
+
+Keep it manageable in scope. Let's define the playfield in logical coordinates W=480, H=720.
+
+Layout:
+- Outer walls: left x=10, right x=470, top y=10 (arc but use straight lines and a corner arc at the top). Simplification: rectangular boundary with rounded top corners approximated by two quarter-circle arcs — or just straight walls for simplicity; add a top arc? Just keep it as a rectangle, that's fine.
+- Launch lane: wall from x=430 to 470 on the right side: inner wall segment from (430, 120) to (430, 690). Ball is launched inside the lane at x~450.
+- Flippers: left pivot (170, 660), right pivot (310, 660), length 62. Rest angle: left ~30° below horizontal pointing right-down... standard: left flipper rests at +30° (pointing down-right) and rotates to -30°. Right is mirrored.
+- Slingshots above the flippers: triangles on both sides — implement as line segments with a bounce boost.
+
+Zombies: 5-6 bumpers placed in the upper area, radius ~28, each with HP (e.g., 3 hits). When HP reaches 0, zombie "dies" (becomes X eyes), gives bonus, then respawns after all are dead? Or stay dead and grant a bonus. Let's do: kill all zombies → wave complete, +10000, respawn new wave with more HP. Score increases per hit.
+
+Ball launch: ball starts at the bottom of the lane (450, 680). Hold Space to charge power, release to launch upward. Ball travels up through the lane, exits from top of inner wall into the playfield. Inner wall from y=120 down; above y=120 is open — ball arcs over and leftward.
+
+Controls: Left/Right arrows or A/D for flippers. Space = launch / start / restart. Enter also works.
+
+Sound: simple oscillator beeps on hit, flipper, drain, zombie kill. AudioContext created/resumed on first input.
+
+Game state: 'start', 'play', 'gameover'. Restart with R key or button.
+
+Draw zombies: green circle, dark patches, eyes (white circles with red pupils), mouth. Flash white briefly when hit. Dead: gray, X eyes.
+
+Physics loop with fixed timestep substeps for stability (e.g., 4 substeps per frame at dt).
+
+Collision with segment: closest point on segment to ball center; if dist < r, push out and reflect velocity about normal, apply coefficient of restitution.
+
+Flipper collision: treat as a capsule with radius ~12. When flipper rotates, tip speed adds to impulse: compute velocity at contact point = omega × r (perpendicular). Reflect relative velocity.
+
+Simpler approach: after moving the flipper angle, do circle-capsule collision; add tangential velocity from angular motion: v_contact = omega * dist_from_pivot in the perpendicular direction. Compute ball's relative velocity and reflect about normal with restitution 0.6, plus add a portion of the flipper's surface velocity.
+
+Let's write the code carefully.
+
+Constants:
+```
+const W=480,H=720,BALL_R=11,GRAV=900 (units/s^2), REST=0.55
+```
+
+Flipper object: {px,py,len,restAngle,activeAngle,angle,omega,side}
+Left: pivot (168,655), rest = 0.42 rad (~24°, pointing down-right? Angles are measured from positive x-axis; for left flipper the tip is to the right of the pivot at angle +0.4 (downward since y is positive downward). Active = -0.5 (upward). So angle goes from 0.4 → -0.5.
+Right: pivot (312,655), rest = PI-0.4, active = PI+0.5.
+
+Tip position: px + len*cos(a), py + len*sin(a).
+
+Flipper update: target = pressed? active:rest; move angle toward target at speed 18 rad/s; omega = (newAngle-old)/dt.
+
+Collision function capsule(ball, p1, p2, radius):
+- closest point, distance; if dist < r+radius: normal n = (ball - cp)/dist; push ball out to cp + n*(r+radius); relative velocity vr = vball - vsurf; vn = dot(vr,n); if vn<0: vball -= (1+e)*vn*n.
+- vsurf at contact point for flipper: omega * dist_from_pivot, direction perpendicular: (-sin(rel), cos(rel))... For a point at vector r from pivot rotating at omega, velocity = omega × r = omega*(-ry, rx) in 2D (with y-down and positive omega meaning clockwise on screen? Just use v = omega * (-rel.y, rel.x) — consistent sign; it works out).
+
+Walls: list of segments. Include:
+- Left wall (10,10)-(10,H)
+- Right wall (470,10)-(470,H)
+- Top (10,10)-(470,10)
+- Inner lane wall (430,110)-(430,690)
+- Lane floor (430,690)? Ball launch position: ball at (452, 685), lane floor is bottom wall (10,H)-(470,H). Actually the lane is between x=430 and 470; the ball sits on the bottom.
+- Drain: gap between flippers — no wall below flippers; ball falls past y > H+30 → drain. But need walls guiding to flippers: small angled walls from inner lane wall bottom (430,690) to right flipper pivot area: segment (430,690)-(312,655)? Hmm, right flipper pivot at (312,655); add diagonal (430, 700)→(312, 650)? Let's do: guide from inner wall bottom to right flipper pivot: segment (430,700)-(318,652). Left side: (50,700)-(162,652). Plus outer walls down to H.
+
+Slingshots: triangles above flippers: left sling from point (10, 560) to (10, 640)? Standard slingshot: sloped face. Simplify: two small angled "bumpers" segments with boost:
+- Left sling face: (30,570)-(90,620), bounce boost (add velocity along normal * 250).
+- Right sling face: (430... wait, lane wall at 430. Use (410,570)?? The lane is on the right; left of x=430 is playfield. Right sling: (400,570)-(340,620).
+Let's set: left sling face from (28, 565) to (95, 618); right from (402,565) to (335,618). Boost these.
+
+Zombies (bumpers): positions in upper area:
+- (150,180,r=30), (330,180,30), (240,300,32), (120,380,26), (360,380,26), maybe (240,470,24). 6 zombies. HP starts at 3, +1 per wave.
+
+Bumper hit: reflect with boost (min normal velocity after reflection ~350), score += 100 * (wave?), flash timer. If hp<=0 → dead, bonus 1000, sound. All dead → wave++, respawn zombies with HP = 2+wave, bonus 5000.
+
+Ball count: 3. On drain: balls--; if 0 → gameover state; else reset ball to lane.
+
+High score in localStorage with try/catch.
+
+Rendering: scale canvas to fit window preserving aspect ratio; center it. Use ctx.setTransform for scaling. Canvas size = window inner, compute scale = min(w/W, h/H), offset centered. Draw dark background outside playfield.
+
+Input: keydown/keyup on window; prevent default for Space/arrows. Keys: ArrowLeft/A left flipper, ArrowRight/D right, Space launch/start/restart, R restart.
+
+Charging: while ball in lane (state 'ready'), hold Space to charge power 0..1 over ~1s, release launches with velocity = -(500 + 700*power). Ball in lane: state 'launch'; after leaving lane (x < 430 - something or y<120) state 'play'. Actually ball goes up through the lane and crosses the top of the inner wall — as long as x>430 it's "in lane" until it exits left; once x < 430-BALL_R... but there's a possibility the ball comes back into the lane area? The inner wall prevents re-entry from playfield side. So track: once ball has been launched and x < 420, inPlay=true.
+
+Also, ball could bounce off top of the lane; that's fine.
+
+Magnet/dashed lines etc — skip.
+
+Sound: function beep(freq, dur, type, vol). Hit: 200Hz square short; flipper: 150; drain: descending tone; kill: chord.
+
+Let's write it.
+
+Ball physics substeps: dt frame clamped to 1/60; substeps = 4; each step: v.y += g*dt_sub; pos += v*dt_sub; collide with walls, zombies, flippers, slings. Cap max speed at ~1200.
+
+Zombie collision: circle-circle. If dist < r+BALL_R: normal from zombie to ball; push out; reflect with restitution 0.9 and boost: ensure outward normal velocity >= 380 → add if less. Trigger hit (with cooldown per zombie of 0.1s to avoid multi-hit).
+
+Flipper collision details:
+```
+function flipperCollide(f){
+ const tx=f.px+f.len*Math.cos(f.angle), ty=f.py+f.len*Math.sin(f.angle);
+ // closest point on segment pivot->tip
+ ...
+ const R = BALL_R + 13;
+ if(dist<R){ n=...; ball position = cp+n*R;
+   // surface velocity at contact
+   const rx=cp.x-f.px, ry=cp.y-f.py;
+   const svx = -f.omega*ry, svy = f.omega*rx;
+   let rvx=ball.vx-svx, rvy=ball.vy-svy;
+   const vn=rvx*n.x+rvy*n.y;
+   if(vn<0){ const e=0.75; ball.vx -= (1+e)*vn*n.x; ball.vy -= (1+e)*vn*n.y; }
+ }
+}
+```
+
+Flipper omega computed during update: f.omega=(newA-oldA)/dt per frame, then used in substeps (fine).
+
+Draw zombies with simple face. Flash white if z.flash>0. Dead: grayish green, X eyes.
+
+HUD: score top-left, balls, wave, high score. Draw on canvas.
+
+Start screen overlay drawn on canvas: title "ZOMBIE PINBALL", control instructions, "Press SPACE to start". Game over similarly with final score, "SPACE to restart".
+
+Also click/tap to start? Add a canvas click handler that starts/launches. Keep it keyboard-centric; also allow mousedown=space for touch convenience. Simple: pointerdown = space press, pointerup = release.
+
+Let's write the full HTML now.
+
+Ball reset in lane: pos (451, 682), v=0, state 'ready', charging=false.
+
+Drain check: ball.y > H+40 → drain.
+
+Also ensure ball doesn't tunnel through thin walls at high speed — substeps of 4 with dt/4; max speed 1200 → movement per substep = 1200*(1/60)/4 = 5px < wall thickness, fine.
+
+Ceiling: top wall y=10; ball bounces.
+
+Lane: right wall at x=470 so ball center is between 430+R and 470-R → lane width 40, ball R 11 fits (center range 441..459). Launch position x=450.
+
+Draw playfield background: dark greenish gradient, some decorations (cracks, "GRAVEYARD" text?). Keep simple: subtle grid/texture lines.
+
+Let me write the code now, being careful with length but complete.
+
+Score popup? Skip or small floating score text — nice to have; add a simple floaters array.
+
+Let's write it.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zombie Pinball</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0a0d0a;}
+  canvas{display:block;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+var W=480,H=720,BALL_R=11,GRAV=900;
+var canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
+var scale=1,offX=0,offY=0;
+
+function resize(){
+  canvas.width=window.innerWidth;canvas.height=window.innerHeight;
+  scale=Math.min(canvas.width/W,canvas.height/H);
+  offX=(canvas.width-W*scale)/2;offY=(canvas.height-H*scale)/2;
+}
+window.addEventListener('resize',resize);resize();
+
+/* ---------- audio ---------- */
+var AC=null;
+function audio(){ if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}} if(AC&&AC.state==='suspended')AC.resume(); return AC;}
+function beep(freq,dur,type,vol,slide){
+  var ac=audio();if(!ac)return;
+  var o=ac.createOscillator(),g=ac.createGain();
+  o.type=type||'square';o.frequency.setValueAtTime(freq,ac.currentTime);
+  if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(30,freq+slide),ac.currentTime+dur);
+  g.gain.setValueAtTime(vol||0.15,ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001,ac.currentTime+dur);
+  o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+dur);
+}
+
+/* ---------- walls ---------- */
+var walls=[
+ {x1:10,y1:10,x2:10,y2:H},          // left
+ {x1:470,y1:10,x2:470,y2:H},        // right
+ {x1:10,y1:10,x2:470,y2:10},        // top
+ {x1:430,y1:110,x2:430,y2:700},     // launch lane inner wall
+ {x1:50,y1:700,x2:160,y2:652},      // left guide
+ {x1:430,y1:700,x2:320,y2:652}      // right guide
+];
+var slings=[
+ {x1:28,y1:565,x2:95,y2:618,boost:280},
+ {x1:402,y1:565,x2:335,y2:618,boost:280}
+];
+
+/* ---------- flippers ---------- */
+function mkFlip(px,py,len,rest,act){return{px:px,py:py,len:len,rest:rest,act:act,angle:rest,omega:0};}
+var flipL=mkFlip(165,655,64, 0.42,-0.55);
+var flipR=mkFlip(315,655,64, Math.PI-0.42,Math.PI+0.55);
+
+/* ---------- zombies ---------- */
+var zombieDefs=[
+ {x:150,y:185,r:30},{x:330,y:185,r:30},{x:240,y:305,r:32},
+ {x:115,y:395,r:26},{x:365,y:395,r:26},{x:240,y:475,r:24}
+];
+var zombies=[];
+function spawnWave(){
+  zombies=zombieDefs.map(function(d){return{x:d.x,y:d.y,r:d.r,hp:2+wave,flash:0,dead:false,cd:0,wob:Math.random()*6.28};});
+}
+
+/* ---------- state ---------- */
+var state='start'; // start, play, gameover
+var ball={x:450,y:682,vx:0,vy:0,inPlay:false};
+var score=0,balls=3,wave=1,charge=0;
+var floaters=[];
+var hiScore=0;
+try{hiScore=parseInt(localStorage.getItem('zp_hi')||'0',10)||0;}catch(e){}
+
+function addFloater(x,y,txt,col){floaters.push({x:x,y:y,t:txt,c:col,life:1});}
+
+function resetBall(){ball.x=450;ball.y=682;ball.vx=0;ball.vy=0;ball.inPlay=false;charge=0;}
+function newGame(){score=0;balls=3;wave=1;spawnWave();resetBall();state='play';floaters=[];}
+
+/* ---------- input ---------- */
+var keys={};
+window.addEventListener('keydown',function(e){
+  audio();
+  if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].indexOf(e.key)>=0)e.preventDefault();
+  keys[e.key.toLowerCase()]=true;keys[e.code]=true;
+  if((e.code==='Space'||e.key==='Enter')&&!e.repeat){
+    if(state==='start'||state==='gameover'){newGame();}
+    else if(state==='play'&&!ball.inPlay){charge=0.05;}
+  }
+  if(e.key.toLowerCase()==='r'&&state!=='start'){newGame();}
+});
+window.addEventListener('keyup',function(e){
+  keys[e.key.toLowerCase()]=false;keys[e.code]=false;
+  if((e.code==='Space'||e.key==='Enter')&&state==='play'&&!ball.inPlay){
+    var p=Math.min(1,charge);
+    ball.vy=-(480+720*p);
+    beep(300,0.15,'sawtooth',0.12,600);
+  }
+});
+canvas.addEventListener('pointerdown',function(){audio();
+  if(state==='start'||state==='gameover')newGame();
+  else if(!ball.inPlay)charge=0.05;
+});
+window.addEventListener('pointerup',function(){
+  if(state==='play'&&!ball.inPlay&&charge>0){
+    var p=Math.min(1,charge);
+    ball.vy=-(480+720*p);beep(300,0.15,'sawtooth',0.12,600);
+  }
+});
+
+/* ---------- physics ---------- */
+function segCollide(x,y,vx,vy,x1,y1,x2,y2,R,e,boost){
+  var dx=x2-x1,dy=y2-y1,L2=dx*dx+dy*dy;
+  var t=((x-x1)*dx+(y-y1)*dy)/L2;t=t<0?0:(t>1?1:t);
+  var cx=x1+t*dx,cy=y1+t*dy;
+  var nx=x-cx,ny=y-cy,d=Math.sqrt(nx*nx+ny*ny);
+  if(d<R||d===0){
+    if(d===0){nx=0;ny=-1;d=1;}else{nx/=d;ny/=d;}
+    x=cx+nx*R;y=cy+ny*R;
+    var vn=vx*nx+vy*ny;
+    if(vn<0){vx-=(1+e)*vn*nx;vy-=(1+e)*vn*ny;}
+    if(boost){var vn2=vx*nx+vy*ny;if(vn2<boost){vx+=(boost-vn2)*nx;vy+=(boost-vn2)*ny;}}
+  }
+  return{x:x,y:y,vx:vx,vy:vy};
+}
+
+function flipCollide(f){
+  var tx=f.px+f.len*Math.cos(f.angle),ty=f.py+f.len*Math.sin(f.angle);
+  var dx=tx-f.px,dy=ty-f.py,L2=dx*dx+dy*dy;
+  var t=((ball.x-f.px)*dx+(ball.y-f.py)*dy)/L2;t=t<0?0:(t>1?1:t);
+  var cx=f.px+t*dx,cy=f.py+t*dy;
+  var R=BALL_R+13;
+  var nx=ball.x-cx,ny=ball.y-cy,d=Math.sqrt(nx*nx+ny*ny);
+  if(d<R){
+    if(d===0){nx=-Math.sin(f.angle);ny=Math.cos(f.angle);d=0.001;}else{nx/=d;ny/=d;}
+    ball.x=cx+nx*R;ball.y=cy+ny*R;
+    var rx=cx-f.px,ry=cy-f.py;
+    var svx=-f.omega*ry,svy=f.omega*rx;
+    var rvx=ball.vx-svx,rvy=ball.vy-svy;
+    var vn=rvx*nx+rvy*ny;
+    if(vn<0){
+      ball.vx-=(1+0.7)*vn*nx;ball.vy-=(1+0.7)*vn*ny;
+      beep(140,0.06,'square',0.1);
+    }
+  }
+}
+
+function step(dt){
+  // flippers
+  var tl=keys['arrowleft']||keys['a'],tr=keys['arrowright']||keys['d'];
+  var spd=20*dt;
+  [[flipL,tl],[flipR,tr]].forEach(function(p){
+    var f=p[0],target=p[1]?f.act:f.rest;
+    var old=f.angle;
+    if(target>f.angle)f.angle=Math.min(target,f.angle+spd);
+    else f.angle=Math.max(target,f.angle-spd);
+    f.omega=(f.angle-old)/dt;
+  });
+
+  // charging
+  if(!ball.inPlay&&(keys[' ']||keys['Space']===undefined&&false)){/*noop*/}
+  if(!ball.inPlay&&(keys[' ']!==undefined?keys[' ']:false)||!ball.inPlay&&keys['space']){charge+=dt*1.2;}
+
+  // ball
+  var sub=4,sd=dt/sub;
+  for(var s=0;s<sub;s++){
+    ball.vy+=GRAV*sd;
+    var sp=Math.sqrt(ball.vx*ball.vx+ball.vy*ball.vy);
+    if(sp>1300){ball.vx*=1300/sp;ball.vy*=1300/sp;}
+    ball.x+=ball.vx*sd;ball.y+=ball.vy*sd;
+
+    // walls
+    for(var i=0;i<walls.length;i++){
+      var w=walls[i],r2=segCollide(ball.x,ball.y,ball.vx,ball.vy,w.x1,w.y1,w.x2,w.y2,BALL_R,0.55,0);
+      ball.x=r2.x;ball.y=r2.y;ball.vx=r2.vx;ball.vy=r2.vy;
+    }
+    // slings
+    for(var j=0;j<slings.length;j++){
+      var sl=slings[j],r3=segCollide(ball.x,ball.y,ball.vx,ball.vy,sl.x1,sl.y1,sl.x2,sl.y2,BALL_R,0.6,sl.boost);
+      if(r3.vx!==ball.vx||r3.vy!==ball.vy)beep(500,0.08,'triangle',0.12,-200);
+      ball.x=r3.x;ball.y=r3.y;ball.vx=r3.vx;ball.vy=r3.vy;
+    }
+    // zombies
+    for(var k=0;k<zombies.length;k++){
+      var z=zombies[k];
+      var nx=ball.x-z.x,ny=ball.y-z.y,d=Math.sqrt(nx*nx+ny*ny);
+      if(d<z.r+BALL_R){
+        if(d===0){nx=1;ny=0;d=1;}else{nx/=d;ny/=d;}
+        ball.x=z.x+nx*(z.r+BALL_R);ball.y=z.y+ny*(z.r+BALL_R);
+        var vn=ball.vx*nx+ball.vy*ny;
+        if(vn<0){ball.vx-=1.85*vn*nx;ball.vy-=1.85*vn*ny;}
+        // boost outward
+        var vn2=ball.vx*nx+ball.vy*ny;
+        if(vn2<340){ball.vx+=(340-vn2)*nx;ball.vy+=(340-vn2)*ny;}
+        z.wob=6.28;
+        if(z.cd<=0&&!z.dead){
+          z.cd=0.15;z.hp--;
+          var pts=(100*wave);score+=pts;
+          addFloater(z.x,z.y-z.r-6,'+'+pts,'#8f8');
+          beep(220,0.09,'square',0.14,-80);
+          if(z.hp<=0){
+            z.dead=true;score+=1000;
+            addFloater(z.x,z.y-z.r-6,'KILLED +1000','#ff5');
+            beep(120,0.3,'sawtooth',0.2,-60);
+            beep(180,0.3,'square',0.12,-90);
+            if(zombies.every(function(zz){return zz.dead;})){
+              score+=5000;wave++;
+              addFloater(W/2,H/2-40,'WAVE '+wave+' CLEARED!','#ff5');
+              beep(440,0.15,'square',0.15);setTimeout(function(){beep(660,0.2,'square',0.15);},150);
+              spawnWave();
+            }
+          }
+        }
+      }
+    }
+    flipCollide(flipL);flipCollide(flipR);
+  }
+  // timers
+  zombies.forEach(function(z){z.flash=Math.max(0,z.flash-dt);z.cd=Math.max(0,z.cd-dt);z.wob-=dt*6;});
+  floaters=floaters.filter(function(f){f.life-=dt*1.2;f.y-=40*dt;return f.life>0;});
+
+  // left the lane?
+  if(!ball.inPlay&&ball.vy<0&&ball.x<425)ball.inPlay=true;
+
+  // drain
+  if(ball.y>H+50){
+    balls--;beep(300,0.5,'sawtooth',0.18,-260);
+    if(balls<=0){
+      state='gameover';
+      try{if(score>hiScore){hiScore=score;localStorage.setItem('zp_hi',''+hiScore);}}catch(e){}
+    }else resetBall();
+  }
+}
+
+/* ---------- drawing ---------- */
+function drawZombie(z,t){
+  var wob=Math.sin(t*3+z.wob)*2;
+  ctx.save();ctx.translate(z.x,z.y+wob);
+  // body
+  ctx.beginPath();ctx.arc(0,0,z.r,0,6.283);
+  if(z.dead)ctx.fillStyle='#4a5a44';else ctx.fillStyle=z.flash>0?'#eaffe0':'#5c9b4a';
+  ctx.fill();
+  ctx.lineWidth=3;ctx.strokeStyle=z.dead?'#2c3a28':'#2f5a26';ctx.stroke();
+  // patch
+  if(!z.dead){ctx.beginPath();ctx.arc(z.r*0.4,-z.r*0.3,z.r*0.28,0,6.283);ctx.fillStyle='#4c8a3c';ctx.fill();}
+  // eyes
+  var ey=-z.r*0.2,ex=z.r*0.35;
+  if(z.dead){
+    ctx.strokeStyle='#111';ctx.lineWidth=3;
+    [-1,1].forEach(function(s){
+      ctx.beginPath();ctx.moveTo(s*ex-5,ey-5);ctx.lineTo(s*ex+5,ey+5);
+      ctx.moveTo(s*ex+5,ey-5);ctx.lineTo(s*ex-5,ey+5);ctx.stroke();
+    });
+  }else{
+    [-1,1].forEach(function(s){
+      ctx.beginPath();ctx.arc(s*ex,ey,z.r*0.2,0,6.283);ctx.fillStyle='#fff';ctx.fill();
+      ctx.beginPath();ctx.arc(s*ex+Math.sin(t*5+z.wob)*2,ey+1,z.r*0.09,0,6.283);
+      ctx.fillStyle=z.flash>0?'#000':'#c22';ctx.fill();
+    });
+  }
+  // mouth
+  ctx.strokeStyle=z.dead?'#111':'#1e3a18';ctx.lineWidth=2.5;
+  ctx.beginPath();
+  if(z.dead)ctx.moveTo(-z.r*0.4,z.r*0.4),ctx.lineTo(z.r*0.4,z.r*0.4);
+  else{ctx.moveTo(-z.r*0.4,z.r*0.35);
+    for(var i=1;i<=6;i++)ctx.lineTo(-z.r*0.4+i*z.r*0.8/6, z.r*0.35+(i%2?4:-2));}
+  ctx.stroke();
+  // hp dots
+  if(!z.dead){
+    for(var h=0;h<z.hp;h++){
+      ctx.beginPath();ctx.arc(-z.r*0.6+h*z.r*0.3,z.r+8,3,0,6.283);
+      ctx.fillStyle='#ff5';ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+function drawFlipper(f){
+  var tx=f.px+f.len*Math.cos(f.angle),ty=f.py+f.len*Math.sin(f.angle);
+  ctx.lineCap='round';
+  ctx.strokeStyle='#c33';ctx.lineWidth=26;
+  ctx.beginPath();ctx.moveTo(f.px,f.py);ctx.lineTo(tx,ty);ctx.stroke();
+  ctx.strokeStyle='#f77';ctx.lineWidth=14;
+  ctx.beginPath();ctx.moveTo(f.px,f.py);ctx.lineTo(tx,ty);ctx.stroke();
+}
+
+function roundRect(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+
+function draw(t){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle='#070a07';ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.setTransform(scale,0,0,scale,offX,offY);
+
+  // playfield bg
+  var g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#132015');g.addColorStop(1,'#0d150e');
+  ctx.fillStyle=g;roundRect(4,4,W-8,H-8,18);ctx.fill();
+  // texture lines
+  ctx.strokeStyle='rgba(255,255,255,0.03)';ctx.lineWidth=1;
+  for(var i=0;i<10;i++){ctx.beginPath();ctx.moveTo(10,80+i*65);ctx.lineTo(470,80+i*65);ctx.stroke();}
+
+  // walls
+  ctx.lineCap='round';
+  ctx.strokeStyle='#3d5a42';ctx.lineWidth=10;
+  walls.forEach(function(w){ctx.beginPath();ctx.moveTo(w.x1,w.y1);ctx.lineTo(w.x2,w.y2);ctx.stroke();});
+  // slings
+  slings.forEach(function(s){
+    ctx.strokeStyle='#a33';ctx.lineWidth=8;
+    ctx.beginPath();ctx.moveTo(s.x1,s.y1);ctx.lineTo(s.x2,s.y2);ctx.stroke();
+    ctx.strokeStyle='#e66';ctx.lineWidth=4;
+    ctx.beginPath();ctx.moveTo(s.x1,s.y1);ctx.lineTo(s.x2,s.y2);ctx.stroke();
+  });
+
+  zombies.forEach(function(z){drawZombie(z,t);});
+  drawFlipper(flipL);drawFlipper(flipR);
+
+  // charge meter
+  if(state==='play'&&!ball.inPlay){
+    var p=Math.min(1,charge);
+    ctx.fillStyle='#222';ctx.fillRect(438,400,24,280);
+    ctx.fillStyle='hsl('+Math.round(120-120*p)+',90%,50%)';
+    ctx.fillRect(438,680-280*p,24,280*p);
+    ctx.strokeStyle='#fff';ctx.lineWidth=1;ctx.strokeRect(438,400,24,280);
+  }
+
+  // ball
+  if(state==='play'){
+    var bg=ctx.createRadialGradient(ball.x-4,ball.y-4,2,ball.x,ball.y,BALL_R);
+    bg.addColorStop(0,'#fff');bg.addColorStop(1,'#9aa');
+    ctx.beginPath();ctx.arc(ball.x,ball.y,BALL_R,0,6.283);ctx.fillStyle=bg;ctx.fill();
+    ctx.strokeStyle='#556';ctx.lineWidth=1.5;ctx.stroke();
+  }
+
+  // floaters
+  floaters.forEach(function(f){
+    ctx.globalAlpha=Math.max(0,f.life);
+    ctx.font='bold 20px monospace';ctx.textAlign='center';
+    ctx.fillStyle=f.c;ctx.fillText(f.t,f.x,f.y);
+    ctx.globalAlpha=1;
+  });
+
+  // HUD
+  ctx.textAlign='left';ctx.font='bold 18px monospace';ctx.fillStyle='#cfe';
+  ctx.fillText('SCORE '+score,20,36);
+  ctx.font='14px monospace';ctx.fillStyle='#9b9';
+  ctx.fillText('WAVE '+wave+'   HI '+Math.max(hiScore,score),20,56);
+  // balls remaining (mini skulls)
+  for(var b=0;b<balls;b++){
+    ctx.beginPath();ctx.arc(420+b*22,30,8,0,6.283);ctx.fillStyle='#cfe';ctx.fill();
+    ctx.fillStyle='#123';ctx.fillRect(417+b*22,28,4,4);ctx.fillRect(425+b*22,28,4,4);
+  }
+
+  // overlays
+  if(state==='start'||state==='gameover'){
+    ctx.fillStyle='rgba(0,0,0,0.72)';roundRect(40,120,W-80,480,20);ctx.fill();
+    ctx.strokeStyle='#5c9b4a';ctx.lineWidth=3;roundRect(40,120,W-80,480,20);ctx.stroke();
+    ctx.textAlign='center';
+    ctx.font='bold 44px monospace';ctx.fillStyle='#7ec850';
+    ctx.fillText('ZOMBIE',W/2,200);ctx.fillText('PINBALL',W/2,250);
+    // little zombie face
+    drawZombie({x:W/2,y:315,r:34,hp:3,flash:0,dead:false,wob:t*6},t);
+
+    ctx.font='16px monospace';ctx.fillStyle='#cfe';
+    if(state==='start'){
+      ctx.fillText('LEFT / A  :  LEFT FLIPPER',W/2,395);
+      ctx.fillText('RIGHT / D :  RIGHT FLIPPER',W/2,420);
+      ctx.fillText('HOLD SPACE:  CHARGE LAUNCH',W/2,445);
+      ctx.fillText('R         :  RESTART',W/2,470);
+      ctx.fillStyle='#9b9';
+      ctx.fillText('Knock out the zombies. Kill all to',W/2,510);
+      ctx.fillText('clear the wave and earn a bonus!',W/2,532);
+    }else{
+      ctx.font='bold 30px monospace';ctx.fillStyle='#e66';
+      ctx.fillText('GAME OVER',W/2,400);
+      ctx.font='20px monospace';ctx.fillStyle='#cfe';
+      ctx.fillText('FINAL SCORE: '+score,W/2,440);
+      ctx.fillStyle='#ff5';
+      ctx.fillText('HIGH SCORE: '+Math.max(hiScore,score),W/2,468);
+    }
+    var blink=Math.sin(t*5)>-0.3;
+    if(blink){ctx.font='bold 18px monospace';ctx.fillStyle='#fff';
+      ctx.fillText('PRESS SPACE TO '+(state==='start'?'START':'RESTART'),W/2,575);}
+  }
+}
+
+/* ---------- loop ---------- */
+var last=performance.now();
+function loop(now){
+  var dt=Math.min(0.033,(now-last)/1000);last=now;
+  if(state==='play')step(dt);
+  draw(now/1000);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
+```
