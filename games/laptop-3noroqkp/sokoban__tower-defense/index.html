@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tower Defense Sokoban</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, TILE;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    calcTile();
+}
+window.addEventListener('resize', resize);
+
+const COLS = 13, ROWS = 9;
+function calcTile() {
+    TILE = Math.floor(Math.min(W / (COLS + 2), H / (ROWS + 4)));
+    if (TILE > 80) TILE = 80;
+}
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    const now = audioCtx.currentTime;
+    switch(type) {
+        case 'push':
+            osc.type = 'square'; osc.frequency.setValueAtTime(120, now);
+            osc.frequency.linearRampToValueAtTime(80, now + 0.1);
+            gain.gain.setValueAtTime(0.15, now); gain.gain.linearRampToValueAtTime(0, now + 0.1);
+            osc.start(now); osc.stop(now + 0.1); break;
+        case 'activate':
+            osc.type = 'sine'; osc.frequency.setValueAtTime(440, now);
+            osc.frequency.linearRampToValueAtTime(880, now + 0.2);
+            gain.gain.setValueAtTime(0.2, now); gain.gain.linearRampToValueAtTime(0, now + 0.3);
+            osc.start(now); osc.stop(now + 0.3); break;
+        case 'shoot':
+            osc.type = 'sawtooth'; osc.frequency.setValueAtTime(600, now);
+            osc.frequency.linearRampToValueAtTime(200, now + 0.08);
+            gain.gain.setValueAtTime(0.08, now); gain.gain.linearRampToValueAtTime(0, now + 0.08);
+            osc.start(now); osc.stop(now + 0.08); break;
+        case 'enemyDie':
+            osc.type = 'square'; osc.frequency.setValueAtTime(300, now);
+            osc.frequency.linearRampToValueAtTime(100, now + 0.15);
+            gain.gain.setValueAtTime(0.12, now); gain.gain.linearRampToValueAtTime(0, now + 0.15);
+            osc.start(now); osc.stop(now + 0.15); break;
+        case 'baseHit':
+            osc.type = 'sawtooth'; osc.frequency.setValueAtTime(80, now);
+            gain.gain.setValueAtTime(0.25, now); gain.gain.linearRampToValueAtTime(0, now + 0.3);
+            osc.start(now); osc.stop(now + 0.3); break;
+        case 'win':
+            osc.type = 'sine'; osc.frequency.setValueAtTime(523, now);
+            gain.gain.setValueAtTime(0.15, now); gain.gain.linearRampToValueAtTime(0, now + 0.5);
+            osc.start(now); osc.stop(now + 0.5); break;
+        case 'lose':
+            osc.type = 'sawtooth'; osc.frequency.setValueAtTime(200, now);
+            osc.frequency.linearRampToValueAtTime(60, now + 0.5);
+            gain.gain.setValueAtTime(0.2, now); gain.gain.linearRampToValueAtTime(0, now + 0.5);
+            osc.start(now); osc.stop(now + 0.5); break;
+    }
+}
+
+// Game state
+let gameState = 'START'; // START, PLAYING, WIN, LOSE
+let grid = [];
+let player = { x: 1, y: 4 };
+let boxes = [];
+let targets = [];
+let towers = [];
+let enemies = [];
+let projectiles = [];
+let particles = [];
+let baseHP = 20;
+let maxBaseHP = 20;
+let wave = 0;
+let waveTimer = 0;
+let spawnQueue = [];
+let score = 0;
+let animFrame = 0;
+
+function initLevel() {
+    grid = [];
+    for (let r = 0; r < ROWS; r++) {
+        grid[r] = [];
+        for (let c = 0; c < COLS; c++) {
+            grid[r][c] = 0; // 0=empty, 1=wall
+        }
+    }
+    
+    // Walls
+    const walls = [
+        [2,3],[3,3],[4,3],[5,3],
+        [2,6],[3,6],[4,6],[5,6],
+        [7,1],[7,2],[7,6],[7,7],
+        [9,3],[9,4],[9,5],
+        [0,0],[0,8],[12,0],[12,8]
+    ];
+    walls.forEach(([c,r]) => { if(r>=0&&r<ROWS&&c>=0&&c<COLS) grid[r][c]=1; });
+
+    player = { x: 1, y: 4 };
+    
+    targets = [
+        {x:5, y:2}, {x:5, y:6}, {x:8, y:4}
+    ];
+    
+    boxes = [
+        {x:3, y:4, onTarget:false, tower:null},
+        {x:4, y:1, onTarget:false, tower:null},
+        {x:2, y:7, onTarget:false, tower:null}
+    ];
+    
+    towers = [];
+    enemies = [];
+    projectiles = [];
+    particles = [];
+    baseHP = maxBaseHP;
+    wave = 0;
+    waveTimer = 180; // frames until first wave
+    spawnQueue = [];
+    score = 0;
+}
+
+function getGridAt(x, y) {
+    if (y < 0 || y >= ROWS || x < 0 || x >= COLS) return 1;
+    return grid[y][x];
+}
+
+function isBoxAt(x, y) {
+    return boxes.findIndex(b => b.x === x && b.y === y);
+}
+
+function movePlayer(dx, dy) {
+    const nx = player.x + dx;
+    const ny = player.y + dy;
+    
+    if (getGridAt(nx, ny) === 1) return;
+    
+    const boxIdx = isBoxAt(nx, ny);
+    if (boxIdx >= 0) {
+        const bx = nx + dx;
+        const by = ny + dy;
+        if (getGridAt(bx, by) === 1) return;
+        if (isBoxAt(bx, by) >= 0) return;
+        // Push box
+        boxes[boxIdx].x = bx;
+        boxes[boxIdx].y = by;
+        playSound('push');
+        
+        // Check if on target
+        const tIdx = targets.findIndex(t => t.x === bx && t.y === by);
+        if (tIdx >= 0 && !boxes[boxIdx].onTarget) {
+            boxes[boxIdx].onTarget = true;
+            playSound('activate');
+            // Create tower
+            const tw = { x: bx, y: by, range: 3, damage: 1, fireRate: 60, cooldown: 0, level: 1 };
+            towers.push(tw);
+            boxes[boxIdx].tower = tw;
+            spawnParticles(bx, by, '#4fc3f7', 8);
+        } else if (tIdx < 0 && boxes[boxIdx].onTarget) {
+            // Popped off target - deactivate tower
+            boxes[boxIdx].onTarget = false;
+            if (boxes[boxIdx].tower) {
+                const ti = towers.findIndex(t => t === boxes[boxIdx].tower);
+                if (ti >= 0) towers.splice(ti, 1);
+                boxes[boxIdx].tower = null;
+            }
+        }
+        player.x = nx;
+        player.y = ny;
+    } else {
+        player.x = nx;
+        player.y = ny;
+    }
+}
+
+function spawnWave() {
+    wave++;
+    const count = 2 + wave * 2;
+    for (let i = 0; i < count; i++) {
+        const type = Math.random();
+        let e;
+        if (wave >= 3 && type > 0.7) {
+            e = { x: COLS, y: Math.floor(Math.random() * ROWS), hp: 4 + wave, maxHp: 4 + wave, speed: 90, damage: 3, type: 'tank', radius: TILE * 0.35 };
+        } else if (wave >= 2 && type < 0.4) {
+            e = { x: COLS, y: Math.floor(Math.random() * ROWS), hp: 1 + Math.floor(wave/2), maxHp: 1 + Math.floor(wave/2), speed: 50, damage: 1, type: 'fast', radius: TILE * 0.25 };
+        } else {
+            e = { x: COLS, y: Math.floor(Math.random() * ROWS), hp: 2 + wave, maxHp: 2 + wave, speed: 70, damage: 2, type: 'normal', radius: TILE * 0.3 };
+        }
+        spawnQueue.push({...e, x: COLS + Math.floor(Math.random()*2)});
+    }
+}
+
+function updateEnemies() {
+    for (let i = enemies.length - 1; i >= 0; i--) {
+        const e = enemies[i];
+        e.x -= 1 / e.speed * (TILE > 40 ? 1 : 0.8);
+        
+        // Check wall collision - try to move around
+        const gc = Math.floor(e.x);
+        const gr = Math.floor(e.y);
+        if (gc >= 0 && gc < COLS && gr >= 0 && gr < ROWS && grid[gr][gc] === 1) {
+            // Try to go up or down
+            if (Math.random() > 0.5) e.y += 0.3; else e.y -= 0.3;
+        }
+        
+        // Clamp y
+        if (e.y < 0) e.y = 0;
+        if (e.y >= ROWS - 1) e.y = ROWS - 1;
+        
+        // Reached base
+        if (e.x <= 0.5) {
+            baseHP -= e.damage;
+            playSound('baseHit');
+            spawnParticles(0, e.y, '#f44336', 12);
+            enemies.splice(i, 1);
+            if (baseHP <= 0) {
+                gameState = 'LOSE';
+                playSound('lose');
+            }
+            continue;
+        }
+        
+        // Dead
+        if (e.hp <= 0) {
+            score += e.type === 'tank' ? 30 : e.type === 'fast' ? 15 : 20;
+            playSound('enemyDie');
+            spawnParticles(e.x, e.y, '#ff9800', 6);
+            enemies.splice(i, 1);
+        }
+    }
+    
+    // Process spawn queue
+    if (spawnQueue.length > 0) {
+        waveTimer--;
+        if (waveTimer <= 0) {
+            const e = spawnQueue.shift();
+            enemies.push(e);
+            waveTimer = 30 + Math.floor(Math.random() * 20);
+        }
+    } else if (enemies.length === 0 && towers.length > 0) {
+        // Wave complete - check win condition
+        const allOnTarget = boxes.every(b => b.onTarget);
+        if (allOnTarget) {
+            gameState = 'WIN';
+            playSound('win');
+        } else {
+            waveTimer = 120;
+            spawnWave();
+        }
+    }
+}
+
+function updateTowers() {
+    for (const t of towers) {
+        if (t.cooldown > 0) { t.cooldown--; continue; }
+        
+        // Find nearest enemy in range
+        let best = null, bestDist = Infinity;
+        for (const e of enemies) {
+            const dx = e.x - t.x;
+            const dy = e.y - t.y;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            if (dist <= t.range && dist < bestDist) {
+                best = e;
+                bestDist = dist;
+            }
+        }
+        
+        if (best) {
+            t.cooldown = t.fireRate;
+            best.hp -= t.damage;
+            playSound('shoot');
+            // Projectile visual
+            projectiles.push({
+                x: t.x, y: t.y, tx: best.x, ty: best.y, life: 10, maxLife: 10
+            });
+        }
+    }
+}
+
+function updateProjectiles() {
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+        const p = projectiles[i];
+        p.life--;
+        if (p.life <= 0) projectiles.splice(i, 1);
+    }
+}
+
+function spawnParticles(gx, gy, color, count) {
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 0.5 + Math.random() * 1.5;
+        particles.push({
+            x: gx, y: gy,
+            vx: Math.cos(angle) * speed * 0.05,
+            vy: Math.sin(angle) * speed * 0.05,
+            life: 20 + Math.random() * 15,
+            maxLife: 35,
+            color: color
+        });
+    }
+}
+
+function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life--;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function update() {
+    if (gameState !== 'PLAYING') return;
+    
+    // Wave spawning
+    if (spawnQueue.length === 0 && enemies.length === 0) {
+        waveTimer--;
+        if (waveTimer <= 0) {
+            spawnWave();
+        }
+    }
+    
+    updateEnemies();
+    updateTowers();
+    updateProjectiles();
+    updateParticles();
+}
+
+// Rendering
+function drawGrid() {
+    const offX = (W - COLS * TILE) / 2;
+    const offY = (H - ROWS * TILE) / 2;
+    
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            const x = offX + c * TILE;
+            const y = offY + r * TILE;
+            
+            if (grid[r][c] === 1) {
+                ctx.fillStyle = '#37474f';
+                ctx.fillRect(x, y, TILE, TILE);
+                ctx.strokeStyle = '#263238';
+                ctx.strokeRect(x+2, y+2, TILE-4, TILE-4);
+            } else {
+                // Floor
+                const checker = (c + r) % 2 === 0;
+                ctx.fillStyle = checker ? '#263238' : '#1e2a30';
+                ctx.fillRect(x, y, TILE, TILE);
+            }
+        }
+    }
+    
+    // Targets
+    for (const t of targets) {
+        const x = offX + t.x * TILE;
+        const y = offY + t.y * TILE;
+        const pulse = Math.sin(animFrame * 0.05) * 0.3 + 0.7;
+        ctx.fillStyle = `rgba(79, 195, 247, ${pulse * 0.3})`;
+        ctx.fillRect(x + 2, y + 2, TILE - 4, TILE - 4);
+        ctx.strokeStyle = `rgba(79, 195, 247, ${pulse})`;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x + 4, y + 4, TILE - 8, TILE - 8);
+        // Diamond
+        ctx.beginPath();
+        ctx.moveTo(x + TILE/2, y + TILE*0.3);
+        ctx.lineTo(x + TILE*0.7, y + TILE/2);
+        ctx.lineTo(x + TILE/2, y + TILE*0.7);
+        ctx.lineTo(x + TILE*0.3, y + TILE/2);
+        ctx.closePath();
+        ctx.fillStyle = `rgba(79, 195, 247, ${pulse * 0.5})`;
+        ctx.fill();
+    }
+    
+    // Base
+    const bx = offX;
+    const by = offY + (ROWS/2 - 1) * TILE;
+    ctx.fillStyle = '#e53935';
+    ctx.fillRect(bx, by, TILE, TILE);
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${TILE*0.5}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('🏰', bx + TILE/2, by + TILE/2);
+}
+
+function drawBoxes() {
+    const offX = (W - COLS * TILE) / 2;
+    const offY = (H - ROWS * TILE) / 2;
+    
+    for (const b of boxes) {
+        const x = offX + b.x * TILE;
+        const y = offY + b.y * TILE;
+        
+        if (b.onTarget) {
+            // Tower appearance
+            ctx.fillStyle = '#4fc3f7';
+            ctx.fillRect(x+2, y+2, TILE-4, TILE-4);
+            ctx.fillStyle = '#01579b';
+            ctx.beginPath();
+            ctx.arc(x + TILE/2, y + TILE/2, TILE*0.25, 0, Math.PI*2);
+            ctx.fill();
+            // Range indicator
+            const rangePx = b.tower ? b.tower.range * TILE : 3 * TILE;
+            ctx.strokeStyle = 'rgba(79, 195, 247, 0.15)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.arc(x + TILE/2, y + TILE/2, rangePx, 0, Math.PI*2);
+            ctx.stroke();
+        } else {
+            // Box appearance
+            ctx.fillStyle = '#ff8a65';
+            ctx.fillRect(x+3, y+3, TILE-6, TILE-6);
+            ctx.strokeStyle = '#bf360c';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x+5, y+5, TILE-10, TILE-10);
+            // Cross pattern
+            ctx.beginPath();
+            ctx.moveTo(x+8, y+8); ctx.lineTo(x+TILE-8, y+TILE-8);
+            ctx.moveTo(x+TILE-8, y+8); ctx.lineTo(x+8, y+TILE-8);
+            ctx.strokeStyle = '#bf360c';
+            ctx.stroke();
+        }
+    }
+}
+
+function drawPlayer() {
+    const offX = (W - COLS * TILE) / 2;
+    const offY = (H - ROWS * TILE) / 2;
+    const x = offX + player.x * TILE;
+    const y = offY + player.y * TILE;
+    
+    ctx.fillStyle = '#69f0ae';
+    ctx.beginPath();
+    ctx.arc(x + TILE/2, y + TILE/2, TILE*0.35, 0, Math.PI*2);
+    ctx.fill();
+    // Eyes
+    ctx.fillStyle = '#004d40';
+    ctx.beginPath();
+    ctx.arc(x + TILE*0.38, y + TILE*0.42, TILE*0.06, 0, Math.PI*2);
+    ctx.arc(x + TILE*0.62, y + TILE*0.42, TILE*0.06, 0, Math.PI*2);
+    ctx.fill();
+    // Smile
+    ctx.beginPath();
+    ctx.arc(x + TILE/2, y + TILE*0.58, TILE*0.15, 0, Math.PI);
+    ctx.stroke();
+}
+
+function drawEnemies() {
+    const offX = (W - COLS * TILE) / 2;
+    const offY = (H - ROWS * TILE) / 2;
+    
+    for (const e of enemies) {
+        const x = offX + e.x * TILE;
+        const y = offY + e.y * TILE;
+        
+        let color = '#ef5350';
+        if (e.type === 'fast') color = '#ffee58';
+        if (e.type === 'tank') color = '#ab47bc';
+        
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(x, y, e.radius, 0, Math.PI*2);
+        ctx.fill();
+        
+        // Angry eyes
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(x - e.radius*0.3, y - e.radius*0.2, e.radius*0.2, 0, Math.PI*2);
+        ctx.arc(x + e.radius*0.3, y - e.radius*0.2, e.radius*0.2, 0, Math.PI*2);
+        ctx.fill();
+        
+        // HP bar
+        const hpW = TILE * 0.6;
+        const hpX = x - hpW/2;
+        const hpY = y - e.radius - 8;
+        ctx.fillStyle = '#333';
+        ctx.fillRect(hpX, hpY, hpW, 5);
+        ctx.fillStyle = '#4caf50';
+        ctx.fillRect(hpX, hpY, hpW * (e.hp/e.maxHp), 5);
+    }
+}
+
+function drawProjectiles() {
+    const offX = (W - COLS * TILE) / 2;
+    const offY = (H - ROWS * TILE) / 2;
+    
+    for (const p of projectiles) {
+        const t = 1 - p.life / p.maxLife;
+        const x = offX + (p.x + (p.tx - p.x) * t) * TILE;
+        const y = offY + (p.y + (p.ty - p.y) * t) * TILE;
+        
+        ctx.fillStyle = `rgba(79, 195, 247, ${t})`;
+        ctx.beginPath();
+        ctx.arc(x, y, 4, 0, Math.PI*2);
+        ctx.fill();
+    }
+}
+
+function drawParticles() {
+    const offX = (W - COLS * TILE) / 2;
+    const offY = (H - ROWS * TILE) / 2;
+    
+    for (const p of particles) {
+        const alpha = p.life / p.maxLife;
+        ctx.fillStyle = p.color + Math.floor(alpha * 255).toString(16).padStart(2,'0');
+        ctx.fillRect(offX + p.x * TILE - 3, offY + p.y * TILE - 3, 6, 6);
+    }
+}
+
+function drawHUD() {
+    const offX = (W - COLS * TILE) / 2;
+    
+    // Base HP bar
+    const hpBarW = Math.min(COLS * TILE * 0.5, W * 0.3);
+    const hpX = offX + (COLS*TILE - hpBarW)/2;
+    const hpY = 10;
+    
+    ctx.fillStyle = '#333';
+    ctx.fillRect(hpX, hpY, hpBarW, 20);
+    const hpPct = baseHP / maxBaseHP;
+    ctx.fillStyle = hpPct > 0.5 ? '#4caf50' : hpPct > 0.25 ? '#ff9800' : '#f44336';
+    ctx.fillRect(hpX, hpY, hpBarW * hpPct, 20);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(hpX, hpY, hpBarW, 20);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`HP: ${baseHP}/${maxBaseHP}`, hpX + 5, hpY + 14);
+    
+    // Wave info
+    ctx.textAlign = 'right';
+    const remaining = enemies.length + spawnQueue.length;
+    ctx.fillText(`Wave: ${wave}  Enemies: ${remaining}`, W - 20, hpY + 14);
+    
+    // Score
+    ctx.textAlign = 'center';
+    ctx.fillText(`Score: ${score}`, W/2, hpY + 14);
+    
+    // Objective
+    const onTarget = boxes.filter(b => b.onTarget).length;
+    ctx.fillStyle = '#4fc3f7';
+    ctx.fillText(`Towers: ${onTarget}/${boxes.length}`, W/2, hpY + 38);
+    
+    // Instructions at bottom
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.font = '12px monospace';
+    ctx.fillText('Arrow keys/WASD: Move | Push boxes onto blue pads to build towers', W/2, H - 10);
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+    
+    const cx = W/2;
+    const cy = H/2;
+    
+    // Title
+    ctx.fillStyle = '#4fc3f7';
+    ctx.font = `bold ${Math.min(48, W*0.05)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('TOWER DEFENSE', cx, cy - 80);
+    ctx.fillStyle = '#ff8a65';
+    ctx.fillText('SOKOBAN', cx, cy - 40);
+    
+    // Instructions
+    ctx.fillStyle = '#ccc';
+    ctx.font = `${Math.min(16, W*0.02)}px monospace`;
+    const lines = [
+        'Push boxes onto blue pads to activate towers.',
+        'Towers auto-shoot enemies that approach your base.',
+        'Enemies spawn from the right and march left.',
+        '',
+        'Win: Activate all towers AND survive!',
+        'Lose: Base HP reaches 0.',
+        '',
+        'Controls:',
+        'Arrow Keys / WASD - Move & Push',
+        'R - Restart'
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, cx, cy + 20 + i * 24);
+    });
+    
+    // Start prompt
+    const pulse = Math.sin(animFrame * 0.05) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(105, 240, 174, ${pulse})`;
+    ctx.font = `bold ${Math.min(20, W*0.025)}px monospace`;
+    ctx.fillText('Press ENTER or SPACE to Start', cx, cy + lines.length * 24 + 30);
+}
+
+function drawEndScreen(won) {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    
+    const cx = W/2;
+    const cy = H/2;
+    
+    if (won) {
+        ctx.fillStyle = '#4caf50';
+        ctx.font = `bold ${Math.min(48, W*0.05)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('VICTORY!', cx, cy - 30);
+    } else {
+        ctx.fillStyle = '#f44336';
+        ctx.font = `bold ${Math.min(48, W*0.05)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('BASE DESTROYED', cx, cy - 30);
+    }
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.min(20, W*0.025)}px monospace`;
+    ctx.fillText(`Score: ${score}`, cx, cy + 10);
+    ctx.fillText(`Waves Survived: ${wave}`, cx, cy + 40);
+    
+    const pulse = Math.sin(animFrame * 0.05) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(255,255,255,${pulse})`;
+    ctx.font = `bold ${Math.min(18, W*0.02)}px monospace`;
+    ctx.fillText('Press R to Restart', cx, cy + 90);
+}
+
+function render() {
+    ctx.clearRect(0, 0, W, H);
+    
+    if (gameState === 'START') {
+        drawStartScreen();
+    } else {
+        drawGrid();
+        drawBoxes();
+        drawPlayer();
+        drawEnemies();
+        drawProjectiles();
+        drawParticles();
+        drawHUD();
+        
+        if (gameState === 'WIN') drawEndScreen(true);
+        if (gameState === 'LOSE') drawEndScreen(false);
+    }
+}
+
+function gameLoop() {
+    animFrame++;
+    update();
+    render();
+    requestAnimationFrame(gameLoop);
+}
+
+// Input
+let firstInput = false;
+window.addEventListener('keydown', (e) => {
+    if (!firstInput) {
+        initAudio();
+        firstInput = true;
+    }
+    
+    e.preventDefault();
+    
+    if (gameState === 'START') {
+        if (e.key === 'Enter' || e.key === ' ') {
+            initLevel();
+            gameState = 'PLAYING';
+        }
+        return;
+    }
+    
+    if (gameState === 'WIN' || gameState === 'LOSE') {
+        if (e.key === 'r' || e.key === 'R') {
+            initLevel();
+            gameState = 'PLAYING';
+        }
+        return;
+    }
+    
+    if (gameState === 'PLAYING') {
+        switch(e.key) {
+            case 'ArrowUp': case 'w': case 'W': movePlayer(0, -1); break;
+            case 'ArrowDown': case 's': case 'S': movePlayer(0, 1); break;
+            case 'ArrowLeft': case 'a': case 'A': movePlayer(-1, 0); break;
+            case 'ArrowRight': case 'd': case 'D': movePlayer(1, 0); break;
+            case 'r': case 'R': initLevel(); break;
+        }
+    }
+});
+
+// High score
+try {
+    const hs = parseInt(localStorage.getItem('tds_highscore') || '0');
+    window._highScore = isNaN(hs) ? 0 : hs;
+} catch(e) { window._highScore = 0; }
+
+function saveHighScore() {
+    try {
+        if (score > window._highScore) {
+            window._highScore = score;
+            localStorage.setItem('tds_highscore', String(score));
+        }
+    } catch(e) {}
+}
+
+// Override win/lose to save score
+const origUpdate = update;
+update = function() {
+    const prev = gameState;
+    origUpdate();
+    if ((prev === 'PLAYING' && (gameState === 'WIN' || gameState === 'LOSE'))) {
+        saveHighScore();
+    }
+};
+
+initLevel();
+gameLoop();
+</script>
+</body>
+</html>
