@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Maze Zombie</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    scale = Math.min(W, H) / 600;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, type, duration, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.15, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+
+// Game state
+let gameState = 'start'; // start, playing, gameover
+let score = 0;
+let wave = 1;
+let zombiesKilledThisWave = 0;
+let zombiesNeededForWave = 5;
+
+// Maze
+const MAZE_W = 21;
+const MAZE_H = 15;
+let maze = [];
+let cellSize;
+
+function generateMaze() {
+    maze = Array.from({length: MAZE_H}, () => Array(MAZE_W).fill(1));
+    const stack = [];
+    const startX = 1, startY = 1;
+    maze[startY][startX] = 0;
+    stack.push([startX, startY]);
+
+    while (stack.length > 0) {
+        const [cx, cy] = stack[stack.length - 1];
+        const dirs = [[0,-1],[1,0],[0,1],[-1,0]].sort(() => Math.random() - 0.5);
+        let found = false;
+        for (const [dx, dy] of dirs) {
+            const nx = cx + dx * 2;
+            const ny = cy + dy * 2;
+            if (nx > 0 && nx < MAZE_W - 1 && ny > 0 && ny < MAZE_H - 1 && maze[ny][nx] === 1) {
+                maze[ny][nx] = 0;
+                maze[cy + dy][cx + dx] = 0;
+                stack.push([nx, ny]);
+                found = true;
+                break;
+            }
+        }
+        if (!found) stack.pop();
+    }
+    // Open some extra passages for gameplay
+    for (let i = 0; i < 30; i++) {
+        const x = Math.floor(Math.random() * (MAZE_W - 2)) + 1;
+        const y = Math.floor(Math.random() * (MAZE_H - 2)) + 1;
+        if (maze[y][x] === 1) {
+            maze[y][x] = 0;
+        }
+    }
+    // Ensure center area is open
+    for (let y = 6; y < 9; y++) {
+        for (let x = 8; x < 13; x++) {
+            maze[y][x] = 0;
+        }
+    }
+}
+
+// Player
+let player = { x: 0, y: 0, w: 20, h: 20, hp: 100, maxHp: 100, speed: 3, angle: 0, cooldown: 0 };
+// Zombies
+let zombies = [];
+// Bullets
+let bullets = [];
+// Particles
+let particles = [];
+// Items (medkits)
+let items = [];
+// Camera
+let camX = 0, camY = 0;
+
+function resetGame() {
+    generateMaze();
+    cellSize = Math.min(W / MAZE_W, H / MAZE_H);
+    player.x = 10 * cellSize + cellSize / 2;
+    player.y = 7 * cellSize + cellSize / 2;
+    player.hp = 100;
+    player.maxHp = 100;
+    player.cooldown = 0;
+    zombies = [];
+    bullets = [];
+    particles = [];
+    items = [];
+    score = 0;
+    wave = 1;
+    zombiesKilledThisWave = 0;
+    zombiesNeededForWave = 5;
+    spawnWave();
+}
+
+function spawnWave() {
+    const count = 3 + wave * 2;
+    for (let i = 0; i < count; i++) {
+        let zx, zy;
+        let attempts = 0;
+        do {
+            zx = Math.floor(Math.random() * MAZE_W);
+            zy = Math.floor(Math.random() * MAZE_H);
+            attempts++;
+        } while ((maze[zy][zx] !== 0 || Math.hypot(zx * cellSize + cellSize/2 - player.x, zy * cellSize + cellSize/2 - player.y) < cellSize * 5) && attempts < 100);
+        
+        zombies.push({
+            x: zx * cellSize + cellSize / 2,
+            y: zy * cellSize + cellSize / 2,
+            w: 18, h: 18,
+            speed: 0.8 + wave * 0.15,
+            hp: 3 + Math.floor(wave / 2),
+            maxHp: 3 + Math.floor(wave / 2),
+            angle: 0,
+            wanderTimer: 0,
+            targetDx: 0, targetDy: 0,
+            hitFlash: 0
+        });
+    }
+    // Spawn medkits
+    if (wave > 1 && Math.random() < 0.6) {
+        let ix, iy;
+        for (let a = 0; a < 50; a++) {
+            ix = Math.floor(Math.random() * MAZE_W);
+            iy = Math.floor(Math.random() * MAZE_H);
+            if (maze[iy][ix] === 0) break;
+        }
+        items.push({ x: ix * cellSize + cellSize/2, y: iy * cellSize + cellSize/2, type: 'medkit' });
+    }
+}
+
+function mazeBlocked(px, py) {
+    const gx = Math.floor(px / cellSize);
+    const gy = Math.floor(py / cellSize);
+    if (gx < 0 || gx >= MAZE_W || gy < 0 || gy >= MAZE_H) return true;
+    return maze[gy][gx] === 1;
+}
+
+function canMove(px, py, w, h) {
+    const hw = w / 2, hh = h / 2;
+    if (mazeBlocked(px - hw, py - hh)) return false;
+    if (mazeBlocked(px + hw, py - hh)) return false;
+    if (mazeBlocked(px - hw, py + hh)) return false;
+    if (mazeBlocked(px + hw, py + hh)) return false;
+    // Check corners more precisely
+    const margin = 2;
+    if (mazeBlocked(px - hw + margin, py - hh + margin)) return false;
+    if (mazeBlocked(px + hw - margin, py - hh + margin)) return false;
+    if (mazeBlocked(px - hw + margin, py + hh - margin)) return false;
+    if (mazeBlocked(px + hw - margin, py + hh - margin)) return false;
+    return true;
+}
+
+// Input
+const keys = {};
+let mouseX = 0, mouseY = 0, mouseDown = false;
+
+window.addEventListener('keydown', e => {
+    keys[e.key.toLowerCase()] = true;
+    if (gameState === 'start' && (e.key === 'Enter' || e.key === ' ')) {
+        initAudio();
+        resetGame();
+        gameState = 'playing';
+    }
+    if (gameState === 'gameover' && (e.key === 'Enter' || e.key === ' ' || e.key.toLowerCase() === 'r')) {
+        resetGame();
+        gameState = 'playing';
+    }
+});
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+canvas.addEventListener('mousemove', e => {
+    const rect = canvas.getBoundingClientRect();
+    mouseX = e.clientX - rect.left;
+    mouseY = e.clientY - rect.top;
+});
+canvas.addEventListener('mousedown', () => { mouseDown = true; initAudio(); });
+canvas.addEventListener('mouseup', () => { mouseDown = false; });
+
+function shoot() {
+    if (player.cooldown > 0) return;
+    player.cooldown = 12;
+    const dx = mouseX - (player.x - camX);
+    const dy = mouseY - (player.y - camY);
+    const dist = Math.hypot(dx, dy) || 1;
+    const nx = dx / dist, ny = dy / dist;
+    bullets.push({
+        x: player.x + nx * 12,
+        y: player.y + ny * 12,
+        vx: nx * 8,
+        vy: ny * 8,
+        life: 60
+    });
+    playSound(200, 'square', 0.1, 0.1);
+    // Muzzle flash particles
+    for (let i = 0; i < 3; i++) {
+        particles.push({
+            x: player.x + nx * 15,
+            y: player.y + ny * 15,
+            vx: nx * 2 + (Math.random()-0.5)*2,
+            vy: ny * 2 + (Math.random()-0.5)*2,
+            life: 8,
+            color: '#ffcc00'
+        });
+    }
+}
+
+function update() {
+    if (gameState !== 'playing') return;
+
+    // Player movement
+    let dx = 0, dy = 0;
+    if (keys['w'] || keys['arrowup']) dy -= 1;
+    if (keys['s'] || keys['arrowdown']) dy += 1;
+    if (keys['a'] || keys['arrowleft']) dx -= 1;
+    if (keys['d'] || keys['arrowright']) dx += 1;
+    
+    if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
+    
+    const spd = player.speed;
+    const nx = player.x + dx * spd;
+    const ny = player.y + dy * spd;
+    
+    if (dx !== 0) {
+        if (canMove(nx, player.y, player.w, player.h)) player.x = nx;
+    }
+    if (dy !== 0) {
+        if (canMove(player.x, ny, player.w, player.h)) player.y = ny;
+    }
+
+    // Player angle
+    const pdx = mouseX - (player.x - camX);
+    const pdy = mouseY - (player.y - camY);
+    player.angle = Math.atan2(pdy, pdx);
+
+    // Shoot
+    if (player.cooldown > 0) player.cooldown--;
+    if (mouseDown) shoot();
+
+    // Bullets
+    for (let i = bullets.length - 1; i >= 0; i--) {
+        const b = bullets[i];
+        b.x += b.vx;
+        b.y += b.vy;
+        b.life--;
+        if (b.life <= 0) { bullets.splice(i, 1); continue; }
+        if (mazeBlocked(b.x, b.y)) {
+            // Wall hit particles
+            for (let j = 0; j < 4; j++) {
+                particles.push({ x: b.x, y: b.y, vx: (Math.random()-0.5)*3, vy: (Math.random()-0.5)*3, life: 12, color: '#888' });
+            }
+            bullets.splice(i, 1);
+            continue;
+        }
+        // Hit zombie
+        for (let j = zombies.length - 1; j >= 0; j--) {
+            const z = zombies[j];
+            if (Math.abs(b.x - z.x) < z.w && Math.abs(b.y - z.y) < z.h) {
+                z.hp--;
+                z.hitFlash = 6;
+                bullets.splice(i, 1);
+                playSound(150, 'sawtooth', 0.15, 0.2);
+                // Blood particles
+                for (let k = 0; k < 5; k++) {
+                    particles.push({ x: z.x, y: z.y, vx: (Math.random()-0.5)*4, vy: (Math.random()-0.5)*4, life: 15, color: '#cc2200' });
+                }
+                if (z.hp <= 0) {
+                    zombies.splice(j, 1);
+                    score += 10 + wave * 2;
+                    zombiesKilledThisWave++;
+                    playSound(80, 'sawtooth', 0.3, 0.25);
+                    for (let k = 0; k < 8; k++) {
+                        particles.push({ x: z.x, y: z.y, vx: (Math.random()-0.5)*5, vy: (Math.random()-0.5)*5, life: 20, color: '#993300' });
+                    }
+                    if (zombiesKilledThisWave >= zombiesNeededForWave) {
+                        wave++;
+                        zombiesKilledThisWave = 0;
+                        zombiesNeededForWave = 4 + wave * 2;
+                        setTimeout(() => { if (gameState === 'playing') spawnWave(); }, 1500);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Zombies
+    for (let i = zombies.length - 1; i >= 0; i--) {
+        const z = zombies[i];
+        if (z.hitFlash > 0) z.hitFlash--;
+        
+        // AI: chase player if close enough, else wander
+        const distToPlayer = Math.hypot(player.x - z.x, player.y - z.y);
+        let moveDx = 0, moveDy = 0;
+        
+        if (distToPlayer < cellSize * 5) {
+            // Chase
+            const a = Math.atan2(player.y - z.y, player.x - z.x);
+            moveDx = Math.cos(a);
+            moveDy = Math.sin(a);
+        } else {
+            // Wander
+            z.wanderTimer--;
+            if (z.wanderTimer <= 0) {
+                const a = Math.random() * Math.PI * 2;
+                z.targetDx = Math.cos(a);
+                z.targetDy = Math.sin(a);
+                z.wanderTimer = 60 + Math.random() * 60;
+            }
+            moveDx = z.targetDx;
+            moveDy = z.targetDy;
+        }
+        
+        const nzx = z.x + moveDx * z.speed;
+        const nzy = z.y + moveDy * z.speed;
+        
+        if (canMove(nzx, z.y, z.w, z.h)) z.x = nzx;
+        else if (canMove(z.x, nzy, z.w, z.h)) z.y = nzy;
+        else {
+            // Try to navigate around wall
+            const perp1x = -moveDy, perp1y = moveDx;
+            const perp2x = moveDy, perp2y = -moveDx;
+            if (canMove(z.x + perp1x * z.speed, z.y + perp1y * z.speed, z.w, z.h)) {
+                z.x += perp1x * z.speed;
+                z.y += perp1y * z.speed;
+            } else if (canMove(z.x + perp2x * z.speed, z.y + perp2y * z.speed, z.w, z.h)) {
+                z.x += perp2x * z.speed;
+                z.y += perp2y * z.speed;
+            }
+        }
+
+        // Attack player
+        if (distToPlayer < 20) {
+            player.hp -= 1.5;
+            playSound(100, 'square', 0.1, 0.1);
+            if (player.hp <= 0) {
+                gameState = 'gameover';
+                playSound(60, 'sawtooth', 0.8, 0.3);
+            }
+        }
+    }
+
+    // Items
+    for (let i = items.length - 1; i >= 0; i--) {
+        const it = items[i];
+        if (Math.hypot(player.x - it.x, player.y - it.y) < 20) {
+            player.hp = Math.min(player.maxHp, player.hp + 30);
+            items.splice(i, 1);
+            playSound(600, 'sine', 0.2, 0.15);
+            for (let j = 0; j < 5; j++) {
+                particles.push({ x: it.x, y: it.y, vx: (Math.random()-0.5)*3, vy: (Math.random()-0.5)*3, life: 15, color: '#00ff88' });
+            }
+        }
+    }
+
+    // Particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life--;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    // Camera
+    camX = player.x - W / 2;
+    camY = player.y - H / 2;
+}
+
+function drawMaze() {
+    ctx.save();
+    ctx.translate(-camX, -camY);
+    
+    // Draw floor
+    for (let y = 0; y < MAZE_H; y++) {
+        for (let x = 0; x < MAZE_W; x++) {
+            if (maze[y][x] === 1) {
+                ctx.fillStyle = '#3d5a80';
+                ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+                // Brick pattern
+                ctx.strokeStyle = '#2a4a6e';
+                ctx.lineWidth = 1;
+                ctx.strokeRect(x * cellSize, y * cellSize, cellSize, cellSize);
+            } else {
+                ctx.fillStyle = (x + y) % 2 === 0 ? '#2b2b3d' : '#2e2e42';
+                ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+            }
+        }
+    }
+
+    // Items
+    for (const it of items) {
+        ctx.fillStyle = '#00ff88';
+        ctx.font = `${14}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('+', it.x, it.y + 5);
+        ctx.strokeStyle = '#00ff88';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(it.x - 8, it.y - 8, 16, 16);
+    }
+
+    // Particles
+    for (const p of particles) {
+        ctx.globalAlpha = p.life / 20;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+        ctx.globalAlpha = 1;
+    }
+
+    // Bullets
+    ctx.fillStyle = '#ffcc00';
+    for (const b of bullets) {
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Zombies
+    for (const z of zombies) {
+        const flash = z.hitFlash > 0;
+        ctx.fillStyle = flash ? '#ff4444' : '#5a8c3a';
+        ctx.beginPath();
+        ctx.arc(z.x, z.y, z.w / 2, 0, Math.PI * 2);
+        ctx.fill();
+        // Eyes
+        const ea = Math.atan2(player.y - z.y, player.x - z.x);
+        ctx.fillStyle = '#ff3333';
+        ctx.beginPath();
+        ctx.arc(z.x + Math.cos(ea) * 5, z.y + Math.sin(ea) * 5, 3, 0, Math.PI * 2);
+        ctx.fill();
+        // HP bar
+        if (z.hp < z.maxHp) {
+            const bw = 20;
+            ctx.fillStyle = '#333';
+            ctx.fillRect(z.x - bw/2, z.y - 15, bw, 4);
+            ctx.fillStyle = '#ff4444';
+            ctx.fillRect(z.x - bw/2, z.y - 15, bw * (z.hp / z.maxHp), 4);
+        }
+    }
+
+    // Player
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, 10, 0, Math.PI * 2);
+    ctx.fill();
+    // Gun direction
+    ctx.strokeStyle = '#cccccc';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(player.x, player.y);
+    ctx.lineTo(player.x + Math.cos(player.angle) * 16, player.y + Math.sin(player.angle) * 16);
+    ctx.stroke();
+
+    ctx.restore();
+}
+
+function drawHUD() {
+    // HP bar
+    const bw = 200;
+    ctx.fillStyle = '#333';
+    ctx.fillRect(20, 20, bw, 24);
+    ctx.fillStyle = player.hp > 30 ? '#4caf50' : '#f44336';
+    ctx.fillRect(20, 20, bw * (player.hp / player.maxHp), 24);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(20, 20, bw, 24);
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`HP: ${Math.ceil(player.hp)}`, 25, 37);
+
+    // Score & Wave
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px monospace';
+    ctx.fillText(`Score: ${score}`, 20, 65);
+    ctx.fillText(`Wave: ${wave}`, 20, 85);
+    
+    // Zombies remaining
+    ctx.fillStyle = '#aaa';
+    ctx.font = '13px monospace';
+    ctx.fillText(`Zombies: ${zombies.length}`, 20, 105);
+
+    // Crosshair
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    ctx.lineWidth = 1;
+    const cx = mouseX, cy = mouseY;
+    ctx.beginPath();
+    ctx.moveTo(cx - 10, cy); ctx.lineTo(cx + 10, cy);
+    ctx.moveTo(cx, cy - 10); ctx.lineTo(cx, cy + 10);
+    ctx.stroke();
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.fillStyle = '#ff4444';
+    ctx.font = `bold ${Math.min(W/8, 60)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('MAZE ZOMBIE', W/2, H/3);
+
+    ctx.fillStyle = '#ccc';
+    ctx.font = `${Math.min(W/30, 18)}px monospace`;
+    ctx.fillText('Survive the zombie horde in the maze!', W/2, H/3 + 50);
+
+    ctx.fillStyle = '#aaa';
+    ctx.font = `${Math.min(W/40, 15)}px monospace`;
+    const lines = [
+        'WASD / Arrow Keys - Move',
+        'Mouse - Aim',
+        'Click / Hold - Shoot',
+        '',
+        'Collect + medkits to heal.',
+        'Kill all zombies each wave to advance.'
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, W/2, H/2 + 20 + i * 25);
+    });
+
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.min(W/25, 20)}px monospace`;
+    const pulse = Math.sin(Date.now() / 500) * 0.3 + 0.7;
+    ctx.globalAlpha = pulse;
+    ctx.fillText('Press ENTER or SPACE to Start', W/2, H - 80);
+    ctx.globalAlpha = 1;
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.fillStyle = '#ff4444';
+    ctx.font = `bold ${Math.min(W/8, 50)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('YOU DIED', W/2, H/3);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.min(W/20, 24)}px monospace`;
+    ctx.fillText(`Final Score: ${score}`, W/2, H/3 + 60);
+    ctx.fillText(`Waves Survived: ${wave}`, W/2, H/3 + 100);
+
+    ctx.fillStyle = '#aaa';
+    ctx.font = `${Math.min(W/30, 18)}px monospace`;
+    const pulse = Math.sin(Date.now() / 500) * 0.3 + 0.7;
+    ctx.globalAlpha = pulse;
+    ctx.fillText('Press ENTER or R to Restart', W/2, H - 80);
+    ctx.globalAlpha = 1;
+}
+
+function render() {
+    if (gameState === 'start') {
+        drawStartScreen();
+    } else if (gameState === 'playing') {
+        ctx.fillStyle = '#1a1a2e';
+        ctx.fillRect(0, 0, W, H);
+        drawMaze();
+        drawHUD();
+    } else if (gameState === 'gameover') {
+        ctx.fillStyle = '#1a1a2e';
+        ctx.fillRect(0, 0, W, H);
+        drawMaze();
+        drawHUD();
+        drawGameOver();
+    }
+}
+
+function gameLoop() {
+    update();
+    render();
+    requestAnimationFrame(gameLoop);
+}
+
+generateMaze();
+cellSize = Math.min(W / MAZE_W, H / MAZE_H);
+gameLoop();
+</script>
+</body>
+</html>
