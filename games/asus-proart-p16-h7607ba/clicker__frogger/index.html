@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Clicker Frogger</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#0b1c12; font-family:'Courier New', monospace; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  #stage { position:relative; }
+  canvas { display:block; background:#123322; image-rendering:auto; }
+  .overlay {
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; text-align:center;
+    background:rgba(5,20,10,0.88); color:#d9ffd9; z-index:5; padding:20px;
+  }
+  .overlay h1 { font-size:42px; letter-spacing:3px; color:#7dff8a; text-shadow:0 0 18px #2f9e44, 3px 3px 0 #14532d; margin-bottom:14px; }
+  .overlay p { font-size:15px; line-height:1.7; color:#bfeec6; margin-bottom:8px; }
+  .overlay .big { font-size:22px; color:#ffe066; margin:10px 0; }
+  button {
+    margin-top:16px; font-family:inherit; font-size:18px; letter-spacing:2px;
+    padding:12px 34px; background:#2f9e44; color:#fff; border:3px solid #7dff8a;
+    border-radius:8px; cursor:pointer; box-shadow:0 5px 0 #14532d;
+  }
+  button:hover { background:#37b24d; }
+  button:active { transform:translateY(3px); box-shadow:0 2px 0 #14532d; }
+  .hidden { display:none !important; }
+  .frog-emoji { font-size:60px; margin-bottom:8px; filter:drop-shadow(0 0 12px #7dff8a); }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <canvas id="game"></canvas>
+
+    <div id="startScreen" class="overlay">
+      <div class="frog-emoji">🐸</div>
+      <h1>CLICKER FROGGER</h1>
+      <p>Click (or tap) a square next to the frog to hop.<br>
+         Arrow keys / WASD also work.</p>
+      <p>Dodge the traffic. Ride the logs across the river.<br>
+         Reach a lily pad hole at the top to clear the level!</p>
+      <button id="startBtn">START</button>
+      <p style="margin-top:14px;font-size:12px;color:#7aa88a;">Press ENTER or SPACE to start &nbsp;•&nbsp; R to restart</p>
+    </div>
+
+    <div id="overScreen" class="overlay hidden">
+      <h1 id="overTitle">GAME OVER</h1>
+      <p class="big" id="finalScore">SCORE: 0</p>
+      <p id="bestScore">BEST: 0</p>
+      <button id="restartBtn">PLAY AGAIN</button>
+      <p style="margin-top:12px;font-size:12px;color:#7aa88a;">Press R or ENTER to restart</p>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+// ---------- constants ----------
+const W = 480, H = 520;
+const COLS = 12, ROWS = 13, CELL = 40;
+const GOAL_COLS = [0,2,4,6,8,10];
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const stage = document.getElementById('stage');
+const startScreen = document.getElementById('startScreen');
+const overScreen  = document.getElementById('overScreen');
+const finalScoreEl= document.getElementById('finalScore');
+const bestScoreEl = document.getElementById('bestScore');
+const overTitle   = document.getElementById('overTitle');
+
+// ---------- resize / dpr ----------
+let dpr = 1;
+function fit(){
+  dpr = window.devicePixelRatio || 1;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.98;
+  canvas.style.width  = (W*s) + 'px';
+  canvas.style.height = (H*s) + 'px';
+}
+window.addEventListener('resize', fit);
+fit();
+
+// ---------- audio ----------
+let actx = null;
+function initAudio(){
+  if(!actx){
+    try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
+  }
+  if(actx && actx.state === 'suspended') actx.resume();
+}
+function beep(freq, dur, type, vol, slideTo){
+  if(!actx) return;
+  const t = actx.currentTime;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type || 'square';
+  o.frequency.setValueAtTime(freq, t);
+  if(slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(30, slideTo), t+dur);
+  g.gain.setValueAtTime(vol||0.12, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t+dur);
+  o.connect(g); g.connect(actx.destination);
+  o.start(t); o.stop(t+dur+0.02);
+}
+const sfx = {
+  hop:   ()=>beep(420,0.08,'square',0.10,560),
+  splash:()=>beep(300,0.25,'sawtooth',0.12,90),
+  death: ()=>{ beep(220,0.3,'sawtooth',0.14,60); setTimeout(()=>beep(140,0.35,'square',0.12,50),120); },
+  win:   ()=>{ [523,659,784,1047].forEach((f,i)=>setTimeout(()=>beep(f,0.15,'triangle',0.14),i*110)); }
+};
+
+// ---------- game state ----------
+let state = 'start';   // start | play | dead | levelup | over
+let score = 0, lives = 3, level = 1;
+let timeInLevel = 0, msgTimer = 0, msgText = '', waterT = 0;
+let best = 0;
+try { best = parseInt(localStorage.getItem('clickerFroggerBest')||'0',10)||0; } catch(e){}
+
+const frog = { x:0, y:0, hop:null, dead:false, deadT:0, drown:0 };
+let lanes = [];   // per water/road row: {type:'car'|'log', dir, speed, items:[{x}], w, h}
+
+function laneSpeedMul(){ return 1 + (level-1)*0.18; }
+
+const CAR_CFG = [
+  {dir: 1, speed:55, count:3, color:'#e74c3c'},
+  {dir:-1, speed:72, count:2, color:'#f1c40f'},
+  {dir: 1, speed:88, count:2, color:'#9b59b6'},
+  {dir:-1, speed:64, count:3, color:'#3498db'}
+];
+const LOG_CFG = [
+  {dir:-1, speed:44, len:3, count:2},
+  {dir: 1, speed:56, len:2, count:3},
+  {dir:-1, speed:66, len:3, count:3},
+  {dir: 1, speed:40, len:4, count:2}
+];
+
+function buildLanes(){
+  lanes = [];
+  for(let r=0;r<ROWS;r++){
+    if(r>=1 && r<=4){
+      const c = CAR_CFG[r-1];
+      const w = CELL*1.25, h = CELL*0.62;
+      const items=[];
+      const P = W + w;
+      for(let i=0;i<c.count;i++) items.push({ x: (i+0.5)*(W/c.count) });
+      lanes[r] = {type:'car', dir:c.dir, speed:c.speed*laneSpeedMul(), items, w, h, color:c.color};
+    } else if(r>=6 && r<=9){
+      const c = LOG_CFG[r-6];
+      const w = c.len*CELL - 10, h = CELL*0.58;
+      const items=[];
+      for(let i=0;i<c.count;i++) items.push({ x: (i+0.5)*(W/c.count) });
+      lanes[r] = {type:'log', dir:c.dir, speed:c.speed*laneSpeedMul(), items, w, h};
+    } else lanes[r] = null;
+  }
+}
+
+function resetFrog(){
+  frog.x = (COLS/2 - 0.5)*CELL; // col 5 center -> 5.5*40=220
+  frog.y = (ROWS-1+0.5)*CELL;
+  frog.hop = null; frog.dead=false; frog.deadT=0; frog.drown=0;
+}
+
+function startGame(){
+  score=0; lives=3; level=1; timeInLevel=0;
+  buildLanes(); resetFrog();
+  msgText='LEVEL 1'; msgTimer=1.4;
+  state='play';
+  startScreen.classList.add('hidden');
+  overScreen.classList.add('hidden');
+}
+
+function nextLevel(){
+  level++; timeInLevel=0;
+  buildLanes(); resetFrog();
+  msgText='LEVEL '+level; msgTimer=1.4;
+  state='play';
+}
+
+function die(){
+  if(frog.dead) return;
+  frog.dead = true; frog.deadT = 0; frog.drown = 0;
+  lives--;
+  sfx.death();
+  state = 'dead';
+}
+
+function showGameOver(){
+  state='over';
+  finalScoreEl.textContent = 'SCORE: '+score;
+  overTitle.textContent = 'GAME OVER';
+  if(score > best){
+    best = score;
+    try{ localStorage.setItem('clickerFroggerBest', String(best)); }catch(e){}
+  }
+  bestScoreEl.textContent = 'BEST: '+best;
+  overScreen.classList.remove('hidden');
+}
+
+function levelClear(){
+  score += 50 + Math.max(0, Math.floor((25 - timeInLevel)) * 5);
+  sfx.win();
+  msgText='LEVEL CLEAR! +'+ (50 + Math.max(0, Math.floor((25-timeInLevel))*5));
+  msgTimer = 1.4;
+  state = 'levelup';
+}
+
+// ---------- input ----------
+function frogCell(){
+  return { c: Math.floor(frog.x / CELL), r: Math.floor(frog.y / CELL) };
+}
+function tryMove(dc, dr){
+  if(state!=='play' || frog.hop) return;
+  const fc = frogCell();
+  const tc = fc.c + dc, tr = fc.r + dr;
+  if(tc<0||tc>=COLS||tr<0||tr>=ROWS) return;
+  frog.hop = { sx:frog.x, sy:frog.y, tx:(tc+0.5)*CELL, ty:(tr+0.5)*CELL, t:0, dur:0.13 };
+  sfx.hop();
+}
+
+function canvasCell(ev){
+  const rect = canvas.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) * (W/rect.width);
+  const y = (ev.clientY - rect.top) * (H/rect.height);
+  return { c: Math.floor(x/CELL), r: Math.floor(y/CELL) };
+}
+
+canvas.addEventListener('pointerdown', function(ev){
+  initAudio();
+  if(state!=='play') return;
+  const t = canvasCell(ev);
+  const fc = frogCell();
+  const dc = t.c - fc.c, dr = t.r - fc.r;
+  if(Math.abs(dc)+Math.abs(dr) === 1) tryMove(dc, dr);
+});
+
+window.addEventListener('keydown', function(e){
+  const k = e.key;
+  initAudio();
+  if(k==='r'||k==='R'){ if(state!=='start') startGame(); return; }
+  if(state==='start' && (k==='Enter'||k===' ')){ e.preventDefault(); startGame(); return; }
+  if(state==='over' && (k==='Enter'||k===' ')){ e.preventDefault(); startGame(); return; }
+  if(state!=='play') return;
+  switch(k){
+    case 'ArrowUp': case 'w': case 'W': e.preventDefault(); tryMove(0,-1); break;
+    case 'ArrowDown': case 's': case 'S': e.preventDefault(); tryMove(0,1); break;
+    case 'ArrowLeft': case 'a': case 'A': e.preventDefault(); tryMove(-1,0); break;
+    case 'ArrowRight': case 'd': case 'D': e.preventDefault(); tryMove(1,0); break;
+  }
+});
+
+document.getElementById('startBtn').addEventListener('click', function(){ initAudio(); startGame(); });
+document.getElementById('restartBtn').addEventListener('click', function(){ initAudio(); startGame(); });
+
+// ---------- update ----------
+function update(dt){
+  waterT += dt;
+  if(msgTimer>0) msgTimer -= dt;
+  if(state==='play') timeInLevel += dt;
+
+  // move lane items
+  for(let r=0;r<ROWS;r++){
+    const L = lanes[r];
+    if(!L) continue;
+    for(const it of L.items){
+      it.x += L.dir * L.speed * dt;
+      const half = L.w/2;
+      if(L.dir>0 && it.x > W + half) it.x = -half;
+      if(L.dir<0 && it.x < -half) it.x = W + half;
+    }
+  }
+
+  // frog hop
+  if(frog.hop){
+    const hp = frog.hop;
+    hp.t += dt/hp.dur;
+    if(hp.t>=1){ frog.x=hp.tx; frog.y=hp.ty; frog.hop=null; }
+    else {
+      const t = hp.t, e = 1 - Math.pow(1-t,2);
+      frog.x = hp.sx + (hp.tx-hp.sx)*e;
+      frog.y = hp.sy + (hp.ty-hp.sy)*e;
+    }
+  }
+
+  if(state==='dead'){
+    frog.deadT += dt;
+    if(frog.deadT > 1.1){
+      if(lives<=0) showGameOver();
+      else { resetFrog(); state='play'; }
+    }
+    return;
+  }
+  if(state!=='play') return;
+
+  const row = Math.floor(frog.y / CELL);
+
+  // road collision
+  if(row>=1 && row<=4){
+    const L = lanes[row];
+    for(const it of L.items){
+      if(Math.abs(frog.x - it.x) < (L.w/2 + 13)){ die(); return; }
+    }
+  }
+
+  // water
+  if(row>=6 && row<=9){
+    const L = lanes[row];
+    let onLog = false, carried = 0;
+    for(const it of L.items){
+      if(frog.x > it.x - L.w/2 + 6 && frog.x < it.x + L.w/2 - 6){
+        onLog = true;
+        carried = L.dir * L.speed * dt;
+        break;
+      }
+    }
+    if(onLog){
+      frog.drown = 0;
+      frog.x += carried;
+      if(frog.x < 14 || frog.x > W-14){ sfx.splash(); die(); return; }
+    } else {
+      frog.drown += dt;
+      if(frog.drown > 0.65){ sfx.splash(); die(); return; }
+    }
+  } else frog.drown = 0;
+
+  // goal check (only when settled)
+  if(row===0 && !frog.hop){
+    for(const c of GOAL_COLS){
+      const hx = (c+0.5)*CELL;
+      if(Math.abs(frog.x - hx) < CELL*0.38){ levelClear(); return; }
+    }
+  }
+}
+
+// ---------- draw ----------
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+function drawBackground(){
+  // grass rows
+  ctx.fillStyle = '#2f7d3a';
+  ctx.fillRect(0,0,W,H);
+  // subtle grass texture stripes
+  ctx.fillStyle = 'rgba(255,255,255,0.04)';
+  for(let r=0;r<ROWS;r++) if(r%2===0) ctx.fillRect(0,r*CELL,W,CELL);
+
+  // road rows 1..4
+  for(let r=1;r<=4;r++){
+    ctx.fillStyle = '#3a3f47';
+    ctx.fillRect(0,r*CELL,W,CELL);
+  }
+  // lane dashes
+  ctx.strokeStyle = 'rgba(255,220,90,0.5)';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([14,12]);
+  for(let r=2;r<=4;r++){
+    ctx.beginPath(); ctx.moveTo(0,r*CELL); ctx.lineTo(W,r*CELL); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // water rows 6..9
+  for(let r=6;r<=9;r++){
+    const g = ctx.createLinearGradient(0,r*CELL,0,(r+1)*CELL);
+    g.addColorStop(0,'#1b5e8a'); g.addColorStop(1,'#144a70');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,r*CELL,W,CELL);
+  }
+  // animated ripples
+  ctx.strokeStyle = 'rgba(255,255,255,0.13)';
+  ctx.lineWidth = 2;
+  for(let r=6;r<=9;r++){
+    const off = (waterT*22 + r*17) % 48;
+    for(let x=-48+off; x<W; x+=48){
+      const y = r*CELL + CELL/2 + Math.sin(x*0.08 + waterT*3)*4;
+      ctx.beginPath();
+      ctx.moveTo(x, y-3);
+      ctx.quadraticCurveTo(x+12, y-7, x+24, y-3);
+      ctx.stroke();
+    }
+  }
+
+  // borders top/bottom
+  ctx.fillStyle = '#1c5a28';
+  ctx.fillRect(0,0,W,4);
+  ctx.fillRect(0,H-4,W,4);
+
+  // goal holes
+  for(const c of GOAL_COLS){
+    const cx=(c+0.5)*CELL, cy=CELL/2;
+    ctx.fillStyle = '#173a1e';
+    ctx.beginPath(); ctx.arc(cx,cy,15,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#0d2410'; ctx.lineWidth=3; ctx.stroke();
+    // lily pad
+    ctx.fillStyle = '#4caf50';
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,11,0.5,Math.PI*2-0.1); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle='#2e7d32'; ctx.lineWidth=1.5; ctx.stroke();
+  }
+}
+
+function drawLanes(){
+  for(let r=0;r<ROWS;r++){
+    const L = lanes[r];
+    if(!L) continue;
+    const y = (r+0.5)*CELL;
+    for(const it of L.items){
+      const x = it.x;
+      if(L.type==='car'){
+        // shadow
+        ctx.fillStyle='rgba(0,0,0,0.3)';
+        roundRect(x-L.w/2-2, y-L.h/2+3, L.w, L.h, 6); ctx.fill();
+        // body
+        ctx.fillStyle = L.color;
+        roundRect(x-L.w/2, y-L.h/2, L.w, L.h, 6); ctx.fill();
+        // roof / windshield
+        ctx.fillStyle='rgba(0,0,0,0.35)';
+        const dir = L.dir;
+        roundRect(x - L.w*0.18 + dir*L.w*0.08, y-L.h/2+4, L.w*0.36, L.h-8, 4); ctx.fill();
+        // wheels
+        ctx.fillStyle='#111';
+        ctx.fillRect(x-L.w/2+5, y-L.h/2-2, 9, 4);
+        ctx.fillRect(x+L.w/2-14, y-L.h/2-2, 9, 4);
+        ctx.fillRect(x-L.w/2+5, y+L.h/2-2, 9, 4);
+        ctx.fillRect(x+L.w/2-14, y+L.h/2-2, 9, 4);
+      } else {
+        // log
+        ctx.fillStyle='rgba(0,0,0,0.25)';
+        roundRect(x-L.w/2-2, y-L.h/2+3, L.w, L.h, 8); ctx.fill();
+        const g = ctx.createLinearGradient(0,y-L.h/2,0,y+L.h/2);
+        g.addColorStop(0,'#a5713b'); g.addColorStop(0.5,'#8a5a2c'); g.addColorStop(1,'#6e4520');
+        ctx.fillStyle=g;
+        roundRect(x-L.w/2, y-L.h/2, L.w, L.h, 8); ctx.fill();
+        // grain
+        ctx.strokeStyle='rgba(60,35,12,0.5)';
+        ctx.lineWidth=1.5;
+        for(let i=1;i<4;i++){
+          const gx = x - L.w/2 + (L.w/4)*i;
+          ctx.beginPath(); ctx.moveTo(gx, y-L.h/2+4); ctx.lineTo(gx, y+L.h/2-4); ctx.stroke();
+        }
+      }
+    }
+  }
+}
+
+function drawFrog(){
+  const x = frog.x, y = frog.y;
+  let scale = 1;
+  if(frog.hop){
+    const t = frog.hop.t;
+    scale = 1 + Math.sin(t*Math.PI)*0.35;
+  }
+  ctx.save();
+  ctx.translate(x,y);
+  if(frog.dead){
+    const p = Math.min(1, frog.deadT/0.9);
+    ctx.rotate(p*Math.PI*1.6);
+    ctx.globalAlpha = 1-p;
+    ctx.scale(1-p*0.5, 1-p*0.5);
+  } else {
+    ctx.scale(scale, 2-scale);
+  }
+  // shadow
+  if(!frog.dead){
+    ctx.fillStyle='rgba(0,0,0,0.3)';
+    ctx.beginPath(); ctx.ellipse(0,6,14,8,0,0,Math.PI*2); ctx.fill();
+  }
+  // body
+  ctx.fillStyle = frog.drown>0 ? '#c9e265' : '#6fd44b';
+  ctx.beginPath(); ctx.ellipse(0,0,13,11,0,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#2e7d32'; ctx.lineWidth=2; ctx.stroke();
+  // belly
+  ctx.fillStyle='rgba(255,255,255,0.35)';
+  ctx.beginPath(); ctx.ellipse(0,3,8,6,0,0,Math.PI*2); ctx.fill();
+  // eyes
+  for(const s of [-1,1]){
+    ctx.fillStyle='#fff';
+    ctx.beginPath(); ctx.arc(s*7,-9,5,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#2e7d32'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.fillStyle='#111';
+    ctx.beginPath(); ctx.arc(s*7+ (s<0?-1:1),-9,2.3,0,Math.PI*2); ctx.fill();
+  }
+  // feet
+  ctx.fillStyle = frog.drown>0 ? '#c9e265' : '#6fd44b';
+  for(const s of [-1,1]){
+    ctx.beginPath(); ctx.ellipse(s*11,7,5,3.5,s*0.5,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#2e7d32'; ctx.lineWidth=1.5; ctx.stroke();
+  }
+  ctx.restore();
+
+  // drowning bubbles
+  if(frog.drown>0 && !frog.dead){
+    ctx.fillStyle='rgba(255,255,255,0.8)';
+    for(let i=0;i<3;i++){
+      const bt = (waterT*2 + i*0.7)%1;
+      ctx.beginPath();
+      ctx.arc(x + Math.sin(i*2+waterT*4)*8, y - 8 - bt*16, 2+i%2, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+}
+
+function drawHUD(){
+  // top strip
+  ctx.fillStyle='rgba(0,0,0,0.55)';
+  ctx.fillRect(0,0,W,18);
+  ctx.font='bold 12px "Courier New", monospace';
+  ctx.textBaseline='middle';
+  ctx.fillStyle='#ffe066';
+  ctx.textAlign='left';
+  ctx.fillText('SCORE '+score, 8, 10);
+  ctx.textAlign='center';
+  ctx.fillStyle='#7dff8a';
+  ctx.fillText('LEVEL '+level, W/2, 10);
+  ctx.textAlign='right';
+  let s='';
+  for(let i=0;i<Math.max(0,lives);i++) s+='🐸';
+  ctx.fillStyle='#fff';
+  ctx.fillText(s || '—', W-8, 10);
+
+  if(msgTimer>0 && (state==='play'||state==='levelup')){
+    const a = Math.min(1, msgTimer/0.4);
+    ctx.globalAlpha = a;
+    ctx.fillStyle='rgba(0,0,0,0.6)';
+    ctx.fillRect(W/2-130,H/2-30,260,58);
+    ctx.strokeStyle='#7dff8a'; ctx.lineWidth=2;
+    ctx.strokeRect(W/2-130,H/2-30,260,58);
+    ctx.fillStyle='#7dff8a';
+    ctx.font='bold 24px "Courier New", monospace';
+    ctx.textAlign='center';
+    ctx.fillText(msgText, W/2, H/2+1);
+    ctx.globalAlpha=1;
+  }
+}
+
+function draw(){
+  drawBackground();
+  drawLanes();
+  if(!(state==='over')) drawFrog();
+  drawHUD();
+}
+
+// ---------- loop ----------
+let last = performance.now();
+function loop(now){
+  let dt = (now - last)/1000;
+  last = now;
+  if(dt > 0.05) dt = 0.05;
+  if(state==='play' || state==='dead' || state==='levelup'){
+    update(dt);
+    if(state==='levelup' && msgTimer<=0) nextLevel();
+  } else {
+    waterT += dt; // keep water animating behind menus
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+// init idle scene behind start screen
+buildLanes(); resetFrog();
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
