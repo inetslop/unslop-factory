@@ -1,0 +1,704 @@
+<think>
+The user wants a 3D shooting game as a single HTML file. I need to make a first-person style 3D shooter without external libraries (Three.js is not allowed since it would be an external script). So I'll implement my own simple 3D rendering — either raycasting (Wolfenstein-style) or perspective projection of boxes onto canvas.
+
+The simplest and most robust approach: software-rendered 3D via a custom engine — render enemies as billboard sprites with depth sorting, and draw the floor/ceiling grid to give a sense of space. This is easy and looks good enough. Or raycasting with a textured wall maze. First-person shooter: pointer lock for mouse look, WASD movement, click to shoot, enemies approaching, health, score, waves, sound via Web Audio.
+
+Let's make it a "wave survival" FPS on an open arena:
+- Fullscreen canvas, resize handler.
+- Pointer lock for view control (yaw/pitch). Fallback if pointer lock fails? Keep it simple: use pointer lock; also allow arrow keys for turning.
+- Arena: floor grid drawn with perspective projection of a plane; sky gradient; distant fog. Walls at the arena boundaries drawn as quads.
+- Enemies: floating spheres/blobs, rendered as billboards (circles that shrink with distance) with simple shading; they move toward the player; when close, they deal damage to health.
+- Shooting: hitscan raycast from camera center against enemies (sphere intersection). Muzzle flash, tracer line, gun view model drawn at bottom of screen (simple 2D shape), recoil.
+- HUD: crosshair, health bar, score, wave, ammo with reload (R key), start screen, game over screen with restart.
+- Sound: WebAudio — laser shot sound, hit sound, enemy death, player taking damage.
+
+Projection math: world coords x (right), y (up), z (forward). Camera yaw, pitch. For each object, transform into camera space: rotate by -yaw around Y axis, then rotate by -pitch around X axis. If zc > near then screenX = cx + f * xc/zc, screenY = cy - f*yc/zc, where f = (h/2)/tan(fov/2).
+
+Floor: draw a grid — project grid lines onto the floor plane y=0. Simpler: draw horizontal scanlines? Better approach: for each grid line of the world (x = k*step, z from near to far) project the endpoints and draw lines with fog. Same for z lines. This gives a good Tron-style ground.
+
+Walls: 4 boundary quads at ±R; project the 4 corners, fill with a semi-transparent color, add glowing edge lines.
+
+Enemy rendering: position (x, y~1.2, z), billboard circle of radius r world units → screen radius = f*r/zc. Draw radial gradient, eyes. Depth-sort in descending order.
+
+Shooting hitscan: ray from camera direction; for each enemy compute t = dot(p - o, d) and check distance to line < radius. Pick the closest hit.
+
+Enemy AI: move toward player's xz position, face the player, bob up and down; attack when within 1.5 units (damage with cooldown). Enemy count per wave increases.
+
+Gun view model: draw at bottom-right — a simple rectangle/gun with recoil offset, bob while moving.
+
+Ammo: 12 rounds, reload 1.2 seconds, R key or auto-reload.
+
+Health 100; red flash on damage. Game over screen with score and restart button (click) + Enter key.
+
+Start screen: title "NEON STRIKE", controls, click to start (also requests pointer lock).
+
+Keys: WASD movement, Shift dash? Keep it simple. Mouse for look, click to shoot, R reload, maybe Esc to release the pointer.
+
+Sound: functions using oscillators + noise buffer. AudioContext created on first input.
+
+Let's write the code carefully and compactly.
+
+Structure:
+- state: 'menu' | 'playing' | 'gameover'
+- Loop via requestAnimationFrame, clamp dt.
+
+Player: pos {x,z}, y fixed at 1.6 (eye height). yaw, pitch clamped to ±~1.2.
+
+Movement speed 6, dash 9 with Shift? Add it.
+
+Enemies: array of {x, z, hp, r, speed, hitFlash, attackCd, dead?}. Spawn in ring radius 18–24 at random angles. Wave n: count = 3 + n*2, hp increases.
+
+Wave logic: all enemies dead → wave++, brief "WAVE n" banner, respawn after 3 seconds.
+
+Rendering order: sky gradient, sun/planet?, floor grid, walls, enemies (sorted), tracers, muzzle flash, gun, HUD, vignette/damage flash.
+
+Tracer: store {x1.., life} in world coords, project and draw a line, fade out.
+
+Muzzle flash: timer.
+
+Crosshair: lines at screen center; spread expands with movement/recoil.
+
+Pointer lock: on canvas click during play. mousemove while locked updates yaw/pitch. Also allow arrow keys for turning as fallback.
+
+Damage to player: enemy within 1.6 distance and attackCd<=0 → damage 10–15, red flash, knockback? Keep it simple.
+
+Health regen? No; pickup? Skip pickups to keep the scope manageable. Maybe health +20 on wave clear. Good.
+
+Score: 100 per kill * wave? Simple: 100 + combo? Just 100*waveMult or so. Simple: 100 per kill, bonus for headshot… no heads (they're blobs). OK.
+
+Audio functions:
+- shot(): square wave oscillator descending sweep 800→200, 0.1s + noise burst.
+- hit(): short beep.
+- enemyDie(): descending sawtooth wave + noise.
+- hurt(): low rumble.
+- reload(): two clicks.
+
+Let's write it out.
+
+Canvas resize: canvas.width = innerWidth * dpr or so; keep dpr=1 for performance, use devicePixelRatio min 1.5? Just use window size as-is.
+
+Fog: alpha based on distance.
+
+Floor grid drawing: for lines parallel to z: x from -R..R in step 4, project (x,0,zNear) to (x,0,R). Lines parallel to x same way. Compute projection; if either endpoint is behind camera skip or clamp — handle zc < 0.1 by clamping t. Implement a project function returning null if behind; for lines do manual near-plane clip in camera space: transform both endpoints into camera space, clip segment against z=0.1, then project.
+
+Let's write the code.
+
+function camTransform(x,y,z): relative to player pos (px, py=eye, pz). dx=x-px, dy=y-py, dz=z-pz. Yaw rotation:
+x1 = dx*cos(yaw) - dz*sin(yaw)? Define yaw so that forward is +z when yaw=0. Camera space:
+xc = dx*cosY - dz*sinY? Let's define: rotating the world by -yaw: xc = dx*cos(-yaw) - ... let's do it standardly:
+cos=cos(yaw), sin=sin(yaw).
+x1 = dx*cos + dz*sin? Hmm.
+
+Camera forward vector: fx = sin(yaw)*cos(pitch), fy = sin(pitch), fz = cos(yaw)*cos(pitch).
+Right vector: rx = cos(yaw), rz = -sin(yaw)? right = (cos yaw, 0, -sin yaw)?? Check: at yaw=0 forward=(0,0,1), right should be (1,0,0). With rx=cos(yaw)=1, rz=-sin(yaw)=0 ✓. At yaw=90° forward=(1,0,0), right should be (0,0,-1): rx=cos90=0, rz=-sin90=-1 ✓.
+Up vector = forward × right... u = f × r: f=(fx,fy,fz), r=(rx,0,rz). u = f×r = (fy*rz - fz*0, fz*rx - fx*rz, fx*0 - fy*rx) = (fy*rz, fz*rx - fx*rz, -fy*rx).
+
+Camera space coords: xc = dot(d, r), yc = dot(d, u), zc = dot(d, f).
+
+Screen: sx = cx + f * xc/zc, sy = cy - f*yc/zc, where f = (h/2)/tan(fov/2). fov 75°.
+
+Good.
+
+Near-clip for lines: in camera space clip segment (x1,y1,z1)-(x2,y2,z2) at z=0.15.
+
+Wall rendering: arena radius R=30 square? Use square arena with half-size A=28. Walls at x=±A, z=±A, y from 0 to 6. Project corners; fill polygon if all 4 corners have zc>near (or clip… simpler: check all corners' zc > 0.15 and draw; otherwise skip). Since the player is inside the arena walls are always visible so it's fine — but a corner wall behind? At most half the wall may be behind. Simplify: if any corner has zc<near, split each wall into 2 triangles and draw the ones with all vertices in front. Let's do that.
+
+Enemy spawn distance ~20 < A=28 OK, player clamped to |x|,|z| <= A-1.5.
+
+Enemy rendering: circle at projected position, radius = f*er/zc. Draw glow (radial gradient), body, two eyes facing camera (offset by enemy's orientation? Simple: fixed). Hit flash white. HP bar on top when damaged.
+
+Also add a slight vertical bob to the enemy: y = 1.2 + sin(time*3+phase)*0.15.
+
+Enemy attack: distance < 1.8 → player damage, cooldown 1s, small lunge? Just damage + sound + flash.
+
+Tracers: from muzzle world position (player pos + forward*0.5 + right*0.2 - up*0.2) to hit point or far point; lifetime 0.08s.
+
+Muzzle flash: draw at gun position on screen, timer 0.06s.
+
+Gun drawing: bottom-right of screen: simple shape — barrel rectangle, body; recoil offset = recoil*10 px down/back; bob from movement: bobPhase += speed*dt.
+
+HUD: health bar top-left, score top-right, wave banner center, ammo bottom-right near gun, reload indicator.
+
+Damage flash: red overlay with alpha decay. Low-health vignette.
+
+Menu/gameover: HTML overlay divs or drawn on canvas? Use DOM overlays — easier for text/buttons. Start screen div with title and "Click to start" button; click requests pointer lock + starts. Game over div with score, restart button.
+
+Pause: if pointer lock is released during play show a pause overlay ("click to resume"). Let's add that.
+
+Handle Esc automatically releasing pointer lock → listen for pointerlockchange: if lost while playing and not game-over → paused=true, show pause overlay; click resumes (request lock).
+
+Keys on window: keydown/up set keys map; preventDefault as needed. Enter to start/restart when in menu/gameover.
+
+Write the audio helper:
+
+let AC=null; function ac(){ if(!AC) AC=new (window.AudioContext||window.webkitAudioContext)(); return AC;}
+function beep(freq, dur, type, vol, slideTo)...
+noise(dur, vol, filterFreq).
+
+Now let's code it. Keep it organized but complete. Estimated ~500 lines. Here we go.
+
+Enemy death: spawn a particle burst (billboard dots) — small particles in world space with velocity, fade. Good juice, low cost.
+
+Wave banner: display "WAVE n" for 2 seconds.
+
+Healing on wave clear: +15, max 100.
+
+Ammo 12, reload 1.1s. Auto-reload when empty and firing is attempted.
+
+Let's write the final HTML.
+
+Edge cases: pointer lock request must be from user gesture — start button click is fine.
+
+Mouse sensitivity 0.0022.
+
+Fire rate: semi-auto on mousedown? Let's do full-auto with 0.13s cooldown while mouse held down.
+
+Now let me write it all out.
+
+Enemy hit detection: ray o=player eye, d=forward (with slight random spread). For each enemy: w = e - o; t = dot(w,d); if t>0: closest = o + t d; dist2 = |w - t*d|^2 < r^2 → hit. Pick smallest t.
+
+Damage 34 per shot, enemy hp 100* (1+ (wave-1)*0.15). Kill score 100.
+
+Enemy speed: 2 + wave*0.2, cap ~4.5; radius 0.7.
+
+Particles: {x,y,z,vx,vy,vz,life,color}. Update with slight gravity. Render as projected small circles.
+
+OK, writing it out.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NEON STRIKE — 3D Shooter</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000;font-family:'Courier New',monospace;}
+  #c{display:block;width:100vw;height:100vh;cursor:crosshair;}
+  .overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:radial-gradient(circle at 50% 40%, rgba(20,0,50,.85), rgba(0,0,10,.96));color:#fff;text-align:center;z-index:10;}
+  .hidden{display:none !important;}
+  h1{font-size:min(9vw,72px);letter-spacing:.15em;margin:0 0 8px;color:#0ff;text-shadow:0 0 20px #0ff,0 0 60px #f0f;}
+  .sub{color:#f0f;letter-spacing:.4em;font-size:14px;margin-bottom:34px;text-shadow:0 0 10px #f0f;}
+  .panel{border:1px solid rgba(0,255,255,.4);box-shadow:0 0 25px rgba(0,255,255,.25) inset;padding:22px 38px;margin-bottom:30px;background:rgba(0,10,30,.5);}
+  .panel div{margin:6px 0;color:#9ff;font-size:15px;letter-spacing:.05em;}
+  .panel b{color:#fff;}
+  button{font-family:inherit;font-size:20px;letter-spacing:.2em;padding:14px 44px;background:transparent;color:#0ff;
+    border:2px solid #0ff;cursor:pointer;text-shadow:0 0 10px #0ff;box-shadow:0 0 18px rgba(0,255,255,.4);transition:all .15s;}
+  button:hover{background:#0ff;color:#001030;box-shadow:0 0 40px #0ff;}
+  #goScore{font-size:30px;color:#ff0;text-shadow:0 0 15px #ff0;margin-bottom:26px;letter-spacing:.1em;}
+  #pauseOv h1{font-size:min(8vw,54px);}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="menuOv" class="overlay">
+  <h1>NEON STRIKE</h1>
+  <div class="sub">SECTOR DEFENSE PROTOCOL</div>
+  <div class="panel">
+    <div><b>W A S D</b> — move &nbsp;•&nbsp; <b>MOUSE</b> — aim</div>
+    <div><b>SHIFT</b> — sprint &nbsp;•&nbsp; <b>LMB</b> — fire</div>
+    <div><b>R</b> — reload &nbsp;•&nbsp; <b>ESC</b> — pause</div>
+  </div>
+  <button id="startBtn">INITIALIZE</button>
+</div>
+
+<div id="pauseOv" class="overlay hidden">
+  <h1>PAUSED</h1>
+  <div class="sub">SYSTEMS ON STANDBY</div>
+  <button id="resumeBtn">RESUME</button>
+</div>
+
+<div id="overOv" class="overlay hidden">
+  <h1 style="color:#f33;text-shadow:0 0 20px #f33;">SIGNAL LOST</h1>
+  <div class="sub">UNIT DESTROYED</div>
+  <div id="goScore">SCORE: 0</div>
+  <button id="restartBtn">REDEPLOY</button>
+</div>
+
+<script>
+(function(){
+"use strict";
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let W=0,H=0,CX=0,CY=0,F=0;
+const FOV = 75*Math.PI/180;
+function resize(){
+  W = cv.width = window.innerWidth;
+  H = cv.height = window.innerHeight;
+  CX = W/2; CY = H/2;
+  F = (H/2)/Math.tan(FOV/2);
+}
+window.addEventListener('resize', resize); resize();
+
+/* ---------- AUDIO ---------- */
+let AC=null;
+function audio(){ if(!AC){ try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } if(AC&&AC.state==='suspended') AC.resume(); return AC; }
+function tone(f0,f1,dur,type,vol){
+  const a=audio(); if(!a) return;
+  const o=a.createOscillator(), g=a.createGain();
+  o.type=type; o.frequency.setValueAtTime(f0,a.currentTime);
+  o.frequency.exponentialRampToValueAtTime(Math.max(1,f1),a.currentTime+dur);
+  g.gain.setValueAtTime(vol,a.currentTime);
+  g.gain.exponentialRampToValueAtTime(.0001,a.currentTime+dur);
+  o.connect(g).connect(a.destination); o.start(); o.stop(a.currentTime+dur+.02);
+}
+let noiseBuf=null;
+function noise(dur,vol,freq){
+  const a=audio(); if(!a) return;
+  if(!noiseBuf){ noiseBuf=a.createBuffer(1,a.sampleRate*0.5,a.sampleRate);
+    const d=noiseBuf.getChannelData(0); for(let i=0;i<d.length;i++) d[i]=Math.random()*2-1; }
+  const s=a.createBufferSource(), g=a.createGain(), f=a.createBiquadFilter();
+  s.buffer=noiseBuf; f.type='lowpass'; f.frequency.value=freq;
+  g.gain.setValueAtTime(vol,a.currentTime);
+  g.gain.exponentialRampToValueAtTime(.0001,a.currentTime+dur);
+  s.connect(f).connect(g).connect(a.destination); s.start(); s.stop(a.currentTime+dur+.02);
+}
+const SFX = {
+  shot(){ tone(880,140,.11,'square',.16); noise(.07,.10,3000); },
+  hit(){ tone(520,900,.06,'sine',.15); },
+  die(){ tone(300,40,.4,'sawtooth',.22); noise(.3,.2,900); },
+  hurt(){ tone(120,50,.3,'sawtooth',.3); noise(.25,.2,500); },
+  reload(){ tone(700,700,.04,'square',.12); setTimeout(()=>tone(950,950,.05,'square',.12),180); },
+  empty(){ tone(200,150,.06,'square',.1); },
+  wave(){ tone(440,880,.3,'triangle',.15); setTimeout(()=>tone(660,1320,.35,'triangle',.15),150); }
+};
+
+/* ---------- STATE ---------- */
+const ARENA=28;
+let state='menu'; // menu | play | pause | over
+let player, enemies, particles, tracers, wave, score, keys={}, mouseDown=false;
+let camY=0,camP=0,yaw=0,pitch=0;
+let recoil=0,muzzleT=0,dmgFlash=0,bobPhase=0,waveBannerT=0,reloadT=0,spawnDelay=0;
+
+function reset(){
+  player={x:0,z:0,hp:100,ammo:12,maxAmmo:12};
+  enemies=[]; particles=[]; tracers=[];
+  wave=0; score=0; yaw=Math.PI; pitch=0; camY=yaw; camP=pitch;
+  recoil=0; muzzleT=0; dmgFlash=0; reloadT=0; spawnDelay=2; waveBannerT=0; mouseDown=false;
+}
+reset();
+
+function nextWave(){
+  wave++;
+  const count = 3 + wave*2;
+  for(let i=0;i<count;i++){
+    const a=Math.random()*Math.PI*2, r=16+Math.random()*8;
+    enemies.push({
+      x:Math.cos(a)*r, z:Math.sin(a)*r,
+      hp:100*(1+(wave-1)*.18), maxHp:100*(1+(wave-1)*.18),
+      r:.75, speed:1.9+Math.min(2.6,wave*.22)+Math.random()*.4,
+      phase:Math.random()*7, atkCd:0, flash:0
+    });
+  }
+  waveBannerT=2.2; SFX.wave();
+}
+
+/* ---------- INPUT ---------- */
+window.addEventListener('keydown',e=>{
+  keys[e.code]=true;
+  if(e.code==='Space') e.preventDefault();
+  if(state==='menu' && (e.code==='Enter'||e.code==='Space')) startGame();
+  else if(state==='over' && e.code==='Enter') startGame();
+  else if(state==='play' && e.code==='KeyR') tryReload();
+});
+window.addEventListener('keyup',e=>{ keys[e.code]=false; });
+
+document.getElementById('startBtn').addEventListener('click',startGame);
+document.getElementById('restartBtn').addEventListener('click',startGame);
+document.getElementById('resumeBtn').addEventListener('click',()=>lockPointer());
+
+function startGame(){
+  audio(); reset(); state='play';
+  document.getElementById('menuOv').classList.add('hidden');
+  document.getElementById('overOv').classList.add('hidden');
+  document.getElementById('pauseOv').classList.add('hidden');
+  lockPointer();
+}
+function lockPointer(){
+  try{ cv.requestPointerLock && cv.requestPointerLock(); }catch(e){}
+}
+document.addEventListener('pointerlockchange',()=>{
+  const locked = document.pointerLockElement===cv;
+  if(state==='play' && !locked){ state='pause'; mouseDown=false; document.getElementById('pauseOv').classList.remove('hidden'); }
+  else if(state==='pause' && locked){ state='play'; document.getElementById('pauseOv').classList.add('hidden'); }
+});
+cv.addEventListener('mousemove',e=>{
+  if(document.pointerLockElement!==cv) return;
+  yaw -= e.movementX*0.0022;
+  pitch -= e.movementY*0.0022;
+  pitch = Math.max(-1.25,Math.min(1.25,pitch));
+});
+cv.addEventListener('mousedown',e=>{
+  if(e.button!==0) return;
+  audio();
+  if(state==='play') mouseDown=true;
+  else if(state==='menu'||state==='over') startGame();
+  else if(state==='pause') lockPointer();
+});
+window.addEventListener('mouseup',e=>{ if(e.button===0) mouseDown=false; });
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+
+/* ---------- SHOOTING ---------- */
+let fireCd=0;
+function tryReload(){
+  if(state!=='play'||reloadT>0||player.ammo===player.maxAmmo) return;
+  reloadT=1.15; SFX.reload();
+}
+function camDir(){
+  const cp=Math.cos(pitch);
+  return {x:Math.sin(yaw)*cp, y:Math.sin(pitch), z:Math.cos(yaw)*cp};
+}
+function shoot(){
+  if(reloadT>0) return;
+  if(player.ammo<=0){ SFX.empty(); tryReload(); return; }
+  player.ammo--; fireCd=.13; recoil=1; muzzleT=.06;
+  SFX.shot();
+  const d=camDir(), sp=.004;
+  const dir={x:d.x+(Math.random()-.5)*sp, y:d.y+(Math.random()-.5)*sp, z:d.z+(Math.random()-.5)*sp};
+  const o={x:player.x, y:1.6, z:player.z};
+  let best=null,bestT=1e9;
+  for(const e of enemies){
+    const wx=e.x-o.x, wy=(e.y||1.2)-o.y, wz=e.z-o.z;
+    const t=wx*dir.x+wy*dir.y+wz*dir.z;
+    if(t<=0) continue;
+    const cx=o.x+dir.x*t, cy=o.y+dir.y*t, cz=o.z+dir.z*t;
+    const dd=(cx-e.x)**2+(cy-(e.y||1.2))**2+(cz-e.z)**2;
+    if(dd < e.r*e.r && t<bestT){ best=e; bestT=t; }
+  }
+  let end = {x:o.x+dir.x*60, y:o.y+dir.y*60, z:o.z+dir.z*60};
+  if(best){
+    end={x:o.x+dir.x*bestT, y:o.y+dir.y*bestT, z:o.z+dir.z*bestT};
+    best.hp-=34; best.flash=.12; SFX.hit();
+    if(best.hp<=0){
+      score+=100; SFX.die();
+      for(let i=0;i<14;i++){
+        particles.push({x:best.x,y:1.2,z:best.z,
+          vx:(Math.random()-.5)*7,vy:Math.random()*6,vz:(Math.random()-.5)*7,
+          life:.7,max:.7,hue:180+Math.random()*60});
+      }
+      enemies.splice(enemies.indexOf(best),1);
+    }
+  }
+  const r={x:Math.cos(yaw), z:-Math.sin(yaw)};
+  tracers.push({
+    x1:o.x+dir.x*.4+r.x*.22, y1:1.45, z1:o.z+dir.z*.4+r.z*.22,
+    x2:end.x,y2:end.y,z2:end.z, life:.08
+  });
+  if(player.ammo<=0) tryReload();
+}
+
+/* ---------- UPDATE ---------- */
+function update(dt){
+  // movement
+  const sprint = keys['ShiftLeft']||keys['ShiftRight'];
+  let mx=0,mz=0;
+  if(keys['KeyW']){mx+=Math.sin(yaw);mz+=Math.cos(yaw);}
+  if(keys['KeyS']){mx-=Math.sin(yaw);mz-=Math.cos(yaw);}
+  if(keys['KeyA']){mx+=-Math.cos(yaw);mz+=Math.sin(yaw);}
+  if(keys['KeyD']){mx+=Math.cos(yaw);mz+-=0; mz-=Math.sin(yaw);}
+  // arrow-key look fallback
+  if(keys['ArrowLeft']) yaw+=2.4*dt;
+  if(keys['ArrowRight']) yaw-=2.4*dt;
+  if(keys['ArrowUp']) pitch=Math.max(-1.25,pitch-1.8*dt);
+  if(keys['ArrowDown']) pitch=Math.min(1.25,pitch+1.8*dt);
+  const ml=Math.hypot(mx,mz);
+  let speed=0;
+  if(ml>0){ mx/=ml;mz/=ml; speed=sprint?9:6;
+    player.x+=mx*speed*dt; player.z+=mz*speed*dt;
+    bobPhase+=dt*(sprint?13:9); }
+  player.x=Math.max(-ARENA+1.5,Math.min(ARENA-1.5,player.x));
+  player.z=Math.max(-ARENA+1.5,Math.min(ARENA-1.5,player.z));
+
+  // shooting / reload
+  fireCd-=dt;
+  if(mouseDown && fireCd<=0) shoot();
+  if(reloadT>0){ reloadT-=dt; if(reloadT<=0) player.ammo=player.maxAmmo; }
+  recoil=Math.max(0,recoil-dt*6);
+  muzzleT=Math.max(0,muzzleT-dt);
+  dmgFlash=Math.max(0,dmgFlash-dt*2.2);
+
+  // waves
+  if(waveBannerT>0) waveBannerT-=dt;
+  if(enemies.length===0){
+    spawnDelay-=dt;
+    if(spawnDelay<=0){ nextWave(); player.hp=Math.min(100,player.hp+15); }
+  } else spawnDelay=2.5;
+
+  // enemies
+  for(const e of enemies){
+    const dx=player.x-e.x, dz=player.z-e.z, d=Math.hypot(dx,dz)||.001;
+    if(d>1.3){ e.x+=dx/d*e.speed*dt; e.z+=dz/d*e.speed*dt; }
+    e.atkCd-=dt; e.flash=Math.max(0,e.flash-dt);
+    e.y=1.2+Math.sin(performance.now()/300+e.phase)*.15;
+    if(d<1.9 && e.atkCd<=0){
+      e.atkCd=1.0;
+      player.hp-=8+wave; dmgFlash=1; SFX.hurt();
+      if(player.hp<=0){ player.hp=0; gameOver(); }
+    }
+  }
+
+  // particles & tracers
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i]; p.life-=dt;
+    p.x+=p.vx*dt;p.y+=p.vy*dt;p.z+=p.vz*dt;p.vy-=9*dt;
+    if(p.life<=0) particles.splice(i,1);
+  }
+  for(let i=tracers.length-1;i>=0;i--){ tracers[i].life-=dt; if(tracers[i].life<=0) tracers.splice(i,1); }
+}
+function gameOver(){
+  state='over'; mouseDown=false;
+  document.exitPointerLock && document.exitPointerLock();
+  document.getElementById('goScore').textContent='SCORE: '+score+'  •  WAVE '+wave;
+  document.getElementById('overOv').classList.remove('hidden');
+}
+
+/* ---------- PROJECTION ---------- */
+function camBasis(){
+  const cy=Math.cos(yaw), sy=Math.sin(yaw), cp=Math.cos(pitch), sp=Math.sin(pitch);
+  const f={x:sy*cp,y:sp,z:cy*cp};
+  const r={x:cy,y:0,z:-sy};
+  return {f,r,u:{x:f.y*r.z, y:f.z*r.x-f.x*r.z, z:-f.y*r.x}};
+}
+function toCam(b,x,y,z){
+  const dx=x-player.x, dy=y-1.6, dz=z-player.z;
+  return { x:dx*b.r.x+dy*b.r.y+dz*b.r.z,
+           y:dx*b.u.x+dy*b.u.y+dz*b.u.z,
+           z:dx*b.f.x+dy*b.f.y+dz*b.f.z };
+}
+function proj(c){
+  if(c.z<0.15) return null;
+  return {x:CX+F*c.x/c.z, y:CY-F*c.y/c.z, s:F/c.z};
+}
+function fogA(dist){ return Math.max(0,Math.min(1,1-dist/70)); }
+
+/* ---------- RENDER ---------- */
+function render(){
+  const b=camBasis();
+  // sky
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#050018'); g.addColorStop(.55,'#12043a'); g.addColorStop(1,'#2a0a4a');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  // stars
+  ctx.save();
+  for(let i=0;i<70;i++){
+    const sx=((i*997)%1000)/1000, sy=((i*613)%620)/1000;
+    let px=(sx+.5)*W - CX, py=-sy*H*.8 + CY*0.3;
+    // simple rotate by yaw for parallax feel
+    const ang=yaw*.7;
+    const rx=px*Math.cos(ang)-py*Math.sin(ang), ry=px*Math.sin(ang)+py*Math.cos(ang);
+    px=rx+CX; py=ry+CY-H*.15;
+    if(py>0&&py<H*.62&&px>-10&&px<W+10){
+      ctx.globalAlpha=.3+.5*((i*37)%10)/10;
+      ctx.fillStyle='#fff';
+      ctx.fillRect(px,py,i%5===0?2:1,i%5===0?2:1);
+    }
+  }
+  ctx.restore();
+
+  // floor grid
+  const step=4;
+  ctx.lineWidth=1;
+  for(let i=-ARENA;i<=ARENA;i+=step){
+    gridLine(i,0,i,ARENA*3,false);
+    gridLine(-ARENA*3,i,ARENA*3,i,true);
+  }
+  function gridLine(x1,z1,x2,z2,main){
+    const a=toCam(b,x1,0,z1), c=toCam(b,x2,0,z2);
+    let p1=a,q1=c;
+    // near clip
+    if(p1.z<0.15&&q1.z<0.15) return;
+    const t=(p1.z<0.15)?(0.15-p1.z)/(q1.z-p1.z):((q1.z<0.15)?(0.15-q1.z)/(p1.z-q1.z):null);
+    if(t!==null){
+      const nx=p1.x+(q1.x-p1.x)*t, ny=p1.y+(q1.y-p1.y)*t, nz=.15;
+      if(p1.z<0.15) p1={x:nx,y:ny,z:nz}; else q1={x:nx,y:ny,z:nz};
+    }
+    const P=proj(p1),Q=proj(q1);
+    if(!P||!Q) return;
+    const dist=Math.hypot((x1+x2)/2-player.x,(z1+z2)/2-player.z);
+    ctx.strokeStyle='rgba(0,255,255,'+(fogA(dist)*(main?.28:.16)).toFixed(3)+')';
+    ctx.beginPath(); ctx.moveTo(P.x,P.y); ctx.lineTo(Q.x,Q.y); ctx.stroke();
+  }
+
+  // walls (triangulated, clipped)
+  const hgt=7;
+  const corners=[[-ARENA,-ARENA],[ARENA,-ARENA],[ARENA,ARENA],[-ARENA,ARENA]];
+  for(let i=0;i<4;i++){
+    const A=corners[i],B=corners[(i+1)%4];
+    const pts=[toCam(b,A[0],0,A[1]),toCam(b,B[0],0,B[1]),toCam(b,B[0],hgt,B[1]),toCam(b,A[0],hgt,A[1])];
+    for(const tri of [[pts[0],pts[1],pts[2]],[pts[0],pts[2],pts[3]]]){
+      if(tri.some(p=>p.z<0.15)) continue;
+      const P=tri.map(proj); if(P.some(p=>!p)) continue;
+      const dist=Math.hypot((A[0]+B[0])/2-player.x,(A[1]+B[1])/2-player.z);
+      ctx.fillStyle='rgba(40,0,80,'+(fogA(dist)*.75).toFixed(3)+')';
+      ctx.strokeStyle='rgba(255,0,255,'+(fogA(dist)*.8).toFixed(3)+')';
+      ctx.lineWidth=1.5;
+      ctx.beginPath(); ctx.moveTo(P[0].x,P[0].y); ctx.lineTo(P[1].x,P[1].y); ctx.lineTo(P[2].x,P[2].y);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+  }
+
+  // tracers
+  for(const t of tracers){
+    const P=proj(toCam(b,t.x1,t.y1,t.z1)), Q=proj(toCam(b,t.x2,t.y2,t.z2));
+    if(P&&Q){
+      ctx.strokeStyle='rgba(180,255,255,'+(t.life/.08).toFixed(2)+')';
+      ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(P.x,P.y); ctx.lineTo(Q.x,Q.y); ctx.stroke();
+    }
+  }
+
+  // enemies (depth sorted)
+  const list=enemies.map(e=>({e,d:(e.x-player.x)**2+(e.z-player.z)**2})).sort((a,b)=>b.d-a.d);
+  for(const {e} of list){
+    const c=toCam(b,e.x,e.y||1.2,e.z), P=proj(c);
+    if(!P) continue;
+    const r=Math.max(2,P.s*e.r), fa=fogA(Math.sqrt((e.x-player.x)**2+(e.z-player.z)**2));
+    ctx.save(); ctx.globalAlpha=fa;
+    // glow
+    const rg=ctx.createRadialGradient(P.x,P.y,r*.2,P.x,P.y,r*2.1);
+    rg.addColorStop(0,'rgba(255,40,120,.5)'); rg.addColorStop(1,'rgba(255,40,120,0)');
+    ctx.fillStyle=rg; ctx.beginPath(); ctx.arc(P.x,P.y,r*2.1,0,7); ctx.fill();
+    // body
+    const bg=ctx.createRadialGradient(P.x-r*.3,P.y-r*.3,r*.1,P.x,P.y,r);
+    if(e.flash>0){ bg.addColorStop(0,'#fff'); bg.addColorStop(1,'#ff88bb'); }
+    else { bg.addColorStop(0,'#ff77aa'); bg.addColorStop(.6,'#c81050'); bg.addColorStop(1,'#4a0020'); }
+    ctx.fillStyle=bg; ctx.beginPath(); ctx.arc(P.x,P.y,r,0,7); ctx.fill();
+    // eyes
+    const ew=r*.32, eh=r*.55*(1+Math.sin(performance.now()/200+e.phase)*.15);
+    ctx.fillStyle='#fff';
+    ctx.beginPath(); ctx.ellipse(P.x-r*.32,P.y-r*.15,ew*.6,eh,0,0,7); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(P.x+r*.32,P.y-r*.15,ew*.6,eh,0,0,7); ctx.fill();
+    ctx.fillStyle='#f0f';
+    ctx.beginPath(); ctx.arc(P.x-r*.32,P.y-r*.15,ew*.28,0,7); ctx.fill();
+    ctx.beginPath(); ctx.arc(P.x+r*.32,P.y-r*.15,ew*.28,0,7); ctx.fill();
+    // hp bar
+    if(e.hp<e.maxHp){
+      const bw=r*2;
+      ctx.fillStyle='rgba(0,0,0,.6)'; ctx.fillRect(P.x-bw/2,P.y-r-10,bw,5);
+      ctx.fillStyle='#0f8'; ctx.fillRect(P.x-bw/2,P.y-r-10,bw*Math.max(0,e.hp/e.maxHp),5);
+    }
+    ctx.restore();
+  }
+
+  // particles
+  for(const p of particles){
+    const P=proj(toCam(b,p.x,p.y,p.z));
+    if(!P) continue;
+    const a=p.life/p.max, s=Math.max(1,P.s*.08);
+    ctx.fillStyle='hsla('+p.hue+',100%,65%,'+a.toFixed(2)+')';
+    ctx.beginPath(); ctx.arc(P.x,P.y,s,0,7); ctx.fill();
+  }
+
+  drawGun(b);
+  drawHUD();
+
+  // damage flash
+  if(dmgFlash>0){
+    ctx.fillStyle='rgba(255,0,40,'+(dmgFlash*.35).toFixed(3)+')';
+    ctx.fillRect(0,0,W,H);
+  }
+  if(state==='play'&&player.hp<35){
+    const v=ctx.createRadialGradient(CX,CY,H*.3,CX,CY,H*.75);
+    v.addColorStop(0,'rgba(255,0,0,0)'); v.addColorStop(1,'rgba(180,0,20,'+(.4*(1-player.hp/35)).toFixed(3)+')');
+    ctx.fillStyle=v; ctx.fillRect(0,0,W,H);
+  }
+}
+
+function drawGun(b){
+  const bobX=Math.sin(bobPhase)*6, bobY=Math.abs(Math.cos(bobPhase))*8;
+  const rec=recoil*16;
+  const gx=CX+W*.2+bobX, gy=H- H*.24 + bobY + rec;
+  ctx.save();
+  // muzzle flash
+  if(muzzleT>0){
+    const fx=gx-W*.055, fy=gy-H*.16;
+    const mg=ctx.createRadialGradient(fx,fy,2,fx,fy,40+Math.random()*25);
+    mg.addColorStop(0,'rgba(255,255,220,.95)'); mg.addColorStop(.4,'rgba(120,220,255,.7)'); mg.addColorStop(1,'rgba(0,150,255,0)');
+    ctx.fillStyle=mg; ctx.beginPath(); ctx.arc(fx,fy,65,0,7); ctx.fill();
+  }
+  // barrel
+  ctx.translate(gx,gy); ctx.rotate(-.28+recoil*.05);
+  ctx.fillStyle='#0a1430'; ctx.strokeStyle='#0ff'; ctx.lineWidth=2;
+  ctx.fillRect(-W*.09,-H*.16,W*.075,H*.05); ctx.strokeRect(-W*.09,-H*.16,W*.075,H*.05);
+  // body
+  ctx.fillStyle='#101d45';
+  ctx.beginPath();
+  ctx.moveTo(-W*.03,0); ctx.lineTo(W*.02,0); ctx.lineTo(-W*.005,-H*.13); ctx.lineTo(-W*.085,-H*.13);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  // glow strip
+  ctx.fillStyle='rgba(0,255,255,.7)';
+  ctx.fillRect(-W*.075,-H*.09,W*.06,H*.008);
+  ctx.restore();
+}
+
+function drawHUD(){
+  if(state!=='play'&&state!=='pause') return;
+  // crosshair
+  const spread=6+recoil*14+(keys['KeyW']?3:0);
+  ctx.strokeStyle='rgba(0,255,255,.9)'; ctx.lineWidth=2;
+  ctx.beginPath();
+  ctx.moveTo(CX-spread-8,CY); ctx.lineTo(CX-spread,CY);
+  ctx.moveTo(CX+spread,CY); ctx.lineTo(CX+spread+8,CY);
+  ctx.moveTo(CX,CY-spread-8); ctx.lineTo(CX,CY-spread);
+  ctx.moveTo(CX,CY+spread); ctx.lineTo(CX,CY+spread+8);
+  ctx.stroke();
+  ctx.fillStyle='rgba(0,255,255,.9)'; ctx.fillRect(CX-1,CY-1,2,2);
+
+  // health
+  const hw=Math.min(260,W*.3), hx=24, hy=24;
+  ctx.fillStyle='rgba(0,0,0,.5)'; ctx.fillRect(hx,hy,hw,18);
+  const hpFrac=player.hp/100;
+  ctx.fillStyle=hpFrac>.5?'#0f8':(hpFrac>.25?'#ff0':'#f33');
+  ctx.fillRect(hx+2,hy+2,(hw-4)*Math.max(0,hpFrac),14);
+  ctx.strokeStyle='#0ff'; ctx.lineWidth=1; ctx.strokeRect(hx,hy,hw,18);
+  ctx.fillStyle='#fff'; ctx.font='bold 13px Courier New'; ctx.textAlign='left';
+  ctx.fillText('HULL '+Math.ceil(player.hp)+'%',hx+6,hy-6);
+
+  // score / wave
+  ctx.textAlign='right';
+  ctx.fillStyle='#0ff'; ctx.font='bold 22px Courier New';
+  ctx.fillText('SCORE '+score,W-24,40);
+  ctx.fillStyle='#f0f'; ctx.font='bold 15px Courier New';
+  ctx.fillText('WAVE '+wave+'   HOSTILES: '+enemies.length,W-24,62);
+
+  // ammo
+  ctx.textAlign='right';
+  if(reloadT>0){
+    ctx.fillStyle='#ff0'; ctx.font='bold 18px Courier New';
+    ctx.fillText('RELOADING...',W-24,H-40);
+  } else {
+    ctx.fillStyle=player.ammo===0?'#f33':'#fff'; ctx.font='bold 30px Courier New';
+    ctx.fillText(player.ammo+' / '+player.maxAmmo,W-24,H-36);
+  }
+
+  // wave banner
+  if(waveBannerT>0){
+    const a=Math.min(1,waveBannerT/0.5);
+    ctx.globalAlpha=a;
+    ctx.textAlign='center';
+    ctx.fillStyle='#0ff'; ctx.font='bold '+Math.min(64,W*.08)+'px Courier New';
+    ctx.shadowColor='#0ff'; ctx.shadowBlur=25;
+    ctx.fillText('WAVE '+wave,CX,H*.3);
+    ctx.shadowBlur=0; ctx.globalAlpha=1;
+  } else if(enemies.length===0){
+    ctx.textAlign='center'; ctx.fillStyle='#f0f'; ctx.font='bold 24px Courier New';
+    ctx.fillText('NEXT WAVE INBOUND...',CX,H*.3);
+  }
+}
+
+/* ---------- LOOP ---------- */
+let last=performance.now();
+function loop(now){
+  const dt=Math.min(.05,(now-last)/1000); last=now;
+  if(state==='play') update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
+```
