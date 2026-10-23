@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pac-Man Asteroids</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#000; }
+  #game { display:block; position:absolute; inset:0; }
+  .overlay {
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; text-align:center;
+    font-family:'Courier New', monospace; color:#ffe600; z-index:10;
+    background:rgba(0,0,10,0.75); user-select:none;
+  }
+  .overlay h1 {
+    font-size:min(8vw, 64px); margin:0 0 10px; letter-spacing:2px;
+    text-shadow:0 0 18px #ffe600, 0 0 40px #ff00ff;
+  }
+  .overlay p { font-size:min(3.4vw, 18px); color:#8ef; margin:6px 0; line-height:1.5; }
+  .overlay .big { font-size:min(4.5vw, 26px); color:#fff; margin-top:18px; animation:pulse 1s infinite alternate; }
+  @keyframes pulse { from{opacity:.4} to{opacity:1} }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="startScreen" class="overlay">
+  <h1>PAC-MAN ASTEROIDS</h1>
+  <p>You are a space-eating Pac-Man ship.</p>
+  <p>&larr; / A &mdash; rotate left &nbsp;&nbsp; &rarr; / D &mdash; rotate right</p>
+  <p>&uarr; / W &mdash; thrust &nbsp;&nbsp; SPACE &mdash; fire laser</p>
+  <p>Eat dots (+10). Power dots make you invincible (purple!).<br>
+     Blast asteroids before they eat YOU. Don't let them hit your hull!</p>
+  <p class="big">PRESS SPACE OR CLICK TO START</p>
+</div>
+
+<div id="overScreen" class="overlay hidden">
+  <h1 style="color:#f44; text-shadow:0 0 18px #f44;">GAME OVER</h1>
+  <p id="finalScore" style="font-size:min(5vw,28px); color:#fff;"></p>
+  <p id="hiScore"></p>
+  <p class="big">PRESS R OR ENTER TO RESTART</p>
+</div>
+
+<script>
+(function(){
+"use strict";
+var canvas = document.getElementById('game');
+var ctx = canvas.getContext('2d');
+var startScreen = document.getElementById('startScreen');
+var overScreen = document.getElementById('overScreen');
+var finalScoreEl = document.getElementById('finalScore');
+var hiScoreEl = document.getElementById('hiScore');
+
+var W=0, H=0;
+function resize(){ W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
+window.addEventListener('resize', resize); resize();
+
+// ---------- audio ----------
+var AC = null;
+function audio(){ if(!AC){ try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } if(AC && AC.state==='suspended') AC.resume(); return AC; }
+function beep(freq, dur, type, vol, slideTo){
+  var ac = audio(); if(!ac) return;
+  try{
+    var o = ac.createOscillator(), g = ac.createGain();
+    o.type = type||'square'; o.frequency.setValueAtTime(freq, ac.currentTime);
+    if(slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(20,slideTo), ac.currentTime+dur);
+    g.gain.setValueAtTime(vol||0.15, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, ac.currentTime+dur);
+    o.connect(g); g.connect(ac.destination);
+    o.start(); o.stop(ac.currentTime+dur+0.02);
+  }catch(e){}
+}
+function noiseBurst(dur, vol){
+  var ac = audio(); if(!ac) return;
+  try{
+    var len = Math.floor(ac.sampleRate*dur), buf = ac.createBuffer(1,len,ac.sampleRate);
+    var d = buf.getChannelData(0);
+    for(var i=0;i<len;i++) d[i] = (Math.random()*2-1)*(1-i/len);
+    var s = ac.createBufferSource(), g = ac.createGain();
+    s.buffer = buf; g.gain.value = vol||0.3;
+    s.connect(g); g.connect(ac.destination); s.start();
+  }catch(e){}
+}
+
+// ---------- state ----------
+var state = 'start'; // start, play, dead (pause after death), over
+var keys = {};
+window.addEventListener('keydown', function(e){
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].indexOf(e.code)>=0) e.preventDefault();
+  keys[e.code] = true;
+  audio();
+  if(state==='start' && (e.code==='Space'||e.code==='Enter')) startGame();
+  else if(state==='over' && (e.code==='KeyR'||e.code==='Enter')) startGame();
+});
+window.addEventListener('keyup', function(e){ keys[e.code]=false; });
+canvas.addEventListener('mousedown', function(){ audio(); if(state==='start') startGame(); else if(state==='over') startGame(); });
+startScreen.addEventListener('click', function(){ audio(); startGame(); });
+
+var hiScore = 0;
+try{ hiScore = parseInt(localStorage.getItem('pma_hi')||'0',10)||0; }catch(e){}
+
+var player, pellets, powerPellets, asteroids, bullets, particles, stars;
+var score, lives, invincibleT, fireCd, shake, elapsed, spawnTimer, level;
+
+function rand(a,b){ return a + Math.random()*(b-a); }
+
+function makeStars(){
+  stars = [];
+  for(var i=0;i<120;i++) stars.push({x:Math.random()*W, y:Math.random()*H, r:Math.random()*1.6+0.3, tw:Math.random()*6.28});
+}
+
+function spawnPellets(){
+  pellets = []; powerPellets = [];
+  var n = Math.max(40, Math.floor(W*H/9000));
+  for(var i=0;i<n;i++){
+    var x = rand(30,W-30), y = rand(30,H-30);
+    if(Math.hypot(x-W/2,y-H/2) < 130) continue; // keep spawn area clear
+    pellets.push({x:x,y:y,ph:Math.random()*6.28});
+  }
+  for(var j=0;j<4;j++){
+    var px = rand(60,W-60), py = rand(60,H-60);
+    if(Math.hypot(px-W/2,py-H/2) < 160) continue;
+    powerPellets.push({x:px,y:py,ph:Math.random()*6.28});
+  }
+}
+
+function asteroidShape(r){
+  var pts = [], n = Math.floor(rand(9,13));
+  for(var i=0;i<n;i++){
+    var a = i/n*Math.PI*2;
+    pts.push({a:a, d:rand(0.65,1.15)});
+  }
+  return pts;
+}
+
+function spawnAsteroid(size, x, y){
+  var speeds = [40,80,140];
+  var s = size===3?speeds[0]:size===2?speeds[1]:speeds[2];
+  var ang = Math.random()*Math.PI*2;
+  asteroids.push({
+    x:x, y:y, vx:Math.cos(ang)*s*rand(0.6,1.4), vy:Math.sin(ang)*s*rand(0.6,1.4),
+    size:size, r:size===3?rand(55,75):size===2?rand(30,42):rand(15,22),
+    rot:Math.random()*6.28, vr:rand(-1.5,1.5), shape:asteroidShape(1)
+  });
+}
+
+function spawnEdgeAsteroid(size){
+  var side = Math.floor(Math.random()*4);
+  var x,y;
+  if(side===0){x=rand(0,W); y=-80;} else if(side===1){x=W+80; y=rand(0,H);}
+  else if(side===2){x=rand(0,W); y=H+80;} else {x=-80; y=rand(0,H);}
+  spawnAsteroid(size, x, y);
+}
+
+function boom(x,y,color,n,big){
+  for(var i=0;i<(n||20);i++){
+    var a = Math.random()*Math.PI*2, sp = rand(30, big?260:160);
+    particles.push({x:x,y:y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:rand(0.4,0.9),max:0.9,color:color,sz:rand(1.5,3.5)});
+  }
+}
+
+function startGame(){
+  state = 'play';
+  startScreen.classList.add('hidden');
+  overScreen.classList.add('hidden');
+  score = 0; lives = 3; invincibleT = 2; fireCd = 0; shake = 0; elapsed = 0; spawnTimer = 4; level = 1;
+  player = {x:W/2, y:H/2, vx:0, vy:0, rot:-Math.PI/2, r:16, mouth:0};
+  bullets = []; particles = []; asteroids = [];
+  makeStars(); spawnPellets();
+  for(var i=0;i<3;i++) spawnEdgeAsteroid(3);
+}
+
+function gameOver(){
+  state = 'over';
+  finalScoreEl.textContent = 'SCORE: ' + score;
+  if(score >= hiScore){ hiScore = score; try{ localStorage.setItem('pma_hi', String(hiScore)); }catch(e){} hiScoreEl.textContent = 'NEW HIGH SCORE!'; }
+  else hiScoreEl.textContent = 'HIGH SCORE: ' + hiScore;
+  overScreen.classList.remove('hidden');
+}
+
+function killPlayer(){
+  if(invincibleT > 0) return;
+  lives--;
+  shake = 14;
+  boom(player.x, player.y, '#ffe600', 40, true);
+  noiseBurst(0.5, 0.5); beep(200, 0.6, 'sawtooth', 0.2, 40);
+  if(lives <= 0){ setTimeout(gameOver, 900); state='dead'; }
+  else { player.x = W/2; player.y = H/2; player.vx = 0; player.vy = 0; invincibleT = 2.5; }
+}
+
+function wrap(o){
+  if(o.x < -o.r-10) o.x = W+o.r+10;
+  if(o.x > W+o.r+10) o.x = -o.r-10;
+  if(o.y < -o.r-10) o.y = H+o.r+10;
+  if(o.y > H+o.r+10) o.y = -o.r-10;
+}
+
+// ---------- update ----------
+function update(dt){
+  elapsed += dt;
+  level = 1 + Math.floor(elapsed/30);
+  var spdMul = 1 + (level-1)*0.15;
+
+  // stars twinkle handled in draw
+  if(state==='play'){
+    // player controls
+    var turn = 3.4*dt, thrust = 260*dt;
+    if(keys['ArrowLeft']||keys['KeyA']) player.rot -= turn;
+    if(keys['ArrowRight']||keys['KeyD']) player.rot += turn;
+    if(keys['ArrowUp']||keys['KeyW']){
+      player.vx += Math.cos(player.rot)*thrust;
+      player.vy += Math.sin(player.rot)*thrust;
+      // thruster particles
+      if(Math.random()<0.7) particles.push({x:player.x-Math.cos(player.rot)*14, y:player.y-Math.sin(player.rot)*14,
+        vx:-Math.cos(player.rot)*rand(60,120)+rand(-30,30), vy:-Math.sin(player.rot)*rand(60,120)+rand(-30,30),
+        life:0.3, max:0.3, color:'#f80', sz:2});
+    }
+    player.vx *= Math.pow(0.35, dt); player.vy *= Math.pow(0.35, dt);
+    var sp = Math.hypot(player.vx,player.vy), maxSp = 320;
+    if(sp>maxSp){ player.vx*=maxSp/sp; player.vy*=maxSp/sp; }
+    player.x += player.vx*dt; player.y += player.vy*dt; wrap(player);
+
+    fireCd -= dt;
+    if(keys['Space'] && fireCd<=0){
+      fireCd = 0.25;
+      bullets.push({x:player.x+Math.cos(player.rot)*18, y:player.y+Math.sin(player.rot)*18,
+        vx:Math.cos(player.rot)*520+player.vx*0.3, vy:Math.sin(player.rot)*520+player.vy*0.3, life:1.1});
+      beep(880, 0.12, 'square', 0.1, 220);
+    }
+    if(invincibleT>0) invincibleT -= dt;
+
+    // mouth animation
+    player.mouth += dt*(4 + Math.hypot(player.vx,player.vy)*0.02);
+  }
+
+  // bullets
+  for(var i=bullets.length-1;i>=0;i--){
+    var b = bullets[i];
+    b.x += b.vx*dt; b.y += b.vy*dt; b.life -= dt; wrap(b);
+    if(b.life<=0) bullets.splice(i,1);
+  }
+
+  // asteroids
+  for(var j=asteroids.length-1;j>=0;j--){
+    var a = asteroids[j];
+    a.x += a.vx*dt*spdMul; a.y += a.vy*dt*spdMul; a.rot += a.vr*dt; wrap(a);
+
+    // bullet hits
+    for(var k=bullets.length-1;k>=0;k--){
+      var bb = bullets[k];
+      if(Math.hypot(bb.x-a.x, bb.y-a.y) < a.r+4){
+        bullets.splice(k,1);
+        boom(a.x,a.y,'#9ab',20,a.size===3);
+        noiseBurst(a.size===3?0.4:0.2, 0.3); beep(150+a.size*80,0.2,'triangle',0.15,60);
+        score += a.size===3?20:a.size===2?50:100;
+        if(a.size>1){
+          spawnAsteroid(a.size-1, a.x+rand(-10,10), a.y+rand(-10,10));
+          spawnAsteroid(a.size-1, a.x+rand(-10,10), a.y+rand(-10,10));
+        }
+        asteroids.splice(j,1);
+        break;
+      }
+    }
+
+    // player collision
+    if(state==='play' && j<asteroids.length){
+      var p = asteroids[j];
+      var d = Math.hypot(p.x-player.x, p.y-player.y);
+      if(d < p.r + player.r - 4){
+        if(invincibleT>0){
+          boom(p.x,p.y,'#c6f',24,p.size===3);
+          noiseBurst(0.3,0.35); beep(1200,0.2,'sawtooth',0.15,300);
+          score += p.size===3?20:p.size===2?50:100;
+          if(p.size>1){ spawnAsteroid(p.size-1,p.x,p.y); spawnAsteroid(p.size-1,p.x,p.y); }
+          asteroids.splice(j,1);
+        } else killPlayer();
+      }
+    }
+  }
+
+  // keep asteroid population up
+  var target = Math.min(3 + level*2, 14);
+  if(asteroids.length < target && (spawnTimer-=dt) <= 0){
+    spawnTimer = rand(1.5,3.5);
+    spawnEdgeAsteroid(Math.random()<0.7?3:2);
+  }
+
+  // pellets
+  if(state==='play'){
+    for(var m=pellets.length-1;m>=0;m--){
+      var pl = pellets[m];
+      if(Math.hypot(pl.x-player.x, pl.y-player.y) < player.r+6){
+        pellets.splice(m,1); score += 10;
+        beep(400 + (score%5)*90, 0.08, 'square', 0.08, 700);
+        boom(pl.x, pl.y, '#ffe600', 5);
+      }
+    }
+    for(var q=powerPellets.length-1;q>=0;q--){
+      var pp = powerPellets[q];
+      if(Math.hypot(pp.x-player.x, pp.y-player.y) < player.r+9){
+        powerPellets.splice(q,1); score += 50; invincibleT = 8;
+        beep(300,0.4,'sawtooth',0.15,900); beep(600,0.4,'square',0.1,1400);
+        boom(pp.x, pp.y, '#c6f', 20);
+      }
+    }
+    // re-seed pellets if almost gone
+    if(pellets.length < 15){ spawnPellets(); }
+  }
+
+  // particles
+  for(var t=particles.length-1;t>=0;t--){
+    var pa = particles[t];
+    pa.x += pa.vx*dt; pa.y += pa.vy*dt; pa.life -= dt;
+    if(pa.life<=0) particles.splice(t,1);
+  }
+
+  if(shake>0) shake = Math.max(0, shake - dt*30);
+}
+
+// ---------- draw ----------
+function drawAsteroid(a){
+  ctx.save();
+  ctx.translate(a.x,a.y); ctx.rotate(a.rot);
+  ctx.beginPath();
+  for(var i=0;i<a.shape.length;i++){
+    var p = a.shape[i], x = Math.cos(p.a)*p.d*a.r, y = Math.sin(p.a)*p.d*a.r;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = '#23262e';
+  ctx.fill();
+  ctx.strokeStyle = '#8f9bb0';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  // crater
+  ctx.beginPath();
+  ctx.arc(a.r*0.25, -a.r*0.15, a.r*0.22, 0, 6.28);
+  ctx.strokeStyle = 'rgba(143,155,176,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawPlayer(){
+  if(state!=='play' && state!=='dead') return;
+  var blink = invincibleT>0 && (Math.floor(elapsed*10)%2===0);
+  var col = invincibleT>0 ? '#c46bff' : '#ffe600';
+  ctx.save();
+  ctx.translate(player.x, player.y);
+  ctx.rotate(player.rot);
+  if(blink) ctx.globalAlpha = 0.35;
+  var mouthOpen = 0.25 + Math.abs(Math.sin(player.mouth))*0.45; // radians each side
+  ctx.beginPath();
+  ctx.moveTo(0,0);
+  ctx.arc(0,0,player.r, -mouthOpen, mouthOpen);
+  ctx.closePath();
+  ctx.fillStyle = col;
+  ctx.shadowColor = col; ctx.shadowBlur = 16;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  // eye
+  ctx.beginPath();
+  ctx.arc(2,-7,2.6,0,6.28);
+  ctx.fillStyle = '#000';
+  ctx.fill();
+  ctx.restore();
+}
+
+function draw(){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = '#04040c';
+  ctx.fillRect(0,0,W,H);
+
+  if(shake>0) ctx.translate(rand(-shake,shake), rand(-shake,shake));
+
+  // stars
+  for(var i=0;i<stars.length;i++){
+    var s = stars[i];
+    s.tw += 0.03;
+    ctx.globalAlpha = 0.4 + Math.sin(s.tw)*0.35;
+    ctx.fillStyle = '#cde';
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,6.28); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // pellets
+  for(var p=0;p<pellets.length;p++){
+    var el = pellets[p];
+    el.ph += 0.05;
+    ctx.fillStyle = '#ffe600';
+    ctx.globalAlpha = 0.7 + Math.sin(el.ph)*0.3;
+    ctx.beginPath(); ctx.arc(el.x, el.y, 3, 0, 6.28); ctx.fill();
+  }
+  for(var q=0;q<powerPellets.length;q++){
+    var pw = powerPellets[q];
+    pw.ph += 0.1;
+    ctx.fillStyle = '#c46bff';
+    ctx.shadowColor = '#c46bff'; ctx.shadowBlur = 12;
+    ctx.globalAlpha = 0.75 + Math.sin(pw.ph)*0.25;
+    ctx.beginPath(); ctx.arc(pw.x, pw.y, 8+Math.sin(pw.ph)*2, 0, 6.28); ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+  ctx.globalAlpha = 1;
+
+  // asteroids
+  for(var a=0;a<asteroids.length;a++) drawAsteroid(asteroids[a]);
+
+  // bullets
+  ctx.strokeStyle = '#4ff';
+  ctx.lineWidth = 3;
+  ctx.shadowColor = '#4ff'; ctx.shadowBlur = 8;
+  for(var b=0;b<bullets.length;b++){
+    var bu = bullets[b];
+    ctx.beginPath();
+    ctx.moveTo(bu.x, bu.y);
+    ctx.lineTo(bu.x - bu.vx*0.02, bu.y - bu.vy*0.02);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+
+  // particles
+  for(var t=0;t<particles.length;t++){
+    var pa = particles[t];
+    ctx.globalAlpha = Math.max(0, pa.life/pa.max);
+    ctx.fillStyle = pa.color;
+    ctx.beginPath(); ctx.arc(pa.x,pa.y,pa.sz,0,6.28); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  drawPlayer();
+
+  // HUD
+  if(state==='play' || state==='dead'){
+    ctx.font = 'bold 20px "Courier New", monospace';
+    ctx.fillStyle = '#ffe600';
+    ctx.textAlign = 'left';
+    ctx.fillText('SCORE ' + score, 16, 30);
+    ctx.fillStyle = '#8ef';
+    ctx.fillText('LEVEL ' + level, 16, 54);
+    // lives as mini pac-mans
+    for(var l=0;l<lives;l++){
+      ctx.save();
+      ctx.translate(W-30-l*30, 28);
+      ctx.beginPath(); ctx.moveTo(0,0); ctx.arc(0,0,10,-0.5,0.5); ctx.closePath();
+      ctx.fillStyle = '#ffe600'; ctx.fill();
+      ctx.restore();
+    }
+    if(invincibleT>0){
+      ctx.fillStyle = '#c46bff';
+      ctx.textAlign = 'center';
+      ctx.fillText('INVINCIBLE ' + Math.ceil(invincibleT) + 's', W/2, 30);
+    }
+  }
+}
+
+// ---------- loop ----------
+var last = performance.now();
+function frame(now){
+  var dt = Math.min(0.033, (now-last)/1000);
+  last = now;
+  if(state==='play' || state==='dead') update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+makeStars();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
