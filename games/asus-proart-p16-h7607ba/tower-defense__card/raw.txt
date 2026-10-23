@@ -1,0 +1,835 @@
+<think>
+The user wants a single-file HTML5 tower defense card game. Design: enemies advance along a path on a grid, and the player places towers by playing cards from a hand (with cost/energy). Each wave, energy regenerates. Towers are aimed at enemies and shoot projectiles.
+
+Let me think about the design:
+- Canvas fills the window, scales.
+- Grid-based map with a fixed path. Click on empty cells to place a selected tower card.
+- Hand of cards at the bottom (drawn in canvas or HTML). Cards have cost (energy), type: e.g., Arrow Tower (cheap, fast), Cannon (splash), Frost (slow), Tesla (chain?), Sniper (long range high damage).
+- Energy regenerates over time + bonus per wave.
+- Waves spawn enemies; enemy types: normal, fast, tank, boss on every 5 waves.
+- Lives, score, game over screen with restart.
+- Start screen with title and how-to-play instructions.
+- Web Audio for shooting/hit sounds, initialized after first input.
+
+Implementation approach: canvas game loop. Draw the hand as HTML divs at the bottom? Simpler: draw everything on the canvas including cards. But HTML cards are easier to click. Go with an HTML UI overlay: top bar (wave, lives, energy), bottom card hand as divs, canvas in the middle. Resize handling: fit canvas to the container.
+
+Grid: e.g., 12x8 cells. Path defined by a list of waypoints on the grid. Enemies follow the waypoints.
+
+Card types:
+- Archer: cost 3, dmg 8, range 2.5 cells, rate 0.5s
+- Cannon: cost 5, dmg 20 splash 1 cell, range 2.2, rate 1.2s
+- Frost: cost 4, dmg 4 + slow 50% for 1.5s, range 2, rate 0.8s
+- Sniper: cost 6, dmg 45, range 4.5, rate 1.6s
+- Tesla: cost 7, chain to 3 targets, dmg 12 each, range 2.5, rate 0.9s
+
+Energy: start at 10, regen 1 per second? + bonus at wave end. Cards in hand: draw random cards, hand max 5, refill. Sell towers with right-click for a partial refund? Keep it simple: click a tower to sell (refund 50%)—or skip. Add selling by clicking an existing tower while a card is not selected? Let's do this: if no card is selected and you click on a tower → sell at 60%.
+
+Waves: auto-start with a countdown, or "Next Wave" button for early bonus. Keep it simple: waves auto-start after a 5-second countdown; button to start early.
+
+Enemy stats scale with wave number.
+
+Projectiles: homing bullets. Cannon has splash on impact. Tesla is instant chain lightning (draw lines). Frost applies slow.
+
+Rendering: draw the grid, path tiles, towers as shapes, enemies as circles with HP bars, projectiles, particles for death effects, floating damage text (maybe skip).
+
+Audio: simple oscillator beeps: shoot (short square wave), hit, explosion (noise), enemy death, wave start, game over. Keep a small helper.
+
+Let me write the code carefully and concisely.
+
+Layout:
+- body flex column; #topbar; #gameWrap flex:1 relative; canvas absolute filling it; #hand at bottom; overlays for start/gameover.
+
+Canvas scaling: use fixed logical size? Better: compute cell size from available area, grid 13x8. On resize, set canvas width/height to wrap's clientWidth/Height with devicePixelRatio. Compute origin offset to center the grid.
+
+Path waypoints (grid coords): design a path: enter at row 1 on the left, go right to col 9, down to row 5, left to col 3, down to row 7... let me define it for a 13x8 grid (cols 0..12, rows 0..7).
+
+Path: (-1,1) → (9,1) → (9,4) → (3,4) → (3,6) → (12,6)? Exit on the right. Waypoints in cells: [ {x:-1,y:1},{x:9,y:1},{x:9,y:4},{x:3,y:4},{x:3,y:6},{x:13,y:6} ]. Path cells = all cells between consecutive waypoints; mark as blocked.
+
+Enemy movement: pixel position from cell centers, move toward next waypoint at speed*cellSize.
+
+Placement: click on canvas → if a card is selected and the cell is empty (not path, no tower, enough energy) → place. Show range preview with hover highlight.
+
+Hand cards: HTML divs with name, cost, small description; clickable to select; grayed out if not affordable. Refill from deck each time you play one (random). Keep hand always at 5: after playing, draw a new random card.
+
+Energy regen: +1 every 1.2s, cap at 30? Show as integer.
+
+Wave logic: wave n: count = 6 + n*2, hp scale = 1 + (n-1)*0.25, speed slightly up. Enemy types: normal; fast from wave 2 (every 4th); tank from wave 3 (every 5th); boss every 5 waves. Spawn interval about 0.8s, decreasing.
+
+Reward per kill = value. Wave clear bonus energy +5+n.
+
+Lives 10, -1 on leak (-3 for boss).
+
+Game over overlay with score and restart button; also "Restart" in the top bar.
+
+Pause? Not needed.
+
+Sound helper:
+```js
+let actx=null;
+function initAudio(){ if(!actx){ try{actx=new (window.AudioContext||window.webkitAudioContext)();}catch(e){} } }
+function beep(freq,dur,type,vol,slide){...}
+```
+Call initAudio on first pointerdown/keydown.
+
+Now let me write the full HTML. Aim for compact but complete code.
+
+Tower rendering: circle base + shape per type, color-coded. Enemies: circles with HP bars, color per type.
+
+Chain lightning: store flashes {points, t} drawn for 0.15s.
+
+Frost slow: enemy.slowT timer; speed * (slow? 0.5 : 1).
+
+Projectile: {x,y,target,speed,dmg,type,splash}. Homing: home toward target; if target dies, move to last position and expire (cannon explodes at that point).
+
+Damage function: kill → reward energy + score, particles, sound.
+
+Let me write it.
+
+Card data:
+```js
+const TOWERS={
+ archer:{name:'Archer',cost:3,dmg:8,range:2.6,rate:0.5,color:'#7ec850',desc:'Fast single shot'},
+ cannon:{name:'Cannon',cost:5,dmg:18,range:2.4,rate:1.3,splash:1.1,color:'#e07840',desc:'Splash damage'},
+ frost:{name:'Frost',cost:4,dmg:5,range:2.2,rate:0.9,slow:1.6,color:'#6ec3e8',desc:'Slows enemies'},
+ sniper:{name:'Sniper',cost:6,dmg:42,range:4.6,rate:1.7,color:'#c06ee8',desc:'Long range, high dmg'},
+ tesla:{name:'Tesla',cost:7,dmg:13,range:2.5,rate:0.9,chain:3,color:'#f0d048',desc:'Chain to 3 foes'}
+};
+```
+
+Tower object: {type,x(cell),y,cd}. Target acquisition: nearest enemy in range (or furthest along the path? use max progress). Compute enemy.progress as total distance traveled.
+
+Sell: click a tower with no card selected → refund Math.floor(cost*0.6), remove.
+
+Hover: track mouse cell for preview.
+
+Wave countdown: state machine: 'start','playing','gameover'. During playing, phase: 'spawning'|'waiting'|'break' (countdown to next). Show "Next wave in X s" and a button? Make it clickable text on canvas, or an HTML button in the top bar. Add a small button in the top bar: "Send Wave (+2⚡)".
+
+Actually simpler: break time 6 seconds; button to start early with +3 energy bonus.
+
+Score: points per kill (enemy value * 10).
+
+Now let me write it all. Keep it organized.
+
+Canvas draw each frame: clear, draw grass background (subtle checker), path tiles, hover highlight, range circle, towers, enemies, projectiles, flashes, particles, floating text.
+
+Floating text for energy gain? Small "+n⚡" on kill—nice touch, keep as a small array.
+
+Grid size: cols=13, rows=8. cell = min(w/cols, h/rows) with margin. Origin ox=(w - cell*cols)/2, oy same.
+
+Enemy pixel position: compute from waypoint list in pixels (cell centers). Precompute pathPts on resize.
+
+Spawn: enemy at pathPts[0] (off-screen left).
+
+Movement:
+```js
+function moveEnemy(e,dt){ let sp=e.speed*(e.slowT>0?0.5:1)*cell*dt; while(sp>0 && e.wp<pathPts.length-1){ const t=pathPts[e.wp+1]; const dx=t.x-e.x,dy=t.y-e.y; const d=Math.hypot(dx,dy); if(d<=sp){e.x=t.x;e.y=t.y;e.wp++;sp-=d;} else {e.x+=dx/d*sp; e.y+=dy/d*sp; sp=0;} } e.progress += ... }
+```
+Progress: track total distance moved. If wp is at the end → leak.
+
+Enemy types:
+- grunt: hp 20*scale, speed 1.6 (cells/sec), reward 1
+- fast: hp 12*scale, speed 2.8, reward 1
+- tank: hp 55*scale, speed 1.0, reward 2
+- boss: hp 300*scale, speed 0.7, reward 8, leak -3
+
+scale = 1+ (wave-1)*0.22.
+
+Spawn queue is built at wave start: type array.
+
+OK, code:
+
+HTML structure:
+
+```html
+<!DOCTYPE html><html><head><meta charset=utf-8><title>Tower Cards</title><style>...</style></head>
+<body>
+<div id="topbar">... stats ... <button id="waveBtn">Next Wave (+3)</button><button id="restartBtn">Restart</button></div>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="hand"></div>
+<div id="overlay" class="show"><h1>TOWER CARDS</h1><p>controls...</p><button id="startBtn">Start Game</button></div>
+<script>...</script>
+</body></html>
+```
+
+Overlay is also used for game over (changes content).
+
+Hand: 5 card divs, each with cost badge, name, description. Rebuild every frame? Only on change; simpler to rebuild innerHTML when hand changes and update afford state via class each frame. Update text/classes in a function called from the loop (lightweight enough)—but rebuilding DOM every frame is bad. Keep card elements persistent, update classes/text only when values change... Simplest: renderHand() on change (play/draw), and each frame just toggle 'afford' class per card. Let's do that.
+
+Card element:
+```html
+<div class="card"><div class="cost">3⚡</div><div class="cname">Archer</div><div class="cdesc">Fast single shot</div></div>
+```
+
+Selected card has a .sel class.
+
+Click canvas: if selectedCardIdx != null → try to place; otherwise check tower under mouse → sell (with confirm? no, just sell and show floating text). Actually accidental selling is annoying; require... let's keep it as-is, refund 60%, show "-Tower sold +X⚡" text.
+
+Keyboard too: 1-5 to select cards, Esc/0 to deselect, R to restart on game over? Also Space to send wave early. Add to how-to-play instructions.
+
+Now let me write the code fully.
+
+Audio functions:
+```js
+function tone(f,d,type='square',v=0.15,f2){
+ if(!actx)return; const t=actx.currentTime; const o=actx.createOscillator(),g=actx.createGain();
+ o.type=type;o.frequency.setValueAtTime(f,t); if(f2)o.frequency.exponentialRampToValueAtTime(f2,t+d);
+ g.gain.setValueAtTime(v,t); g.gain.exponentialRampToValueAtTime(0.001,t+d);
+ o.connect(g).connect(actx.destination); o.start(t); o.stop(t+d);
+}
+```
+Sounds: shoot tone(600,0.08,'square',0.05,300); cannon boom: noise? use low-freq triangle + fast down-slide; hit: tone(200,0.05,...); death: tone(400→100,0.15); place: tone(500,0.1,'sine',0.1,700); error: tone(120,0.15,'sawtooth'); wave: arpeggio; gameover: descending.
+
+Noise for explosion: create buffer. Keep it simple with just oscillators.
+
+Main loop with requestAnimationFrame and dt clamp.
+
+State object G holding everything; reset() function.
+
+Let me count the path cells to mark: iterate waypoints in grid coords, fill cells between them (clamped to grid). Path cell set stored as a "x,y" key.
+
+Grid waypoints: [[-1,1],[9,1],[9,4],[3,4],[3,6],[13,6]]. Cell centers: px = ox + (gx+0.5)*cell.
+
+pathPts computed from these using current cell/ox/oy; recompute on resize. Enemy positions are in pixel coords; if canvas resizes during play, positions go off. Acceptable—can also scale enemy positions by ratio. Simpler: store enemies' positions as path-relative? Alternative: store everything in grid units and multiply by cell when drawing/moving. Speed is already in cells/sec. Range is in cells. This makes it resize-friendly! Let's do that: all game coords in cell units. Path points in cell units (fixed). Projectiles also in cell units. Draw multiplies by cell + origin.
+
+So enemy.x,y are in cell units, speed is cells/sec, range is in cells, splash radius in cells.
+
+Projectiles: {x,y,tx,ty target ref,speed cells/sec (e.g., 10),dmg,type}. Update: move toward target position (current if alive); if dist<0.15 → impact.
+
+Tesla: no projectile; on fire, find chain targets: start from nearest in range, then nearest to previous within 2.0 of it. Apply damage, add flash {pts:[...],t:0.15}.
+
+Frost bullet applies slow on hit.
+
+Cannon splash: on impact, damage all enemies within radius, particles.
+
+Target selection: max-progress enemy in range.
+
+Tower firing sound per type.
+
+Particles: {x,y,vx,vy,life,color,size}.
+
+Floating text: {x,y,txt,t,color}.
+
+OK let me write the file. Also handle DPR scaling: canvas.width = w*dpr; ctx.setTransform(dpr,0,0,dpr,0,0); draw in CSS pixels.
+
+Mouse coords: e.clientX - rect.left → css px; convert to cell: gx = Math.floor((mx-ox)/cell).
+
+Hover state {gx,gy}.
+
+Top bar stats: lives ❤, wave, energy ⚡, score. Update via DOM textContent each frame (lightweight enough, or only on change—fine).
+
+Break phase: G.phase='break', G.breakT=6 (first wave is 3 after start?). Start: phase 'break' with breakT=5. When breakT<=0 → startWave(). During spawn and waiting for all dead → phase='break' with bonus energy.
+
+waveBtn only clickable during break, +3 energy.
+
+Game over: lives<=0 → state='over', show overlay with score, restart button.
+
+Restart: reset(); hide overlay; state='playing'.
+
+Start screen buttons: Start Game → initAudio, reset, playing.
+
+Now let me write the code.
+
+Card draw: random type from keys each time.
+
+Hand: array of 5 types. On play: hand[i]=randomType().
+
+Selection index variable selIdx (or -1). Keyboard 1-5 selects/toggles.
+
+Placement check: gx,gy in bounds, not path key, no tower at cell, energy>=cost.
+
+Tower map: store in an object keyed by "x,y" for O(1), plus array for iteration. Or just keep an array and find. Array is fine (few towers).
+
+Sell: find tower at cell → refund floor(cost*0.6), remove, floating text.
+
+Draw order and visuals—keep it moderately pretty: grass checker of two greens, path a tan with darker border, start/end markers.
+
+Tower draw: rounded square base color, inner symbol:
+- archer: triangle
+- cannon: circle
+- frost: snowflake-ish (asterisk lines)
+- sniper: crosshair lines
+- tesla: lightning zigzag
+Simplify: colored base + white glyph letter? Use a simple shape.
+
+Enemy draw: circle in type color, HP bar above, boss is bigger. Slow tint: blue ring.
+
+OK, let me write the final code. Estimated about 450 lines. Here we go.
+
+Edge case: enemies with slowT decrement.
+
+Damage function:
+```js
+function hurt(e,dmg){ if(e.dead)return; e.hp-=dmg; if(e.hp<=0){e.dead=true; G.energy=Math.min(30,G.energy+e.reward); G.score+=e.reward*10; floatText(...'+⚡'); particles; tone...} }
+```
+
+Wave spawn: build queue at startWave: for i in count: pick type. Spawn timer interval = max(0.35, 0.9 - wave*0.02).
+
+Count: 6+wave*2. Boss wave (wave%5==0): add boss at end, maybe fewer others.
+
+Lives: grunt/fast leak 1, tank 2, boss 4? Let's do damage=1 for normal types, boss = 3. Lives 15.
+
+Energy cap 40. Regen: G.energyT += dt; every 1.1s +1 (only during playing state). Start energy 8? Wave 1 archer cost 3—OK start at 8.
+
+Wave clear bonus: +4+floor(wave/2) energy, floating text in the center? Just update stats and play sound.
+
+Now let me write it.
+
+Card CSS: dark theme, gradient background.
+
+Final answer: single html block.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tower Cards — Tower Defense Card Game</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; user-select:none; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#141a24; font-family:'Segoe UI',Arial,sans-serif; color:#e8eefc; }
+  #topbar { display:flex; align-items:center; gap:14px; padding:6px 12px; background:#0d1320; border-bottom:2px solid #2a3b5c; font-size:15px; flex-wrap:wrap; }
+  .stat { background:#1a2540; border:1px solid #33487a; border-radius:6px; padding:3px 10px; white-space:nowrap; }
+  .stat b { color:#ffd76a; }
+  #topbar button { margin-left:auto; background:#2f6fe0; color:#fff; border:none; border-radius:6px; padding:5px 12px; font-size:14px; cursor:pointer; }
+  #topbar button + button { margin-left:8px; background:#3a4a6b; }
+  #topbar button:hover { filter:brightness(1.15); }
+  #waveBtn:disabled { opacity:.4; cursor:default; }
+  #wrap { position:relative; flex:1; width:100%; }
+  body { display:flex; flex-direction:column; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; display:block; cursor:crosshair; }
+  #hand { display:flex; gap:8px; padding:8px 10px; background:#0d1320; border-top:2px solid #2a3b5c; justify-content:center; flex-wrap:nowrap; overflow:hidden; }
+  .card { position:relative; width:118px; min-width:96px; background:linear-gradient(160deg,#22304f,#17203a); border:2px solid #3b5388; border-radius:10px; padding:6px 8px 8px; cursor:pointer; transition:transform .08s, border-color .08s; }
+  .card:hover { transform:translateY(-4px); }
+  .card.sel { border-color:#ffd76a; box-shadow:0 0 12px rgba(255,215,106,.5); transform:translateY(-6px); }
+  .card.noafford { opacity:.45; filter:grayscale(.6); cursor:not-allowed; }
+  .card .cost { position:absolute; top:-8px; right:-6px; background:#ffd76a; color:#20314f; font-weight:bold; border-radius:12px; padding:2px 9px; font-size:13px; box-shadow:0 2px 4px rgba(0,0,0,.5); }
+  .card .cname { font-weight:bold; font-size:15px; margin-top:2px; }
+  .card .cdesc { font-size:11px; color:#9fb2d8; line-height:1.3; min-height:28px; }
+  .card .cicon { width:100%; height:34px; border-radius:6px; margin-bottom:4px; display:flex; align-items:center; justify-content:center; font-size:20px; background:rgba(0,0,0,.25); }
+  #overlay { position:absolute; inset:0; background:rgba(8,12,22,.92); display:none; flex-direction:column; align-items:center; justify-content:center; text-align:center; z-index:10; padding:20px; }
+  #overlay.show { display:flex; }
+  #overlay h1 { font-size:min(56px,9vw); letter-spacing:4px; background:linear-gradient(180deg,#ffe9a0,#f0a03c); -webkit-background-clip:text; background-clip:text; color:transparent; margin-bottom:12px; }
+  #overlay p { max-width:560px; line-height:1.7; color:#b9c8e8; font-size:15px; margin-bottom:8px; white-space:pre-line; }
+  #overlay .big { font-size:22px; color:#ffd76a; margin-bottom:14px; }
+  #overlay button { margin-top:16px; background:linear-gradient(180deg,#4b93ff,#2f6fe0); color:#fff; border:none; border-radius:10px; padding:12px 36px; font-size:20px; font-weight:bold; cursor:pointer; box-shadow:0 4px 14px rgba(47,111,224,.5); }
+  #overlay button:hover { filter:brightness(1.15); transform:scale(1.03); }
+</style>
+</head>
+<body>
+<div id="topbar">
+  <span class="stat">❤ <b id="sLives">15</b></span>
+  <span class="stat">Wave <b id="sWave">0</b></span>
+  <span class="stat">⚡ <b id="sEnergy">8</b>/40</span>
+  <span class="stat">Score <b id="sScore">0</b></span>
+  <button id="waveBtn">Send Wave (+3⚡)</button>
+  <button id="restartBtn">Restart</button>
+</div>
+<div id="wrap"><canvas id="cv"></canvas>
+  <div id="overlay" class="show">
+    <h1>TOWER CARDS</h1>
+    <p>Defend the path! Enemies march left to right.
+Play cards from your hand to build towers on empty grass tiles.
+
+• Click a card (or press 1–5), then click a tile to build
+• Click an existing tower (no card selected) to sell it for 60%
+• Earn ⚡ energy over time, per kill and per cleared wave
+• Space / "Send Wave" starts the next wave early for bonus energy
+
+Towers auto-attack. Survive forever — every 5th wave has a BOSS!</p>
+    <button id="startBtn">Start Game</button>
+  </div>
+</div>
+<div id="hand"></div>
+
+<script>
+(function(){
+"use strict";
+// ---------- constants ----------
+var COLS=13, ROWS=8;
+var PATH_GRID=[[-1,1],[9,1],[9,4],[3,4],[3,6],[13,6]];
+var TOWERS={
+  archer:{name:'Archer',icon:'🏹',cost:3,dmg:8, range:2.6,rate:0.5, color:'#7ec850',desc:'Fast single-target shots'},
+  cannon:{name:'Cannon',icon:'💣',cost:5,dmg:18,range:2.4,rate:1.3,splash:1.1,color:'#e07840',desc:'Explosion deals splash damage'},
+  frost:{ name:'Frost', icon:'❄️',cost:4,dmg:5, range:2.2,rate:0.9,slow:1.6,color:'#6ec3e8',desc:'Chills & slows enemies 50%'},
+  sniper:{name:'Sniper',icon:'🎯',cost:6,dmg:42,range:4.6,rate:1.7,color:'#c06ee8',desc:'Very long range, huge damage'},
+  tesla:{ name:'Tesla', icon:'⚡',cost:7,dmg:13,range:2.5,rate:0.9,chain:3,color:'#f0d048',desc:'Lightning chains to 3 enemies'}
+};
+var TKEYS=Object.keys(TOWERS);
+var ENEMY_TYPES={
+  grunt:{hp:20,speed:1.6,radius:0.28,color:'#e05555',reward:1,dmg:1},
+  fast:{ hp:12,speed:2.9,radius:0.22,color:'#ffb347',reward:1,dmg:1},
+  tank:{ hp:60,speed:1.0,radius:0.36,color:'#8a5fd6',reward:2,dmg:2},
+  boss:{ hp:320,speed:0.7,radius:0.48,color:'#e0399e',reward:8,dmg:3}
+};
+
+// ---------- audio ----------
+var actx=null;
+function initAudio(){ if(!actx){ try{ actx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } if(actx&&actx.state==='suspended') actx.resume(); }
+function tone(f,d,type,v,f2){
+  if(!actx) return;
+  try{
+    var t=actx.currentTime,o=actx.createOscillator(),g=actx.createGain();
+    o.type=type||'square'; o.frequency.setValueAtTime(f,t);
+    if(f2) o.frequency.exponentialRampToValueAtTime(Math.max(1,f2),t+d);
+    g.gain.setValueAtTime(v||0.1,t); g.gain.exponentialRampToValueAtTime(0.001,t+d);
+    o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t+d+0.02);
+  }catch(e){}
+}
+var SFX={
+  shoot:function(){tone(650,0.07,'square',0.04,320);},
+  cannon:function(){tone(120,0.25,'triangle',0.18,40);tone(90,0.3,'sawtooth',0.08,30);},
+  frost:function(){tone(900,0.12,'sine',0.07,1400);},
+  sniper:function(){tone(1600,0.1,'square',0.06,200);},
+  tesla:function(){tone(300,0.15,'sawtooth',0.09,900);},
+  place:function(){tone(420,0.1,'sine',0.12,720);},
+  sell:function(){tone(600,0.1,'sine',0.1,300);},
+  error:function(){tone(140,0.18,'sawtooth',0.1,90);},
+  kill:function(){tone(520,0.12,'square',0.06,120);},
+  leak:function(){tone(200,0.3,'sawtooth',0.14,80);},
+  wave:function(){tone(440,0.12,'square',0.09);setTimeout(function(){tone(660,0.15,'square',0.09);},120);},
+  clear:function(){tone(523,0.12,'sine',0.12);setTimeout(function(){tone(784,0.2,'sine',0.12);},130);},
+  over:function(){tone(392,0.3,'sawtooth',0.12,196);setTimeout(function(){tone(196,0.6,'sawtooth',0.12,78);},250);}
+};
+
+// ---------- dom ----------
+var cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+var wrap=document.getElementById('wrap');
+var sLives=document.getElementById('sLives'), sWave=document.getElementById('sWave'),
+    sEnergy=document.getElementById('sEnergy'), sScore=document.getElementById('sScore');
+var waveBtn=document.getElementById('waveBtn'), restartBtn=document.getElementById('restartBtn');
+var overlay=document.getElementById('overlay'), startBtn=document.getElementById('startBtn');
+var handEl=document.getElementById('hand');
+
+// ---------- layout ----------
+var cell=40, ox=0, oy=0;
+function resize(){
+  var w=wrap.clientWidth,h=wrap.clientHeight,dpr=Math.min(2,window.devicePixelRatio||1);
+  cv.width=w*dpr; cv.height=h*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+  cell=Math.floor(Math.min((w-20)/COLS,(h-20)/ROWS));
+  ox=Math.floor((w-cell*COLS)/2); oy=Math.floor((h-cell*ROWS)/2);
+}
+window.addEventListener('resize',resize);
+
+var pathCells={};
+(function(){
+  for(var i=0;i<PATH_GRID.length-1;i++){
+    var a=PATH_GRID[i],b=PATH_GRID[i+1];
+    var x=a[0],y=a[1],sx=Math.sign(b[0]-x),sy=Math.sign(b[1]-y);
+    while(true){ if(x>=0&&x<COLS&&y>=0&&y<ROWS) pathCells[x+','+y]=true;
+      if(x===b[0]&&y===b[1])break; x+=sx; y+=sy; }
+  }
+})();
+function pathPts(){ // cell units (grid coords, center-based)
+  return PATH_GRID.map(function(p){return {x:p[0]+0.5,y:p[1]+0.5};});
+}
+
+// ---------- game state ----------
+var G;
+function reset(){
+  G={ state:'playing', wave:0, lives:15, energy:8, score:0,
+      towers:[], enemies:[], projs:[], flashes:[], parts:[], texts:[],
+      hand:TKEYS.map(randomType), sel:-1,
+      phase:'break', breakT:4, spawnQ:[], spawnT:0, energyT:0 };
+  renderHand(); updateTop();
+}
+function randomType(){ return TKEYS[Math.floor(Math.random()*TKEYS.length)]; }
+
+// ---------- waves ----------
+function startWave(){
+  G.wave++; G.phase='spawning'; G.spawnQ=[]; G.spawnT=0.5;
+  var n=G.wave, count=6+n*2;
+  for(var i=0;i<count;i++){
+    var t='grunt';
+    if(n>=2 && i%4===3) t='fast';
+    if(n>=3 && i%5===4) t='tank';
+    G.spawnQ.push(t);
+  }
+  if(n%5===0){ G.spawnQ.pop(); G.spawnQ.push('boss'); }
+  SFX.wave(); addText(COLS/2,ROWS/2,'WAVE '+n,'#ffd76a',1.4);
+}
+function hpScale(){ return 1+(G.wave-1)*0.22; }
+
+// ---------- enemies ----------
+function spawnEnemy(type){
+  var d=ENEMY_TYPES[type], p=pathPts()[0];
+  G.enemies.push({type:type,x:p.x,y:p.y,wp:1,hp:d.hp*hpScale(),maxHp:d.hp*hpScale(),
+    speed:d.speed*(1+G.wave*0.01),radius:d.radius,color:d.color,reward:d.reward,dmg:d.dmg,
+    slowT:0,progress:0,dead:false});
+}
+function moveEnemy(e,dt){
+  var sp=e.speed*(e.slowT>0?0.5:1)*dt;
+  var pts=pathPts();
+  while(sp>0 && e.wp<pts.length){
+    var t=pts[e.wp], dx=t.x-e.x, dy=t.y-e.y, d=Math.hypot(dx,dy);
+    if(d<=sp){ e.x=t.x; e.y=t.y; e.wp++; sp-=d; }
+    else { e.x+=dx/d*sp; e.y+=dy/d*sp; sp=0; }
+  }
+  e.progress+=sp;
+  if(e.slowT>0) e.slowT-=dt;
+  if(e.wp>=pts.length){ // leaked
+    e.dead=true; G.lives-=e.dmg; SFX.leak();
+    addText(pts[pts.length-1].x-1,pts[pts.length-1].y,'-'+e.dmg+' ❤','#ff6a6a',1);
+    if(G.lives<=0){ G.lives=0; gameOver(); }
+  }
+}
+function hurt(e,dmg){
+  if(e.dead) return;
+  e.hp-=dmg;
+  if(e.hp<=0){
+    e.dead=true;
+    var gain=e.reward;
+    G.energy=Math.min(40,G.energy+gain);
+    G.score+=e.reward*10;
+    SFX.kill();
+    addText(e.x,e.y-0.3,'+'+gain+'⚡','#ffd76a',0.8);
+    for(var i=0;i<10;i++){
+      var a=Math.random()*Math.PI*2,s=1+Math.random()*3;
+      G.parts.push({x:e.x,y:e.y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:0.4,maxLife:0.4,color:e.color,size:0.08});
+    }
+  }
+}
+
+// ---------- towers ----------
+function towerAt(gx,gy){ for(var i=0;i<G.towers.length;i++) if(G.towers[i].gx===gx&&G.towers[i].gy===gy) return G.towers[i]; return null; }
+function placeTower(gx,gy,type){
+  var d=TOWERS[type];
+  if(G.energy<d.cost) { SFX.error(); addText(gx+0.5,gy+0.5,'Need ⚡','#ff6a6a',0.8); return; }
+  if(pathCells[gx+','+gy]) { SFX.error(); return; }
+  if(towerAt(gx,gy)) { SFX.error(); return; }
+  G.energy-=d.cost;
+  G.towers.push({type:type,gx:gx,gy:gy,x:gx+0.5,y:gy+0.5,cd:0,angle:-Math.PI/2});
+  SFX.place();
+}
+function sellTower(t){
+  var refund=Math.floor(TOWERS[t.type].cost*0.6);
+  G.energy=Math.min(40,G.energy+refund);
+  G.towers.splice(G.towers.indexOf(t),1);
+  SFX.sell();
+  addText(t.x,t.y,'Sold +'+refund+'⚡','#8fd2ff',0.9);
+}
+function fireTower(t,dt){
+  t.cd-=dt; if(t.cd>0) return;
+  var d=TOWERS[t.type];
+  // target: most-progressed enemy in range
+  var best=null,bp=-1;
+  for(var i=0;i<G.enemies.length;i++){
+    var e=G.enemies[i]; if(e.dead) continue;
+    var dist=Math.hypot(e.x-t.x,e.y-t.y);
+    if(dist<=d.range && e.progress>bp){ bp=e.progress; best=e; }
+  }
+  if(!best) return;
+  t.cd=d.rate; t.angle=Math.atan2(best.y-t.y,best.x-t.x);
+  if(t.type==='tesla'){
+    var hitList=[],cur=best,used={};
+    for(var c=0;c<d.chain;c++){
+      if(!cur||used[cur]) break;
+      used[cur]=true; hitList.push(cur);
+      hurt(cur,d.dmg);
+      var nx=null,nd=1e9;
+      for(var i=0;i<G.enemies.length;i++){
+        var e2=G.enemies[i]; if(e2.dead||used[e2])continue;
+        var dd=Math.hypot(e2.x-cur.x,e2.y-cur.y);
+        if(dd<2.2&&dd<nd){nd=dd;nx=e2;}
+      }
+      cur=nx;
+    }
+    var pts=[{x:t.x,y:t.y}].concat(hitList.map(function(h){return {x:h.x,y:h.y};}));
+    G.flashes.push({pts:pts,t:0.15});
+    SFX.tesla();
+  } else if(t.type==='sniper'){
+    G.flashes.push({pts:[{x:t.x,y:t.y},{x:best.x,y:best.y}],t:0.08,beam:true});
+    hurt(best,d.dmg); SFX.sniper();
+  } else {
+    G.projs.push({x:t.x,y:t.y,target:best,lastX:best.x,lastY:best.y,speed:12,dmg:d.dmg,type:t.type});
+    if(t.type==='cannon')SFX.cannon(); else if(t.type==='frost')SFX.frost(); else SFX.shoot();
+  }
+}
+
+// ---------- projectiles / fx ----------
+function updateProjs(dt){
+  for(var i=G.projs.length-1;i>=0;i--){
+    var p=G.projs[i];
+    if(p.target&&!p.target.dead){ p.lastX=p.target.x; p.lastY=p.target.y; }
+    var dx=p.lastX-p.x, dy=p.lastY-p.y, d=Math.hypot(dx,dy), step=p.speed*dt;
+    if(d<=step||d<0.12){
+      // impact
+      if(p.type==='cannon'){
+        var r=TOWERS.cannon.splash;
+        for(var j=0;j<G.enemies.length;j++){
+          var e=G.enemies[j]; if(e.dead)continue;
+          if(Math.hypot(e.x-p.lastX,e.y-p.lastY)<=r+e.radius) hurt(e,p.dmg);
+        }
+        for(var k=0;k<14;k++){ var a=Math.random()*Math.PI*2,s=1+Math.random()*3;
+          G.parts.push({x:p.lastX,y:p.lastY,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:0.35,maxLife:0.35,color:'#ff9c4a',size:0.1}); }
+        tone(80,0.2,'triangle',0.12,30);
+      } else {
+        if(p.target&&!p.target.dead){
+          hurt(p.target,p.dmg);
+          if(p.type==='frost'&&!p.target.dead) p.target.slowT=TOWERS.frost.slow;
+        }
+      }
+      G.projs.splice(i,1);
+    } else { p.x+=dx/d*step; p.y+=dy/d*step; }
+  }
+}
+function addText(x,y,txt,color,scale){ G.texts.push({x:x,y:y,txt:txt,color:color,t:1.2,scale:scale||1}); }
+
+// ---------- main update ----------
+var last=0;
+function loop(ts){
+  requestAnimationFrame(loop);
+  var dt=Math.min(0.05,(ts-last)/1000||0.016); last=ts;
+  if(G&&G.state==='playing') update(dt);
+  draw();
+}
+function update(dt){
+  // energy regen
+  G.energyT+=dt; while(G.energyT>=1.1){ G.energyT-=1.1; G.energy=Math.min(40,G.energy+1); }
+
+  if(G.phase==='break'){
+    G.breakT-=dt;
+    if(G.breakT<=0) startWave();
+  } else if(G.phase==='spawning'){
+    G.spawnT-=dt;
+    if(G.spawnT<=0 && G.spawnQ.length){
+      spawnEnemy(G.spawnQ.shift());
+      G.spawnT=Math.max(0.35,0.9-G.wave*0.02);
+    }
+    if(!G.spawnQ.length) G.phase='fighting';
+  } else if(G.phase==='fighting'){
+    if(!G.enemies.length){
+      G.phase='break'; G.breakT=6;
+      var bonus=4+Math.floor(G.wave/2);
+      G.energy=Math.min(40,G.energy+bonus);
+      SFX.clear(); addText(COLS/2,ROWS/2,'Wave cleared! +'+bonus+'⚡','#8fff9c',1.2);
+    }
+  }
+
+  for(var i=G.enemies.length-1;i>=0;i--){ var e=G.enemies[i]; if(!e.dead) moveEnemy(e,dt); else G.enemies.splice(i,1); }
+  for(var i=0;i<G.towers.length;i++) fireTower(G.towers[i],dt);
+  updateProjs(dt);
+
+  for(var i=G.flashes.length-1;i>=0;i--){ G.flashes[i].t-=dt; if(G.flashes[i].t<=0)G.flashes.splice(i,1); }
+  for(var i=G.parts.length-1;i>=0;i--){ var p=G.parts[i]; p.x+=p.vx*dt;p.y+=p.vy*dt;p.life-=dt; if(p.life<=0)G.parts.splice(i,1); }
+  for(var i=G.texts.length-1;i>=0;i--){ var t=G.texts[i]; t.y-=dt*0.6; t.t-=dt; if(t.t<=0)G.texts.splice(i,1); }
+  updateTop();
+}
+
+// ---------- drawing ----------
+function P(x,y){ return {x:ox+x*cell, y:oy+y*cell}; }
+function draw(){
+  var w=wrap.clientWidth,h=wrap.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  if(!G) return;
+  // grass checker
+  for(var gy=0;gy<ROWS;gy++)for(var gx=0;gx<COLS;gx++){
+    ctx.fillStyle=((gx+gy)%2===0)?'#2e5c38':'#2a5534';
+    ctx.fillRect(ox+gx*cell,oy+gy*cell,cell,cell);
+  }
+  // path
+  for(var key in pathCells){
+    var p=key.split(','),gx=+p[0],gy=+p[1];
+    ctx.fillStyle='#8a7346'; ctx.fillRect(ox+gx*cell,oy+gy*cell,cell,cell);
+    ctx.fillStyle='rgba(0,0,0,.12)';
+    ctx.fillRect(ox+gx*cell+2,oy+gy*cell+2,cell-4,3);
+  }
+  // start/end markers
+  var s=P(-0.5,1), eP=P(COLS+0.2,6);
+  ctx.font=(cell*0.7)+'px serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('🚪',ox+ (COLS-0.4)*cell, oy+(6.5)*cell);
+
+  // hover preview
+  if(hover.gx>=0&&hover.gx<COLS&&hover.gy>=0&&hover.gy<ROWS){
+    var gx=hover.gx,gy=hover.gy;
+    var valid = !pathCells[gx+','+gy] && !towerAt(gx,gy);
+    if(G.sel>=0){
+      var d=TOWERS[G.hand[G.sel]];
+      ctx.fillStyle=valid?'rgba(120,255,140,.28)':'rgba(255,90,90,.3)';
+      ctx.fillRect(ox+gx*cell,oy+gy*cell,cell,cell);
+      var c=P(gx+0.5,gy+0.5);
+      ctx.beginPath(); ctx.arc(c.x,c.y,d.range*cell,0,Math.PI*2);
+      ctx.fillStyle='rgba(255,255,255,.08)'; ctx.fill();
+      ctx.strokeStyle='rgba(255,255,255,.35)'; ctx.setLineDash([6,5]); ctx.stroke(); ctx.setLineDash([]);
+    } else if(towerAt(gx,gy)){
+      var t=towerAt(gx,gy), td=TOWERS[t.type], c2=P(t.x,t.y);
+      ctx.beginPath(); ctx.arc(c2.x,c2.y,td.range*cell,0,Math.PI*2);
+      ctx.fillStyle='rgba(255,215,106,.08)'; ctx.fill();
+      ctx.strokeStyle='rgba(255,215,106,.4)'; ctx.setLineDash([6,5]); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle='rgba(255,120,120,.35)';
+      ctx.fillRect(ox+gx*cell,oy+gy*cell,cell,cell);
+    }
+  }
+
+  // towers
+  for(var i=0;i<G.towers.length;i++){
+    var t=G.towers[i], d=TOWERS[t.type], c=P(t.x,t.y), r=cell*0.36;
+    ctx.fillStyle='rgba(0,0,0,.3)'; ctx.beginPath(); ctx.arc(c.x,c.y+2,r,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle=d.color; roundRect(c.x-r,c.y-r,r*2,r*2,cell*0.14); ctx.fill();
+    ctx.strokeStyle='rgba(0,0,0,.35)'; ctx.lineWidth=2; roundRect(c.x-r,c.y-r,r*2,r*2,cell*0.14); ctx.stroke();
+    // glyph
+    ctx.save(); ctx.translate(c.x,c.y); ctx.rotate(t.angle);
+    ctx.fillStyle='#fff'; ctx.strokeStyle='#fff'; ctx.lineWidth=Math.max(2,cell*0.06);
+    if(t.type==='archer'){ ctx.beginPath(); ctx.moveTo(r*0.8,0); ctx.lineTo(-r*0.4,-r*0.5); ctx.lineTo(-r*0.4,r*0.5); ctx.closePath(); ctx.fill(); }
+    else if(t.type==='cannon'){ ctx.beginPath(); ctx.arc(0,0,r*0.42,0,Math.PI*2); ctx.fill(); ctx.fillStyle='#331'; ctx.fillRect(r*0.1,-r*0.18,r*0.75,r*0.36); }
+    else if(t.type==='frost'){ for(var k=0;k<3;k++){ ctx.save(); ctx.rotate(k*Math.PI/3); ctx.beginPath(); ctx.moveTo(-r*0.6,0); ctx.lineTo(r*0.6,0); ctx.stroke(); ctx.restore(); } }
+    else if(t.type==='sniper'){ ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(r*0.85,0); ctx.stroke(); ctx.beginPath(); ctx.arc(r*0.15,0,r*0.3,0,Math.PI*2); ctx.stroke(); }
+    else { ctx.beginPath(); ctx.moveTo(-r*0.4,-r*0.6); ctx.lineTo(r*0.15,-r*0.05); ctx.lineTo(-r*0.1,r*0.05); ctx.lineTo(r*0.4,r*0.6); ctx.stroke(); }
+    ctx.restore();
+  }
+
+  // enemies
+  for(var i=0;i<G.enemies.length;i++){
+    var e=G.enemies[i], c=P(e.x,e.y), r=e.radius*cell;
+    ctx.fillStyle='rgba(0,0,0,.3)'; ctx.beginPath(); ctx.ellipse(c.x,c.y+r*0.7,r,r*0.4,0,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle=e.color; ctx.beginPath(); ctx.arc(c.x,c.y,r,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='rgba(0,0,0,.4)'; ctx.lineWidth=2; ctx.stroke();
+    if(e.slowT>0){ ctx.strokeStyle='#8fd8ff'; ctx.lineWidth=3; ctx.beginPath(); ctx.arc(c.x,c.y,r+3,0,Math.PI*2); ctx.stroke(); }
+    // eyes
+    ctx.fillStyle='#fff';
+    var ex=r*0.35;
+    ctx.beginPath(); ctx.arc(c.x-ex*0.4,c.y-r*0.15,r*0.18,0,Math.PI*2); ctx.arc(c.x+ex*0.6,c.y-r*0.15,r*0.18,0,Math.PI*2); ctx.fill();
+    // hp bar
+    var bw=r*2,bh=Math.max(4,cell*0.09), bx=c.x-r, by=c.y-r-cell*0.16;
+    ctx.fillStyle='rgba(0,0,0,.55)'; ctx.fillRect(bx-1,by-1,bw+2,bh+2);
+    var f=Math.max(0,e.hp/e.maxHp);
+    ctx.fillStyle=f>0.5?'#7ee06a':(f>0.25?'#ffd76a':'#ff6a5a');
+    ctx.fillRect(bx,by,bw*f,bh);
+  }
+
+  // projectiles
+  for(var i=0;i<G.projs.length;i++){
+    var p=G.projs[i], c=P(p.x,p.y);
+    if(p.type==='cannon'){ ctx.fillStyle='#3a2a1a'; ctx.beginPath(); ctx.arc(c.x,c.y,cell*0.14,0,Math.PI*2); ctx.fill(); }
+    else if(p.type==='frost'){ ctx.fillStyle='#bfeaff'; ctx.beginPath(); ctx.arc(c.x,c.y,cell*0.1,0,Math.PI*2); ctx.fill(); }
+    else { ctx.strokeStyle='#d8ffb0'; ctx.lineWidth=3; var a=Math.atan2(p.lastY-p.y,p.lastX-p.x);
+      ctx.beginPath(); ctx.moveTo(c.x-Math.cos(a)*cell*0.16,c.y-Math.sin(a)*cell*0.16);
+      ctx.lineTo(c.x+Math.cos(a)*cell*0.16,c.y+Math.sin(a)*cell*0.16); ctx.stroke(); }
+  }
+
+  // flashes (lightning / beams)
+  for(var i=0;i<G.flashes.length;i++){
+    var f=G.flashes[i];
+    ctx.strokeStyle=f.beam?'rgba(230,180,255,'+(f.t/0.08)+')':'rgba(240,220,90,'+(f.t/0.15)+')';
+    ctx.lineWidth=f.beam?2:Math.max(2,cell*0.07);
+    ctx.beginPath();
+    for(var j=0;j<f.pts.length;j++){ var c=P(f.pts[j].x,f.pts[j].y); if(j===0)ctx.moveTo(c.x,c.y); else ctx.lineTo(c.x,c.y); }
+    ctx.stroke();
+  }
+
+  // particles
+  for(var i=0;i<G.parts.length;i++){
+    var p=G.parts[i], c=P(p.x,p.y), a=Math.max(0,p.life/p.maxLife);
+    ctx.globalAlpha=a; ctx.fillStyle=p.color;
+    ctx.beginPath(); ctx.arc(c.x,c.y,p.size*cell,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+  }
+
+  // floating text
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  for(var i=0;i<G.texts.length;i++){
+    var t=G.texts[i], c=P(t.x,t.y);
+    ctx.globalAlpha=Math.min(1,t.t);
+    ctx.font='bold '+(cell*0.35*(t.scale||1))+'px Segoe UI, Arial';
+    ctx.strokeStyle='rgba(0,0,0,.7)'; ctx.lineWidth=3; ctx.strokeText(t.txt,c.x,c.y);
+    ctx.fillStyle=t.color; ctx.fillText(t.txt,c.x,c.y);
+    ctx.globalAlpha=1;
+  }
+
+  // break banner
+  if(G.state==='playing'&&G.phase==='break'){
+    var m=Math.ceil(G.breakT);
+    ctx.font='bold '+(cell*0.5)+'px Segoe UI, Arial';
+    ctx.strokeStyle='rgba(0,0,0,.7)'; ctx.lineWidth=4;
+    ctx.strokeText('Next wave in '+m+' — press SPACE',ox+COLS*cell/2,oy-cell*0.4);
+    ctx.fillStyle='#ffd76a';
+    ctx.fillText('Next wave in '+m+' — press SPACE',ox+COLS*cell/2,oy-cell*0.4);
+  }
+}
+function roundRect(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+
+// ---------- top bar / hand ----------
+function updateTop(){
+  sLives.textContent=G.lives; sWave.textContent=G.wave;
+  sEnergy.textContent=Math.floor(G.energy); sScore.textContent=G.score;
+  waveBtn.disabled = !(G.state==='playing'&&G.phase==='break');
+  for(var i=0;i<cardEls.length;i++){
+    cardEls[i].classList.toggle('noafford', G.energy<TOWERS[G.hand[i]].cost);
+    cardEls[i].classList.toggle('sel', i===G.sel);
+  }
+}
+var cardEls=[];
+function renderHand(){
+  handEl.innerHTML=''; cardEls=[];
+  for(var i=0;i<G.hand.length;i++){
+    (function(idx){
+      var d=TOWERS[G.hand[idx]];
+      var el=document.createElement('div'); el.className='card';
+      el.innerHTML='<div class="cost">'+d.cost+'⚡</div><div class="cicon" style="color:'+d.color+'">'+d.icon+'</div><div class="cname" style="color:'+d.color+'">'+d.name+'</div><div class="cdesc">'+d.desc+'</div>';
+      el.addEventListener('click',function(){ initAudio(); G.sel=(G.sel===idx?-1:idx); updateTop(); });
+      handEl.appendChild(el); cardEls.push(el);
+    })(i);
+  }
+}
+
+// ---------- input ----------
+var hover={gx:-1,gy:-1};
+cv.addEventListener('mousemove',function(ev){
+  var r=cv.getBoundingClientRect(), mx=ev.clientX-r.left, my=ev.clientY-r.top;
+  hover.gx=Math.floor((mx-ox)/cell); hover.gy=Math.floor((my-oy)/cell);
+});
+cv.addEventListener('mouseleave',function(){ hover.gx=-1; hover.gy=-1; });
+cv.addEventListener('click',function(ev){
+  initAudio();
+  if(!G||G.state!=='playing') return;
+  var r=cv.getBoundingClientRect(), gx=Math.floor((ev.clientX-r.left-ox)/cell), gy=Math.floor((ev.clientY-r.top-oy)/cell);
+  if(gx<0||gx>=COLS||gy<0||gy>=ROWS) return;
+  if(G.sel>=0){
+    placeTower(gx,gy,G.hand[G.sel]);
+    G.hand[G.sel]=randomType(); renderHand();
+    G.sel=-1; updateTop();
+  } else {
+    var t=towerAt(gx,gy);
+    if(t) sellTower(t), updateTop();
+  }
+});
+window.addEventListener('keydown',function(ev){
+  initAudio();
+  if(!G) return;
+  var k=ev.key;
+  if(k>='1'&&k<='5'){ var i=+k-1; G.sel=(G.sel===i?-1:i); updateTop(); }
+  else if(k==='Escape'||k==='0'){ G.sel=-1; updateTop(); }
+  else if(k===' '){ ev.preventDefault(); sendWaveEarly(); }
+  else if((k==='r'||k==='R')&&G.state!=='playing'){ startGame(); }
+});
+function sendWaveEarly(){
+  if(G&&G.state==='playing'&&G.phase==='break'){
+    G.energy=Math.min(40,G.energy+3); addText(COLS/2,ROWS/2-0.5,'+3⚡ early!','#8fff9c',0.9); startWave();
+  }
+}
+waveBtn.addEventListener('click',function(){ initAudio(); sendWaveEarly(); });
+
+// ---------- screens ----------
+function showOverlay(html){ overlay.innerHTML=html; overlay.classList.add('show'); }
+function gameOver(){
+  G.state='over'; SFX.over(); saveBest();
+  showOverlay('<h1>GAME OVER</h1><p class="big">You survived '+G.wave+(G.wave===1?' wave':' waves')+' — Score: '+G.score+'</p><p>Best score: '+(bestScore()||0)+'</p><button id="againBtn">Play Again (R)</button>');
+  document.getElementById('againBtn').addEventListener('click',startGame);
+}
+function startGame(){ initAudio(); reset(); overlay.classList.remove('show'); }
+startBtn.addEventListener('click',startGame);
+restartBtn.addEventListener('click',function(){ initAudio(); if(G&&G.state!=='over') startGame(); else gameOver_screen_restart(); });
+function gameOver_screen_restart(){ startGame(); }
+
+// ---------- best score ----------
+function saveBest(){ try{ var b=+localStorage.getItem('towerCardsBest')||0; if(G.score>b) localStorage.setItem('towerCardsBest',G.score);}catch(e){} }
+function bestScore(){ try{ return +localStorage.getItem('towerCardsBest')||0; }catch(e){ return 0; } }
+
+// ---------- boot ----------
+resize();
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
+```
