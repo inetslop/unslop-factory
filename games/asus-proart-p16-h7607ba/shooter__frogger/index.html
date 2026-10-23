@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Frog Shooter</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#0a0f1a;}
+  body{display:flex;align-items:center;justify-content:center;}
+  canvas{background:#000;image-rendering:auto;box-shadow:0 0 40px rgba(0,255,180,.15);}
+</style>
+</head>
+<body>
+<canvas id="c" width="540" height="720"></canvas>
+<script>
+(function(){
+"use strict";
+const canvas=document.getElementById('c'),ctx=canvas.getContext('2d');
+const W=540,H=720,HUD=60,COLS=9,ROWS=11,CELL=60;
+
+function fit(){
+  const s=Math.min(window.innerWidth/W,window.innerHeight/H);
+  canvas.style.width=(W*s)+'px';canvas.style.height=(H*s)+'px';
+}
+window.addEventListener('resize',fit);fit();
+
+/* ---------- audio ---------- */
+let AC=null;
+function ac(){ if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}} return AC; }
+function tone(f,d,type,vol,delay,slide){
+  const a=ac(); if(!a)return;
+  try{
+    const t0=a.currentTime+(delay||0);
+    const o=a.createOscillator(),g=a.createGain();
+    o.type=type||'square';o.frequency.setValueAtTime(f,t0);
+    if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(20,slide),t0+d);
+    g.gain.setValueAtTime(vol||0.15,t0);
+    g.gain.exponentialRampToValueAtTime(0.0001,t0+d);
+    o.connect(g);g.connect(a.destination);o.start(t0);o.stop(t0+d+0.02);
+  }catch(e){}
+}
+const sfxMove=()=>tone(1400,0.035,'square',0.04);
+const sfxShoot=()=>tone(950,0.12,'square',0.1,0,280);
+const sfxHit=()=>{tone(220,0.16,'sawtooth',0.2,0,55);tone(140,0.2,'square',0.12,0.03,40);};
+const sfxDie=()=>tone(420,0.55,'triangle',0.25,0,55);
+const sfxSplash=()=>{tone(300,0.3,'sine',0.2,0,60);tone(180,0.35,'sine',0.15,0.05,50);};
+const sfxWin=()=>{[523,659,784,1046].forEach((f,i)=>tone(f,0.14,'square',0.14,i*0.09));};
+
+/* ---------- state ---------- */
+let state='start'; // start, play, dead, gameover
+let score=0,best=0,lives=3,level=1;
+try{best=parseInt(localStorage.getItem('frogShooterBest')||'0',10)||0;}catch(e){}
+function saveBest(){try{localStorage.setItem('frogShooterBest',''+best);}catch(e){}}
+
+let turtles=[],cars=[],bugs=[],bullets=[],particles=[];
+let bugTimer=2, deadTimer=0, shootCd=0, moveCd=0, time=0;
+let pads=[];
+const frog={col:4,row:10,x:0,y:0,alive:false};
+
+function laneY(r){return HUD+r*CELL;}
+function speedMul(){return 1+(level-1)*0.16;}
+
+function setupBoard(){
+  turtles=[];cars=[];bugs=[];bullets=[];particles=[];
+  const m=speedMul();
+  // river rows 1..4 : [speed, count]
+  const river=[[42*m,5],[-58*m,4],[72*m,6],[-48*m,5]];
+  for(let r=0;r<4;r++){
+    const row=r+1,sp=river[r][0],n=river[r][1];
+    for(let i=0;i<n;i++)turtles.push({row:row,x:i*(W/n)+Math.random()*30,sp:sp,w:52});
+  }
+  // road rows 6..9 : [kind, speed, count]
+  const road=[['car',-95*m,3],['truck',78*m,2],['car',-125*m,4],['truck',60*m,3]];
+  for(let r=0;r<4;r++){
+    const row=r+6,kind=road[r][0],sp=road[r][1],n=road[r][2];
+    for(let i=0;i<n;i++)cars.push({row:row,x:i*(W/n)+Math.random()*40,sp:sp,kind:kind,w:kind==='truck'?96:72});
+  }
+  // pads
+  const all=[0,1,2,3,4,5,6,7,8];
+  pads=[];
+  for(let i=all.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[all[i],all[j]]=[all[j],all[i]];}
+  pads=all.slice(0,4);
+}
+
+function resetFrog(){
+  frog.col=4;frog.row=10;frog.x=frog.col*CELL+CELL/2;frog.y=laneY(10)+CELL/2;frog.alive=true;
+}
+
+function newGame(){
+  score=0;lives=3;level=1;time=0;bugTimer=2.5;
+  setupBoard();resetFrog();state='play';
+}
+
+/* ---------- particles ---------- */
+function burst(x,y,color,n,spd){
+  for(let i=0;i<n;i++){
+    const a=Math.random()*Math.PI*2,s=(0.3+Math.random()*0.7)*(spd||160);
+    particles.push({x:x,y:y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-40,life:0.5+Math.random()*0.4,max:0.9,color:color,size:2+Math.random()*4});
+  }
+}
+
+/* ---------- input ---------- */
+window.addEventListener('keydown',function(e){
+  const k=e.key;
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].indexOf(k)>=0)e.preventDefault();
+  ac(); // unlock audio on first input
+  if(state==='start'){ if(k==='Enter'||k===' ')newGame(); return; }
+  if(state==='gameover'){ if(k==='Enter'||k===' '||k==='r'||k==='R')newGame(); return; }
+  if(k==='r'||k==='R'){ newGame(); return; }
+  if(state!=='play'||!frog.alive)return;
+
+  const now=time;
+  if((k===' '||k==='Spacebar')&&shootCd<=0){
+    bullets.push({x:frog.x,y:frog.y-24});
+    shootCd=0.25;sfxShoot();
+  }
+  if(moveCd<=0){
+    let dc=0,dr=0;
+    if(k==='ArrowUp'||k==='w'||k==='W')dr=-1;
+    else if(k==='ArrowDown'||k==='s'||k==='S')dr=1;
+    else if(k==='ArrowLeft'||k==='a'||k==='A')dc=-1;
+    else if(k==='ArrowRight'||k==='d'||k==='D')dc=1;
+    if(dc||dr){
+      const nc=frog.col+dc,nr=frog.row+dr;
+      if(nc>=0&&nc<COLS&&nr>=0&&nr<ROWS){
+        frog.col=nc;frog.row=nr;moveCd=0.14;sfxMove();
+      }
+    }
+  }
+});
+
+/* ---------- update ---------- */
+function die(cause){
+  if(!frog.alive)return;
+  frog.alive=false;lives--;state='dead';deadTimer=1.3;
+  if(cause==='water')sfxSplash();else sfxDie();
+  burst(frog.x,frog.y,cause==='water'?'#7ec8ff':'#ffd24a',26,190);
+}
+
+function winPad(){
+  frog.alive=false;
+  score+=200+(level-1)*50;sfxWin();
+  burst(frog.x,frog.y,'#baff6e',30,200);
+  level++;
+  setupBoard();resetFrog();state='play';bugTimer=2.5;
+}
+
+function update(dt){
+  time+=dt;
+  shootCd-=dt;moveCd-=dt;
+
+  // move lanes always (looks alive even on dead pause)
+  for(const t of turtles){
+    t.x+=t.sp*dt;
+    if(t.sp>0&&t.x>W+70)t.x=-70;
+    if(t.sp<0&&t.x<-70)t.x=W+70;
+  }
+  for(const c of cars){
+    c.x+=c.sp*dt;
+    if(c.sp>0&&c.x>W+120)c.x=-120;
+    if(c.sp<0&&c.x<-120)c.x=W+120;
+  }
+
+  // bugs
+  if(state==='play'){
+    bugTimer-=dt;
+    if(bugTimer<=0&&bugs.length<6){
+      const row=6+Math.floor(Math.random()*4);
+      const fromLeft=Math.random()<0.5;
+      bugs.push({row:row,x:fromLeft?-30:W+30,vx:(fromLeft?1:-1)*(28+Math.random()*35)*speedMul(),baseY:laneY(row)+CELL/2,t:Math.random()*10,dead:false});
+      bugTimer=Math.max(0.8,2.6-level*0.18)+Math.random();
+    }
+  }
+  for(const b of bugs){
+    if(b.dead)continue;
+    b.x+=b.vx*dt;b.t+=dt;
+    b.y=b.baseY+Math.sin(b.t*4)*9;
+  }
+  bugs=bugs.filter(b=>!b.dead&&b.x>-60&&b.x<W+60);
+
+  // bullets
+  for(const bl of bullets){
+    bl.y-=520*dt;
+    for(const b of bugs){
+      if(!b.dead&&Math.abs(bl.x-b.x)<22&&Math.abs(bl.y-b.y)<20){
+        b.dead=true;score+=50;sfxHit();burst(b.x,b.y,'#ff5a4d',18,170);bl.y=-999;
+      }
+    }
+  }
+  bullets=bullets.filter(b=>b.y>HUD-20);
+
+  // frog
+  if(state==='play'&&frog.alive){
+    const tx=frog.col*CELL+CELL/2, ty=laneY(frog.row)+CELL/2;
+    const f=1-Math.exp(-dt*22);
+    frog.x+=(tx-frog.x)*f;frog.y+=(ty-frog.y)*f;
+
+    // riding a turtle?
+    let riding=false;
+    for(const t of turtles){
+      if(t.row===frog.row&&Math.abs(t.x-frog.x)<t.w/2+10){
+        frog.x+=t.sp*dt*0.95;riding=true;break;
+      }
+    }
+    if(frog.x<CELL*0.35||frog.x>W-CELL*0.35){die('edge');}
+
+    const curRow=Math.round((frog.y-HUD-CELL/2)/CELL);
+    // water check
+    if(curRow>=1&&curRow<=4){
+      let onTurtle=false;
+      for(const t of turtles)if(t.row===curRow&&Math.abs(t.x-frog.x)<t.w/2+8){onTurtle=true;break;}
+      if(!onTurtle){die('water');}
+    }
+    // goal row
+    if(curRow===0){
+      if(pads.indexOf(frog.col)>=0)winPad();else die('water');
+    }
+    // cars & bugs collision (AABB)
+    if(frog.alive){
+      for(const c of cars){
+        if(Math.abs(c.row-frog.row)<1.2&&Math.abs(c.x-frog.x)<(c.w/2+16)&&Math.abs(laneY(c.row)+CELL/2-frog.y)<34){die('car');break;}
+      }
+      for(const b of bugs){
+        if(!b.dead&&Math.abs(b.x-frog.x)<26&&Math.abs(b.y-frog.y)<24){die('bug');break;}
+      }
+    }
+  }
+
+  // particles
+  for(const p of particles){p.life-=dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=300*dt;}
+  particles=particles.filter(p=>p.life>0);
+
+  if(state==='dead'){
+    deadTimer-=dt;
+    if(deadTimer<=0){
+      if(lives>0){setupBoard();resetFrog();state='play';}
+      else{
+        state='gameover';
+        if(score>best){best=score;saveBest();}
+      }
+    }
+  }
+  if(score>best)best=score;
+}
+
+/* ---------- drawing ---------- */
+function rr(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+
+function drawFrog(x,y,scale){
+  ctx.save();ctx.translate(x,y);ctx.scale(scale||1,scale||1);
+  ctx.fillStyle='#2fae4a';
+  // legs
+  ctx.beginPath();ctx.ellipse(-15,10,9,6,-0.5,0,7);ctx.fill();
+  ctx.beginPath();ctx.ellipse(15,10,9,6,0.5,0,7);ctx.fill();
+  ctx.beginPath();ctx.ellipse(-14,-12,8,5,-0.6,0,7);ctx.fill();
+  ctx.beginPath();ctx.ellipse(14,-12,8,5,0.6,0,7);ctx.fill();
+  // body
+  ctx.beginPath();ctx.ellipse(0,0,17,19,0,0,7);ctx.fill();
+  ctx.fillStyle='#3ecf62';ctx.beginPath();ctx.ellipse(0,4,12,13,0,0,7);ctx.fill();
+  // eyes
+  ctx.fillStyle='#fff';
+  ctx.beginPath();ctx.arc(-8,-13,6,0,7);ctx.fill();
+  ctx.beginPath();ctx.arc(8,-13,6,0,7);ctx.fill();
+  ctx.fillStyle='#111';
+  ctx.beginPath();ctx.arc(-8,-14,2.6,0,7);ctx.fill();
+  ctx.beginPath();ctx.arc(8,-14,2.6,0,7);ctx.fill();
+  ctx.restore();
+}
+
+function drawTurtle(t){
+  const y=laneY(t.row)+CELL/2;
+  ctx.save();ctx.translate(t.x,y);
+  ctx.fillStyle='#3f7d3a';
+  // head + legs
+  const d=t.sp>=0?1:-1;
+  ctx.beginPath();ctx.arc(d*26,0,7,0,7);ctx.fill();
+  [[-14,-20],[14,-20],[-14,20],[14,20]].forEach(p=>{ctx.beginPath();ctx.arc(p[0],p[1],5,0,7);ctx.fill();});
+  // shell
+  ctx.fillStyle='#2c5e28';ctx.beginPath();ctx.ellipse(0,0,22,19,0,0,7);ctx.fill();
+  ctx.strokeStyle='#4f8f45';ctx.lineWidth=2;
+  ctx.beginPath();ctx.ellipse(0,0,22,19,0,0,7);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(-22,0);ctx.lineTo(22,0);ctx.moveTo(0,-19);ctx.lineTo(0,19);ctx.stroke();
+  ctx.restore();
+}
+
+function drawCar(c){
+  const y=laneY(c.row)+CELL/2;
+  ctx.save();ctx.translate(c.x,y);
+  if(c.kind==='truck'){
+    ctx.fillStyle='#c8542f';rr(-46,-19,70,38,6);ctx.fill();
+    ctx.fillStyle='#e8d9b0';rr(24,-19,22,38,5);ctx.fill();
+    ctx.fillStyle='#8a3a1e';ctx.fillRect(-46,-4,70,8);
+  }else{
+    const cols=['#e0b422','#c0392b','#4a7fb5','#8e6bbf'];
+    ctx.fillStyle=cols[Math.floor(c.x/40+cols.length)%cols.length];
+    rr(-34,-18,68,36,9);ctx.fill();
+    ctx.fillStyle='#bfe6ff';rr(-16,-12,34,24,5);ctx.fill();
+  }
+  ctx.fillStyle='#1a1a1a';
+  [[-28,16],[28,16],[-28,-16],[28,-16]].forEach(p=>{ctx.beginPath();ctx.arc(p[0],p[1],5,0,7);ctx.fill();});
+  ctx.restore();
+}
+
+function drawBug(b){
+  ctx.save();ctx.translate(b.x,b.y);
+  ctx.fillStyle='#3a2418';
+  for(let i=-1;i<=1;i++){
+    ctx.beginPath();ctx.ellipse(-10,i*7,6,2.5,-0.5,0,7);ctx.fill();
+    ctx.beginPath();ctx.ellipse(10,i*7,6,2.5,0.5,0,7);ctx.fill();
+  }
+  ctx.fillStyle='#e8433a';ctx.beginPath();ctx.ellipse(0,0,13,10,0,0,7);ctx.fill();
+  ctx.fillStyle='#ff7d6e';ctx.beginPath();ctx.ellipse(-2,-3,7,5,0,0,7);ctx.fill();
+  ctx.fillStyle='#111';
+  ctx.beginPath();ctx.arc(9,-4,2.4,0,7);ctx.fill();
+  ctx.beginPath();ctx.arc(9,4,2.4,0,7);ctx.fill();
+  ctx.restore();
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // background per row
+  for(let r=0;r<ROWS;r++){
+    const y=laneY(r);
+    if(r===0){ctx.fillStyle='#123c6b';}
+    else if(r>=1&&r<=4){ctx.fillStyle=(r%2)?'#1a5fa8':'#1e6ab8';}
+    else if(r===5||r===10){ctx.fillStyle='#2f7d33';}
+    else{ctx.fillStyle=(r%2)?'#3a3f47':'#343941';}
+    ctx.fillRect(0,y,W,CELL);
+  }
+  // road dashes
+  ctx.strokeStyle='rgba(255,255,255,.35)';ctx.lineWidth=3;ctx.setLineDash([18,16]);
+  for(let r=6;r<10;r++){
+    ctx.beginPath();ctx.moveTo(0,laneY(r)+CELL);ctx.lineTo(W,laneY(r)+CELL);ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  // pads
+  for(const pc of pads){
+    const x=pc*CELL+CELL/2,y=laneY(0)+CELL/2;
+    ctx.fillStyle='#3fae4c';ctx.beginPath();ctx.ellipse(x,y,24,18,0,0,7);ctx.fill();
+    ctx.fillStyle='#5fd96f';ctx.beginPath();ctx.ellipse(x-4,y-4,14,9,0,0,7);ctx.fill();
+  }
+
+  for(const t of turtles)drawTurtle(t);
+  for(const c of cars)drawCar(c);
+  for(const b of bugs)if(!b.dead)drawBug(b);
+
+  // bullets
+  ctx.fillStyle='#ffe45e';
+  for(const bl of bullets){
+    ctx.beginPath();ctx.moveTo(bl.x,bl.y-12);ctx.lineTo(bl.x-5,bl.y+6);ctx.lineTo(bl.x+5,bl.y+6);ctx.closePath();ctx.fill();
+    ctx.fillStyle='rgba(255,200,60,.4)';ctx.fillRect(bl.x-1.5,bl.y+6,3,8);ctx.fillStyle='#ffe45e';
+  }
+
+  // frog
+  if(frog.alive&&(state==='play')){
+    const bob=Math.sin(time*10)*1.5;
+    drawFrog(frog.x,frog.y+bob,1);
+  }else if(state==='dead'){
+    ctx.fillStyle='#fff';ctx.font='bold 42px monospace';ctx.textAlign='center';
+    ctx.fillText('!',frog.x,frog.y+14);
+  }
+
+  // particles
+  for(const p of particles){
+    ctx.globalAlpha=Math.max(0,p.life/p.max);
+    ctx.fillStyle=p.color;
+    ctx.fillRect(p.x-p.size/2,p.y-p.size/2,p.size,p.size);
+  }
+  ctx.globalAlpha=1;
+
+  /* HUD */
+  ctx.fillStyle='#0d1524';ctx.fillRect(0,0,W,HUD);
+  ctx.strokeStyle='rgba(80,200,255,.3)';ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(0,HUD);ctx.lineTo(W,HUD);ctx.stroke();
+  ctx.textAlign='left';ctx.fillStyle='#fff';ctx.font='bold 22px monospace';
+  ctx.fillText('SCORE '+score,14,38);
+  ctx.textAlign='center';ctx.fillStyle='#7ec8ff';ctx.font='16px monospace';
+  ctx.fillText('BEST '+best+'   LV '+level,W/2+30,38);
+  ctx.textAlign='right';
+  for(let i=0;i<lives;i++)drawFrog(W-24-i*30,30,0.55);
+
+  /* overlays */
+  if(state==='start'){
+    overlay();
+    ctx.fillStyle='#3ecf62';ctx.font='bold 52px monospace';ctx.textAlign='center';
+    ctx.fillText('FROG SHOOTER',W/2,240);
+    ctx.fillStyle='#fff';ctx.font='18px monospace';
+    ctx.fillText('Cross the road and river... but this time,',W/2,310);
+    ctx.fillText('you can shoot the mutant bugs!',W/2,336);
+    ctx.fillStyle='#ffe45e';ctx.font='17px monospace';
+    ctx.fillText('ARROWS / WASD  -  move',W/2,410);
+    ctx.fillText('SPACE  -  shoot bug (+50)',W/2,438);
+    ctx.fillText('REACH A LILY PAD  -  next level (+200)',W/2,466);
+    ctx.fillStyle='#9fd';ctx.font='16px monospace';
+    ctx.fillText('Cars and bugs kill you. Water kills too. Ride turtles!',W/2,510);
+    blink(W/2,580,'PRESS ENTER TO START');
+  }
+  if(state==='gameover'){
+    overlay();
+    ctx.fillStyle='#ff5a4d';ctx.font='bold 52px monospace';ctx.textAlign='center';
+    ctx.fillText('GAME OVER',W/2,300);
+    ctx.fillStyle='#fff';ctx.font='24px monospace';
+    ctx.fillText('SCORE '+score,W/2,360);
+    ctx.fillStyle='#ffe45e';ctx.font='18px monospace';
+    ctx.fillText(score>=best&&score>0?'NEW BEST!':'BEST '+best,W/2,395);
+    blink(W/2,470,'PRESS ENTER TO RESTART');
+  }
+}
+
+function overlay(){
+  ctx.fillStyle='rgba(5,10,20,.82)';ctx.fillRect(0,HUD,W,H-HUD);
+}
+function blink(x,y,txt){
+  if(Math.floor(time*2)%2)return;
+  ctx.fillStyle='#fff';ctx.font='bold 20px monospace';ctx.textAlign='center';
+  ctx.fillText(txt,x,y);
+}
+
+/* ---------- loop ---------- */
+let last=performance.now();
+function loop(now){
+  let dt=(now-last)/1000;last=now;
+  if(dt>0.05)dt=0.05;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
