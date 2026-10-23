@@ -1,0 +1,776 @@
+<think>
+The user wants a physics-based match-3 game as a single HTML file. Let me think about design: blocks fall with gravity, and when 3 or more of the same color align (row/column), they're destroyed and the blocks above fall down. This is essentially a "SameGame"/"Drop Match" style — blocks drop into a grid, and matches are cleared automatically.
+
+Design:
+- Grid, e.g. 8 columns × 10 rows. Blocks spawn at the top in random colors (4–5 colors).
+- Physics: blocks fall with gravity, bounce slightly? Keep it simple: per-block velocity, collision detection with floor/walls, land on the grid. Matches are detected on the settled grid, cleared with particle effects, and the blocks above resume falling.
+- Player controls: aim with left/right arrows or mouse, drop a block (space/click). Or auto-drop at fixed intervals? Better: player controls horizontal position and timing — this gives it gameplay meaning. Actually, in classic physics match-3 (like "SameGame"), pieces fall automatically. Let's go with player-controlled: the piece hovers at the top, moves left/right (smoothly), drops on space/click/down-arrow. If a stack reaches the top, game over. Score = number cleared × combo multiplier.
+
+Implementation:
+- Canvas fills the window, scales to fit. Fixed logical size, e.g. 480×640 grid area + HUD. Resize handler for scaling.
+- Blocks are drawn as rounded squares with gradients and glossy highlights.
+- Physics: falling blocks have vy, gravity; on landing they snap to a grid cell. Check for matches after each landing (and after cascade clears). Clearing: blocks shrink/fade animation + particles. Then recompute the support of remaining blocks — more simply: maintain a settled grid array; falling blocks are separate entities. When a falling block lands in column c at row r, place it and check matches on the entire settled grid; cleared cells become empty; then all settled blocks fall? If we keep settled as static, blocks above a cleared cell would float. To do real physics: after clearing, convert all settled blocks into dynamic falling entities (with vy=0) that fall to their new rest positions, and when they land re-check matches → cascades with combo multiplier. This is the fun "physics" part.
+
+So state machine:
+- 'aim': current piece at top position x (continuous), moves left/right; drop → 'falling'.
+- 'falling': block falls in its own column (x locked to a cell? or continuous x that snaps to nearest column on landing?). Simplest: lock the piece's x to the nearest grid column when dropped. Continuous motion during aim, snap on drop.
+- When it lands at a row: place into settled grid; check matches; if none → spawn new piece (aim). If yes → clear animation (short), then convert all settled blocks into falling entities with cascade multiplier++, and wait until everything is settled before checking matches again.
+
+Data structures:
+- settled: 2D array [row][col] = null or colorIndex.
+- dynamic: list of {col, x, y, vy, color} — but if col is fixed, each block just falls to its own row; that's fine, and visually nice with a slight bounce too.
+- Actually make it continuous x? Keep blocks in columns (classic). Add bounce: on landing vy = -vy*0.25, until |vy| is small → settle.
+
+Match detection: scan rows and columns for runs of 3+ of the same color; mark cells; clear.
+
+Particles on clear. Sound: Web Audio beeps — drop thud, clear pop (pitch rises with combo), game over.
+
+Game over: when a new piece can't spawn because there's a block in the topmost row? When a settled cell exists in row 0 and the stack reaches the top. Simpler: if on landing the row becomes < 0, or on spawn the column is filled to the top → game over.
+
+Score & best score via localStorage with try/catch.
+
+Controls: ←/→ or A/D to move, ↓/Space/click to drop. Start screen overlay; game-over screen with restart (R key or button).
+
+Canvas logical size: COLS=8, ROWS=10? Let's go 8×12 for depth. Cell size computed from window: fit grid + header into the window. Use a scale transform.
+
+Let me write the code.
+
+Constants:
+COLS=8, ROWS=12, colors = 4 colors (maybe 5). Keep 4 for playability.
+
+Logical layout: cellSize CS; board width = COLS*CS, height = ROWS*CS. Header height ~60. Total W = boardW + padding, H = header + boardH + padding. Compute CS from the window: CS = min((W-20)/COLS, (H-80)/ROWS).
+
+Drawing:
+- Background dark gradient.
+- Board frame.
+- Grid lines subtle.
+- Settled blocks, dynamic blocks, aiming piece with a drop guide line? Maybe show the target column highlight.
+- Score, combo display.
+
+Piece aim: px is continuous in [0, COLS*CS], move speed; snap on drop: col = clamp(round(px/CS - 0.5))? Piece width CS; center at px+CS/2; col = floor((px)/CS) clamped to 0..COLS-1.
+
+Falling block physics: y velocity, gravity g = 2600 px/s² (scaled by CS? use CS-based units). Use dt in seconds. Bounce coefficient of restitution 0.3, settle when |vy|<40 and near the rest position.
+
+Landing row: compute lowest empty row from the top in that column (using settled + other dynamic blocks in the same column?). Dynamic blocks are per-column; if multiple dynamic blocks are in the same column (after a cascade all fall), they might visually collide — but they're at different rows and falling to their own rest positions, so no problem as long as we compute rest position accounting for other dynamic blocks in the same column? When everything falls simultaneously after a clear, each block's target = resting on top of settled blocks below it... but during the fall other dynamic blocks above are also moving. Simplest: when converting to dynamic, compute targets based on current settled (with cleared cells empty) — blocks above land at positions where higher blocks will later rest; since all move downward together, if we sort by y per column, collisions won't be a problem. Each block's target y = the lowest available row below its original position considering settled + dynamic blocks below it in the same column. Compute: for each column, collect dynamic blocks sorted by row descending (bottom first), assign rows from the top of the stack upward... let me compute: bottom-most occupied settled row r0 (or ROWS). For dynamic blocks in that column sorted by y ascending (top→bottom)? The bottom-most block lands at r0-1, the one above it at r0-2, and so on. Since they all fall together maintaining relative order, no interpenetration occurs.
+
+Landing check: when block.y >= targetY, snap, vy = -vy*BOUNCE; if |vy| < threshold → settle into settled grid, remove from dynamic. Once a column's dynamics are all settled... actually once the entire dynamic list is empty → check matches with combo++.
+
+Combo: start at 0 on drop-landing; first clear is combo=1, each cascade increments. Score += clearedCount * 10 * combo.
+
+Game over condition: when a falling block from aim lands and its row becomes < 0 — meaning the column is full to the top before the piece lands. Or check after settle: if any settled cell in row 0 → can't spawn? That'd be game over only when it blocks new pieces. Classic: if stack reaches the top, game over. Check: after settling a dropped piece, if settled[0][col] is non-null (or actually any of row 0) → game over. Let's do this: if any cell in row 0 is filled and the player has to place more... simpler: on landing, if row <= 0 → game over? That's too strict maybe; use: after settle, if settled[0][col] exists → game over. Hmm, but a match might clear it. Check after cascade completes: if any of row 0 is filled → game over. Also check during aim — actually, if row 0 has blocks, new pieces have nowhere to go; trigger game over when the dynamic list empties and row 0 has any block. Also for immediate landing: compute landRow; if landRow < 0 then piece disappears at top → game over.
+
+Sound: AudioContext lazily created on first input. Functions: pop(combo) with rising pitch, thud (low sine), gameOver (descending tone), moveTick (maybe skip).
+
+Particles: {x,y,vx,vy,life,color}. Update and draw as small squares/circles.
+
+Aim drop guide: dashed line from piece to landing row? Nice touch: show a faint column highlight.
+
+HUD: score on left, best in middle?, combo popup text "COMBO x3" with animation.
+
+Start overlay & game-over overlay: HTML div positioned over canvas, or draw on canvas. Let's use an HTML overlay for crisp text and buttons. Restart button + R key.
+
+Resize: recompute CS, positions need to be rescaled — store positions in cell units? Simpler: store y in pixels but convert on resize: factor = newCS/oldCS; multiply x,y,vy,g etc. Or just restart the layout scaling: multiply all dynamic ys and aim px by ratio. Let's do that.
+
+Now let me write the code.
+
+Structure:
+
+```html
+<!DOCTYPE html><html><head><meta charset=utf-8><title>Gravity Match</title>
+<style>...</style></head>
+<body>
+<canvas id=c></canvas>
+<div id="overlay">... start screen ...</div>
+<script>...</script>
+</body></html>
+```
+
+Overlay: one div used for both start and game over, contents swapped.
+
+JS details:
+
+```js
+const COLS=8, ROWS=12, COLORS=[{main:'#ff5252',dark:'#b71c1c'},...]; // 4 colors: red, blue, green, yellow? Let's do 5 for more variety but harder. Use 4.
+```
+
+Colors: #ff6b6b, #4dabf7 / better palette:
+- Red #ff5e57, Orange? Keep 4: red #ff5252, blue #40c4ff, green #69f0ae, yellow #ffd740. Add purple #b388ff for 5th color — use 5? With auto-cascade and player control, 5 colors is fine but matches are rarer... let's stick with 4.
+
+State: 'menu','aim','falling','clearing','gameover'. 'clearing' is a short timer (0.25s) during which cleared cells animate (scale down); then convert to dynamic.
+
+Actually simpler: when match is found, immediately remove from settled, spawn particles + score, then convert all remaining to dynamic with combo++. No separate clearing state needed; the "physics" cascade IS the feedback. Add a small screen shake on clear.
+
+Let's define:
+
+```js
+let CS=40, boardX=0, boardY=70; // computed
+let settled, dynamic=[], particles=[], current=null, px=0, score, best, combo, shake, over=false;
+```
+
+spawnPiece(): color random, px = (COLS/2 - 0.5)*CS ... place at center. current={color, x:px, y:-CS} — aim y fixed at boardY-? Draw piece just above the board top, or in row -1 area? Place it at y = 0 (above the topmost row inside the board?) better: draw it hovering just above the board frame: y = -CS*0.9 (relative to board). On drop: col=floor(px/CS) clamped; falling block {col, x:col*CS, y:-CS, vy:0}.
+
+landRow for column: first row r from 0 where settled[r][col]==null → that's the landing row. If none → game over.
+
+Falling update: y += vy*dt; vy += G*dt; target = landRow*CS (recompute each frame — since it only changes when blocks above are... during a single drop, others don't change). When y >= target: y=target; if vy > minBounce then vy=-vy*0.3 else settle.
+
+Wait, bounce: after bouncing up and coming back down, re-snap at y>=target — handle with condition: if (y>=target && vy>0){ y=target; if(vy<SETTLE_V) settle else vy*=-0.3 }.
+
+Settle: settled[targetRow][col]=color; dynamic=[]? On initial drop dynamic has one block. After settle → checkMatches(combo=1). If no match → spawn new piece, state='aim'.
+
+checkMatches(): find all runs of 3+ in rows and columns of same color. If none return false. For each cell: score += 10*combo; particles at cell position; settled[r][c]=null. Then convert to dynamic: for each column, collect cells that are non-null, sort by row ascending (top→bottom); determine landing slots: bottom-most occupied settled... wait, we just cleared and converted all — after conversion settled is fully empty? No: only matched cells are removed from settled; the rest get converted. So per column: dynamicBlocks sorted by y descending (bottom first). Available rows below: since settled has holes (cleared cells), a block might fall into a hole. Target for each: scan the column's remaining blocks... let me compute: for each column, list of blocks with row indices; sort ascending (top→bottom). Then assign targets: for bottom-most block, target = ROWS-1 minus settled below? Since we're converting everything to dynamic, after conversion settled is empty. So per column: n blocks in top→bottom order; the bottommost lands at ROWS-1, next at ROWS-2, etc. Target row = ROWS - 1 - indexFromBottom. But wait — that ignores holes... no, since all fall to the bottom of the column, final arrangement is compacted at bottom: correct physics! Blocks stack from the bottom up. Yes — because everything falls simultaneously and nothing remains static below. So targetRow = (ROWS - count) + i where i is index from top? Let me verify: n blocks, sorted top→bottom i=0..n-1; final rows are (ROWS-n)..(ROWS-1), topmost block goes to ROWS-n. So target = (ROWS-n)+i.
+
+Then dynamic list entries {col, x: col*CS, y: row*CS, vy:0, color}. When all settle → checkMatches(combo+1). If no match and combo>1 → spawn new piece; if combo==0... initial drop has combo=1.
+
+Game-over check: after cascade completes (no matches), if any of settled[0][c] is non-null → game over. Also during aim drop if landRow<0 → game over immediately.
+
+Edge case: match detection should only run on settled grid — yes.
+
+Aim movement: keys held → px += speed*dt; clamp [0, COLS*CS - CS]. Speed = 12*CS/s? Maybe use 8 columns/sec. Also allow mouse: piece follows mouse x? Add: during aim state, mousemove sets targetX with lerp. Keep it simple: keyboard + click to drop + mouse movement steers (lerp px toward mouseX). Both are fine — set px directly from mouse when mouse moves.
+
+Input: window keydown: ArrowLeft/A → left=true; right; Space/ArrowDown/S → drop (if aim) or start/restart. R for restart on game over. M mute? Skip.
+
+Drop action: only in 'aim'. col = clamp(Math.round(px/CS - 0.5), 0, COLS-1)? Since px is left edge of piece width CS: col = Math.floor(px/CS) but if px is near right boundary... px clamped to [0,(COLS-1)*CS], so floor works, gives 0..COLS-1. Good.
+
+Sound via WebAudio:
+```js
+let AC=null; function beep(freq,dur,type='sine',vol=0.2){ if(!AC)return; ... }
+function initAudio(){ if(!AC){ try{AC=new (window.AudioContext||window.webkitAudioContext)()}catch(e){} } if(AC&&AC.state==='suspended')AC.resume(); }
+```
+Call initAudio on first keydown/click.
+
+pop(combo): freq = 300 + combo*120, triangle, short. thud: 90Hz sine 0.08s. gameOver: sequence of descending tones.
+
+Draw:
+- Clear, background gradient (#1a1c2c → #101223).
+- Apply shake offset via translate.
+- Board frame: rounded rect stroke, faint grid lines.
+- Column highlight for current aim: fill target column with rgba(255,255,255,0.04).
+- Draw settled blocks and dynamic blocks with drawBlock(x,y,color,scale=1).
+- Aim piece + dashed drop line to landing row (compute landRow for the snapped col; draw a ghost outline there at low alpha).
+- Particles.
+- HUD text: "SCORE 1234" top-left, "BEST ..." top-right, combo popup if combo>1 and recent: "COMBO xN!" with scale animation in center.
+
+drawBlock(x,y,colorIdx,scale): rounded rect with vertical gradient lighter→main→dark, inner highlight ellipse on top, subtle border. Use ctx.save/translate to center for scale.
+
+Combo popup timer: comboT=0.8 when combo increases; alpha and scale by decay.
+
+Screen shake: shake = min(8, 2+combo); each frame offset random * shake, shake decays *= (1-6*dt).
+
+localStorage: best with try/catch.
+
+Overlay HTML:
+```html
+<div id="overlay"><h1>GRAVITY MATCH</h1><p>controls...</p><button id="btn">PLAY</button></div>
+```
+Toggle contents for game over via JS: title "GAME OVER", score, button "RESTART".
+
+CSS: body margin 0, overflow hidden; canvas block; overlay absolute inset 0 flex center, background rgba(10,10,25,.85), z-index.
+
+Resize:
+```js
+function resize(){ W=innerWidth,H=innerHeight; dpr... canvas.width=W*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+ oldCS=CS; CS=Math.floor(Math.min((W-24)/COLS,(H-110)/ROWS)); boardX=(W-COLS*CS)/2; boardY=80;
+ if(oldCS){ const f=CS/oldCS; dynamic.forEach(b=>{b.y*=f;b.x=b.col*CS;b.vy*=f}); px*=f; }
+}
+```
+Note: after settling y is exact row*CS so no issue.
+
+Game loop with requestAnimationFrame, dt clamped to 0.033.
+
+Match detection code:
+```js
+function findMatches(){ const mark=Array.from({length:ROWS},()=>Array(COLS).fill(false));
+ // rows
+ for(let r=0;r<ROWS;r++){ let run=1; for(let c=1;c<=COLS;c++){ if(c<COLS&&settled[r][c]&&settled[r][c]===settled[r][c-1])run++; else{ if(run>=3&&settled[r][c-1]!=null) for(let k=c-run;k<c;k++)mark[r][k]=true; run=1; } } }
+ // columns similarly.
+ return mark;
+}
+```
+
+Then count marks; if 0 → none.
+
+Clear & cascade:
+```js
+function doCascade(comboVal){ let cleared=0; scan marked cells → particles, score+=10*comboVal each... maybe base 20.
+ settled[r][c]=null;
+ // convert
+ for(let c=0;c<COLS;c++){ const blocks=[]; for(let r=0;r<ROWS;r++) if(settled[r][c]!=null) blocks.push({col:c,row:r,color:settled[r][c]}); settled[r][c]=null... 
+  const n=blocks.length; blocks.forEach((b,i)=>{ b.target=(ROWS-n)+i; dynamic.push({col:b.col,x:b.col*CS,y:b.row*CS,vy:0,color:b.color,targetRow:b.target}); });
+ }
+ if(cleared>0){ combo=comboVal; comboT=1; shake=...; pop sound; }
+}
+```
+
+Settle logic in update: for each dynamic block: physics with target = targetRow*CS (for cascade) or computed landRow (for drop). Give all blocks a targetRow field. On initial drop: targetRow = landRow. Since nothing else moves during a single drop, it's constant — fine.
+
+When block settles: settled[targetRow][col]=color; thud sound (small); remove from dynamic. When dynamic.length===0: if state==='falling' → const m=findMatches(); if any → doCascade(1) (state stays 'cascade') else { checkGameOver or spawn }. Distinguish states: 'drop' vs 'cascade'. Let's have a single state 'falling' with pendingCombo. After empty:
+```js
+if(pendingMatches()){ doCascade(combo+... )}
+```
+Track comboCount: on initial drop landing, set curCombo=1; if match → cascade(1); after cascade settle → if match → cascade(curCombo+1) else finish (spawn or game over).
+
+Implement:
+```js
+function onAllSettled(){
+  const m=findMatches();
+  if(countMarks(m)>0){ curCombo++; doClear(m,curCombo); } // state stays 'falling'
+  else { curCombo=0; checkTop(); if(!over) spawnPiece(); }
+}
+```
+doClear sets state to 'clearing'? No — immediately convert to dynamic and keep state='falling'. But we need a brief pause so the player sees the clear? Immediate cascade is standard and fun. Add small delay: set state='cascadePause' with timer 0.15s, then start fall. Actually let's do it this way: on match → mark cells, spawn particles, remove from settled, convert to dynamic but with a "hold" — blocks just start falling; that IS the pause (they're at same position and start moving). Fine, immediate.
+
+Game over check: any of settled[0][c] non-null → gameOver(). Also during aim drop: landRow = first empty row in column; if none → gameOver() on drop.
+
+Also after spawn... fine.
+
+Score values: 10 per block × combo. Combo popup shown when curCombo>=2.
+
+Ghost preview: during aim, compute col and landRow for that column (if exists), draw a ghost block outline at row*CS with alpha 0.25, dashed line from piece to it.
+
+Aim piece y: boardY - CS*1.4? Draw above the board top: relative y = -CS*1.2. In board coordinates (translate by boardX,boardY), aim piece is at (px, -CS*0.9). Drop starts falling from y=-CS*0.9 with vy=200.
+
+Let me write the final code carefully.
+
+HUD: draw above board: "SCORE" small + value; best on right. Combo text center of board when comboT>0.
+
+Also add a subtle background starfield? Skip, keep clean. Maybe faint dots. Let's skip.
+
+Mute button? Add M to toggle mute — nice, low cost. Include in controls description.
+
+Now let me write it all out.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gravity Match</title>
+<style>
+html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#101223;font-family:'Segoe UI',Arial,sans-serif}
+#c{display:block;position:absolute;inset:0}
+#ov{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(8,10,24,.88);z-index:5;color:#fff;text-align:center}
+#ov h1{font-size:min(9vw,56px);margin:0 0 8px;letter-spacing:3px;background:linear-gradient(90deg,#ff5252,#ffd740,#69f0ae,#40c4ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+#ov p{color:#aab;font-size:16px;line-height:1.8;margin:6px 20px}
+kbd{background:#2a2e4a;border-radius:5px;padding:2px 8px;border:1px solid #444a75;color:#fff;font-family:inherit;font-size:13px}
+#btn{margin-top:18px;padding:12px 44px;font-size:20px;font-weight:bold;letter-spacing:2px;color:#101223;background:linear-gradient(180deg,#69f0ae,#2bd576);border:none;border-radius:30px;cursor:pointer;box-shadow:0 4px 18px rgba(60,255,150,.35)}
+#btn:hover{transform:scale(1.05)}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ov">
+ <h1>GRAVITY MATCH</h1>
+ <p id="sub"><kbd>←</kbd><kbd>→</kbd> or mouse to aim &nbsp;·&nbsp; <kbd>Space</kbd>/<kbd>↓</kbd>/click to drop<br>Match 3+ of a color — blocks fall with gravity!<br><kbd>M</kbd> mute</p>
+ <button id="btn">PLAY</button>
+</div>
+<script>
+...
+</script>
+</body></html>
+```
+
+JS:
+
+```js
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const ov=document.getElementById('ov'),btn=document.getElementById('btn'),sub=document.getElementById('sub');
+const COLS=8,ROWS=12;
+const COLORS=[['#ff7b73','#e0453f','#a8261f'],['#6ec6ff','#3d9be9','#1f5fa8'],['#8af5b6','#3fd67f','#1e8f4c'],['#ffe07a','#ffc93c','#c78f12']];
+let W,H,CS=40,bx=0,by=0;
+let settled,dynamic=[],particles=[],current=null,px=0;
+let state='menu',score=0,best=0,curCombo=0,comboT=0,shake=0,muted=false,over=false;
+try{best=+localStorage.getItem('gmBest')||0}catch(e){}
+const G=()=>2600*(CS/40), BOUNCE=0.32;
+```
+
+Hmm gravity is CS-scaled: g = 22*CS per s²? At CS=40 → 880... let's do g = CS*70 (at CS=40 that's 2800). Settle velocity threshold = CS*1.2.
+
+Resize:
+```js
+function resize(){
+ W=innerWidth;H=innerHeight;const dpr=Math.min(devicePixelRatio||1,2);
+ cv.width=W*dpr;cv.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);
+ const old=CS;
+ CS=Math.max(16,Math.floor(Math.min((W-16)/COLS,(H-96)/ROWS)));
+ bx=Math.round((W-COLS*CS)/2); by=Math.round((H-(ROWS*CS+70))/2)+40; 
+ if(old&&old!==CS){const f=CS/old;px*=f;dynamic.forEach(b=>{b.y*=f;b.vy*=f;b.x=b.col*CS});}
+}
+addEventListener('resize',resize);
+```
+
+by: board top; want header space of ~40 above. Total = ROWS*CS + 70 (header 50 + margin). by = (H - ROWS*CS)/2 + 10 maybe. Let's do: by = Math.round((H-ROWS*CS)/2)+14.
+
+init():
+```js
+function reset(){ settled=Array.from({length:ROWS},()=>Array(COLS).fill(null)); dynamic=[];particles=[];score=0;curCombo=0;comboT=0;shake=0;over=false;px=(COLS/2-0.5)*CS; spawn(); }
+function spawn(){ const c=Math.floor(Math.random()*COLORS.length); current={color:c,x:px}; state='aim'; }
+```
+
+drop():
+```js
+function drop(){ if(state!=='aim'||!current)return; const col=Math.max(0,Math.min(COLS-1,Math.floor(current.x/CS))); let r=0; while(r<ROWS&&settled[r][col]!=null)r++; if(r>=ROWS){gameOver();return;} dynamic.push({col,x:col*CS,y:-CS*0.9,vy:CS*4,color:current.color,targetRow:r}); current=null; state='falling'; sThud? no — play a whoosh, skip; }
+```
+
+update(dt):
+```js
+if(state==='aim'&&current){ if(keys.l)px-=COLS*CS*dt/1.2; ... clamp; current.x=px; }
+// falling
+const g=CS*70, settleV=CS*1.4;
+for(let i=dynamic.length-1;i>=0;i--){ const b=dynamic[i]; b.vy+=g*dt; b.y+=b.vy*dt; const t=b.targetRow*CS; if(b.y>=t&&b.vy>0){ b.y=t; if(b.vy<settleV*2? ...
+```
+Bounce: on hitting floor, if vy > settleV → vy=-vy*BOUNCE, small thud sound; else snap-settle.
+
+Settle: settled[b.targetRow][b.col]=b.color; dynamic.splice(i,1); sLand();
+After loop: if(state==='falling'&&dynamic.length===0) onAllSettled();
+
+onAllSettled():
+```js
+const m=marks(); let n=count; if(n>0){curCombo++; doClear(m);} else { curCombo=0; for(let c=0;c<COLS;c++) if(settled[0][c]!=null){gameOver();return;} spawn(); }
+```
+
+doClear(m):
+```js
+let cleared=0;
+for r,c where m: settled[r][c]=null,cleared++; spawnBurst(boardX+c*CS+CS/2, by+r*CS+CS/2, color from m? need color before clearing — save: const colIdx=settled[r][c] then clear.
+score+=cleared*10*curCombo; comboT=1; shake=Math.min(10,3+curCombo*1.5); sPop(curCombo);
+// convert to dynamic
+for(let c=0;c<COLS;c++){ const list=[]; for(let r=0;r<ROWS;r++) if(settled[r][c]!=null) list.push({r,color:settled[r][c]}); const n=list.length; for(let i=0;i<n;i++){ settled... need to clear; dynamic.push({col:c,x:c*CS,y:list[i].r*CS,vy:0,color:list[i].color,targetRow:(ROWS-n)+i}); } for(let r=0;r<ROWS;r++)settled[r][c]=null; }
+```
+
+Note: list is top→bottom (r ascending) → target rows ascending (ROWS-n)+i — correct order preserved.
+
+marks():
+```js
+function marks(){ const m=Array.from({length:ROWS},()=>Array(COLS).fill(false));
+ for(let r=0;r<ROWS;r++){ let c=1; while(c<COLS){ const v=settled[r][c]; if(v==null){c++;continue;} let e=c+1; while(e<COLS&&settled[r][e]===v)e++; if(e-c>=3)for(let k=c;k<e;k++)m[r][k]=true; c=e; } }
+ for(let c=0;c<COLS;c++){ let r=1; while(r<ROWS){ const v=settled[r][c]; if(v==null){r++;continue;} let e=r+1; while(e<ROWS&&settled[e][c]===v)e++; if(e-r>=3)for(let k=r;k<e;k++)m[k][c]=true; r=e; } }
+ return m; }
+```
+
+gameOver(): state='gameover'; over=true; sOver(); save best; show overlay with score.
+
+Particle update: vy+=g*0.5*dt, life-=dt.
+
+Draw:
+```js
+function draw(){ ctx.clearRect... background gradient fill.
+ let sx=0,sy=0; if(shake>0.2){sx=(Math.random()-0.5)*shake;sy=(Math.random()-0.5)*shake;}
+ // board
+ ctx.save();ctx.translate(bx+sx,by+sy);
+ frame: rounded rect -6..COLS*CS+6 stroke #3a3f66 lw 3; fill rgba(255,255,255,0.02)
+ grid lines alpha .05
+ column highlight if aim: col=floor(px/CS); fillStyle rgba(255,255,255,.045) rect(col*CS,0,CS,ROWS*CS)
+ settled blocks; dynamic blocks (scale 1);
+ ghost: if aim compute landRow for column; draw dashed line + ghost outline at row*CS with alpha .3.
+ particles.
+ ctx.restore();
+ // HUD
+ score text at bx+? : 'SCORE' small at (bx, by-24) left align... use textAlign.
+ combo popup: if comboT>0 && curCombo>=2: alpha=comboT; scale=1+(1-comboT)*... center of board.
+}
+```
+
+drawBlock(x,y,ci,scale,alpha):
+```js
+function block(g,x,y,ci,s=1,a=1){ const c=COLORS[ci]; g.save();g.globalAlpha=a;g.translate(x+CS/2,y+CS/2);g.scale(s,s);const h=CS/2-3, r=CS*0.22;
+ const gr=g.createLinearGradient(0,-h,0,h);gr.addColorStop(0,c[0]);gr.addColorStop(.5,c[1]);gr.addColorStop(1,c[2]);
+ roundRect path (-h,-h,2h,2h,r); fill with gr; stroke rgba(0,0,0,.25) lw 2;
+ // gloss
+ g.fillStyle='rgba(255,255,255,.35)'; ellipse at (0,-h*0.45), rx h*0.6, ry h*0.3 → fill
+ g.restore(); }
+```
+
+roundRect: use ctx.roundRect if available, else manual path. Write helper rr(g,x,y,w,h,r).
+
+Aim piece drawn at (px, -CS*1.1) with slight bobbing: y=-CS*1.1 + Math.sin(t*3)*2. t is global time.
+
+Sound:
+```js
+let AC=null;
+function ac(){ if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}} if(AC&&AC.state==='suspended')AC.resume(); return AC; }
+function tone(f,d,type,vol,slide){ const a=ac(); if(!a||muted)return; const o=a.createOscillator(),g=a.createGain(); o.type=type; o.frequency.setValueAtTime(f,a.currentTime); if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(30,f+slide),a.currentTime+d); g.gain.setValueAtTime(vol,a.currentTime); g.gain.exponentialRampToValueAtTime(0.001,a.currentTime+d); o.connect(g).connect(a.destination); o.start(); o.stop(a.currentTime+d); }
+sLand=()=>tone(90,0.08,'sine',0.15,-30);
+sPop=c=>{ tone(280+c*90,0.15,'triangle',0.25, 200+c*60); };
+sOver=()=>{ [440,330,220,147].forEach((f,i)=>setTimeout(()=>tone(f,0.25,'sawtooth',0.15),i*180)); };
+```
+
+Input:
+```js
+const keys={l:false,r:false};
+addEventListener('keydown',e=>{ initAudioOnce(); if(e.repeat&&e.code!=='ArrowLeft'&&e.code!=='ArrowRight'){} 
+ switch(e.code){case 'ArrowLeft':case 'KeyA':keys.l=true;break; case 'ArrowRight':case 'KeyD':keys.r=true;break;
+ case 'Space':case 'ArrowDown':case 'KeyS': e.preventDefault(); if(state==='menu')startGame(); else if(state==='gameover')restart... startGame handles both. else drop(); break;
+ case 'KeyR': if(state==='gameover'||state==='aim')startGame(); break;
+ case 'KeyM': muted=!muted; break;}
+});
+keyup to clear keys.
+```
+
+startGame(): ac(); reset(); hide overlay.
+
+Button click: same as Space. Overlay click too? Just button.
+
+Mouse: mousemove → if state==='aim': px = clamp(e.clientX - bx - CS/2, 0,(COLS-1)*CS); current.x=px. Click on canvas: if aim drop; (menu overlay covers screen so clicks go to overlay).
+
+Touch: touchstart → drop or start. Add basic: pointerdown on cv → drop.
+
+Overlay contents for game over:
+```js
+function showOver(){ ov.classList.remove('hidden'); h1 text 'GAME OVER'; sub.innerHTML=`SCORE ${score}<br>BEST ${best}`; btn.textContent='RESTART'; }
+```
+h1 id? Give it an id: <h1 id="ttl">.
+
+Update best on game over: if score>best {best=score; try{localStorage.setItem('gmBest',best)}catch(e){}}
+
+Loop:
+```js
+let last=0,tt=0;
+function frame(ts){ const dt=Math.min(0.033,(ts-last)/1000||0); last=ts; tt+=dt; update(dt); draw(); requestAnimationFrame(frame); }
+requestAnimationFrame(frame);
+resize();
+```
+
+update only runs game logic if state is aim/falling (particles always). comboT-=dt, shake decays.
+
+Ghost landing row: compute on each draw during aim — cheap.
+
+Also prevent Space scroll: preventDefault on Space/arrow keys.
+
+Edge case: during 'falling' with cascade blocks, if the player hits R to restart — fine, reset clears everything.
+
+Aim piece drawn only when state==='aim'.
+
+HUD:
+```js
+ctx.textAlign='left'; ctx.fillStyle='#8a90c0'; ctx.font=`bold ${Math.max(12,CS*0.32)}px Segoe UI,Arial`; 
+ctx.fillText('SCORE',bx,by-26);
+ctx.fillStyle='#fff'; ctx.font bold larger; fillText(score, bx, by-8)? 
+```
+Simpler: "SCORE  123" on left, "BEST 456" right-aligned at bx+COLS*CS. One line each above the board: y=by-18.
+
+Combo popup: center of board:
+```js
+if(comboT>0&&curCombo>=2){ const a=Math.min(1,comboT*2); ctx.globalAlpha=a; ctx.font=`bold ${CS*0.9*(1+(1-Math.min(1,comboT))*0.3)}px ...`; textAlign center; fillStyle '#ffd740'; strokeText... fill `COMBO x${curCombo}` at (COLS*CS/2, CS*ROWS*0.45); globalAlpha=1 }
+```
+
+Now let me assemble the final file. Also verify that on drop the block's targetRow accounts for other dynamic blocks — during a single drop there are no others. OK.
+
+One more: after clear cascade, when all settle and no match, spawn; but also check row 0 top-out before spawn (done in onAllSettled).
+
+Also on initial drop landing, if it lands at row 0 (top) → after settle, onAllSettled checks matches first; if no match and settled[0] has block → game over. Good — piece is shown at top then game over. Acceptable.
+
+Aim movement speed: COLS*CS / 1.2s ≈ full board in 1.2s. ok.
+
+Let me write it out.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gravity Match</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#101223;font-family:'Segoe UI',Arial,sans-serif}
+  #c{display:block;position:absolute;inset:0}
+  #ov{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(8,10,24,.9);z-index:5;color:#fff;text-align:center}
+  #ttl{font-size:min(9vw,56px);margin:0 0 10px;letter-spacing:3px;font-weight:800;background:linear-gradient(90deg,#ff7b73,#ffe07a,#8af5b6,#6ec6ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+  #sub{color:#aab2d8;font-size:16px;line-height:2;margin:6px 20px}
+  kbd{background:#2a2e4a;border-radius:5px;padding:2px 9px;border:1px solid #444a75;color:#fff;font-family:inherit;font-size:13px}
+  #btn{margin-top:20px;padding:13px 48px;font-size:20px;font-weight:bold;letter-spacing:2px;color:#101223;background:linear-gradient(180deg,#8af5b6,#2bd576);border:none;border-radius:30px;cursor:pointer;box-shadow:0 4px 20px rgba(60,255,150,.35);transition:transform .1s}
+  #btn:hover{transform:scale(1.06)}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ov">
+  <h1 id="ttl">GRAVITY MATCH</h1>
+  <p id="sub"><kbd>&larr;</kbd><kbd>&rarr;</kbd> or mouse to aim &nbsp;&middot;&nbsp; <kbd>Space</kbd>/<kbd>&darr;</kbd>/click to drop<br>Match 3+ of a color &mdash; blocks fall with real gravity!<br><kbd>M</kbd> mute &nbsp;&middot;&nbsp; <kbd>R</kbd> restart</p>
+  <button id="btn">PLAY</button>
+</div>
+<script>
+(function(){
+"use strict";
+var cv=document.getElementById('c'),ctx=cv.getContext('2d');
+var ov=document.getElementById('ov'),btn=document.getElementById('btn'),sub=document.getElementById('sub'),ttl=document.getElementById('ttl');
+var COLS=8,ROWS=12;
+var COLORS=[['#ff7b73','#e0453f','#a8261f'],['#6ec6ff','#3d9be9','#1f5fa8'],['#8af5b6','#3fd67f','#1e8f4c'],['#ffe07a','#ffc93c','#c78f12']];
+var W=0,H=0,CS=40,bx=0,by=0;
+var settled=null,dynamic=[],particles=[],current=null,px=0;
+var state='menu',score=0,best=0,curCombo=0,comboT=0,shake=0,muted=false,tGlobal=0,lastTs=0;
+try{best=+localStorage.getItem('gmBest')||0;}catch(e){}
+
+/* ---------- audio (Web Audio API, starts after first input) ---------- */
+var AC=null;
+function ac(){ if(!AC){ try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){} } if(AC&&AC.state==='suspended')AC.resume(); return AC; }
+function tone(f,d,type,vol,slide){ var a=ac(); if(!a||muted)return;
+  try{ var o=a.createOscillator(),g=a.createGain(),t=a.currentTime;
+  o.type=type; o.frequency.setValueAtTime(f,t);
+  if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(30,f+slide),t+d);
+  g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.001,t+d);
+  o.connect(g); g.connect(a.destination); o.start(t); o.stop(t+d);}catch(e){} }
+function sLand(){ tone(95,0.07,'sine',0.14,-35); }
+function sPop(c){ tone(260+c*90,0.16,'triangle',0.28,220+c*70); }
+function sOver(){ [440,330,220,147].forEach(function(f,i){ setTimeout(function(){tone(f,0.28,'sawtooth',0.13);},i*190); }); }
+
+/* ---------- layout ---------- */
+function resize(){
+  W=window.innerWidth;H=window.innerHeight;
+  var dpr=Math.min(window.devicePixelRatio||1,2);
+  cv.width=W*dpr;cv.height=H*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);
+  var old=CS;
+  CS=Math.max(16,Math.floor(Math.min((W-16)/COLS,(H-96)/ROWS)));
+  bx=Math.round((W-COLS*CS)/2);
+  by=Math.round((H-ROWS*CS)/2)+14;
+  if(old&&old!==CS){ var f=CS/old; px*=f; for(var i=0;i<dynamic.length;i++){var b=dynamic[i]; b.y*=f;b.vy*=f;b.x=b.col*CS;} }
+}
+window.addEventListener('resize',resize);
+
+/* ---------- game state ---------- */
+function reset(){
+  settled=[];for(var r=0;r<ROWS;r++){settled.push(new Array(COLS).fill(null));}
+  dynamic=[];particles=[];score=0;curCombo=0;comboT=0;shake=0;
+  px=(COLS/2-0.5)*CS; spawn();
+}
+function spawn(){ current={color:Math.floor(Math.random()*COLORS.length),x:px}; state='aim'; }
+function drop(){
+  if(state!=='aim'||!current)return;
+  var col=Math.max(0,Math.min(COLS-1,Math.floor(current.x/CS)));
+  var r=0; while(r<ROWS&&settled[r][col]!=null)r++;
+  if(r>=ROWS){ gameOver(); return; }
+  dynamic.push({col:col,x:col*CS,y:-CS*0.9,vy:CS*4,color:current.color,targetRow:r});
+  current=null; state='falling';
+}
+
+function marks(){
+  var m=[],r,c;
+  for(r=0;r<ROWS;r++){ m.push(new Array(COLS).fill(false)); }
+  for(r=0;r<ROWS;r++){ c=0; while(c<COLS){ var v=settled[r][c]; if(v==null){c++;continue;}
+    var e=c+1; while(e<COLS&&settled[r][e]===v)e++;
+    if(e-c>=3)for(var k=c;k<e;k++)m[r][k]=true; c=e; } }
+  for(c=0;c<COLS;c++){ r=0; while(r<ROWS){ var v2=settled[r][c]; if(v2==null){r++;continue;}
+    var e2=r+1; while(e2<ROWS&&settled[e2][c]===v2)e2++;
+    if(e2-r>=3)for(var k2=r;k2<e2;k2++)m[k2][c]=true; r=e2; } }
+  return m;
+}
+function countMarks(m){ var n=0,r,c; for(r=0;r<ROWS;r++)for(c=0;c<COLS;c++)if(m[r][c])n++; return n; }
+
+function doClear(m){
+  var cleared=0,r,c;
+  for(r=0;r<ROWS;r++)for(c=0;c<COLS;c++) if(m[r][c]){
+    var ci=settled[r][c]; settled[r][c]=null; cleared++;
+    burst(bx+c*CS+CS/2,by+r*CS+CS/2,ci);
+  }
+  score+=cleared*10*curCombo;
+  comboT=1; shake=Math.min(12,3+curCombo*1.5);
+  sPop(curCombo);
+  /* convert all settled blocks into falling physics bodies */
+  for(c=0;c<COLS;c++){
+    var list=[];
+    for(r=0;r<ROWS;r++) if(settled[r][c]!=null) list.push({r:r,color:settled[r][c]});
+    var n=list.length;
+    for(var i=0;i<n;i++) dynamic.push({col:c,x:c*CS,y:list[i].r*CS,vy:0,color:list[i].color,targetRow:(ROWS-n)+i});
+    for(r=0;r<ROWS;r++) settled[r][c]=null;
+  }
+}
+
+function onAllSettled(){
+  var m=marks();
+  if(countMarks(m)>0){ curCombo++; doClear(m); return; }
+  curCombo=0;
+  for(var c=0;c<COLS;c++) if(settled[0][c]!=null){ gameOver(); return; }
+  spawn();
+}
+
+function burst(x,y,ci){
+  var col=COLORS[ci][1];
+  for(var i=0;i<7;i++){
+    var a=Math.random()*Math.PI*2,sp=CS*(2+Math.random()*4);
+    particles.push({x:x,y:y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp-CS*2,life:0.5+Math.random()*0.3,max:0.8,color:col,size:CS*0.12*(0.6+Math.random())});
+  }
+}
+
+function gameOver(){
+  state='gameover'; sOver();
+  if(score>best){ best=score; try{localStorage.setItem('gmBest',String(best));}catch(e){} }
+  ttl.textContent='GAME OVER';
+  sub.innerHTML='SCORE &nbsp;<b style="color:#fff;font-size:22px">'+score+'</b><br>BEST &nbsp;<b style="color:#ffd740">'+best+'</b>';
+  btn.textContent='RESTART';
+  ov.classList.remove('hidden');
+}
+function startGame(){ ac(); reset(); ov.classList.add('hidden'); }
+
+/* ---------- update ---------- */
+var keys={l:false,r:false};
+function update(dt){
+  tGlobal+=dt;
+  if(comboT>0)comboT-=dt*1.4;
+  if(shake>0)shake*=Math.max(0,1-7*dt);
+  /* particles always */
+  for(var i=particles.length-1;i>=0;i--){ var p=particles[i];
+    p.vy+=CS*30*dt; p.x+=p.vx*dt; p.y+=p.vy*dt; p.life-=dt;
+    if(p.life<=0)particles.splice(i,1); }
+
+  if(state==='aim'&&current){
+    var sp=COLS*CS/1.15;
+    if(keys.l)px-=sp*dt;
+    if(keys.r)px+=sp*dt;
+    px=Math.max(0,Math.min((COLS-1)*CS,px));
+    current.x=px;
+  }
+
+  if(state==='falling'){
+    var g=CS*70,settleV=CS*1.6;
+    for(var j=dynamic.length-1;j>=0;j--){ var b=dynamic[j];
+      b.vy+=g*dt; b.y+=b.vy*dt;
+      var t=b.targetRow*CS;
+      if(b.y>=t&&b.vy>0){
+        b.y=t;
+        if(b.vy>settleV){ b.vy=-b.vy*0.32; }
+        else{ settled[b.targetRow][b.col]=b.color; dynamic.splice(j,1); sLand(); }
+      }
+    }
+    if(dynamic.length===0)onAllSettled();
+  }
+}
+
+/* ---------- draw helpers ---------- */
+function rr(g,x,y,w,h,r){ g.beginPath(); g.moveTo(x+r,y); g.arcTo(x+w,y,x+w,y+h,r); g.arcTo(x+w,y+h,x,y+h,r); g.arcTo(x,y+h,x,y,r); g.arcTo(x,y,x+w,y,r); g.closePath(); }
+function block(g,x,y,ci,s,a){
+  var c=COLORS[ci],h=CS/2-3;
+  g.save(); g.globalAlpha=a==null?1:a;
+  g.translate(x+CS/2,y+CS/2); g.scale(s,s);
+  var gr=g.createLinearGradient(0,-h,0,h);
+  gr.addColorStop(0,c[0]);gr.addColorStop(0.5,c[1]);gr.addColorStop(1,c[2]);
+  rr(g,-h,-h,h*2,h*2,CS*0.22); g.fillStyle=gr; g.fill();
+  g.lineWidth=2; g.strokeStyle='rgba(0,0,0,.28)'; g.stroke();
+  g.fillStyle='rgba(255,255,255,.35)';
+  g.beginPath(); g.ellipse(0,-h*0.45,h*0.58,h*0.28,0,0,Math.PI*2); g.fill();
+  g.restore();
+}
+
+function draw(){
+  /* background */
+  var bg=ctx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0,'#1b1e36');bg.addColorStop(1,'#0d0f20');
+  ctx.fillStyle=bg; ctx.fillRect(0,0,W,H);
+
+  var sx=shake>0.2?(Math.random()-0.5)*shake:0, sy=shake>0.2?(Math.random()-0.5)*shake:0;
+  var bw=COLS*CS,bh=ROWS*CS;
+
+  /* HUD */
+  ctx.textBaseline='alphabetic';
+  ctx.fillStyle='#8a90c0'; ctx.font='bold '+Math.max(12,CS*0.3)+'px Segoe UI,Arial';
+  ctx.textAlign='left';  ctx.fillText('SCORE',bx,by-24);
+  ctx.textAlign='right'; ctx.fillText('BEST',bx+bw,by-24);
+  ctx.fillStyle='#fff';   ctx.font='bold '+Math.max(16,CS*0.46)+'px Segoe UI,Arial';
+  ctx.textAlign='left';  ctx.fillText(score,bx,by-6);
+  ctx.fillStyle='#ffd740';
+  ctx.textAlign='right'; ctx.fillText(best,bx+bw,by-6);
+
+  ctx.save(); ctx.translate(bx+sx,by+sy);
+
+  /* board frame */
+  rr(ctx,-8,-8,bw+16,bh+16,CS*0.3);
+  ctx.fillStyle='rgba(255,255,255,0.025)'; ctx.fill();
+  ctx.lineWidth=3; ctx.strokeStyle='#3a3f66'; ctx.stroke();
+
+  /* grid lines */
+  ctx.strokeStyle='rgba(255,255,255,0.045)'; ctx.lineWidth=1;
+  for(var c=1;c<COLS;c++){ ctx.beginPath();ctx.moveTo(c*CS,0);ctx.lineTo(c*CS,bh);ctx.stroke(); }
+  for(var r=1;r<ROWS;r++){ ctx.beginPath();ctx.moveTo(0,r*CS);ctx.lineTo(bw,r*CS);ctx.stroke(); }
+
+  /* aim: column highlight + ghost */
+  if(state==='aim'&&current){
+    var col=Math.max(0,Math.min(COLS-1,Math.floor(current.x/CS)));
+    ctx.fillStyle='rgba(255,255,255,0.05)';
+    ctx.fillRect(col*CS,0,CS,bh);
+    var lr=0; while(lr<ROWS&&settled[lr][col]!=null)lr++;
+    if(lr<ROWS){
+      ctx.setLineDash([6,8]); ctx.strokeStyle='rgba(255,255,255,0.18)'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(col*CS+CS/2,-CS*0.4); ctx.lineTo(col*CS+CS/2,lr*CS+CS/2); ctx.stroke();
+      ctx.setLineDash([]);
+      block(ctx,col*CS,lr*CS,current.color,1,0.22);
+    }
+  }
+
+  /* settled blocks */
+  for(var r2=0;r2<ROWS;r2++)for(var c2=0;c2<COLS;c2++) if(settled[r2][c2]!=null) block(ctx,c2*CS,r2*CS,settled[r2][c2],1);
+  /* falling blocks */
+  for(var i=0;i<dynamic.length;i++){ var b=dynamic[i]; block(ctx,b.x,b.y,b.color,1); }
+
+  /* aiming piece (hovering above board) */
+  if(state==='aim'&&current){
+    var ay=-CS*1.15+Math.sin(tGlobal*3)*2;
+    block(ctx,current.x,ay,current.color,1);
+  }
+
+  /* particles */
+  for(var p=0;p<particles.length;p++){ var pt=particles[p];
+    ctx.globalAlpha=Math.max(0,pt.life/pt.max);
+    ctx.fillStyle=pt.color;
+    ctx.fillRect(pt.x-pt.size/2,pt.y-pt.size/2,pt.size,pt.size);
+  }
+  ctx.globalAlpha=1;
+
+  /* combo popup */
+  if(comboT>0&&curCombo>=2){
+    var a=Math.min(1,comboT*2), sc=1+(1-Math.min(1,comboT))*0.35;
+    ctx.save(); ctx.translate(bw/2,bh*0.42); ctx.scale(sc,sc); ctx.globalAlpha=a;
+    ctx.textAlign='center'; ctx.font='bold '+CS*0.85+'px Segoe UI,Arial';
+    ctx.lineWidth=5; ctx.strokeStyle='rgba(0,0,0,.6)'; ctx.strokeText('COMBO x'+curCombo,0,0);
+    ctx.fillStyle='#ffd740'; ctx.fillText('COMBO x'+curCombo,0,0);
+    ctx.restore(); ctx.globalAlpha=1;
+  }
+
+  ctx.restore();
+}
+
+/* ---------- input ---------- */
+window.addEventListener('keydown',function(e){
+  ac();
+  if(['Space','ArrowDown','ArrowUp','ArrowLeft','ArrowRight'].indexOf(e.code)>=0)e.preventDefault();
+  switch(e.code){
+    case 'ArrowLeft':case 'KeyA': keys.l=true; break;
+    case 'ArrowRight':case 'KeyD': keys.r=true; break;
+    case 'Space':case 'ArrowDown':case 'KeyS':
+      if(state==='menu'||state==='gameover')startGame(); else drop(); break;
+    case 'KeyR': if(state!=='menu')startGame(); break;
+    case 'Enter': if(state==='menu'||state==='gameover')startGame(); break;
+    case 'KeyM': muted=!muted; break;
+  }
+});
+window.addEventListener('keyup',function(e){
+  switch(e.code){
+    case 'ArrowLeft':case 'KeyA': keys.l=false; break;
+    case 'ArrowRight':case 'KeyD': keys.r=false; break;
+  }
+});
+cv.addEventListener('mousemove',function(e){
+  if(state==='aim'&&current){ px=Math.max(0,Math.min((COLS-1)*CS,e.clientX-bx-CS/2)); current.x=px; }
+});
+cv.addEventListener('mousedown',function(){ ac(); drop(); });
+cv.addEventListener('touchstart',function(e){ e.preventDefault(); ac();
+  if(state==='menu'||state==='gameover')return;
+  var t=e.touches[0]; if(t){ px=Math.max(0,Math.min((COLS-1)*CS,t.clientX-bx-CS/2)); }
+  drop();
+},{passive:false});
+btn.addEventListener('click',function(){ ac(); startGame(); });
+
+/* ---------- main loop ---------- */
+function frame(ts){
+  var dt=Math.min(0.033,(ts-lastTs)/1000||0); lastTs=ts;
+  update(dt); draw();
+  requestAnimationFrame(frame);
+}
+resize();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+```
