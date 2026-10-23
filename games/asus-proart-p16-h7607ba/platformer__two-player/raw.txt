@@ -1,0 +1,569 @@
+<think>
+Create a 2-player platformer in a single HTML file. Canvas-based, Player 1 uses WASD, Player 2 uses arrow keys, collect coins, reach the goal flag, or competitive mode: grab more coins than your opponent before time runs out, and possibly knock each other around. Keep it simple and polished: start screen, restart (R), sound via WebAudio after first input.
+
+Design: arena platformer where both players jump between platforms to collect gems. First to 10 gems wins, or a timer. Also bump into the opponent to steal? What to keep: collect gems, first to 10 wins. Add simple knockback on collision with each other.
+
+Implementation: fixed-timestep-ish game loop, camera is a fixed arena (fits in one screen), resize canvas to window size with scaling. Physics: gravity, jump, double jump maybe. Platforms are static rectangles. Gems spawn on platforms.
+
+Write compact but complete code.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Gem Rush - Two Player Platformer</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#0b0e1a; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; image-rendering:pixelated; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+(function(){
+"use strict";
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// Logical game size (arena fits on one screen)
+const GW = 960, GH = 540;
+let scale = 1;
+
+function resize(){
+  const w = window.innerWidth, h = window.innerHeight;
+  scale = Math.min(w / GW, h / GH);
+  canvas.width = Math.floor(GW * scale);
+  canvas.height = Math.floor(GH * scale);
+  ctx.setTransform(scale,0,0,scale,0,0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- Audio (Web Audio API, starts after first input) ----------
+let audioCtx = null;
+function initAudio(){
+  if(!audioCtx){
+    try{
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }catch(e){ audioCtx = null; }
+  }
+}
+function beep(freq, dur, type, vol, slideTo){
+  if(!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type || 'square';
+  o.frequency.setValueAtTime(freq, t);
+  if(slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(30, slideTo), t + dur);
+  g.gain.setValueAtTime(vol || 0.12, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+const sfx = {
+  jump:   () => beep(300, 0.12, 'square', 0.10, 600),
+  djump:  () => beep(400, 0.12, 'square', 0.10, 800),
+  gem:    () => { beep(880, 0.08, 'sine', 0.15); setTimeout(()=>beep(1320,0.1,'sine',0.15),70); },
+  bump:   () => beep(140, 0.1, 'sawtooth', 0.12, 80),
+  win:    () => { [523,659,784,1047].forEach((f,i)=>setTimeout(()=>beep(f,0.18,'square',0.12),i*130)); },
+  steal:  () => beep(500, 0.15, 'triangle', 0.12, 200)
+};
+
+// ---------- Input ----------
+const keys = {};
+window.addEventListener('keydown', e=>{
+  initAudio();
+  if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  keys[e.code] = true;
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  if(e.code === 'KeyR' || (e.code === 'Enter' && state !== 'play')){
+    if(state === 'menu') startGame();
+    else if(state === 'over') startGame();
+  }
+});
+window.addEventListener('keyup', e=>{ keys[e.code] = false; });
+
+// ---------- World ----------
+const GRAV = 2200, MOVE = 340, JUMP = 760, DJUMP = 680, MAXFALL = 1100;
+
+let platforms = [];
+let gems = [];
+let players = [];
+let particles = [];
+let state = 'menu'; // menu | play | over
+let winner = -1;
+let timeLeft = 90;
+let shakeT = 0;
+
+const GEM_TARGET = 12;
+const P_COLORS = [
+  { body:'#ff5a5a', dark:'#b83030', light:'#ffb0b0', name:'RED' },
+  { body:'#4db8ff', dark:'#2a76b8', light:'#bfe6ff', name:'BLUE' }
+];
+
+function buildLevel(){
+  platforms = [
+    // ground
+    {x:0, y:GH-40, w:GW, h:40},
+    // floating platforms (left side)
+    {x:60,  y:410, w:150, h:20},
+    {x:280, y:330, w:140, h:20},
+    {x:90,  y:240, w:130, h:20},
+    // right side
+    {x:750, y:410, w:150, h:20},
+    {x:540, y:330, w:140, h:20},
+    {x:740, y:240, w:130, h:20},
+    // center tower
+    {x:410, y:380, w:140, h:20},
+    {x:430, y:250, w:100, h:20},
+    {x:360, y:130, w:90,  h:20},
+    {x:510, y:130, w:90,  h:20},
+    // top ledge
+    {x:430, y:55,  w:100, h:18}
+  ];
+}
+
+function spawnGem(){
+  // pick a random platform (not ground) and place gem above it
+  const opts = platforms.filter(p=>p.y < GH-60);
+  let tries = 30;
+  while(tries-- > 0){
+    const p = opts[Math.floor(Math.random()*opts.length)];
+    const x = p.x + 20 + Math.random()*(p.w - 40);
+    const y = p.y - 34;
+    // don't overlap existing gems
+    if(gems.every(g => Math.hypot(g.x-x, g.y-y) > 50)){
+      gems.push({x, y, r:12, phase:Math.random()*6.28, life:1});
+      return;
+    }
+  }
+}
+
+function makePlayer(i){
+  return {
+    i, x: i===0 ? 150 : GW-190, y: GH-40-36, w:34, h:36,
+    vx:0, vy:0, onGround:false, jumps:0, face: i===0?1:-1,
+    score:0, invuln:0, squash:0
+  };
+}
+
+function startGame(){
+  buildLevel();
+  players = [makePlayer(0), makePlayer(1)];
+  gems = [];
+  for(let i=0;i<6;i++) spawnGem();
+  particles = [];
+  winner = -1;
+  timeLeft = 90;
+  state = 'play';
+}
+
+// ---------- Physics helpers ----------
+function rectOverlap(a,b){
+  return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y;
+}
+
+function burst(x, y, color, n, speed){
+  for(let i=0;i<n;i++){
+    const a = Math.random()*Math.PI*2;
+    const s = (0.3+Math.random()*0.7)*(speed||260);
+    particles.push({x, y, vx:Math.cos(a)*s, vy:Math.sin(a)*s - 120, life:0.5+Math.random()*0.4, max:0.9, color});
+  }
+}
+
+const P1 = { left:'KeyA', right:'KeyD', jump:'KeyW' };
+const P2 = { left:'ArrowLeft', right:'ArrowRight', jump:'ArrowUp' };
+
+function updatePlayer(p, ctrl, dt){
+  const other = players[1-p.i];
+
+  let ax = 0;
+  if(keys[ctrl.left])  { ax -= 1; p.face = -1; }
+  if(keys[ctrl.right]) { ax += 1; p.face = 1; }
+  p.vx += (ax*MOVE - p.vx) * Math.min(1, dt*14);
+
+  // jump / double jump
+  if(keys[ctrl.jump]){
+    if(!p._jumpHeld){
+      if(p.onGround){
+        p.vy = -JUMP; p.jumps = 1; p.squash = 0.25;
+        sfx.jump();
+        burst(p.x+p.w/2, p.y+p.h, '#ffffff', 6, 140);
+      } else if(p.jumps < 2){
+        p.vy = -DJUMP; p.jumps = 2; p.squash = 0.25;
+        sfx.djump();
+        burst(p.x+p.w/2, p.y+p.h, P_COLORS[p.i].light, 8, 160);
+      }
+    }
+    p._jumpHeld = true;
+  } else {
+    p._jumpHeld = false;
+    // variable jump height
+    if(p.vy < -260) p.vy = -260;
+  }
+
+  p.vy += GRAV*dt;
+  if(p.vy > MAXFALL) p.vy = MAXFALL;
+
+  // horizontal move + collide
+  p.x += p.vx*dt;
+  for(const pl of platforms){
+    if(rectOverlap(p, pl)){
+      if(p.vx > 0) p.x = pl.x - p.w;
+      else if(p.vx < 0) p.x = pl.x + pl.w;
+      p.vx = 0;
+    }
+  }
+  if(p.x < 0){ p.x = 0; p.vx = Math.max(0,p.vx); }
+  if(p.x + p.w > GW){ p.x = GW - p.w; p.vx = Math.min(0,p.vx); }
+
+  // vertical move + collide
+  p.y += p.vy*dt;
+  p.onGround = false;
+  for(const pl of platforms){
+    if(rectOverlap(p, pl)){
+      if(p.vy > 0){
+        p.y = pl.y - p.h;
+        if(!p.onGround && p.vy > 700) burst(p.x+p.w/2, p.y+p.h, '#cccccc', 5, 120);
+        p.vy = 0; p.onGround = true; p.jumps = 0;
+      } else if(p.vy < 0){
+        p.y = pl.y + pl.h;
+        p.vy = 0;
+      }
+    }
+  }
+
+  // fell off the world (shouldn't happen but safe)
+  if(p.y > GH + 100){ p.x = i=>p.i===0?150:GW-190, 0; }
+
+  if(p.invuln > 0) p.invuln -= dt;
+  if(p.squash > 0) p.squash -= dt;
+
+  // player-vs-player bump: knockback + steal a gem point sometimes
+  if(p.invuln <= 0 && other.invuln <= 0 && rectOverlap(p, other)){
+    const dir = (p.x + p.w/2) < (other.x + other.w/2) ? -1 : 1;
+    p.vx = dir * 520;
+    p.vy = Math.min(p.vy, -380);
+    other.vx = -dir * 320;
+    sfx.bump();
+    shakeT = 0.15;
+    burst((p.x+other.x)/2 + 17, (p.y+other.y)/2 + 18, '#ffee88', 10, 240);
+    // steal one point from the other if they have some
+    if(other.score > 0){
+      other.score--;
+      p.score++;
+      sfx.steal();
+      burst(other.x+other.w/2, other.y, P_COLORS[other.i].body, 8, 200);
+    }
+    p.invuln = 0.5;
+    other.invuln = 0.5;
+  }
+
+  // gems
+  for(let i=gems.length-1;i>=0;i--){
+    const g = gems[i];
+    if(Math.hypot(g.x-(p.x+p.w/2), g.y-(p.y+p.h/2)) < g.r + 24){
+      gems.splice(i,1);
+      p.score++;
+      sfx.gem();
+      burst(g.x, g.y, '#7dffce', 12, 220);
+      if(p.score >= GEM_TARGET){
+        winner = p.i;
+        state = 'over';
+        sfx.win();
+      } else {
+        spawnGem();
+      }
+    }
+  }
+}
+
+// ---------- Update ----------
+let lastT = 0;
+function update(dt){
+  if(state === 'play'){
+    timeLeft -= dt;
+    if(timeLeft <= 0){
+      timeLeft = 0;
+      const s0 = players[0].score, s1 = players[1].score;
+      winner = s0 > s1 ? 0 : s1 > s0 ? 1 : -1;
+      state = 'over';
+      if(winner >= 0) sfx.win(); else beep(200,0.5,'sawtooth',0.12,80);
+    }
+    updatePlayer(players[0], P1, dt);
+    updatePlayer(players[1], P2, dt);
+  }
+
+  // particles
+  for(let i=particles.length-1;i>=0;i--){
+    const pa = particles[i];
+    pa.life -= dt;
+    if(pa.life <= 0){ particles.splice(i,1); continue; }
+    pa.vy += 900*dt;
+    pa.x += pa.vx*dt;
+    pa.y += pa.vy*dt;
+  }
+
+  // gem bob phase
+  for(const g of gems) g.phase += dt*3;
+
+  if(shakeT > 0) shakeT -= dt;
+}
+
+// ---------- Draw ----------
+function drawBackground(){
+  const grd = ctx.createLinearGradient(0,0,0,GH);
+  grd.addColorStop(0,'#141a35');
+  grd.addColorStop(0.6,'#1d2547');
+  grd.addColorStop(1,'#2a2f55');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0,0,GW,GH);
+
+  // stars
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  for(let i=0;i<40;i++){
+    const x = (i*197)%GW, y = (i*89)% (GH-120);
+    const tw = 0.5 + 0.5*Math.sin(performance.now()/600 + i);
+    ctx.globalAlpha = 0.15 + tw*0.3;
+    ctx.fillRect(x, y, 2, 2);
+  }
+  ctx.globalAlpha = 1;
+
+  // moon
+  ctx.fillStyle = '#f5f0d8';
+  ctx.beginPath(); ctx.arc(840, 80, 34, 0, 6.29); ctx.fill();
+  ctx.fillStyle = 'rgba(200,190,160,0.5)';
+  ctx.beginPath(); ctx.arc(830, 72, 7, 0, 6.29); ctx.fill();
+  ctx.beginPath(); ctx.arc(852, 92, 5, 0, 6.29); ctx.fill();
+}
+
+function drawPlatforms(){
+  for(const p of platforms){
+    if(p.h >= 40){ // ground
+      ctx.fillStyle = '#3a4470';
+      ctx.fillRect(p.x, p.y, p.w, p.h);
+      ctx.fillStyle = '#59e08a';
+      ctx.fillRect(p.x, p.y, p.w, 6);
+    } else {
+      ctx.fillStyle = '#4a5488';
+      ctx.fillRect(p.x, p.y, p.w, p.h);
+      ctx.fillStyle = '#7fdca4';
+      ctx.fillRect(p.x, p.y, p.w, 5);
+      ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      ctx.fillRect(p.x, p.y+p.h-4, p.w, 4);
+    }
+  }
+}
+
+function drawGems(t){
+  for(const g of gems){
+    const bob = Math.sin(g.phase)*4;
+    const y = g.y + bob;
+    ctx.save();
+    ctx.translate(g.x, y);
+    // glow
+    ctx.fillStyle = 'rgba(125,255,206,0.18)';
+    ctx.beginPath(); ctx.arc(0,0,22,0,6.29); ctx.fill();
+    // diamond shape
+    ctx.rotate(Math.sin(t*2 + g.phase)*0.15);
+    ctx.fillStyle = '#7dffce';
+    ctx.beginPath();
+    ctx.moveTo(0,-13); ctx.lineTo(10,0); ctx.lineTo(0,13); ctx.lineTo(-10,0);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.beginPath();
+    ctx.moveTo(0,-13); ctx.lineTo(10,0); ctx.lineTo(0,0); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawPlayer(p){
+  const c = P_COLORS[p.i];
+  let sx = 1, sy = 1;
+  if(p.squash > 0.12){ sx = 1.25; sy = 0.75; }
+  else if(p.onGround && Math.abs(p.vx) > 40){ sx = 1.08; sy = 0.92; }
+
+  ctx.save();
+  const cx = p.x + p.w/2, by = p.y + p.h;
+  ctx.translate(cx, by);
+  ctx.scale(sx*p.face, sy*p.face);
+  if(p.invuln > 0 && Math.floor(performance.now()/80)%2===0) ctx.globalAlpha = 0.4;
+
+  // body
+  ctx.fillStyle = c.body;
+  roundRect(-p.w/2, -p.h, p.w, p.h-6, 7);
+  ctx.fill();
+  // darker bottom
+  ctx.fillStyle = c.dark;
+  ctx.fillRect(-p.w/2, -8, p.w, 8);
+  // highlight
+  ctx.fillStyle = c.light;
+  ctx.fillRect(-p.w/2+4, -p.h+3, 8, 5);
+
+  // eyes (face direction)
+  ctx.fillStyle = '#ffffff';
+  ctx.beginPath(); ctx.arc(6, -p.h+13, 5.5, 0, 6.29); ctx.fill();
+  ctx.beginPath(); ctx.arc(-4, -p.h+13, 5.5, 0, 6.29); ctx.fill();
+  ctx.fillStyle = '#1a1a2e';
+  ctx.beginPath(); ctx.arc(8, -p.h+13, 2.6, 0, 6.29); ctx.fill();
+  ctx.beginPath(); ctx.arc(-2, -p.h+13, 2.6, 0, 6.29); ctx.fill();
+
+  // feet
+  const step = p.onGround ? Math.sin(performance.now()/70)* (Math.abs(p.vx)>40?3:0) : 3;
+  ctx.fillStyle = c.dark;
+  roundRect(-p.w/2+2, -6, 12, 6, 3); ctx.fill();
+  roundRect(p.w/2-14-step, -6, 12, 6, 3); ctx.fill();
+
+  ctx.restore();
+
+  // name tag + score above head
+  ctx.font = 'bold 13px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = c.body;
+  ctx.fillText('P'+(p.i+1), cx, p.y - 26);
+}
+
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+function drawHUD(){
+  // scores
+  ctx.font = 'bold 20px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = P_COLORS[0].body;
+  ctx.fillText('P1: '+players[0].score+' / '+GEM_TARGET, 16, 30);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = P_COLORS[1].body;
+  ctx.fillText('P2: '+players[1].score+' / '+GEM_TARGET, GW-16, 30);
+
+  // timer
+  ctx.textAlign = 'center';
+  const t = Math.ceil(timeLeft);
+  ctx.fillStyle = timeLeft < 15 ? (Math.floor(performance.now()/400)%2? '#ff5a5a':'#fff') : '#ffffff';
+  ctx.font = 'bold 30px monospace';
+  ctx.fillText(t, GW/2, 36);
+
+  // progress bars
+  bar(16, 40, 180, players[0].score/GEM_TARGET, P_COLORS[0].body);
+  bar(GW-196, 40, 180, players[1].score/GEM_TARGET, P_COLORS[1].body);
+}
+
+function bar(x,y,w,f,c){
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.fillRect(x,y,w,8);
+  ctx.fillStyle = c;
+  ctx.fillRect(x,y,w*Math.min(1,f),8);
+}
+
+function drawParticles(){
+  for(const pa of particles){
+    ctx.globalAlpha = Math.max(0, pa.life/pa.max);
+    ctx.fillStyle = pa.color;
+    ctx.fillRect(pa.x-3, pa.y-3, 6, 6);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawMenu(){
+  overlay();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#7dffce';
+  ctx.font = 'bold 54px monospace';
+  ctx.fillText('GEM RUSH', GW/2, 150);
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 18px monospace';
+  ctx.fillText('Two-Player Platformer', GW/2, 185);
+
+  ctx.fillStyle = P_COLORS[0].body;
+  ctx.font = 'bold 20px monospace';
+  ctx.fillText('PLAYER 1:  W A D  (jump / move)', GW/2, 260);
+  ctx.fillStyle = P_COLORS[1].body;
+  ctx.fillText('PLAYER 2:  ARROW KEYS', GW/2, 295);
+
+  ctx.fillStyle = '#cfd6ff';
+  ctx.font = '16px monospace';
+  ctx.fillText('Collect '+GEM_TARGET+' gems to win. Double jump allowed!', GW/2, 345);
+  ctx.fillText('Bump into your rival to knock them back and steal a point.', GW/2, 370);
+
+  if(Math.floor(performance.now()/500)%2===0){
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 24px monospace';
+    ctx.fillText('PRESS ENTER TO START', GW/2, 440);
+  }
+}
+
+function drawOver(){
+  overlay();
+  ctx.textAlign = 'center';
+  if(winner >= 0){
+    const c = P_COLORS[winner];
+    ctx.fillStyle = c.body;
+    ctx.font = 'bold 52px monospace';
+    ctx.fillText('PLAYER '+(winner+1)+' WINS!', GW/2, 230);
+  } else {
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 52px monospace';
+    ctx.fillText("IT'S A TIE!", GW/2, 230);
+  }
+  ctx.fillStyle = '#cfd6ff';
+  ctx.font = '20px monospace';
+  ctx.fillText(players[0].score + '  -  ' + players[1].score, GW/2, 285);
+
+  if(Math.floor(performance.now()/500)%2===0){
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 22px monospace';
+    ctx.fillText('PRESS ENTER OR R TO RESTART', GW/2, 370);
+  }
+}
+
+function overlay(){
+  ctx.fillStyle = 'rgba(8,10,25,0.82)';
+  ctx.fillRect(0,0,GW,GH);
+}
+
+// ---------- Main loop ----------
+function frame(t){
+  const dt = Math.min(0.033, (t - lastT)/1000 || 0.016);
+  lastT = t;
+
+  update(dt);
+
+  ctx.save();
+  if(shakeT > 0){
+    const m = shakeT*24;
+    ctx.translate((Math.random()-0.5)*m, (Math.random()-0.5)*m);
+  }
+
+  drawBackground();
+  drawPlatforms();
+  drawGems(t/1000);
+  for(const p of players) drawPlayer(p);
+  drawParticles();
+  if(state === 'play') drawHUD();
+
+  ctx.restore();
+
+  if(state === 'menu') drawMenu();
+  if(state === 'over') drawOver();
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
+```
