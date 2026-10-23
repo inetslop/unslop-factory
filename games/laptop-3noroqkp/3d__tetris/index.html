@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>3D Tetris</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0f0f23;overflow:hidden;display:flex;justify-content:center;align-items:center;height:100vh;font-family:'Courier New',monospace}
+canvas{display:block}
+#overlay{position:absolute;top:0;left:0;width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;align-items:center;background:rgba(10,10,30,0.92);z-index:10;color:#fff;text-align:center}
+#overlay h1{font-size:clamp(36px,8vw,72px);margin-bottom:16px;text-shadow:0 0 30px #0ff,0 0 60px #f0f;letter-spacing:4px}
+#overlay p{color:#aab;font-size:clamp(12px,2.5vw,16px);line-height:2;max-width:500px}
+#overlay .score-final{color:#ff0;font-size:clamp(18px,4vw,28px);margin:12px 0}
+#overlay button{margin-top:24px;padding:14px 36px;font-size:clamp(16px,3vw,20px);background:linear-gradient(135deg,#0ff,#f0f);border:none;cursor:pointer;border-radius:8px;color:#fff;font-weight:bold;letter-spacing:2px;box-shadow:0 0 20px rgba(0,255,255,0.3)}
+#overlay button:hover{transform:scale(1.05);box-shadow:0 0 30px rgba(255,0,255,0.5)}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="overlay">
+<h1>3D TETRIS</h1>
+<p>
+<b>Controls:</b><br>
+← → : Move Left / Right<br>
+↑ ↓ : Move Forward / Back (Depth)<br>
+Z : Rotate around Y-axis (Horizontal Spin)<br>
+X : Rotate around X-axis (Vertical Tilt)<br>
+Space : Hard Drop<br>
+Fill a complete 4×4 layer to clear it!
+</p>
+<button id="startBtn">START GAME</button>
+</div>
+<script>
+(function(){
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+const overlay=document.getElementById('overlay');
+const startBtn=document.getElementById('startBtn');
+
+let W,H;
+function resize(){W=window.innerWidth;H=window.innerHeight;canvas.width=W;canvas.height=H;}
+resize();window.addEventListener('resize',resize);
+
+// Audio
+let audioCtx=null;
+function initAudio(){if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();}
+function playSound(freq,dur,type){
+if(!audioCtx)return;
+const osc=audioCtx.createOscillator();
+const gain=audioCtx.createGain();
+osc.type=type||'square';
+osc.frequency.value=freq;
+gain.gain.setValueAtTime(0.15,audioCtx.currentTime);
+gain.gain.exponentialRampToValueAtTime(0.001,audioCtx.currentTime+dur);
+osc.connect(gain);gain.connect(audioCtx.destination);
+osc.start();osc.stop(audioCtx.currentTime+dur);
+}
+
+// Game constants
+const GW=4,GD=4,GH=8; // grid width(x), depth(y), height(z)
+let tileW,tileH;
+
+function calcTile(){
+tileW=Math.min(W/12,H/10)*0.5;
+tileH=tileW*0.5;
+}
+
+// 3D Tetromino shapes [dx,dy,dz]
+const SHAPES=[
+[[0,0,0],[1,0,0],[2,0,0],[3,0,0]], // I horizontal
+[[0,0,0],[0,0,1],[0,0,2],[0,0,3]], // I vertical
+[[0,0,0],[1,0,0],[0,1,0],[1,1,0]], // O square
+[[0,0,0],[0,1,0],[0,2,0],[1,0,0]], // L
+[[0,0,0],[-1,0,0],[1,0,0],[0,1,0]],// T
+[[0,0,0],[1,0,0],[1,1,0],[2,1,0]], // S
+[[0,0,0],[0,1,0],[0,2,0],[0,2,1]], // 3D L (z-span)
+[[0,0,0],[-1,0,0],[1,0,0],[0,0,1]],// Cross/Plus
+[[0,0,0],[1,0,0],[0,0,1],[1,0,1]], // 3D square
+[[0,0,0],[0,1,0],[1,1,0],[1,2,0]], // Z/S flat
+];
+
+const COLORS=[
+'#ff4444','#44ff44','#4488ff','#ffff44',
+'#ff44ff','#44ffff','#ffa500','#ff88cc'
+];
+
+// Game state
+let grid,currentPiece,nextPiece,score,lines,gameOver,running=false;
+let dropInterval=800,lastDrop=0;
+
+function resetGrid(){
+grid=new Array(GW*GD*GH).fill(0);
+}
+function idx(x,y,z){return x+GW*(y+GD*z);}
+function getCell(x,y,z){
+if(x<0||x>=GW||y<0||y>=GD||z<0||z>=GH)return -1;
+return grid[idx(x,y,z)];
+}
+function setCell(x,y,z,v){grid[idx(x,y,z)]=v;}
+
+function normalize(shape){
+let minX=99,minY=99,minZ=99,maxX=-99,maxY=-99,maxZ=-99;
+for(const c of shape){
+minX=Math.min(minX,c[0]);minY=Math.min(minY,c[1]);minZ=Math.min(minZ,c[2]);
+maxX=Math.max(maxX,c[0]);maxY=Math.max(maxY,c[1]);maxZ=Math.max(maxZ,c[2]);
+}
+for(const c of shape){c[0]-=minX;c[1]-=minY;c[2]-=minZ;}
+return shape;
+}
+
+function rotateY(shape){
+let s=shape.map(c=>[c[2],c[1],-c[0]]);
+return normalize(s);
+}
+function rotateX(shape){
+let s=shape.map(c=>[c[0],-c[2],c[1]]);
+return normalize(s);
+}
+
+function randomPiece(){
+const shape=SHAPES[Math.floor(Math.random()*SHAPES.length)].map(c=>[...c]);
+normalize(shape);
+const color=Math.floor(Math.random()*COLORS.length);
+let px=Math.floor((GW-4)/2),py=Math.floor((GD-3)/2),pz=GH-1;
+return{shape,color,x:0,y:0,z:GH-4};
+}
+
+function getPieceCells(p){
+const cells=[];
+for(const c of p.shape){
+cells.push([p.x+c[0],p.y+c[1],p.z+c[2]]);
+}
+return cells;
+}
+
+function canPlace(x,y,z,shape){
+for(const c of shape){
+const nx=x+c[0],ny=y+c[1],nz=z+c[2];
+if(nx<0||nx>=GW||ny<0||ny>=GD||nz<0||nz>=GH)return false;
+if(getCell(nx,ny,nz)!==0)return false;
+}
+return true;
+}
+
+function lockPiece(){
+const cells=getPieceCells(currentPiece);
+for(const[px,py,pz]of cells){
+setCell(px,py,pz,currentPiece.color+1);
+}
+playSound(200,0.1,'square');
+clearLines();
+spawnNext();
+if(!canPlace(currentPiece.x,currentPiece.y,GH-4,currentPiece.shape)){
+gameOver=true;running=false;
+showGameOver();
+}
+}
+
+function clearLines(){
+let cleared=0;
+for(let z=0;z<GH;z++){
+let full=true;
+for(let x=0;x<GW;x++)for(let y=0;y<GD;y++){if(getCell(x,y,z)===0){full=false;break;}}
+if(full)cleared++;
+}
+if(cleared>0){
+score+=cleared*100*(cleared>1?2:1);
+lines+=cleared;
+playSound(400,0.2,'sine');
+// Remove cleared lines and shift down
+for(let z=GH-1;z>=0;z--){
+let full=true;
+for(let x=0;x<GW;x++)for(let y=0;y<GD;y++){if(getCell(x,y,z)===0){full=false;break;}}
+if(full){
+// Shift all above down by 1
+for(let zz=z;zz<GH-1;zz++){
+for(let x=0;x<GW;x++)for(let y=0;y<GD;y++){
+setCell(x,y,zz+1,getCell(x,y,zz));
+}
+}
+for(let x=0;x<GW;x++)for(let y=0;y<GD;y++)setCell(x,y,GH-1,0);
+z--; // recheck same z level
+}
+}
+}
+
+function spawnNext(){
+currentPiece=nextPiece;
+nextPiece=randomPiece();
+if(!canPlace(currentPiece.x,currentPiece.y,currentPiece.z,currentPiece.shape)){
+// Try to find a valid position
+let placed=false;
+for(let zz=GH-1;zz>=0;zz--){
+if(canPlace(0,0,zz,currentPiece.shape)){currentPiece.z=zz;placed=true;break;}
+}
+if(!placed){gameOver=true;running=false;showGameOver();}
+}
+}
+
+function hardDrop(){
+while(canPlace(currentPiece.x,currentPiece.y,currentPiece.z-1,currentPiece.shape)){
+currentPiece.z--;
+}
+lockPiece();
+}
+
+function movePiece(dx,dy,dz){
+let nx=currentPiece.x+dx,ny=currentPiece.y+dy,nz=currentPiece.z+dz;
+if(canPlace(nx,ny,nz,currentPiece.shape)){
+currentPiece.x=nx;currentPiece.y=ny;currentPiece.z=nz;
+}
+}
+
+function rotatePiece(axis){
+let newShape;
+if(axis==='y')newShape=rotateY(currentPiece.shape.map(c=>[...c]));
+else newShape=rotateX(currentPiece.shape.map(c=>[...c]));
+// Try rotation at current position, then try offsets (wall kick)
+const kicks=[[0,0],[1,0],[-1,0],[0,1],[0,-1]];
+for(const[kx,ky]of kicks){
+if(canPlace(currentPiece.x+kx,currentPiece.y+ky,currentPiece.z,newShape)){
+currentPiece.shape=newShape;
+currentPiece.x+=kx;currentPiece.y+=ky;
+playSound(300,0.05,'sine');
+return;
+}
+}
+}
+
+// Isometric rendering
+function project(x,y,z){
+const cx=W/2,cy=H*0.45;
+const sx=cx+(x-y)*tileW;
+const sy=cy+(x+y)*tileH-z*tileW*1.2;
+return[sx,sy];
+}
+
+function drawCube(x,y,z,color,ghost){
+const[px,py]=project(x,y,z);
+const hw=tileW*0.9,hh=tileH*0.9,vh=tileW*1.2;
+
+// Top face
+ctx.beginPath();
+ctx.moveTo(px,py-hh);
+ctx.lineTo(px+hw/2,py-hh/2);
+ctx.lineTo(px,py);
+ctx.lineTo(px-hw/2,py-hh/2);
+ctx.closePath();
+if(ghost){ctx.fillStyle=color;ctx.globalAlpha=0.3;}else{ctx.fillStyle=color;}
+ctx.fill();
+
+// Left face
+ctx.beginPath();
+ctx.moveTo(px-hw/2,py-hh/2);
+ctx.lineTo(px,py);
+ctx.lineTo(px,py+vh);
+ctx.lineTo(px-hw/2,py+vh-hh/2);
+ctx.closePath();
+if(ghost){ctx.globalAlpha=0.3;}else{ctx.fillStyle=shadeColor(color,-30);}
+ctx.fill();
+
+// Right face
+ctx.beginPath();
+ctx.moveTo(px+hw/2,py-hh/2);
+ctx.lineTo(px,py);
+ctx.lineTo(px,py+vh);
+ctx.lineTo(px+hw/2,py+vh-hh/2);
+ctx.closePath();
+if(ghost){ctx.globalAlpha=0.3;}else{ctx.fillStyle=shadeColor(color,-60);}
+ctx.fill();
+
+ctx.globalAlpha=1;
+}
+
+function shadeColor(hex,amt){
+let r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
+r=Math.max(0,Math.min(255,r+amt));g=Math.max(0,Math.min(255,g+amt));b=Math.max(0,Math.min(255,b+amt));
+return`rgb(${r},${g},${b})`;
+}
+
+function drawGrid(){
+// Draw grid floor and walls (subtle)
+ctx.strokeStyle='rgba(100,100,200,0.15)';
+ctx.lineWidth=1;
+for(let x=0;x<GW;x++)for(let y=0;y<GD;y++){
+const[px,py]=project(x,y,0);
+const[px2,py2]=project(x+1,y,0);
+const[px3,py3]=project(x,y+1,0);
+ctx.beginPath();
+ctx.moveTo(px,py);ctx.lineTo(px2,py2);ctx.lineTo(px3,py3);ctx.closePath();
+ctx.stroke();
+}
+// Vertical lines for depth
+for(let x=0;x<=GW;x++)for(let y=0;y<=GD;y++){
+const[px,py]=project(x,y,0);
+const[px2,py2]=project(x,y,GH);
+ctx.beginPath();ctx.moveTo(px,py);ctx.lineTo(px2,py2);ctx.stroke();
+}
+}
+
+function drawScene(){
+ctx.fillStyle='#0f0f23';
+ctx.fillRect(0,0,W,H);
+calcTile();
+drawGrid();
+
+// Collect all cubes to draw
+let cubes=[];
+for(let x=0;x<GW;x++)for(let y=0;y<GD;y++)for(let z=0;z<GH;z++){
+const v=getCell(x,y,z);
+if(v>0)cubes.push({x,y,z,color:COLORS[v-1],ghost:false});
+}
+
+// Add current piece (ghost position)
+if(currentPiece&&!gameOver){
+const cells=getPieceCells(currentPiece);
+for(const[cx,cy,cz]of cells){
+cubes.push({x:cx,y:cy,z:cz,color:COLORS[currentPiece.color],ghost:false});
+}
+// Ghost/preview at bottom
+let ghostZ=currentPiece.z;
+while(canPlace(currentPiece.x,currentPiece.y,ghostZ-1,currentPiece.shape))ghostZ--;
+const gcells=getPieceCells({...currentPiece,z:ghostZ});
+for(const[cx,cy,cz]of gcells){
+cubes.push({x:cx,y:cy,z:cz,color:COLORS[currentPiece.color],ghost:true});
+}
+}
+
+// Sort by isometric depth: x+y+z ascending (back to front)
+cubes.sort((a,b)=>(a.x+a.y+a.z)-(b.x+b.y+b.z));
+
+for(const c of cubes){
+drawCube(c.x,c.y,c.z,c.color,c.ghost);
+}
+
+// Draw next piece preview
+if(nextPiece){
+ctx.save();
+ctx.translate(W-80,60);
+const sc=tileW*0.3;
+ctx.scale(sc/sc,sc/sc);
+for(const cc of nextPiece.shape){
+const px=(cc[0]-cc[1])*20;
+const py=(cc[0]+cc[1])*10-cc[2]*24;
+ctx.fillStyle=COLORS[nextPiece.color];
+ctx.globalAlpha=0.9;
+ctx.fillRect(px-8,py-8,16,16);
+}
+ctx.restore();
+ctx.globalAlpha=1;
+ctx.fillStyle='#aaa';
+ctx.font='12px monospace';
+ctx.fillText('NEXT',W-100,40);
+}
+
+// Score display
+ctx.fillStyle='#fff';
+ctx.font='bold 18px monospace';
+ctx.textAlign='left';
+ctx.fillText('SCORE: '+score,20,30);
+ctx.fillText('LINES: '+lines,20,55);
+ctx.textAlign='start';
+}
+
+function showGameOver(){
+overlay.classList.remove('hidden');
+startBtn.textContent='PLAY AGAIN';
+const h1=overlay.querySelector('h1');
+h1.textContent='GAME OVER';
+const pEl=overlay.querySelector('p');
+pEl.innerHTML='<div class="score-final">Final Score: '+score+'</div><br>Lines Cleared: '+lines+'<br><br>Press button to play again.';
+}
+
+function startGame(){
+initAudio();
+resetGrid();
+score=0;lines=0;gameOver=false;running=true;
+dropInterval=800;lastDrop=performance.now();
+nextPiece=randomPiece();
+currentPiece=randomPiece();
+overlay.classList.add('hidden');
+playSound(500,0.15,'sine');
+}
+
+// Input
+window.addEventListener('keydown',function(e){
+if(!running||gameOver)return;
+e.preventDefault();
+switch(e.code){
+case'ArrowLeft':movePiece(-1,0,0);break;
+case'ArrowRight':movePiece(1,0,0);break;
+case'ArrowUp':movePiece(0,-1,0);break;
+case'ArrowDown':movePiece(0,1,0);break;
+case'KeyZ':rotatePiece('y');break;
+case'KeyX':rotatePiece('x');break;
+case'Space':hardDrop();break;
+}
+});
+
+startBtn.addEventListener('click',function(){
+if(gameOver||!running)startGame();
+});
+
+// Game loop
+function update(now){
+if(running&&!gameOver){
+if(now-lastDrop>dropInterval){
+lastDrop=now;
+if(canPlace(currentPiece.x,currentPiece.y,currentPiece.z-1,currentPiece.shape)){
+currentPiece.z--;
+}else{
+lockPiece();
+}
+// Speed up with score
+dropInterval=Math.max(300,800-score*2);
+}
+}
+drawScene();
+requestAnimationFrame(update);
+}
+
+// Initial render
+overlay.classList.remove('hidden');
+startBtn.textContent='START GAME';
+resetGrid();
+currentPiece=randomPiece();
+nextPiece=randomPiece();
+score=0;lines=0;gameOver=false;
+running=false;
+requestAnimationFrame(update);
+})();
+</script>
+</body>
+</html>
