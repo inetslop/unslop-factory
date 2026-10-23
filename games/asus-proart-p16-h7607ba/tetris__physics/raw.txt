@@ -1,0 +1,770 @@
+<think>
+The user wants a Tetris "physics" game — probably blocks that fall with gravity and bounce/collide like physics objects rather than classic grid-based Tetris. Let's make it: pieces made of multiple square blocks (like tetromino shapes) fall under gravity, rotate, collide with the floor and other blocks, bounce with restitution, and stack up. Score by clearing rows? Hard in a physics environment — instead score when blocks settle / lines get filled… Simpler: score per block that comes to rest, game over if blocks pile above a line.
+
+Design: canvas-based 2D physics using simple AABB collision for square blocks. Each tetromino = 4 rigid squares connected as one body (treat the whole piece as a single rigid body with an oriented bounding shape? Easier: treat each block as an independent small box, but group them so they move together until collision… complex).
+
+Simplest and most robust approach: treat each tetromino as a rigid body composed of 4 unit squares in a fixed arrangement. Collision: for each square, do AABB test against the static "settled" blocks (stored as grid cells or list of axis-aligned boxes) and the floor. On collision, resolve per square: push out, apply bounce to velocity, add rotation angular velocity based on impact point. Once speed is below threshold for a while, lock the piece's squares into a settled list (as rotated AABBs… but when locked they might be at an angle). To keep physics simple, snap locked pieces: convert each square into a small box with its current orientation? Then collisions between rotated boxes get complex.
+
+Alternative: on lock, quantize — convert piece to grid cells (round positions to grid) and merge into a static grid; clear full rows for score. This gives us Tetris line clears + bouncy physics feel during falling. Rotation in the air: allow rotation but snap? If we round to grid on lock, pieces might overlap or float. To avoid weirdness, restrict rotations to 90° steps and make blocks grid-aligned (x,y always integer multiples of cell size)? Then it's basically regular Tetris with bouncy physics added: when a piece hits something, instead of stopping, it bounces (restitution), slides with friction, can roll. Rotation is in 90° increments.
+
+This works well: block positions are floats but sizes are cell-sized; on lock, round to nearest grid cell and merge into grid array (occupancy map). Collision: check each square against grid occupancy and floor. If a collision after rounding would overlap an occupied cell, adjust… just try to place, if that cell is occupied push piece back up / shift; as fallback, mark game over? Keep it simple: on lock, round positions, if any target cell is occupied (shouldn't happen much), nudge piece horizontally until it fits, or if it can't fit → game over.
+
+Gameplay:
+- Piece spawns at top, falls with gravity, slight bounce on collision (restitution ~0.35), friction on floor contact.
+- Controls: left/right arrows to move (apply velocity/impulse), up/down or X to rotate, Z for reverse rotation? Space = hard drop? In a physics game, hard drop could be an impulse. Let's go with: ←→ move, ↑ rotate CW, ↓ rotate CCW (or Z/X), space = boost/drop.
+- Score: +10 per block that settles, +100×n² for line clears, combo bonus.
+- Game over when a new piece can't spawn or stack reaches top.
+- Start screen with title "TETRIS PHYSICS", control instructions, restart button + R key.
+- Sound via WebAudio after first input: blip on rotation, thud on bounce, sound on clear.
+
+Implementation details:
+Cell size computed from canvas height (e.g., grid 10 wide). Canvas resizes to window; scale cell = floor(min(w/cols, h/rows)). Use fixed internal resolution? Simpler: compute cellSize on resize, keep logical coords in pixels but recompute… positions would break on resize. Instead use a fixed world size (e.g., 320x480 units) and scale canvas drawing. World: width 10 cells, height 20 cells, CELL=32 → world 320x640. Scale ctx to fit window with letterboxing.
+
+Piece representation: shape as array of [dx,dy] offsets per rotation state (precomputed via standard rotation). Body: {cx, cy (center in px), vx, vy, angleIndex (0-3), squares computed}. Gravity ~ 900 px/s². Movement: arrows set target velocity or apply force; use horizontal acceleration + damping so it feels physical.
+
+Collision detection: for each square's AABB (cell-sized at rounded position? no — float position), check against floor y, walls x, and grid occupied cells (each cell is an AABB). Resolve: compute penetration, push out along min axis, reflect velocity component with restitution if velocity into surface exceeds threshold; else zero. Track contact for friction: on horizontal contact with floor, apply friction to vx; also add slight angular wobble? Since squares are always axis-aligned (only 90° rotation), no need for real rotation physics — but we can add a small squash animation on impact. Keep it simple: bounce + squash effect visual.
+
+Actually, to make rotation feel physical, when rotating just recompute offsets; if the new shape collides immediately, wall-kick (try shifting x by ±1 cell, y by -1). If still colliding, don't rotate? Or cancel. Let's do wall kick with 2px steps up to 3 cells.
+
+Locking: when piece's speed < threshold and has been in contact for > ~0.5s, or vy==0 on floor and vx small → start a lock timer (0.4s); if it moves again reset? Simple: contactTime accumulates while touching ground/stack; after 0.6s → lock. Hard drop (space): apply big downward velocity impulse; also allow immediate lock? Just impulse of vy = 2500.
+
+Locking: round each square to grid index gx=floor(x/CELL), gy=floor(y/CELL). If occupied or out of bounds, try shifting entire piece by -1..+1 in x and -1 in y until it fits; if can't → game over. Mark cells, score += blocks, check full rows → clear with animation (flash), add score.
+
+Spawn: random bag tetromino, spawn at top center; if immediate collision → game over.
+
+Game over screen overlay with final score, "Press R or click to restart". Also high score in localStorage with try/catch.
+
+Rendering: draw background, grid lines subtle, settled blocks colored, current piece with glow, particle effect on bounce/lock, row clear flash. Simple particles array.
+
+Audio: AudioContext lazily created on first keydown/click. Functions: beep(freq, dur, type, gain), thud (low freq), clearSound (arpeggio).
+
+HUD: score, high score, level? Speed increases with score? Add gravity/line-based speed multiplier — keep subtle: gravity += lines*20.
+
+Let's write the code.
+
+Structure:
+- HTML: canvas fullscreen, overlay div for start/game-over screens? Or draw everything on canvas including text — simpler to have DOM overlays with CSS. Use DOM overlay (#screen) with title, controls list, button; toggle class.
+
+Keys: window keydown; preventDefault for arrows/space.
+
+Physics loop: fixed dt via rAF with clamped dt.
+
+Piece squares: function getSquares(piece): center at (cx,cy); offsets in cell units; square position = cx + (dx*CELL - CELL/2), cy + (dy*CELL - CELL/2). Define shape as list of [dx,dy] where dx,dy are relative from center. Standard shapes defined with rotation function: base cells in 4x4? Simpler: define each tetromino's 4 rotations explicitly as coordinate lists around origin:
+
+Let me define by rotating offsets: rotate (x,y)->(-y,x). Base shape:
+I: [(-1.5,0),(-0.5,0),(0.5,0),(1.5,0)] — fractional, hmm, rotation of even-length shapes gives half cells; that's fine in px but grid alignment on lock uses floor so it's OK… actually rounding to nearest cell is better: gx = Math.round(x/CELL - 0.5)? Let me define square position as top-left of the CELL box: sq.x = cx + dx*CELL, sq.y = cy + dy*CELL, with cx,cy chosen such that squares are integer when at rest. Use rotation on integer offsets:
+
+I base: [(-2,0),(-1,0),(0,0),(1,0)] → rotate90: (x,y)->(y,-x): [(0,2),(0,1),(0,0),(0,-1)]. Fine.
+O: [(-1,-1)? ] O: [(-1,0),(0,0),(-1,1),(0,1)]? Let's do O: [(-1,-1)…] no. O: cells (0,0),(1,0),(0,1),(1,1) → offsets [(-1,-1),(0,-1),(-1,0),(0,0)].
+T: [(-1,0),(0,0),(1,0),(0,-1)]? T pointing up.
+S: [(0,0),(1,0),(-1,1),(0,1)].
+Z: [(-1,0),(0,0),(0,1),(1,1)].
+J: [(-1,-1),(-1,0),(0,0),(1,0)]… J: [(-1,0),(0,0),(1,0),(-1,1)]? Let's do standard: J = [(−1,−1),(−1,0),(0,0),(1,0)]? Whatever, any valid tetromino works.
+L = [(1,-1),(-1,0),(0,0),(1,0)].
+
+Precompute 4 rotations for each shape by applying (x,y)->(y,-x) three times.
+
+Piece center cx,cy in px; square top-left = (cx + ox*CELL, cy + oy*CELL). On spawn, set cx so piece is horizontally centered: cx = WORLD_W/2 - CELL (arbitrary), cy = 0 or slightly negative to drop in.
+
+Collision per square:
+- Floor: if sq.y + CELL > floorY → penetration p; push up; vy = -vy*rest if |vy|>minBounce else 0; contact=true; friction on vx.
+- Walls similarly for x.
+- Grid cells: for each occupied cell (gx,gy) whose AABB overlaps the square: compute overlapX/overlapY, resolve along smaller axis; reflect with restitution; mark contact.
+
+Iterate a few times for stability.
+
+To reduce jitter: after resolution if velocity small, zero it.
+
+Locking condition: piece in contact this frame and speed² < 400 (20 px/s) → lockTimer += dt else lockTimer = max(0, lockTimer - dt*2). Lock when lockTimer > 0.5. Also hard drop: space sets vy += 1800; on landing it bounces slightly then locks.
+
+Actually simpler and more reliable: contact && (|vx|<30 && |vy|<60) → accumulate.
+
+Line clear animation: rows to remove flash for 0.3s then collapse. Implement clearing with a short delay: mark clearRows, set state 'clearing' with timer; during which piece is paused; after timer, remove rows, add score, spawn next.
+
+Particles on bounce (small squares) and on lock.
+
+Colors: classic tetromino colors.
+
+Resize: canvas = window size, scale = min(w/WORLD_W, h/WORLD_H), offset to center; ctx.setTransform(scale,0,0,scale,ox,oy). Background outside world dark fill + subtle border.
+
+Let's write the code. Keep it clean.
+
+High score in localStorage with try/catch.
+
+Sound:
+- ensureAudio() on first input.
+- playTone(freq,dur,type='square',vol)
+- bounce: freq 90, sine, short.
+- rotate: 300 square short.
+- lock: 150 triangle.
+- clear: quick arpeggio 400/600/800.
+- gameover: descending tones.
+
+Code length is medium. Let's write it.
+
+Edge case: rotating piece might overlap grid; wall kick tries dx in [0,-1,1,-2,2] (in cell units) and dy = -1? If fails revert rotation.
+
+Spawn overlap check → game over.
+
+Also, if after rounding a locked square overlaps an occupied cell: try shifts (dxs=[0,-1,1,-2,2], dys=[0,-1,-2]) in cell units; pick first that fits entirely and is within bounds; if none → game over.
+
+Score: on lock +4 per block? Let's do 10 per piece, clear: [0,100,300,500,800][n] * (level). Level = floor(lines/5)+1, gravity increases slightly.
+
+HUD drawn to canvas top or DOM? Draw in-world top area? World is 20 rows; draw HUD above world in letterbox space… simpler: reserve top rows for drawing text within the world with semi-transparent background. Let's put a 2-unit tall header inside the world: WORLD_H = (ROWS+2)*CELL, floor at ROWS*CELL from top of play area? Define: HEADER=64px, play area below it. World width 320, height 640+64=704. Floor y = 704. Walls x=0,320. Grid rows: gy index 0 at top (y=HEADER). Square's grid cell: gy = Math.round((sq.y - HEADER)/CELL), gx = Math.round(sq.x/CELL).
+
+grid[gy][gx] boolean or color index. Occupied cells for collision: iterate all 200 each frame — fine.
+
+Let's write it now.
+
+Squash effect: on strong impact set piece.squash=1, decays; draw squares scaled. Simple: skip? Let's add a small y-scale squash when in contact and recently bounced. Keep it minimal: store piece.flash timer on bounce for white outline flash. Enough.
+
+Let me write the complete HTML.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tetris Physics</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#0a0a14; font-family:'Courier New',monospace; }
+  #game { display:block; width:100vw; height:100vh; }
+  .overlay {
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; text-align:center;
+    background:rgba(5,5,15,.85); color:#fff; z-index:10;
+  }
+  .hidden { display:none; }
+  h1 {
+    font-size:min(9vw,64px); letter-spacing:.15em; margin-bottom:12px;
+    background:linear-gradient(90deg,#ff5f8f,#ffd35f,#5fff9d,#5fb8ff,#c95fff);
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+    text-shadow:0 0 30px rgba(255,255,255,.15);
+  }
+  .sub { color:#8fa3c7; margin-bottom:26px; font-size:min(4vw,18px); letter-spacing:.1em; }
+  .controls {
+    border:1px solid #2a3a5c; border-radius:10px; padding:18px 28px;
+    background:rgba(20,26,48,.7); margin-bottom:30px; line-height:2; font-size:min(3.4vw,16px); color:#cfe0ff;
+  }
+  .controls b { color:#ffd35f; display:inline-block; min-width:120px; text-align:left; }
+  button {
+    font-family:inherit; font-size:min(5vw,22px); letter-spacing:.15em; cursor:pointer;
+    padding:14px 46px; color:#fff; background:linear-gradient(180deg,#3b6cff,#2740a8);
+    border:2px solid #6f9bff; border-radius:10px; transition:transform .1s, box-shadow .1s;
+    box-shadow:0 0 24px rgba(70,120,255,.35);
+  }
+  button:hover { transform:scale(1.06); box-shadow:0 0 36px rgba(90,140,255,.6); }
+  #finalScore { font-size:min(6vw,30px); color:#ffd35f; margin-bottom:8px; letter-spacing:.1em; }
+  #hiScoreLine { color:#8fa3c7; margin-bottom:24px; font-size:min(4vw,18px); }
+  .blink { animation:bl 1.2s infinite; }
+  @keyframes bl { 50% { opacity:.35; } }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="startScreen" class="overlay">
+  <h1>TETRIS PHYSICS</h1>
+  <div class="sub">Bouncy blocks. Real gravity. Same chaos.</div>
+  <div class="controls">
+    <b>&larr; &rarr;</b> push piece left / right<br>
+    <b>&uarr; / Z</b> rotate clockwise / counter-clockwise<br>
+    <b>SPACE</b> slam drop<br>
+    <b>R</b> restart at any time
+  </div>
+  <button id="startBtn">PLAY</button>
+  <div class="sub blink" style="margin-top:20px;font-size:min(3vw,14px);">click or press ENTER to start</div>
+</div>
+
+<div id="overScreen" class="overlay hidden">
+  <h1 style="font-size:min(8vw,52px);">GAME OVER</h1>
+  <div id="finalScore">SCORE: 0</div>
+  <div id="hiScoreLine">BEST: 0</div>
+  <button id="restartBtn">PLAY AGAIN</button>
+  <div class="sub blink" style="margin-top:20px;font-size:min(3vw,14px);">or press R</div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* ---------- constants ---------- */
+var CELL = 32;
+var COLS = 10, ROWS = 20;
+var HEADER = 64;
+var WORLD_W = COLS*CELL;                 // 320
+var WORLD_H = HEADER + ROWS*CELL;        // 704
+var GRAVITY = 980;
+var REST = 0.38;                          // bounciness
+var FRICTION = 6.5;                       // ground drag (per second, exponential)
+var AIR_DRAG = 0.12;
+
+/* ---------- shapes (offsets in cells, rotate (x,y)->(y,-x)) ---------- */
+function rot(o){ return o.map(function(c){ return [c[1], -c[0]]; }); }
+function rotations(base){
+  var r=[base.slice()];
+  for(var i=1;i<4;i++) r.push(rot(r[i-1]));
+  return r;
+}
+var SHAPES = {
+  I:{ color:'#4dd8ff', rots: rotations([[-2,0],[-1,0],[0,0],[1,0]]) },
+  O:{ color:'#ffd35f', rots: rotations([[-1,-1],[0,-1],[-1,0],[0,0]]) },
+  T:{ color:'#c95fff', rots: rotations([[-1,0],[0,0],[1,0],[0,-1]]) },
+  S:{ color:'#5fff9d', rots: rotations([[0,0],[1,0],[-1,1],[0,1]]) },
+  Z:{ color:'#ff5f8f', rots: rotations([[-1,0],[0,0],[0,1],[1,1]]) },
+  J:{ color:'#5fb8ff', rots: rotations([[-1,-1],[-1,0],[0,0],[1,0]]) },
+  L:{ color:'#ff9a4d', rots: rotations([[1,-1],[-1,0],[0,0],[1,0]]) }
+};
+var SHAPE_KEYS = Object.keys(SHAPES);
+
+/* ---------- canvas / scaling ---------- */
+var canvas = document.getElementById('game');
+var ctx = canvas.getContext('2d');
+var scale=1, offX=0, offY=0;
+function resize(){
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  scale = Math.min(canvas.width/WORLD_W, canvas.height/WORLD_H);
+  offX = (canvas.width - WORLD_W*scale)/2;
+  offY = (canvas.height - WORLD_H*scale)/2;
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------- audio (created after first input) ---------- */
+var actx=null;
+function ensureAudio(){
+  if(actx) return;
+  try{ actx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){}
+}
+function tone(freq, dur, type, vol, when){
+  if(!actx) return;
+  var t = actx.currentTime + (when||0);
+  var o = actx.createOscillator(), g = actx.createGain();
+  o.type = type||'square';
+  o.frequency.setValueAtTime(freq, t);
+  g.gain.setValueAtTime(vol||0.12, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+  o.connect(g); g.connect(actx.destination);
+  o.start(t); o.stop(t+dur+0.02);
+}
+function sBounce(v){ tone(70+Math.random()*30, 0.12, 'sine', Math.min(0.3, v/900)); }
+function sRotate(){ tone(340, 0.06, 'square', 0.08); tone(520, 0.05, 'square', 0.05, 0.03); }
+function sLock(){ tone(150, 0.1, 'triangle', 0.18); tone(90, 0.14, 'sine', 0.18, 0.02); }
+function sClear(n){
+  var base=380;
+  for(var i=0;i<Math.min(n+1,5);i++) tone(base*Math.pow(1.26,i), 0.14, 'square', 0.1, i*0.07);
+}
+function sOver(){ [300,220,150,90].forEach(function(f,i){ tone(f,0.28,'sawtooth',0.1,i*0.16); }); }
+function sSpawn(){ tone(240, 0.07, 'triangle', 0.07); }
+
+/* ---------- state ---------- */
+var grid, piece, nextShape, score, hiScore=0, lines, level;
+var particles=[], clearRows=null, clearTimer=0;
+var state='start'; // start | play | clearing | over
+var shakeT=0;
+
+try{ hiScore = parseInt(localStorage.getItem('tetrisPhysHi')||'0',10)||0; }catch(e){}
+
+function newBag(){
+  var b = SHAPE_KEYS.slice();
+  for(var i=b.length-1;i>0;i--){ var j=Math.floor(Math.random()*(i+1)); var t=b[i];b[i]=b[j];b[j]=t; }
+  return b;
+}
+var bag=[];
+function nextKey(){ if(bag.length===0) bag=newBag(); return bag.pop(); }
+
+function makePiece(key){
+  var shape = SHAPES[key];
+  var rotIdx = Math.floor(Math.random()*4);
+  // normalize rotation so no square is left of -2 / above -1 (fits nicely in spawn)
+  var p = {
+    key:key, rot:rotIdx, color:shape.color,
+    cx: WORLD_W/2 - CELL*0.5, cy: -CELL*1.5,
+    vx:0, vy:0, contact:false, lockT:0, flash:0
+  };
+  return p;
+}
+
+function squaresOf(p){
+  var offs = SHAPES[p.key].rots[p.rot];
+  var out=[];
+  for(var i=0;i<offs.length;i++)
+    out.push({ x: p.cx + offs[i][0]*CELL, y: p.cy + offs[i][1]*CELL });
+  return out;
+}
+
+function cellOf(sq){
+  return { gx: Math.round(sq.x/CELL), gy: Math.round((sq.y-HEADER)/CELL) };
+}
+
+function reset(){
+  grid = [];
+  for(var y=0;y<ROWS;y++){ grid.push(new Array(COLS).fill(0)); }
+  score=0; lines=0; level=1; bag=[];
+  particles=[]; clearRows=null; clearTimer=0; shakeT=0;
+  nextShape = nextKey();
+  spawnPiece();
+}
+
+function spawnPiece(){
+  var key = nextShape;
+  nextShape = nextKey();
+  piece = makePiece(key);
+  // nudge down until inside header zone
+  if(overlapsStatic(piece)){ gameOver(); }
+  sSpawn();
+}
+
+/* ---------- collision helpers ---------- */
+function overlapsStatic(p){
+  var sqs = squaresOf(p);
+  for(var i=0;i<sqs.length;i++){
+    var s=sqs[i];
+    if(s.x < -1 || s.x+CELL > WORLD_W+1) return true;
+    if(s.y+CELL > WORLD_H+1) return true;
+    var c = cellOf(s);
+    // check 3x3 neighborhood to be safe with float positions
+    for(var gy=c.gy-1; gy<=c.gy+1; gy++)
+      for(var gx=c.gx-1; gx<=c.gx+1; gx++){
+        if(gx<0||gx>=COLS||gy<0||gy>=ROWS) continue;
+        if(!grid[gy][gx]) continue;
+        var bx=gx*CELL, by=HEADER+gy*CELL;
+        if(s.x < bx+CELL && s.x+CELL > bx && s.y < by+CELL && s.y+CELL > by) return true;
+      }
+  }
+  return false;
+}
+
+/* ---------- physics step ---------- */
+function stepPhysics(dt){
+  var p = piece;
+  p.vy += GRAVITY * dt;
+
+  // horizontal control: force-based for a physical feel
+  var ax = 0;
+  if(input.left)  ax -= 2600;
+  if(input.right) ax += 2600;
+  p.vx += ax*dt;
+  p.vx *= Math.exp(-AIR_DRAG*dt);
+  if(ax===0) p.vx *= Math.exp(-3.2*dt); // extra damping when not pushing
+  p.vx = Math.max(-520, Math.min(520, p.vx));
+
+  p.cx += p.vx*dt;
+  p.cy += p.vy*dt;
+
+  var contact=false;
+  var sqs = squaresOf(p);
+
+  for(var iter=0; iter<3; iter++){
+    sqs = squaresOf(p);
+    for(var i=0;i<sqs.length;i++){
+      var s=sqs[i];
+      // floor
+      if(s.y+CELL > WORLD_H){
+        p.cy -= (s.y+CELL-WORLD_H);
+        if(Math.abs(p.vy) > 90){ bounceFx(p, s.x+CELL/2, WORLD_H, Math.abs(p.vy)); p.vy = -p.vy*REST; }
+        else p.vy = 0;
+        p.vx *= Math.exp(-FRICTION*dt*(iter===0?1:0.3));
+        contact=true;
+      }
+      // walls
+      if(s.x < 0){
+        p.cx -= s.x;
+        if(Math.abs(p.vx)>90){ bounceFx(p,0,s.y+CELL/2,Math.abs(p.vx)); p.vx=-p.vx*REST; } else p.vx=0;
+        contact=true;
+      } else if(s.x+CELL > WORLD_W){
+        p.cx -= (s.x+CELL-WORLD_W);
+        if(Math.abs(p.vx)>90){ bounceFx(p,WORLD_W,s.y+CELL/2,Math.abs(p.vx)); p.vx=-p.vx*REST; } else p.vx=0;
+        contact=true;
+      }
+      // grid blocks
+      var c = cellOf(s);
+      for(var gy=c.gy-1; gy<=c.gy+1; gy++){
+        if(gy<0||gy>=ROWS) continue;
+        for(var gx=c.gx-1; gx<=c.gx+1; gx++){
+          if(gx<0||gx>=COLS||!grid[gy][gx]) continue;
+          var bx=gx*CELL, by=HEADER+gy*CELL;
+          var ox = Math.min(s.x+CELL-bx, bx+CELL-s.x);
+          var oy = Math.min(s.y+CELL-by, by+CELL-s.y);
+          if(ox<=0||oy<=0) continue;
+          if(ox < oy){
+            if(s.x+CELL/2 < bx+CELL/2){ p.cx -= ox; } else { p.cx += ox; }
+            if(Math.abs(p.vx)>90){ bounceFx(p, s.x+CELL/2, s.y+CELL/2, Math.abs(p.vx)); p.vx=-p.vx*REST; } else p.vx=0;
+          } else {
+            if(s.y+CELL/2 < by+CELL/2){ p.cy -= oy; } else { p.cy += oy; }
+            if(Math.abs(p.vy)>90){ bounceFx(p, s.x+CELL/2, s.y+CELL/2, Math.abs(p.vy)); p.vy=-p.vy*REST; } else p.vy=0;
+            p.vx *= (iter===0)?Math.exp(-FRICTION*dt):1;
+          }
+          contact=true;
+        }
+      }
+    }
+  }
+
+  // settle / lock
+  var speed2 = p.vx*p.vx + p.vy*p.vy;
+  if(contact && speed2 < 4500){
+    p.lockT += dt;
+    p.vx *= Math.exp(-FRICTION*dt*2);
+  } else {
+    p.lockT = Math.max(0, p.lockT - dt*3);
+  }
+  p.flash = Math.max(0, p.flash - dt*4);
+
+  if(p.lockT > 0.45) lockPiece();
+}
+
+function bounceFx(p, x, y, v){
+  p.flash = 1;
+  shakeT = Math.min(0.25, v/3000);
+  sBounce(v);
+  var n = Math.min(8, 2 + (v/200)|0);
+  for(var i=0;i<n;i++){
+    particles.push({
+      x:x, y:y, vx:(Math.random()-0.5)*260, vy:-Math.random()*220-40,
+      life:0.5+Math.random()*0.3, size:3+Math.random()*4, color:p.color
+    });
+  }
+}
+
+/* ---------- locking & line clears ---------- */
+function lockPiece(){
+  var sqs = squaresOf(piece);
+  // find a fitting grid placement (shifts in cell units)
+  var found=false;
+  var shifts=[ [0,0],[-1,0],[1,0],[-2,0],[2,0],[0,-1],[-1,-1],[1,-1],[0,-2] ];
+  for(var i=0;i<shifts.length && !found;i++){
+    var dx=shifts[i][0], dy=shifts[i][1];
+    var cells=[];
+    var ok=true;
+    for(var j=0;j<sqs.length;j++){
+      var gx = Math.round(sqs[j].x/CELL)+dx;
+      var gy = Math.round((sqs[j].y-HEADER)/CELL)+dy;
+      if(gx<0||gx>=COLS||gy<0||gy>=ROWS){ ok=false; break; }
+      cells.push([gx,gy]);
+    }
+    if(!ok) continue;
+    for(var k=0;k<cells.length;k++){
+      if(grid[cells[k][1]][cells[k][0]]){ ok=false; break; }
+    }
+    if(ok){
+      for(var m=0;m<cells.length;m++) grid[cells[m][1]][cells[m][0]] = piece.color;
+      found=true;
+    }
+  }
+
+  // particles where piece was
+  var sqs2 = squaresOf(piece);
+  for(var q=0;q<sqs2.length;q++){
+    for(var pp=0;pp<3;pp++){
+      particles.push({
+        x:sqs2[q].x+CELL/2, y:sqs2[q].y+CELL/2,
+        vx:(Math.random()-0.5)*180, vy:-Math.random()*160-30,
+        life:0.4+Math.random()*0.3, size:3+Math.random()*3, color:piece.color
+      });
+    }
+  }
+  sLock();
+
+  if(!found){ gameOver(); return; }
+
+  score += 10;
+
+  // detect full rows
+  var full=[];
+  for(var y=0;y<ROWS;y++){
+    var f=true;
+    for(var x=0;x<COLS;x++) if(!grid[y][x]) { f=false; break; }
+    if(f) full.push(y);
+  }
+
+  if(full.length){
+    clearRows = full; clearTimer = 0.35; state='clearing';
+    sClear(full.length);
+    shakeT = Math.min(0.4, full.length*0.12);
+  } else {
+    spawnPiece();
+  }
+}
+
+function finishClear(){
+  var n = clearRows.length;
+  // remove rows (top to bottom so indices stay valid)
+  for(var i=clearRows.length-1;i>=0;i--){
+    grid.splice(clearRows[i],1);
+    grid.unshift(new Array(COLS).fill(0));
+  }
+  lines += n;
+  level = Math.floor(lines/5)+1;
+  score += [0,100,300,500,800][Math.min(n,4)] * level;
+  clearRows=null;
+  state='play';
+  spawnPiece();
+}
+
+function gameOver(){
+  state='over';
+  sOver();
+  if(score > hiScore){
+    hiScore = score;
+    try{ localStorage.setItem('tetrisPhysHi', String(hiScore)); }catch(e){}
+  }
+  document.getElementById('finalScore').textContent = 'SCORE: '+score;
+  document.getElementById('hiScoreLine').textContent = 'BEST: '+hiScore;
+  setTimeout(function(){ document.getElementById('overScreen').classList.remove('hidden'); }, 500);
+}
+
+/* ---------- input ---------- */
+var input = { left:false, right:false };
+window.addEventListener('keydown', function(e){
+  ensureAudio();
+  var k = e.key;
+  if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].indexOf(k)>=0) e.preventDefault();
+
+  if(k==='r'||k==='R'){ startGame(); return; }
+  if(state==='start' && (k==='Enter'||k===' ')){ startGame(); return; }
+  if(state==='over' && (k==='Enter')){ startGame(); return; }
+  if(state!=='play') return;
+
+  if(k==='ArrowLeft') input.left=true;
+  else if(k==='ArrowRight') input.right=true;
+  else if(k==='ArrowUp' || k==='x' || k==='X'){ tryRotate(1); }
+  else if(k==='z' || k==='Z' || k==='ArrowDown'){ tryRotate(-1); }
+  else if(k===' '){ piece.vy += 1700; sBounce(800); }
+});
+window.addEventListener('keyup', function(e){
+  if(e.key==='ArrowLeft') input.left=false;
+  if(e.key==='ArrowRight') input.right=false;
+});
+
+function tryRotate(dir){
+  var p = piece;
+  var oldRot = p.rot;
+  p.rot = (p.rot + dir + 4) % 4;
+  if(!overlapsStatic(p)){ sRotate(); return; }
+  // wall kicks
+  var kicks=[[0,-1],[ -CELL,0],[CELL,0],[-2*CELL,0],[2*CELL,0],[0,-2*CELL]];
+  for(var i=0;i<kicks.length;i++){
+    var tx=p.cx+kicks[i][0], ty=p.cy+kicks[i][1];
+    p.cx=tx; p.cy=ty;
+    if(!overlapsStatic(p)){ sRotate(); return; }
+  }
+  p.rot = oldRot; // rotate blocked
+}
+
+/* ---------- game flow ---------- */
+function startGame(){
+  ensureAudio();
+  document.getElementById('startScreen').classList.add('hidden');
+  document.getElementById('overScreen').classList.add('hidden');
+  reset();
+  state='play';
+}
+document.getElementById('startBtn').addEventListener('click', startGame);
+document.getElementById('restartBtn').addEventListener('click', startGame);
+
+/* ---------- particles ---------- */
+function stepParticles(dt){
+  for(var i=particles.length-1;i>=0;i--){
+    var p=particles[i];
+    p.life -= dt;
+    if(p.life<=0){ particles.splice(i,1); continue; }
+    p.vy += 900*dt;
+    p.x += p.vx*dt;
+    p.y += p.vy*dt;
+  }
+}
+
+/* ---------- render ---------- */
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+function drawBlock(x,y,color,flash){
+  ctx.fillStyle = color;
+  roundRect(x+1.5,y+1.5,CELL-3,CELL-3,4);
+  ctx.fill();
+  // glossy top
+  ctx.fillStyle='rgba(255,255,255,.28)';
+  roundRect(x+3,y+3,CELL-6,(CELL-6)*0.35,3);
+  ctx.fill();
+  ctx.strokeStyle='rgba(0,0,0,.35)';
+  ctx.lineWidth=1;
+  roundRect(x+1.5,y+1.5,CELL-3,CELL-3,4);
+  ctx.stroke();
+  if(flash>0){
+    ctx.fillStyle='rgba(255,255,255,'+(flash*0.7)+')';
+    roundRect(x+1.5,y+1.5,CELL-3,CELL-3,4);
+    ctx.fill();
+  }
+}
+
+function render(){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle='#0a0a14';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // subtle starfield backdrop
+  ctx.fillStyle='rgba(120,150,255,.12)';
+  for(var i=0;i<40;i++){
+    var sx=(i*97.3)%canvas.width, sy=(i*53.7)%canvas.height;
+    ctx.fillRect(sx,sy,2,2);
+  }
+
+  var shx=0, shy=0;
+  if(shakeT>0){
+    shx=(Math.random()-0.5)*shakeT*40;
+    shy=(Math.random()-0.5)*shakeT*40;
+  }
+  ctx.setTransform(scale,0,0,scale, offX+shx*scale, offY+shy*scale);
+
+  // world frame
+  ctx.fillStyle='#11162b';
+  roundRect(-8,-8,WORLD_W+16,WORLD_H+16,14);
+  ctx.fill();
+  ctx.strokeStyle='#2a3a5c';
+  ctx.lineWidth=3;
+  roundRect(-8,-8,WORLD_W+16,WORLD_H+16,14);
+  ctx.stroke();
+
+  // play area
+  ctx.fillStyle='#0d1224';
+  ctx.fillRect(0,HEADER,WORLD_W,ROWS*CELL);
+
+  // grid lines
+  ctx.strokeStyle='rgba(90,120,200,.1)';
+  ctx.lineWidth=1;
+  ctx.beginPath();
+  for(var gx=1;gx<COLS;gx++){ ctx.moveTo(gx*CELL+.5,HEADER); ctx.lineTo(gx*CELL+.5,WORLD_H); }
+  for(var gy=0;gy<=ROWS;gy++){ ctx.moveTo(0,HEADER+gy*CELL+.5); ctx.lineTo(WORLD_W,HEADER+gy*CELL+.5); }
+  ctx.stroke();
+
+  // danger line
+  ctx.strokeStyle='rgba(255,90,120,.3)';
+  ctx.setLineDash([6,6]);
+  ctx.beginPath();
+  ctx.moveTo(0,HEADER+2.5*CELL+.5); ctx.lineTo(WORLD_W,HEADER+2.5*CELL+.5);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // settled blocks
+  if(grid){
+    for(var y=0;y<ROWS;y++){
+      var flashing = clearRows && clearRows.indexOf(y)>=0;
+      for(var x=0;x<COLS;x++){
+        var col = grid[y][x];
+        if(!col) continue;
+        if(flashing && Math.floor(clearTimer*14)%2===0) continue; // flicker out
+        drawBlock(x*CELL, HEADER+y*CELL, col, 0);
+      }
+    }
+  }
+
+  // current piece (with slight squash while grounded)
+  if(piece && (state==='play'||state==='clearing')){
+    var sqs = squaresOf(piece);
+    var f = piece.flash;
+    for(var i=0;i<sqs.length;i++){
+      drawBlock(sqs[i].x, sqs[i].y, piece.color, f);
+    }
+  }
+
+  // particles
+  for(var pi=0;pi<particles.length;pi++){
+    var p=particles[pi];
+    ctx.globalAlpha = Math.max(0, p.life*2);
+    ctx.fillStyle=p.color;
+    ctx.fillRect(p.x-p.size/2, p.y-p.size/2, p.size, p.size);
+  }
+  ctx.globalAlpha=1;
+
+  // header HUD
+  if(grid){
+    ctx.fillStyle='#cfe0ff';
+    ctx.font='bold 26px Courier New';
+    ctx.textAlign='left';
+    ctx.fillText('SCORE', 14, 30);
+    ctx.fillStyle='#fff';
+    ctx.font='bold 24px Courier New';
+    ctx.fillText(String(score), 14, 55);
+
+    ctx.fillStyle='#cfe0ff';
+    ctx.font='bold 26px Courier New';
+    ctx.textAlign='center';
+    ctx.fillText('LV '+level, WORLD_W/2, 30);
+    ctx.fillStyle='#8fa3c7';
+    ctx.font='16px Courier New';
+    ctx.fillText(lines+' LINES', WORLD_W/2, 54);
+
+    // next piece preview
+    ctx.textAlign='right';
+    ctx.fillStyle='#cfe0ff';
+    ctx.font='bold 26px Courier New';
+    ctx.fillText('NEXT', WORLD_W-14, 30);
+    if(nextShape){
+      var nsh = SHAPES[nextShape];
+      var offs = nsh.rots[0];
+      // center of preview
+      var minx=9,maxx=-9,miny=9,maxy=-9;
+      offs.forEach(function(o){ minx=Math.min(minx,o[0]); maxx=Math.max(maxx,o[0]); miny=Math.min(miny,o[1]); maxy=Math.max(maxy,o[1]); });
+      var pcx = WORLD_W - 34, pcy = 46;
+      var s = 8; // mini cell
+      offs.forEach(function(o){
+        ctx.fillStyle = nsh.color;
+        ctx.fillRect(pcx + (o[0]-(minx+maxx)/2)*s - s/2 + s/2, pcy + (o[1]-(miny+maxy)/2)*s - s/2 + s/2, s-1.5, s-1.5);
+      });
+    }
+  }
+
+  // "getting close" warning glow at top
+  if(state==='play' && piece){
+    var sqs2=squaresOf(piece);
+    var minY=9999;
+    sqs2.forEach(function(s){ minY=Math.min(minY,s.y); });
+    if(minY < HEADER+3*CELL){
+      ctx.fillStyle='rgba(255,60,90,'+(0.12+0.1*Math.sin(Date.now()/120))+')';
+      ctx.fillRect(0,HEADER,WORLD_W,40);
+    }
+  }
+
+  // start/over dim handled by DOM overlays
+}
+
+/* ---------- main loop ---------- */
+var lastT = performance.now();
+function frame(now){
+  var dt = Math.min(0.033, (now-lastT)/1000);
+  lastT = now;
+
+  if(state==='play'){
+    stepPhysics(dt);
+  } else if(state==='clearing'){
+    clearTimer -= dt;
+    if(clearTimer<=0) finishClear();
+  }
+  shakeT = Math.max(0, shakeT - dt*2.5);
+  stepParticles(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+// initialize a preview grid so the background looks right before start
+grid=[]; for(var y=0;y<ROWS;y++) grid.push(new Array(COLS).fill(0));
+piece=null;
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
+```
