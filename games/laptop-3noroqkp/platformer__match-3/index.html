@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Chroma Dash - Match-3 Platformer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; width: 100vw; }
+canvas { display: block; max-width: 100vw; max-height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+function playSound(freq, type, duration, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.15, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+function sfxJump() { playSound(400, 'square', 0.15, 0.1); }
+function sfxCollect() { playSound(800, 'sine', 0.2, 0.15); }
+function sfxMatch() { playSound(600, 'sine', 0.3, 0.2); setTimeout(() => playSound(900, 'sine', 0.3, 0.2), 80); setTimeout(() => playSound(1200, 'sine', 0.4, 0.2), 160); }
+function sfxStomp() { playSound(200, 'square', 0.2, 0.2); }
+function sfxHurt() { playSound(150, 'sawtooth', 0.3, 0.2); }
+function sfxPowerup() { playSound(500, 'triangle', 0.4, 0.2); setTimeout(() => playSound(700, 'triangle', 0.4, 0.2), 100); }
+function sfxFlag() { for(let i=0;i<5;i++) setTimeout(()=>playSound(400+i*200,'sine',0.3,0.15),i*80); }
+
+// Game constants
+const GRAVITY = 0.6;
+const JUMP_FORCE = -12;
+const MOVE_SPEED = 5;
+const GEM_COLORS = ['#ff4444','#4488ff','#44dd44','#ffdd44'];
+const GEM_NAMES = ['red','blue','green','yellow'];
+const POWERUPS = ['shield','doubleJump','speed'];
+
+// Game state
+let gameState = 'START'; // START, PLAYING, LEVEL_COMPLETE, GAME_OVER, WIN
+let level = 0;
+let score = 0;
+let totalScore = 0;
+let keys = {};
+let lastTime = 0;
+let particles = [];
+let cameraX = 0;
+let matchFlash = 0;
+let powerupTimer = 0;
+let currentPowerup = -1;
+
+// Player
+let player = { x: 0, y: 0, vx: 0, vy: 0, w: 28, h: 36, onGround: false, jumps: 0, maxJumps: 1, shield: false, speedBoost: 0, facing: 1 };
+
+// Level data
+let platforms = [];
+let gems = [];
+let enemies = [];
+let flag = null;
+let gemBar = [];
+let levelWidth = 0;
+
+function generateLevel(lvl) {
+    platforms = [];
+    gems = [];
+    enemies = [];
+    gemBar = [];
+    particles = [];
+    
+    const segCount = 8 + lvl * 3;
+    let x = 0;
+    let y = H - 80;
+    levelWidth = 0;
+    
+    // Starting platform
+    platforms.push({ x: 0, y: H - 60, w: 200, h: 40, type: 'ground' });
+    player.x = 50;
+    player.y = H - 100;
+    player.vx = 0;
+    player.vy = 0;
+    player.jumps = 0;
+    player.shield = false;
+    player.speedBoost = 0;
+    player.maxJumps = 1;
+    
+    x = 200;
+    y = H - 60;
+    
+    for (let i = 0; i < segCount; i++) {
+        const gap = 80 + Math.random() * 60 + lvl * 10;
+        const py = y + (Math.random() - 0.5) * 120;
+        const clampedY = Math.max(100, Math.min(H - 150, py));
+        const pw = 100 + Math.random() * 150;
+        
+        x += gap;
+        platforms.push({ x: x, y: clampedY, w: pw, h: 30, type: 'platform' });
+        
+        // Gems on platform
+        const gemCount = 1 + Math.floor(Math.random() * 3);
+        for (let g = 0; g < gemCount; g++) {
+            gems.push({
+                x: x + 20 + g * 40,
+                y: clampedY - 50,
+                w: 20, h: 20,
+                color: Math.floor(Math.random() * 4),
+                collected: false,
+                bob: Math.random() * Math.PI * 2
+            });
+        }
+        
+        // Enemy on platform (chance increases with level)
+        if (Math.random() < 0.3 + lvl * 0.1 && pw > 120) {
+            enemies.push({
+                x: x + pw / 2 - 15,
+                y: clampedY - 36,
+                w: 30, h: 30,
+                vx: 1 + lvl * 0.3,
+                minX: x + 10,
+                maxX: x + pw - 40,
+                alive: true
+            });
+        }
+        
+        y = clampedY;
+    }
+    
+    // Add some floating platforms with gems
+    for (let i = 0; i < 5 + lvl * 2; i++) {
+        const fx = 300 + Math.random() * (segCount * 200);
+        const fy = 100 + Math.random() * (H - 250);
+        platforms.push({ x: fx, y: fy, w: 80, h: 20, type: 'floating' });
+        gems.push({
+            x: fx + 30, y: fy - 45, w: 20, h: 20,
+            color: Math.floor(Math.random() * 4), collected: false,
+            bob: Math.random() * Math.PI * 2
+        });
+    }
+    
+    // Flag at end
+    levelWidth = x + pw + 100;
+    flag = { x: x + pw - 30, y: clampedY - 80, w: 20, h: 80 };
+}
+
+function startGame() {
+    totalScore = 0;
+    level = 0;
+    generateLevel(0);
+    gameState = 'PLAYING';
+}
+
+function nextLevel() {
+    level++;
+    if (level >= 5) {
+        gameState = 'WIN';
+    } else {
+        generateLevel(level);
+        player.maxJumps = 1;
+        gameState = 'PLAYING';
+    }
+}
+
+function checkMatch() {
+    for (let i = 0; i <= gemBar.length - 3; i++) {
+        if (gemBar[i] !== null && gemBar[i] === gemBar[i+1] && gemBar[i] === gemBar[i+2]) {
+            // Remove matched gems
+            gemBar.splice(i, 3);
+            sfxMatch();
+            matchFlash = 20;
+            
+            // Give power-up
+            currentPowerup = (currentPowerup + 1) % POWERUPS.length;
+            const pu = POWERUPS[currentPowerup];
+            if (pu === 'shield') player.shield = true;
+            else if (pu === 'doubleJump') player.maxJumps = 2;
+            else if (pu === 'speed') player.speedBoost = 300;
+            
+            sfxPowerup();
+            score += 100;
+            
+            // Particles
+            for (let p = 0; p < 8; p++) {
+                particles.push({
+                    x: W/2 + (Math.random()-0.5)*100,
+                    y: H - 60,
+                    vx: (Math.random()-0.5)*6,
+                    vy: -Math.random()*5 - 2,
+                    life: 40,
+                    color: GEM_COLORS[gemBar.length % 4] || '#fff'
+                });
+            }
+            return;
+        }
+    }
+}
+
+function update() {
+    if (gameState !== 'PLAYING') return;
+    
+    // Player movement
+    const speed = player.speedBoost > 0 ? MOVE_SPEED * 1.5 : MOVE_SPEED;
+    if (keys['ArrowLeft'] || keys['KeyA']) { player.vx = -speed; player.facing = -1; }
+    else if (keys['ArrowRight'] || keys['KeyD']) { player.vx = speed; player.facing = 1; }
+    else player.vx *= 0.8;
+    
+    // Jump
+    if ((keys['ArrowUp'] || keys['KeyW'] || keys['Space']) && player.jumps < player.maxJumps) {
+        if (!player._jumpHeld) {
+            player.vy = JUMP_FORCE;
+            player.jumps++;
+            sfxJump();
+            player._jumpHeld = true;
+        }
+    }
+    if (!(keys['ArrowUp'] || keys['KeyW'] || keys['Space'])) player._jumpHeld = false;
+    
+    // Gravity
+    player.vy += GRAVITY;
+    if (player.speedBoost > 0) player.speedBoost--;
+    
+    player.x += player.vx;
+    player.y += player.vy;
+    
+    // Platform collision
+    player.onGround = false;
+    for (let p of platforms) {
+        if (player.x + player.w > p.x && player.x < p.x + p.w) {
+            if (player.y + player.h > p.y && player.y + player.h < p.y + p.h + 20 && player.vy >= 0) {
+                player.y = p.y - player.h;
+                player.vy = 0;
+                player.onGround = true;
+                player.jumps = 0;
+            }
+        }
+    }
+    
+    // Gem collection
+    for (let g of gems) {
+        if (!g.collected && Math.abs(player.x + player.w/2 - g.x - g.w/2) < 30 && Math.abs(player.y + player.h/2 - g.y - g.h/2) < 30) {
+            g.collected = true;
+            sfxCollect();
+            score += 10;
+            gemBar.push(g.color);
+            if (gemBar.length >= 5) checkMatch();
+            
+            // Particles
+            for (let p = 0; p < 5; p++) {
+                particles.push({
+                    x: g.x + g.w/2, y: g.y + g.h/2,
+                    vx: (Math.random()-0.5)*4, vy: -Math.random()*3,
+                    life: 25, color: GEM_COLORS[g.color]
+                });
+            }
+        }
+    }
+    
+    // Enemy AI
+    for (let e of enemies) {
+        if (!e.alive) continue;
+        e.x += e.vx;
+        if (e.x < e.minX || e.x > e.maxX) e.vx *= -1;
+        
+        // Collision with player
+        if (player.x + player.w > e.x && player.x < e.x + e.w && player.y + player.h > e.y && player.y < e.y + e.h) {
+            if (player.vy > 0 && player.y + player.h - player.vy <= e.y + 5) {
+                // Stomp
+                e.alive = false;
+                player.vy = JUMP_FORCE * 0.7;
+                sfxStomp();
+                score += 50;
+                for (let p = 0; p < 6; p++) {
+                    particles.push({ x: e.x+e.w/2, y: e.y+e.h/2, vx:(Math.random()-0.5)*5, vy:-Math.random()*4, life:30, color:'#ff8844' });
+                }
+            } else {
+                hurtPlayer();
+            }
+        }
+    }
+    
+    // Flag
+    if (flag && Math.abs(player.x + player.w/2 - flag.x - flag.w/2) < 30 && Math.abs(player.y + player.h/2 - flag.y - flag.h/2) < 50) {
+        sfxFlag();
+        score += 200;
+        gameState = 'LEVEL_COMPLETE';
+    }
+    
+    // Fall off screen
+    if (player.y > H + 100) {
+        hurtPlayer(true);
+    }
+    
+    // Camera
+    const targetCam = player.x - W * 0.35;
+    cameraX += (targetCam - cameraX) * 0.1;
+    if (cameraX < 0) cameraX = 0;
+    if (cameraX > levelWidth - W) cameraX = levelWidth - W;
+    
+    // Particles
+    for (let p of particles) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.2;
+        p.life--;
+    }
+    particles = particles.filter(p => p.life > 0);
+    
+    if (matchFlash > 0) matchFlash--;
+}
+
+function hurtPlayer(fell) {
+    if (player.shield && !fell) {
+        player.shield = false;
+        sfxHurt();
+        player.vy = -8;
+        return;
+    }
+    sfxHurt();
+    gameState = 'GAME_OVER';
+}
+
+function draw() {
+    // Background gradient
+    const bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, '#1a1a3e');
+    bg.addColorStop(1, '#2d2d5e');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+    
+    // Stars
+    for (let i = 0; i < 50; i++) {
+        const sx = ((i * 137 + level * 99) % (levelWidth || W));
+        const sy = (i * 73) % (H * 0.6);
+        ctx.fillStyle = `rgba(255,255,255,${0.3 + (i%3)*0.2})`;
+        ctx.fillRect(sx - cameraX * 0.3 % W, sy, 2, 2);
+    }
+    
+    if (gameState === 'START') {
+        drawStartScreen();
+        return;
+    }
+    
+    // Platforms
+    for (let p of platforms) {
+        const px = p.x - cameraX;
+        if (px + p.w < 0 || px > W) continue;
+        
+        ctx.fillStyle = p.type === 'ground' ? '#4a7a4a' : '#6a5acd';
+        ctx.fillRect(px, p.y, p.w, p.h);
+        ctx.fillStyle = p.type === 'ground' ? '#6aaa6a' : '#8a7aed';
+        ctx.fillRect(px, p.y, p.w, 6);
+    }
+    
+    // Gems
+    for (let g of gems) {
+        if (g.collected) continue;
+        const gx = g.x - cameraX;
+        if (gx < -30 || gx > W + 30) continue;
+        
+        const bobY = Math.sin(Date.now() * 0.003 + g.bob) * 5;
+        ctx.fillStyle = GEM_COLORS[g.color];
+        ctx.beginPath();
+        ctx.arc(gx + g.w/2, g.y + g.h/2 + bobY, 10, 0, Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.4)';
+        ctx.beginPath();
+        ctx.arc(gx + g.w/2 - 3, g.y + g.h/2 + bobY - 3, 4, 0, Math.PI*2);
+        ctx.fill();
+    }
+    
+    // Enemies
+    for (let e of enemies) {
+        if (!e.alive) continue;
+        const ex = e.x - cameraX;
+        if (ex < -50 || ex > W + 50) continue;
+        
+        ctx.fillStyle = '#ff6644';
+        ctx.fillRect(ex, e.y, e.w, e.h);
+        // Eyes
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(ex + 5, e.y + 8, 8, 8);
+        ctx.fillRect(ex + 18, e.y + 8, 8, 8);
+        ctx.fillStyle = '#000';
+        const lookDir = player.x > e.x ? 2 : -2;
+        ctx.fillRect(ex + 7 + lookDir, e.y + 10, 4, 6);
+        ctx.fillRect(ex + 20 + lookDir, e.y + 10, 4, 6);
+        // Spikes
+        ctx.fillStyle = '#ff3333';
+        for (let s = 0; s < 3; s++) {
+            ctx.beginPath();
+            ctx.moveTo(ex + 5 + s*10, e.y);
+            ctx.lineTo(ex + 10 + s*10, e.y - 8);
+            ctx.lineTo(ex + 15 + s*10, e.y);
+            ctx.fill();
+        }
+    }
+    
+    // Flag
+    if (flag) {
+        const fx = flag.x - cameraX;
+        ctx.fillStyle = '#888';
+        ctx.fillRect(fx + 8, flag.y, 4, flag.h);
+        ctx.fillStyle = '#ffdd00';
+        ctx.beginPath();
+        ctx.moveTo(fx + 12, flag.y);
+        ctx.lineTo(fx + 50, flag.y + 15);
+        ctx.lineTo(fx + 12, flag.y + 30);
+        ctx.fill();
+    }
+    
+    // Player
+    const px = player.x - cameraX;
+    if (player.shield) {
+        ctx.strokeStyle = 'rgba(100,200,255,0.6)';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(px + player.w/2, player.y + player.h/2, 28, 0, Math.PI*2);
+        ctx.stroke();
+    }
+    
+    // Body
+    const bodyColor = player.speedBoost > 0 ? '#ffaa00' : (player.shield ? '#66ccff' : '#ff6699');
+    ctx.fillStyle = bodyColor;
+    ctx.fillRect(px, player.y, player.w, player.h);
+    
+    // Face
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(px + 4, player.y + 8, 8, 8);
+    ctx.fillRect(px + 16, player.y + 8, 8, 8);
+    ctx.fillStyle = '#000';
+    const eyeOff = player.facing * 2;
+    ctx.fillRect(px + 6 + eyeOff, player.y + 10, 4, 5);
+    ctx.fillRect(px + 18 + eyeOff, player.y + 10, 4, 5);
+    
+    // Legs animation
+    if (player.onGround && Math.abs(player.vx) > 1) {
+        const legPhase = Math.sin(Date.now() * 0.01) * 4;
+        ctx.fillStyle = bodyColor;
+        ctx.fillRect(px + 4, player.y + player.h - 4, 8, 4 + legPhase);
+        ctx.fillRect(px + 16, player.y + player.h - 4, 8, 4 - legPhase);
+    }
+    
+    // Particles
+    for (let p of particles) {
+        ctx.globalAlpha = p.life / 30;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - cameraX, p.y, 6, 6);
+    }
+    ctx.globalAlpha = 1;
+    
+    // UI
+    drawUI();
+    
+    if (gameState === 'GAME_OVER') {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#ff4444';
+        ctx.font = 'bold 48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W/2, H/2 - 30);
+        ctx.fillStyle = '#fff';
+        ctx.font = '24px monospace';
+        ctx.fillText(`Score: ${totalScore + score}`, W/2, H/2 + 10);
+        ctx.fillText('Press R to Restart', W/2, H/2 + 50);
+    }
+    
+    if (gameState === 'LEVEL_COMPLETE') {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#44dd44';
+        ctx.font = 'bold 42px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('LEVEL COMPLETE!', W/2, H/2 - 30);
+        ctx.fillStyle = '#fff';
+        ctx.font = '24px monospace';
+        ctx.fillText(`Level ${level + 1} | Score: ${totalScore + score}`, W/2, H/2 + 15);
+        ctx.fillText('Press SPACE to continue', W/2, H/2 + 55);
+    }
+    
+    if (gameState === 'WIN') {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#ffdd00';
+        ctx.font = 'bold 48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('YOU WIN!', W/2, H/2 - 50);
+        ctx.fillStyle = '#fff';
+        ctx.font = '28px monospace';
+        ctx.fillText(`Final Score: ${totalScore + score}`, W/2, H/2);
+        ctx.font = '22px monospace';
+        ctx.fillText('Press R to Play Again', W/2, H/2 + 50);
+    }
+}
+
+function drawUI() {
+    // Gem bar
+    const barX = W/2 - (5 * 40) / 2;
+    const barY = H - 50;
+    
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(barX - 10, barY - 10, 220, 50);
+    
+    for (let i = 0; i < 5; i++) {
+        const gx = barX + i * 40;
+        ctx.fillStyle = 'rgba(255,255,255,0.1)';
+        ctx.beginPath();
+        ctx.arc(gx + 15, barY + 10, 14, 0, Math.PI*2);
+        ctx.fill();
+        
+        if (gemBar[i] !== undefined && gemBar[i] !== null) {
+            ctx.fillStyle = GEM_COLORS[gemBar[i]];
+            ctx.beginPath();
+            ctx.arc(gx + 15, barY + 10, 12, 0, Math.PI*2);
+            ctx.fill();
+            ctx.fillStyle = 'rgba(255,255,255,0.4)';
+            ctx.beginPath();
+            ctx.arc(gx + 12, barY + 7, 4, 0, Math.PI*2);
+            ctx.fill();
+        }
+    }
+    
+    // Match flash
+    if (matchFlash > 0) {
+        ctx.fillStyle = `rgba(255,255,255,${matchFlash/20 * 0.3})`;
+        ctx.fillRect(barX - 10, barY - 10, 220, 50);
+    }
+    
+    // Score & Level
+    ctx.fillStyle = '#fff';
+    ctx.font = '18px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Level: ${level + 1}/5`, 20, 30);
+    ctx.fillText(`Score: ${totalScore + score}`, 20, 55);
+    
+    // Power-up indicators
+    if (player.shield) {
+        ctx.fillStyle = '#66ccff';
+        ctx.fillText('🛡 SHIELD', 140, 30);
+    }
+    if (player.maxJumps > 1) {
+        ctx.fillStyle = '#ffaa00';
+        ctx.fillText('⬆⬆ DBL JUMP', 140, 55);
+    }
+    if (player.speedBoost > 0) {
+        ctx.fillStyle = '#ffdd00';
+        ctx.fillText(`⚡ SPEED ${Math.ceil(player.speedBoost/60)}s`, 140, player.shield || player.maxJumps>1 ? 80 : 30);
+    }
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 52px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('CHROMA DASH', W/2, H/2 - 100);
+    
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('A Match-3 Platformer', W/2, H/2 - 60);
+    
+    ctx.font = '18px monospace';
+    ctx.fillStyle = '#ccc';
+    const lines = [
+        '← → or A/D : Move',
+        '↑ / W / SPACE : Jump',
+        '',
+        'Collect gems to fill your bar!',
+        'Match 3 same-color gems for power-ups:',
+        '  🛡 Shield | ⬆ Double Jump | ⚡ Speed',
+        '',
+        'Stomp enemies. Reach the flag!',
+        `Complete ${5} levels to win!`
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillStyle = i >= 4 && i <= 6 ? GEM_COLORS[i-3] : (i < 2 ? '#88f' : '#ccc');
+        ctx.fillText(line, W/2, H/2 - 10 + i * 28);
+    });
+    
+    ctx.fillStyle = `rgba(255,255,255,${0.5 + Math.sin(Date.now()*0.005)*0.3})`;
+    ctx.font = 'bold 24px monospace';
+    ctx.fillText('Press SPACE to Start', W/2, H - 80);
+}
+
+function gameLoop() {
+    update();
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+// Input
+window.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    initAudio();
+    
+    if (gameState === 'START' && e.code === 'Space') {
+        startGame();
+    } else if (gameState === 'PLAYING') {
+        if (e.code === 'KeyR') startGame();
+    } else if (gameState === 'GAME_OVER' && e.code === 'KeyR') {
+        startGame();
+    } else if (gameState === 'LEVEL_COMPLETE' && e.code === 'Space') {
+        totalScore += score;
+        score = 0;
+        nextLevel();
+    } else if (gameState === 'WIN' && e.code === 'KeyR') {
+        startGame();
+    }
+    
+    // Prevent scrolling
+    if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+});
+
+window.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+});
+
+// Start loop
+gameLoop();
+</script>
+</body>
+</html>
