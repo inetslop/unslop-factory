@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Physics Minesweeper</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#141a29;
+    font-family:"Segoe UI",system-ui,Arial,sans-serif;color:#e8ecf5;}
+  #game{position:absolute;inset:0;display:block;cursor:crosshair;}
+  .hud{position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:5;
+    display:flex;gap:24px;background:rgba(15,20,34,.75);border:1px solid #2c3852;
+    border-radius:10px;padding:8px 20px;font-size:15px;letter-spacing:.5px;
+    pointer-events:none;white-space:nowrap;}
+  .hud b{color:#ffd166;font-variant-numeric:tabular-nums;}
+  .overlay{position:absolute;inset:0;z-index:10;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;background:rgba(8,12,22,.82);
+    text-align:center;padding:20px;}
+  .overlay h1{font-size:min(9vw,52px);margin:0 0 6px;color:#ffd166;
+    text-shadow:0 4px 0 #6b3b1e,0 8px 24px rgba(0,0,0,.6);}
+  .overlay h2{font-size:min(8vw,42px);margin:0 0 8px;}
+  .overlay p{max-width:520px;line-height:1.55;color:#aab6cf;margin:6px 0;font-size:15px;}
+  .keys{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;margin:18px 0 6px;}
+  .keys span{background:#232b40;border:1px solid #3a4a6e;border-radius:8px;
+    padding:7px 12px;font-size:13.5px;color:#dfe6f5;}
+  .keys kbd{color:#ffd166;font-family:inherit;font-weight:700;}
+  button{margin-top:20px;font-size:19px;font-weight:700;padding:13px 42px;cursor:pointer;
+    color:#1a1206;background:linear-gradient(#ffe08a,#ffb84d);border:none;border-radius:12px;
+    box-shadow:0 5px 0 #9c6b1e,0 10px 22px rgba(0,0,0,.45);transition:transform .08s;}
+  button:hover{transform:translateY(-2px);}
+  button:active{transform:translateY(3px);box-shadow:0 2px 0 #9c6b1e;}
+  .hidden{display:none !important;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div class="hud" id="hud">
+  <span>⛏ Cleared <b id="hCleared">0/56</b></span>
+  <span>🚩 Flags <b id="hFlags">0</b></span>
+  <span>⏱ <b id="hTime">0:00</b></span>
+  <span>★ Best <b id="hBest">--</b></span>
+</div>
+
+<div class="overlay" id="startScreen">
+  <h1>⛏ Physics Minesweeper</h1>
+  <p>The classic puzzle, but every tile is a real physical block. Dig tiles away and watch the
+     column collapse — knock tiles around, bounce them off the walls, and flag the mines you deduce.
+     Clear every safe tile before you hit one!</p>
+  <div class="keys">
+    <span><kbd>Left-click</kbd> dig</span>
+    <span><kbd>Right-click</kbd> flag / unflag</span>
+    <span><kbd>R</kbd> restart</span>
+    <span><kbd>Enter</kbd> start</span>
+  </div>
+  <button id="startBtn">Dig In</button>
+</div>
+
+<div class="overlay hidden" id="endScreen">
+  <h2 id="endTitle"></h2>
+  <p id="endSub"></p>
+  <button id="restartBtn">Play Again</button>
+</div>
+
+<script>
+(function(){
+"use strict";
+const canvas=document.getElementById('game'), ctx=canvas.getContext('2d');
+const COLS=10, ROWS=8, MINES=14, TOTAL=COLS*ROWS, SAFE=TOTAL-MINES, PAD=3;
+let W=0,H=0,cell=0,ox=0,oy=0,floorY=0;
+let tiles=[],adj=[],particles=[];
+let state='start', time=0, shake=0, firstClick=true;
+let last=performance.now(), endToken=0, best=null;
+try{best=parseFloat(localStorage.getItem('pm_best'))||null;}catch(e){}
+
+/* ---------- audio (starts only after first user input) ---------- */
+const sound={
+  ac:null,
+  init(){ if(!this.ac){ try{ this.ac=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+          if(this.ac && this.ac.state==='suspended') this.ac.resume(); },
+  tone(f,d,type,v,slideTo){ const ac=this.ac; if(!ac)return;
+    const o=ac.createOscillator(), g=ac.createGain(), t0=ac.currentTime;
+    o.type=type||'sine'; o.frequency.setValueAtTime(f,t0);
+    if(slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(1,slideTo),t0+d);
+    g.gain.setValueAtTime(v||.15,t0); g.gain.exponentialRampToValueAtTime(.001,t0+d);
+    o.connect(g); g.connect(ac.destination); o.start(t0); o.stop(t0+d+.02); },
+  dig(n){ this.tone(200+Math.min(n,10)*45,.13,'triangle',.18,90); },
+  flag(on){ this.tone(on?540:320,.07,'square',.07); },
+  boom(){ const ac=this.ac; if(!ac)return;
+    const len=(ac.sampleRate*0.6)|0, buf=ac.createBuffer(1,len,ac.sampleRate), d=buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/len,2.2);
+    const s=ac.createBufferSource(); s.buffer=buf;
+    const f=ac.createBiquadFilter(); f.type='lowpass'; f.frequency.value=420;
+    const g=ac.createGain(); g.gain.value=.55;
+    s.connect(f); f.connect(g); g.connect(ac.destination); s.start();
+    this.tone(64,.5,'sine',.4,30); },
+  win(){ [523,659,784,1047].forEach((f,i)=>setTimeout(()=>this.tone(f,.28,'triangle',.15),i*130)); }
+};
+
+/* ---------- layout / resize ---------- */
+function layout(){
+  cell=Math.max(24,Math.floor(Math.min((W-60)/COLS,(H-130)/ROWS)));
+  ox=(W-COLS*cell)/2;
+  oy=Math.max(70,(H-ROWS*cell)/2+15);
+  floorY=oy+ROWS*cell;
+}
+function resize(){
+  const oC=cell,oX=ox,oY=oy;
+  W=innerWidth; H=innerHeight; canvas.width=W; canvas.height=H;
+  layout();
+  if(oC && tiles.length){ const s=cell/oC;
+    for(const t of tiles){ if(t.removed)continue;
+      t.x=ox+(t.x-oX)*s; t.y=oy+(t.y-oY)*s; t.w=t.h=cell-PAD*2; t.vx*=s; t.vy*=s; } }
+}
+
+/* ---------- game setup ---------- */
+function shuffle(a){ for(let i=a.length-1;i>0;i--){ const j=(Math.random()*(i+1))|0; [a[i],a[j]]=[a[j],a[i]]; } return a; }
+
+function newGame(){
+  tiles=[]; adj=[]; particles=[]; time=0; shake=0; firstClick=true; endToken++;
+  for(let i=0;i<TOTAL;i++){
+    const c=i%COLS, r=(i/COLS)|0, n=[];
+    for(let dr=-1;dr<=1;dr++)for(let dc=-1;dc<=1;dc++){
+      if(!dr&&!dc)continue; const nc=c+dc,nr=r+dr;
+      if(nc>=0&&nc<COLS&&nr>=0&&nr<ROWS) n.push(nr*COLS+nc);
+    }
+    adj.push(n);
+    tiles.push({i,c,r,x:ox+c*cell+PAD,y:oy+r*cell+PAD,vx:0,vy:0,w:cell-PAD*2,h:cell-PAD*2,
+      rot:0,vr:0,mine:false,num:0,removed:false,flagged:false});
+  }
+  placeMines(); updateHUD();
+}
+function placeMines(){
+  for(const t of tiles){ t.mine=false; t.num=0; }
+  const idx=shuffle([...Array(TOTAL).keys()]).slice(0,MINES);
+  for(const i of idx) tiles[i].mine=true;
+  for(let i=0;i<TOTAL;i++){ let n=0; for(const j of adj[i]) if(tiles[j].mine)n++; tiles[i].num=n; }
+}
+
+/* ---------- gameplay ---------- */
+function cascade(start){
+  const stack=[start], seen=new Set([start]), rem=[];
+  while(stack.length){
+    const i=stack.pop(), t=tiles[i];
+    if(t.removed||t.mine)continue;
+    rem.push(i);
+    for(const n of adj[i]){
+      if(seen.has(n))continue; seen.add(n);
+      const nt=tiles[n];
+      if(!nt.mine && nt.num===0) stack.push(n);
+    }
+  }
+  for(const i of rem){
+    if(tiles[i].num!==0)continue;
+    for(const n of adj[i]) if(!tiles[n].mine && !seen.has(n)){ seen.add(n); rem.push(n); }
+  }
+  return rem;
+}
+function dig(t){
+  if(firstClick){ let guard=0; while(t.mine && guard++<60) placeMines(); firstClick=false; }
+  const set = t.num===0 ? cascade(t.i) : [t.i];
+  let popped=0;
+  for(const i of set){ const tt=tiles[i]; if(tt.removed||tt.mine)continue;
+    tt.removed=true; popped++; spawnDust(tt); }
+  if(popped) sound.dig(popped);
+  updateHUD();
+  const cleared=tiles.reduce((a,x)=>a+(x.removed&&!x.mine?1:0),0);
+  if(cleared>=SAFE) winGame();
+}
+function lose(t){
+  state='lost'; t.removed=true; shake=18; sound.boom();
+  const ex=t.x+t.w/2, ey=t.y+t.h/2;
+  explode(ex,ey);
+  for(const o of tiles){ if(o.removed||o.mine)continue;
+    let dx=o.x+o.w/2-ex, dy=o.y+o.h/2-ey; const d=Math.max(1,Math.hypot(dx,dy));
+    const f=cell*10/(1+d/cell);
+    o.vx+=dx/d*f; o.vy+=dy/d*f-cell*4; o.vr=(Math.random()-.5)*8; }
+  const tok=++endToken;
+  setTimeout(()=>{ if(tok===endToken && state==='lost') showEnd(false); },900);
+}
+function winGame(){
+  state='won'; sound.win(); shake=4; confetti();
+  if(best==null || time<best){ best=time; try{ localStorage.setItem('pm_best',String(best)); }catch(e){} }
+  const tok=++endToken;
+  setTimeout(()=>{ if(tok===endToken && state==='won') showEnd(true); },700);
+}
+
+/* ---------- input ---------- */
+function pick(mx,my){
+  for(let i=tiles.length-1;i>=0;i--){ const t=tiles[i];
+    if(!t.removed && mx>=t.x&&mx<=t.x+t.w&&my>=t.y&&my<=t.y+t.h) return t; }
+  return null;
+}
+function startGame(){
+  document.getElementById('startScreen').classList.add('hidden');
+  document.getElementById('endScreen').classList.add('hidden');
+  newGame(); state='playing';
+}
+canvas.addEventListener('mousedown',e=>{
+  sound.init(); if(state!=='playing')return;
+  const t=pick(e.clientX,e.clientY); if(!t)return;
+  if(e.button===2){ t.flagged=!t.flagged; sound.flag(t.flagged); updateHUD(); }
+  else if(e.button===0){ if(!t.flagged) dig(t); }
+});
+canvas.addEventListener('contextmenu',e=>e.preventDefault());
+canvas.addEventListener('touchstart',e=>{
+  sound.init(); e.preventDefault();
+  if(state!=='playing')return;
+  const p=e.touches[0], t=pick(p.clientX,p.clientY);
+  if(t&&!t.flagged) dig(t);
+},{passive:false});
+window.addEventListener('keydown',e=>{
+  sound.init();
+  if(e.key==='Enter'||e.key===' '){ if(state!=='playing') startGame(); }
+  else if((e.key==='r'||e.key==='R') && state!=='start'){ startGame(); }
+});
+document.getElementById('startBtn').addEventListener('click',()=>{sound.init();startGame();});
+document.getElementById('restartBtn').addEventListener('click',()=>{sound.init();startGame();});
+
+/* ---------- physics ---------- */
+function physics(dt){
+  const g=cell*30, rest=.32;
+  for(const t of tiles){ if(t.removed)continue;
+    t.vy+=g*dt; t.x+=t.vx*dt; t.y+=t.vy*dt; t.rot+=t.vr*dt;
+    t.vr*=Math.max(0,1-2.5*dt);
+    const bx0=ox, bx1=ox+COLS*cell-t.w;
+    if(t.x<bx0){ t.x=bx0; t.vx=Math.abs(t.vx)*rest; }
+    else if(t.x>bx1){ t.x=bx1; t.vx=-Math.abs(t.vx)*rest; }
+    const top=oy-cell*.6;
+    if(t.y<top){ t.y=top; t.vy=Math.abs(t.vy)*rest; }
+    if(t.y+t.h>=floorY){ t.y=floorY-t.h;
+      t.vy = Math.abs(t.vy)<cell*1.3 ? 0 : -Math.abs(t.vy)*rest;
+      t.vx*=.94; }
+  }
+  for(let it=0;it<3;it++){
+    for(let i=0;i<tiles.length;i++){ const a=tiles[i]; if(a.removed)continue;
+      for(let j=i+1;j<tiles.length;j++){ const b=tiles[j]; if(b.removed)continue;
+        const dx=(a.x+a.w/2)-(b.x+b.w/2), dy=(a.y+a.h/2)-(b.y+b.h/2);
+        const oxp=(a.w+b.w)/2-Math.abs(dx), oyp=(a.h+b.h)/2-Math.abs(dy);
+        if(oxp<=0||oyp<=0)continue;
+        if(oxp<oyp){ const s=dx>0?1:-1; a.x+=s*oxp/2; b.x-=s*oxp/2;
+          const av=a.vx,bv=b.vx;
+          a.vx=(av+bv)/2+(av-bv)*rest; b.vx=(av+bv)/2-(av-bv)*rest; }
+        else{ const s=dy>0?1:-1; a.y+=s*oyp/2; b.y-=s*oyp/2;
+          const av=a.vy,bv=b.vy;
+          a.vy=(av+bv)/2+(av-bv)*rest; b.vy=(av+bv)/2-(av-bv)*rest; }
+      }}}
+}
+
+/* ---------- particles ---------- */
+function spawnDust(t){
+  const cx=t.x+t.w/2, cy=t.y+t.h/2, cols=['#5d6f96','#7d90b8','#41507a'];
+  for(let i=0;i<10;i++){ const a=Math.random()*Math.PI*2, s=cell*(2+Math.random()*3.5);
+    particles.push({x:cx,y:cy,vx:Math.cos(a)*s,vy:Math.sin(a)*s-cell*2,
+      life:.4+Math.random()*.4,max:.8,size:cell*(.07+Math.random()*.09),
+      col:cols[(Math.random()*cols.length)|0],grav:1}); }
+}
+function explode(x,y){
+  const cols=['#ffd166','#ff7b3a','#ff4d4d','#ffffff'];
+  for(let i=0;i<70;i++){ const a=Math.random()*Math.PI*2, s=cell*(4+Math.random()*9);
+    particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-cell*3,
+      life:.5+Math.random()*.6,max:1.1,size:cell*(.08+Math.random()*.14),
+      col:cols[(Math.random()*cols.length)|0],grav:.7}); }
+}
+function confetti(){
+  const cols=['#ffd166','#6ee7a0','#4da3ff','#c58bff','#ff7b7b','#4de3e0'];
+  for(let i=0;i<130;i++){
+    particles.push({x:ox+Math.random()*COLS*cell, y:oy-20-Math.random()*60,
+      vx:(Math.random()-.5)*cell*3, vy:cell*(1+Math.random()*3),
+      life:1.4+Math.random(),max:2.4,size:cell*(.08+Math.random()*.1),
+      col:cols[(Math.random()*cols.length)|0],grav:.5}); }
+}
+function updateParticles(dt){
+  for(let i=particles.length-1;i>=0;i--){ const p=particles[i];
+    p.life-=dt; if(p.life<=0){ particles.splice(i,1); continue; }
+    p.vy+=cell*26*dt*p.grav; p.x+=p.vx*dt; p.y+=p.vy*dt; }
+}
+
+/* ---------- drawing ---------- */
+function rr(x,y,w,h,r){ ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+
+const NUMCOL={1:'#4da3ff',2:'#6ee7a0',3:'#ff7b7b',4:'#c58bff',5:'#ffb84d',6:'#4de3e0',7:'#ffffff',8:'#9aa4b5'};
+
+function drawTile(t){
+  const cx=t.x+t.w/2, cy=t.y+t.h/2;
+  ctx.save(); ctx.translate(cx,cy); ctx.rotate(t.rot);
+  const w=t.w,h=t.h, r=Math.max(3,w*.12);
+  const isMineRevealed = state==='lost' && t.mine;
+  const g=ctx.createLinearGradient(0,-h/2,0,h/2);
+  if(isMineRevealed){ g.addColorStop(0,'#7a3a48'); g.addColorStop(1,'#54262f'); }
+  else{ g.addColorStop(0,'#3d4d72'); g.addColorStop(1,'#2b3752'); }
+  rr(-w/2,-h/2,w,h,r); ctx.fillStyle=g; ctx.fill();
+  ctx.lineWidth=1.5; ctx.strokeStyle=isMineRevealed?'#a05568':'#55689c'; ctx.stroke();
+  rr(-w/2+3,-h/2+3,w-6,4,2); ctx.fillStyle='rgba(255,255,255,.10)'; ctx.fill();
+
+  if(isMineRevealed){
+    const R=w*.26;
+    ctx.strokeStyle='#151118'; ctx.lineWidth=Math.max(2,w*.07);
+    for(let k=0;k<4;k++){ const a=k*Math.PI/4;
+      ctx.beginPath(); ctx.moveTo(Math.cos(a)*R,Math.sin(a)*R);
+      ctx.lineTo(-Math.cos(a)*R,-Math.sin(a)*R); ctx.stroke(); }
+    ctx.beginPath(); ctx.arc(0,0,R,0,7); ctx.fillStyle='#151118'; ctx.fill();
+    ctx.beginPath(); ctx.arc(-R*.3,-R*.3,R*.24,0,7); ctx.fillStyle='rgba(255,255,255,.5)'; ctx.fill();
+  } else if(t.flagged){
+    const s=w;
+    ctx.strokeStyle='#e8ecf5'; ctx.lineWidth=Math.max(2,s*.06);
+    ctx.beginPath(); ctx.moveTo(s*.04,s*.30); ctx.lineTo(s*.04,-s*.18); ctx.stroke();
+    ctx.fillStyle='#ff5d5d'; ctx.beginPath();
+    ctx.moveTo(s*.04,-s*.18); ctx.lineTo(s*.34,-s*.06); ctx.lineTo(s*.04,s*.05); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle='#e8ecf5'; ctx.beginPath();
+    ctx.moveTo(-s*.12,s*.30); ctx.lineTo(s*.2,s*.30); ctx.stroke();
+  } else if(t.num>0 && adj[t.i].some(n=>tiles[n].removed)){
+    ctx.fillStyle=NUMCOL[t.num]||'#fff';
+    ctx.font='700 '+Math.floor(w*.48)+'px "Segoe UI",Arial,sans-serif';
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(t.num,0,w*.03);
+  }
+  ctx.restore();
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  ctx.save();
+  if(shake>0) ctx.translate((Math.random()-.5)*shake,(Math.random()-.5)*shake);
+  // playfield
+  rr(ox-12,oy-12,COLS*cell+24,ROWS*cell+24,14);
+  ctx.fillStyle='#1c2336'; ctx.fill();
+  ctx.lineWidth=2; ctx.strokeStyle='#2c3852'; ctx.stroke();
+  // dug-out holes at original spots
+  for(const t of tiles){ if(!t.removed)continue;
+    ctx.fillStyle='rgba(0,0,0,.30)';
+    rr(ox+t.c*cell+PAD,oy+t.r*cell+PAD,t.w,t.h,4); ctx.fill(); }
+  // floor line
+  ctx.strokeStyle='#3a4a6e'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(ox-12,floorY+8); ctx.lineTo(ox+COLS*cell+12,floorY+8); ctx.stroke();
+  for(const t of tiles) if(!t.removed) drawTile(t);
+  for(const p of particles){ ctx.globalAlpha=Math.max(0,p.life/p.max);
+    ctx.fillStyle=p.col; ctx.fillRect(p.x-p.size/2,p.y-p.size/2,p.size,p.size); }
+  ctx.globalAlpha=1;
+  ctx.restore();
+}
+
+/* ---------- HUD / screens ---------- */
+const hCleared=document.getElementById('hCleared'), hFlags=document.getElementById('hFlags'),
+      hTime=document.getElementById('hTime'), hBest=document.getElementById('hBest');
+function fmt(s){ s=Math.floor(s); return (s/60|0)+':'+String(s%60).padStart(2,'0'); }
+function updateHUD(){
+  const cleared=tiles.reduce((a,x)=>a+(x.removed&&!x.mine?1:0),0);
+  hCleared.textContent=cleared+'/'+SAFE;
+  hFlags.textContent=tiles.reduce((a,x)=>a+(x.flagged?1:0),0);
+  hBest.textContent=best!=null?fmt(best):'--';
+}
+function showEnd(won){
+  document.getElementById('endTitle').textContent = won?'🎉 Field Cleared!':'💥 BOOM!';
+  document.getElementById('endTitle').style.color = won?'#6ee7a0':'#ff7b7b';
+  document.getElementById('endSub').innerHTML =
+    (won?'You swept every safe tile. ':'You stepped on a mine.')+
+    ' Time: <b style="color:#ffd166">'+fmt(time)+'</b>'+
+    (best!=null?' &nbsp;·&nbsp; Best: <b style="color:#ffd166">'+fmt(best)+'</b>':'')+
+    '<br><span style="font-size:13px;color:#7d8aa5">Press R or Enter to play again</span>';
+  document.getElementById('endScreen').classList.remove('hidden');
+}
+
+/* ---------- main loop ---------- */
+function frame(now){
+  const dt=Math.min(.033,(now-last)/1000); last=now;
+  if(state==='playing'){ time+=dt; hTime.textContent=fmt(time); }
+  physics(dt); updateParticles(dt);
+  shake=Math.max(0,shake-45*dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+window.addEventListener('resize',resize);
+resize(); newGame(); state='start';
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
