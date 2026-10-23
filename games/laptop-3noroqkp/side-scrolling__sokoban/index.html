@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Side Sokoban</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0f0f1a; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H, TILE;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    TILE = Math.max(36, Math.min(52, Math.floor(H / 14)));
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    const now = audioCtx.currentTime;
+    switch (type) {
+        case 'move':
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(220, now);
+            osc.frequency.exponentialRampToValueAtTime(180, now + 0.08);
+            gain.gain.setValueAtTime(0.15, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+            osc.start(now);
+            osc.stop(now + 0.08);
+            break;
+        case 'push':
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(120, now);
+            osc.frequency.exponentialRampToValueAtTime(90, now + 0.12);
+            gain.gain.setValueAtTime(0.12, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+            osc.start(now);
+            osc.stop(now + 0.12);
+            break;
+        case 'placed':
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(440, now);
+            osc.frequency.exponentialRampToValueAtTime(660, now + 0.15);
+            gain.gain.setValueAtTime(0.2, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
+            osc.start(now);
+            osc.stop(now + 0.2);
+            break;
+        case 'win':
+            for (let i = 0; i < 4; i++) {
+                const o = audioCtx.createOscillator();
+                const g = audioCtx.createGain();
+                o.connect(g);
+                g.connect(audioCtx.destination);
+                o.type = 'sine';
+                o.frequency.setValueAtTime([523, 659, 784, 1047][i], now + i * 0.12);
+                g.gain.setValueAtTime(0.15, now + i * 0.12);
+                g.gain.exponentialRampToValueAtTime(0.001, now + i * 0.12 + 0.15);
+                o.start(now + i * 0.12);
+                o.stop(now + i * 0.12 + 0.15);
+            }
+            return;
+        case 'complete':
+            for (let i = 0; i < 6; i++) {
+                const o = audioCtx.createOscillator();
+                const g = audioCtx.createGain();
+                o.connect(g);
+                g.connect(audioCtx.destination);
+                o.type = 'sine';
+                o.frequency.setValueAtTime([523, 659, 784, 1047, 1319, 1568][i], now + i * 0.1);
+                g.gain.setValueAtTime(0.18, now + i * 0.1);
+                g.gain.exponentialRampToValueAtTime(0.001, now + i * 0.1 + 0.2);
+                o.start(now + i * 0.1);
+                o.stop(now + i * 0.1 + 0.25);
+            }
+            return;
+    }
+}
+
+// Levels - side-scrolling wide levels
+const levels = [
+    [
+        "##################",
+        "#......#..........#",
+        "#..$...#....*....#",
+        "#..@...#...#..$..#",
+        "#........#.........#",
+        "####################"
+    ],
+    [
+        "###############",
+        "#.............#",
+        "#..$.....$...#",
+        "#...%...%....#",
+        "#....##.##...#",
+        "#..@.........#",
+        "###############"
+    ],
+    [
+        "#####################",
+        "#....................#",
+        "#..$...........$...#",
+        "#...%.....##...%...#",
+        "#....#.......#.....#",
+        "#..@..........$....#",
+        "#......%...........#",
+        "#####################"
+    ],
+    [
+        "###############",
+        "#.............#",
+        "#..$...$...$.#",
+        "#...%.%...%..#",
+        "#.##...#.....#",
+        "#....$.......#",
+        "#..@.........#",
+        "#......%.....#",
+        "###############"
+    ],
+    [
+        "#######################",
+        "#.....................#",
+        "#..$..........$......#",
+        "#...%..........%.....#",
+        "#..#....##....#......#",
+        "#..#.$........$..#...#",
+        "#..#............#....#",
+        "#..@.................#",
+        "#......%.............#",
+        "#######################"
+    ]
+];
+
+let state = 'start'; // start, playing, levelComplete, gameComplete
+let currentLevel = 0;
+let grid = [];
+let player = { x: 0, y: 0 };
+let boxes = [];
+let targets = [];
+let camX = 0;
+let targetCamX = 0;
+let particles = [];
+let animFrame = 0;
+let moveAnim = 0;
+let placedCount = 0;
+
+function parseLevel(lvl) {
+    grid = [];
+    boxes = [];
+    targets = [];
+    player = { x: 0, y: 0 };
+    placedCount = 0;
+    for (let r = 0; r < lvl.length; r++) {
+        grid[r] = [];
+        for (let c = 0; c < lvl[r].length; c++) {
+            const ch = lvl[r][c];
+            if (ch === '#') grid[r][c] = 1;
+            else if (ch === '@') { grid[r][c] = 0; player.x = c; player.y = r; }
+            else if (ch === '+') { grid[r][c] = 0; player.x = c; player.y = r; targets.push({x:c,y:r}); }
+            else if (ch === '$') { grid[r][c] = 0; boxes.push({x:c,y:r}); }
+            else if (ch === '*') { grid[r][c] = 0; boxes.push({x:c,y:r,onTarget:true}); }
+            else if (ch === '%') { grid[r][c] = 0; targets.push({x:c,y:r}); }
+            else { grid[r][c] = 0; }
+        }
+    }
+    // Update box on-target status
+    for (let b of boxes) {
+        b.onTarget = targets.some(t => t.x === b.x && t.y === b.y);
+    }
+    placedCount = boxes.filter(b => b.onTarget).length;
+}
+
+function loadLevel(idx) {
+    parseLevel(levels[idx]);
+    camX = 0;
+    targetCamX = 0;
+    moveAnim = 0;
+    particles = [];
+}
+
+function isWall(x, y) {
+    if (y < 0 || y >= grid.length) return true;
+    if (x < 0 || x >= grid[y].length) return true;
+    return grid[y][x] === 1;
+}
+
+function hasBox(x, y) {
+    return boxes.some(b => b.x === x && b.y === y);
+}
+
+function tryMove(dx, dy) {
+    if (state !== 'playing') return;
+    const nx = player.x + dx;
+    const ny = player.y + dy;
+    
+    if (isWall(nx, ny)) return;
+    
+    if (hasBox(nx, ny)) {
+        const bx = nx + dx;
+        const by = ny + dy;
+        if (isWall(bx, by) || hasBox(bx, by)) return;
+        // Push box
+        const box = boxes.find(b => b.x === nx && b.y === ny);
+        const wasOnTarget = box.onTarget;
+        box.x = bx;
+        box.y = by;
+        box.onTarget = targets.some(t => t.x === bx && t.y === by);
+        if (!wasOnTarget && box.onTarget) {
+            placedCount++;
+            playSound('placed');
+            spawnParticles(bx, by, '#4ecdc4');
+        } else if (wasOnTarget && !box.onTarget) {
+            placedCount--;
+            playSound('push');
+        } else {
+            playSound('push');
+        }
+    } else {
+        playSound('move');
+    }
+    
+    player.x = nx;
+    player.y = ny;
+    moveAnim = 8;
+    
+    // Check win
+    if (boxes.every(b => b.onTarget)) {
+        state = 'levelComplete';
+        playSound('win');
+        setTimeout(() => {
+            if (currentLevel >= levels.length - 1) {
+                state = 'gameComplete';
+                playSound('complete');
+            }
+        }, 800);
+    }
+}
+
+function spawnParticles(gx, gy, color) {
+    for (let i = 0; i < 12; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 1 + Math.random() * 3;
+        particles.push({
+            x: gx * TILE + TILE / 2,
+            y: gy * TILE + TILE / 2,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed - 2,
+            life: 1,
+            color: color
+        });
+    }
+}
+
+// Input
+window.addEventListener('keydown', (e) => {
+    initAudio();
+    if (state === 'start') {
+        loadLevel(0);
+        state = 'playing';
+        return;
+    }
+    if (state === 'levelComplete') {
+        currentLevel++;
+        loadLevel(currentLevel);
+        state = 'playing';
+        return;
+    }
+    if (state === 'gameComplete') {
+        currentLevel = 0;
+        loadLevel(0);
+        state = 'playing';
+        return;
+    }
+    if (e.key === 'r' || e.key === 'R') {
+        loadLevel(currentLevel);
+        state = 'playing';
+        return;
+    }
+    
+    let dx = 0, dy = 0;
+    switch (e.key) {
+        case 'ArrowLeft': case 'a': case 'A': dx = -1; break;
+        case 'ArrowRight': case 'd': case 'D': dx = 1; break;
+        case 'ArrowUp': case 'w': case 'W': dy = -1; break;
+        case 'ArrowDown': case 's': case 'S': dy = 1; break;
+        default: return;
+    }
+    e.preventDefault();
+    tryMove(dx, dy);
+});
+
+// Rendering
+function drawBackground() {
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, '#1a1a2e');
+    grad.addColorStop(1, '#16213e');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+    
+    // Parallax stars
+    const parallax = camX * 0.3;
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    for (let i = 0; i < 40; i++) {
+        const sx = ((i * 137 + 50) % W + parallax) % W;
+        const sy = (i * 97 + 20) % (H - 60);
+        ctx.beginPath();
+        ctx.arc(sx, sy, 1.5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
+function drawTile(gx, gy, camOffsetX) {
+    const sx = gx * TILE - camOffsetX;
+    const sy = gy * TILE;
+    
+    if (sx < -TILE || sx > W + TILE) return;
+    
+    const ch = grid[gy][gx];
+    if (ch === 1) {
+        // Wall
+        ctx.fillStyle = '#3a3a5c';
+        ctx.fillRect(sx, sy, TILE, TILE);
+        ctx.fillStyle = '#4a4a6e';
+        ctx.fillRect(sx + 2, sy + 2, TILE - 4, TILE - 4);
+        // Brick pattern
+        ctx.strokeStyle = '#2a2a4c';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(sx + 2, sy + 2, TILE / 2 - 2, TILE / 2 - 2);
+        ctx.strokeRect(sx + TILE / 2, sy + 2, TILE / 2 - 2, TILE / 2 - 2);
+        ctx.strokeRect(sx + 2, sy + TILE / 2, TILE / 2 - 2, TILE / 2 - 2);
+        ctx.strokeRect(sx + TILE / 2, sy + TILE / 2, TILE / 2 - 2, TILE / 2 - 2);
+    } else {
+        // Floor
+        ctx.fillStyle = (gx + gy) % 2 === 0 ? '#2a2a45' : '#2e2e4a';
+        ctx.fillRect(sx, sy, TILE, TILE);
+    }
+}
+
+function drawTarget(gx, gy, camOffsetX) {
+    const sx = gx * TILE - camOffsetX;
+    const sy = gy * TILE;
+    if (sx < -TILE || sx > W + TILE) return;
+    
+    const pulse = Math.sin(animFrame * 0.08) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(78, 205, 196, ${pulse * 0.4})`;
+    ctx.beginPath();
+    ctx.arc(sx + TILE / 2, sy + TILE / 2, TILE * 0.35, 0, Math.PI * 2);
+    ctx.fill();
+    
+    ctx.strokeStyle = `rgba(78, 205, 196, ${pulse})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(sx + TILE / 2, sy + TILE / 2, TILE * 0.3, 0, Math.PI * 2);
+    ctx.stroke();
+}
+
+function drawBox(gx, gy, camOffsetX) {
+    const sx = gx * TILE - camOffsetX;
+    const sy = gy * TILE;
+    if (sx < -TILE || sx > W + TILE) return;
+    
+    const box = boxes.find(b => b.x === gx && b.y === gy);
+    if (!box) return;
+    
+    // Wooden crate
+    ctx.fillStyle = box.onTarget ? '#4ecdc4' : '#c8956c';
+    ctx.fillRect(sx + 3, sy + 3, TILE - 6, TILE - 6);
+    ctx.strokeStyle = box.onTarget ? '#2a9d94' : '#8b6914';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(sx + 3, sy + 3, TILE - 6, TILE - 6);
+    
+    // Cross pattern
+    ctx.beginPath();
+    ctx.moveTo(sx + 3, sy + 3);
+    ctx.lineTo(sx + TILE - 3, sy + TILE - 3);
+    ctx.moveTo(sx + TILE - 3, sy + 3);
+    ctx.lineTo(sx + 3, sy + TILE - 3);
+    ctx.stroke();
+    
+    if (box.onTarget) {
+        const glow = Math.sin(animFrame * 0.1) * 0.2 + 0.3;
+        ctx.fillStyle = `rgba(78, 205, 196, ${glow})`;
+        ctx.fillRect(sx, sy, TILE, TILE);
+    }
+}
+
+function drawPlayer(camOffsetX) {
+    const sx = player.x * TILE - camOffsetX;
+    const sy = player.y * TILE;
+    
+    // Body
+    ctx.fillStyle = '#ff6b6b';
+    ctx.fillRect(sx + 6, sy + 10, TILE - 12, TILE - 14);
+    
+    // Head
+    ctx.fillStyle = '#ffd93d';
+    ctx.beginPath();
+    ctx.arc(sx + TILE / 2, sy + 8, TILE * 0.25, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Eyes
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(sx + TILE / 2 - 5, sy + 5, 3, 4);
+    ctx.fillRect(sx + TILE / 2 + 3, sy + 5, 3, 4);
+    
+    // Walk bounce
+    if (moveAnim > 0) {
+        const bounce = Math.sin(moveAnim * 0.8) * 2;
+        ctx.fillStyle = '#ff6b6b';
+        ctx.fillRect(sx + 6, sy + TILE - 10 + bounce, TILE - 12, 6);
+    }
+}
+
+function drawParticles(camOffsetX) {
+    for (let p of particles) {
+        const px = p.x - camOffsetX;
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.life;
+        ctx.fillRect(px - 3, p.y - 3, 6, 6);
+        ctx.globalAlpha = 1;
+    }
+}
+
+function drawHUD() {
+    // Level indicator
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(10, 10, 200, 36);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Level ${currentLevel + 1}/${levels.length}`, 20, 33);
+    
+    // Boxes placed
+    const totalBoxes = boxes.length;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(220, 10, 180, 36);
+    ctx.fillStyle = '#4ecdc4';
+    ctx.fillText(`Boxes: ${placedCount}/${totalBoxes}`, 230, 33);
+    
+    // Controls hint
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.fillRect(W / 2 - 160, H - 40, 320, 30);
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Arrows/WASD: Move | R: Restart Level', W / 2, H - 20);
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#0f0f1a';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Title
+    const titleY = H * 0.3;
+    ctx.fillStyle = '#ff6b6b';
+    ctx.font = `bold ${Math.min(72, W / 8)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('SIDE', W / 2, titleY);
+    ctx.fillStyle = '#4ecdc4';
+    ctx.fillText('SOKOBAN', W / 2, titleY + Math.min(72, W / 8));
+    
+    // Box icon
+    const boxSize = 50;
+    const bx = W / 2 - boxSize / 2;
+    const by = titleY + Math.min(72, W / 8) + 30;
+    ctx.fillStyle = '#c8956c';
+    ctx.fillRect(bx, by, boxSize, boxSize);
+    ctx.strokeStyle = '#8b6914';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(bx, by, boxSize, boxSize);
+    ctx.beginPath();
+    ctx.moveTo(bx, by);
+    ctx.lineTo(bx + boxSize, by + boxSize);
+    ctx.moveTo(bx + boxSize, by);
+    ctx.lineTo(bx, by + boxSize);
+    ctx.stroke();
+    
+    // Instructions
+    ctx.fillStyle = '#aaa';
+    ctx.font = '16px monospace';
+    const lines = [
+        'Push crates onto glowing targets',
+        'You can only push, not pull',
+        '',
+        'Controls:',
+        '  Arrow Keys / WASD - Move & Push',
+        '  R - Restart Level',
+        '',
+        `Press any key to start!`,
+        `${levels.length} Levels`
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, W / 2, titleY + Math.min(72, W / 8) + 100 + i * 24);
+    });
+    
+    // Animated boxes in background
+    for (let i = 0; i < 8; i++) {
+        const fx = ((i * 173 + animFrame * 0.5) % W);
+        const fy = (i * 97) % H;
+        ctx.fillStyle = `rgba(200, 149, 108, ${0.1 + Math.sin(animFrame * 0.03 + i) * 0.05})`;
+        ctx.fillRect(fx, fy, 20, 20);
+    }
+}
+
+function drawLevelComplete() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.fillStyle = '#4ecdc4';
+    ctx.font = `bold ${Math.min(48, W / 10)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('LEVEL COMPLETE!', W / 2, H * 0.35);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = '20px monospace';
+    if (currentLevel < levels.length - 1) {
+        ctx.fillText('Press any key for next level', W / 2, H * 0.5);
+    } else {
+        ctx.fillText('Final level cleared!', W / 2, H * 0.5);
+    }
+    
+    // Confetti
+    for (let i = 0; i < 20; i++) {
+        const cx = ((i * 137 + animFrame * 2) % W);
+        const cy = ((i * 97 + animFrame * 3) % H);
+        ctx.fillStyle = `hsl(${(i * 40 + animFrame) % 360}, 80%, 60%)`;
+        ctx.fillRect(cx, cy, 5, 5);
+    }
+}
+
+function drawGameComplete() {
+    ctx.fillStyle = '#0f0f1a';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.fillStyle = '#ffd93d';
+    ctx.font = `bold ${Math.min(56, W / 8)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('YOU WIN!', W / 2, H * 0.3);
+    
+    ctx.fillStyle = '#4ecdc4';
+    ctx.font = '24px monospace';
+    ctx.fillText('All levels completed!', W / 2, H * 0.42);
+    
+    ctx.fillStyle = '#aaa';
+    ctx.font = '18px monospace';
+    ctx.fillText('Press any key to play again', W / 2, H * 0.55);
+    
+    // Celebration particles
+    for (let i = 0; i < 30; i++) {
+        const px = ((i * 173 + animFrame * 1.5) % W);
+        const py = ((i * 97 + animFrame * 2.5) % H);
+        ctx.fillStyle = `hsl(${(i * 30 + animFrame * 2) % 360}, 90%, 65%)`;
+        ctx.beginPath();
+        ctx.arc(px, py, 4, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
+function update() {
+    animFrame++;
+    
+    if (moveAnim > 0) moveAnim--;
+    
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.3;
+        p.life -= 0.025;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+    
+    // Camera follow
+    const levelWidth = grid.length > 0 ? grid[0].length * TILE : W;
+    targetCamX = player.x * TILE - W / 2 + TILE / 2;
+    targetCamX = Math.max(0, Math.min(targetCamX, levelWidth - W));
+    camX += (targetCamX - camX) * 0.1;
+}
+
+function render() {
+    if (state === 'start') {
+        drawStartScreen();
+        return;
+    }
+    
+    if (state === 'gameComplete') {
+        drawGameComplete();
+        return;
+    }
+    
+    drawBackground();
+    
+    // Draw tiles
+    const levelCols = grid[0] ? grid[0].length : 30;
+    const startCol = Math.max(0, Math.floor(camX / TILE) - 1);
+    const endCol = Math.min(levelCols, Math.ceil((camX + W) / TILE) + 1);
+    
+    for (let gy = 0; gy < grid.length; gy++) {
+        for (let gx = startCol; gx < endCol; gx++) {
+            drawTile(gx, gy, camX);
+        }
+    }
+    
+    // Draw targets
+    for (let t of targets) {
+        drawTarget(t.x, t.y, camX);
+    }
+    
+    // Draw boxes
+    for (let b of boxes) {
+        drawBox(b.x, b.y, camX);
+    }
+    
+    // Draw player
+    drawPlayer(camX);
+    
+    // Particles
+    drawParticles(camX);
+    
+    // HUD
+    drawHUD();
+    
+    if (state === 'levelComplete') {
+        drawLevelComplete();
+    }
+}
+
+function gameLoop() {
+    update();
+    render();
+    requestAnimationFrame(gameLoop);
+}
+
+gameLoop();
+</script>
+</body>
+</html>
