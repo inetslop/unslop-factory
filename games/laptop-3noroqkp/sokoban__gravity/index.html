@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gravity Sokoban</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0f0f23; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function() {
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, cellSize, offsetX, offsetY;
+let gameState = 'start'; // start, playing, win, allWin
+let currentLevel = 0;
+let gravityDir = 1; // 0=up,1=right,2=down,3=left (we start with down... actually let's start with 2=down)
+gravityDir = 2; // down initially
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e) {}
+    }
+}
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    if (type === 'move') {
+        osc.type = 'sine'; osc.frequency.value = 220;
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+    } else if (type === 'push') {
+        osc.type = 'triangle'; osc.frequency.value = 330;
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.12);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.12);
+    } else if (type === 'gravity') {
+        osc.type = 'sawtooth'; osc.frequency.value = 80;
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+    } else if (type === 'win') {
+        osc.type = 'sine'; osc.frequency.value = 523;
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.5);
+        const osc2 = audioCtx.createOscillator();
+        const gain2 = audioCtx.createGain();
+        osc2.connect(gain2); gain2.connect(audioCtx.destination);
+        osc2.type = 'sine'; osc2.frequency.value = 659;
+        gain2.gain.setValueAtTime(0.2, audioCtx.currentTime + 0.15);
+        gain2.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.6);
+        osc2.start(audioCtx.currentTime + 0.15); osc2.stop(audioCtx.currentTime + 0.6);
+    } else if (type === 'complete') {
+        [523,659,784,1047].forEach((f,i) => {
+            const o = audioCtx.createOscillator(); const g = audioCtx.createGain();
+            o.connect(g); g.connect(audioCtx.destination);
+            o.type='sine'; o.frequency.value=f;
+            g.gain.setValueAtTime(0.15, audioCtx.currentTime + i*0.12);
+            g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + i*0.12 + 0.4);
+            o.start(audioCtx.currentTime + i*0.12); o.stop(audioCtx.currentTime + i*0.12 + 0.4);
+        });
+    }
+}
+
+// Levels: # wall, . floor, P player, B box, T target, S box on target, A player on target, ' ' empty (wall)
+const levels = [
+[
+"#########",
+"#       #",
+"#  P B  #",
+"#   T   #",
+"#       #",
+"#########"
+],
+[
+"##########",
+"#        #",
+"# P   B  #",
+"#  ###T# #",
+"#  B     #",
+"#        #",
+"##########"
+],
+[
+"###########",
+"#         #",
+"# P  ##B  #",
+"#  B  # T #",
+"#  ##   T #",
+"#         #",
+"###########"
+],
+[
+"############",
+"#    ##    #",
+"# P  ## B #",
+"#  B #T#  #",
+"#  ##   T #",
+"#  B  #   #",
+"#       T#",
+"############"
+],
+[
+"##############",
+"#           #",
+"#  P  ##B   #",
+"#  B  #  T  #",
+"#  ##    #  #",
+"#  B  ##T#  #",
+"#   B     T #",
+"#           #",
+"##############"
+]
+];
+
+let grid = [];
+let playerPos = {x:0, y:0};
+let boxes = [];
+let targets = [];
+let walls = [];
+let gridSize = {w:0, h:0};
+let animObjects = []; // for gravity animation
+let animTimer = 0;
+let particles = [];
+let shakeTimer = 0;
+let shakeIntensity = 0;
+let winTimer = 0;
+let allWinTimer = 0;
+
+function parseLevel(idx) {
+    const lvl = levels[idx];
+    gridSize.h = lvl.length;
+    gridSize.w = Math.max(...lvl.map(r => r.length));
+    walls = []; boxes = []; targets = []; playerPos = {x:0,y:0};
+    
+    for (let y = 0; y < gridSize.h; y++) {
+        for (let x = 0; x < gridSize.w; x++) {
+            const ch = lvl[y][x] || '#';
+            if (ch === '#' || ch === ' ') walls.push({x,y});
+            if (ch === 'P') playerPos = {x,y};
+            if (ch === 'A') { playerPos = {x,y}; targets.push({x,y}); }
+            if (ch === 'B') boxes.push({x,y, vx:0,vy:0, animX:x, animY:y});
+            if (ch === 'S') { boxes.push({x,y,vx:0,vy:0,animX:x,animY:y}); targets.push({x,y}); }
+            if (ch === 'T') targets.push({x,y});
+        }
+    }
+    // Reset animations
+    animObjects = [];
+    animTimer = 0;
+    particles = [];
+    shakeTimer = 0;
+}
+
+function isWall(x, y) {
+    return walls.some(w => w.x === x && w.y === y);
+}
+
+function isBoxAt(x, y) {
+    return boxes.findIndex(b => b.x === x && b.y === y);
+}
+
+function tryMove(dx, dy) {
+    if (gameState !== 'playing' || animTimer > 0) return;
+    initAudio();
+    const nx = playerPos.x + dx;
+    const ny = playerPos.y + dy;
+    
+    if (isWall(nx, ny)) return;
+    
+    const boxIdx = isBoxAt(nx, ny);
+    if (boxIdx >= 0) {
+        // Try to push box
+        const bx = nx + dx;
+        const by = ny + dy;
+        if (isWall(bx, by) || isBoxAt(bx, by) >= 0) return;
+        
+        boxes[boxIdx].x = bx;
+        boxes[boxIdx].y = by;
+        playerPos.x = nx;
+        playerPos.y = ny;
+        playSound('push');
+        spawnParticles(nx, ny, '#ff9800', 3);
+    } else {
+        playerPos.x = nx;
+        playerPos.y = ny;
+        playSound('move');
+    }
+    
+    checkWin();
+}
+
+function changeGravity() {
+    if (gameState !== 'playing' || animTimer > 0) return;
+    initAudio();
+    gravityDir = (gravityDir + 1) % 4;
+    applyGravity();
+    playSound('gravity');
+    shakeTimer = 8;
+    shakeIntensity = 3;
+    
+    // Spawn particles for all moving objects
+    const dirVec = getDirVec(gravityDir);
+    boxes.forEach(b => {
+        if (b.animX !== b.x || b.animY !== b.y) {
+            spawnParticles(b.x, b.y, '#ff9800', 5);
+        }
+    });
+}
+
+function getDirVec(dir) {
+    return [
+        {x:0,y:-1}, // up
+        {x:1,y:0},  // right
+        {x:0,y:1},  // down
+        {x:-1,y:0}  // left
+    ][dir];
+}
+
+function applyGravity() {
+    const dv = getDirVec(gravityDir);
+    
+    // Collect all movable objects (boxes + player)
+    let objects = [];
+    boxes.forEach(b => objects.push({type:'box', ref:b, x:b.x, y:b.y}));
+    objects.push({type:'player', ref:playerPos, x:playerPos.x, y:playerPos.y});
+    
+    // Sort: objects furthest in gravity direction go first
+    const sorted = objects.sort((a,b) => {
+        if (dv.y !== 0) return a.y - b.y; // for down(1), larger y first -> reverse; for up(-1), smaller y first
+        else return a.x - b.x;
+    });
+    
+    // For "down" gravity (dv.y=1): process from bottom to top (larger y first)
+    // For "up" gravity (dv.y=-1): process from top to bottom (smaller y first)
+    // For "right" (dv.x=1): process from right to left (larger x first)
+    // For "left" (dv.x=-1): process from left to right (smaller x first)
+    
+    if (dv.y === 1 || dv.x === 1) sorted.reverse();
+    
+    // Build occupancy grid
+    let occ = {};
+    walls.forEach(w => { occ[w.x+','+w.y] = true; });
+    boxes.forEach(b => { occ[b.x+','+b.y] = true; });
+    occ[playerPos.x+','+playerPos.y] = true;
+    
+    sorted.forEach(obj => {
+        // Remove current position
+        delete occ[obj.x+','+obj.y];
+        
+        let newX = obj.x, newY = obj.y;
+        while (true) {
+            const tx = newX + dv.x;
+            const ty = newY + dv.y;
+            if (isWall(tx, ty)) break;
+            if (occ[tx+','+ty]) break;
+            newX = tx; newY = ty;
+        }
+        
+        // Update position
+        obj.ref.x = newX;
+        obj.ref.y = newY;
+        occ[newX+','+newY] = true;
+    });
+    
+    // Start animation
+    boxes.forEach(b => {
+        b.animX = b.x; b.animY = b.y;
+    });
+    animTimer = 200; // ms
+}
+
+function checkWin() {
+    const allOnTarget = boxes.every(b => targets.some(t => t.x === b.x && t.y === b.y));
+    if (allOnTarget) {
+        gameState = 'win';
+        winTimer = 0;
+        playSound('win');
+        for (let i = 0; i < 30; i++) {
+            spawnParticles(playerPos.x, playerPos.y, `hsl(${Math.random()*360},80%,60%)`, 1);
+        }
+    }
+}
+
+function nextLevel() {
+    currentLevel++;
+    if (currentLevel >= levels.length) {
+        gameState = 'allWin';
+        allWinTimer = 0;
+        playSound('complete');
+    } else {
+        parseLevel(currentLevel);
+        gameState = 'playing';
+    }
+}
+
+function spawnParticles(gx, gy, color, count) {
+    const cx = (gx + 0.5) * cellSize + offsetX;
+    const cy = (gy + 0.5) * cellSize + offsetY;
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 1 + Math.random() * 3;
+        particles.push({
+            x: cx, y: cy,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            life: 1,
+            color: color,
+            size: 2 + Math.random() * 4
+        });
+    }
+}
+
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    
+    if (gridSize.w > 0) {
+        cellSize = Math.min((W - 80) / gridSize.w, (H - 120) / gridSize.h);
+        cellSize = Math.min(cellSize, 60);
+        offsetX = (W - gridSize.w * cellSize) / 2;
+        offsetY = (H - gridSize.h * cellSize) / 2 + 30;
+    }
+}
+
+function loadLevel(idx) {
+    currentLevel = idx;
+    parseLevel(idx);
+    resize();
+}
+
+// Input
+let keysDown = {};
+window.addEventListener('keydown', (e) => {
+    if (gameState === 'start') {
+        initAudio();
+        loadLevel(0);
+        gameState = 'playing';
+        return;
+    }
+    
+    if (gameState === 'allWin') {
+        if (e.key === 'Enter' || e.key === ' ') {
+            loadLevel(0);
+            gameState = 'playing';
+        }
+        return;
+    }
+    
+    if (e.key === 'r' || e.key === 'R') {
+        loadLevel(currentLevel);
+        return;
+    }
+    
+    if (gameState !== 'playing') return;
+    
+    switch(e.key) {
+        case 'ArrowUp': case 'w': case 'W': tryMove(0,-1); break;
+        case 'ArrowDown': case 's': case 'S': tryMove(0,1); break;
+        case 'ArrowLeft': case 'a': case 'A': tryMove(-1,0); break;
+        case 'ArrowRight': case 'd': case 'D': tryMove(1,0); break;
+        case 'g': case 'G': case ' ': case 'Enter': changeGravity(); break;
+        case 'n': case 'N': if(currentLevel < levels.length-1) loadLevel(currentLevel+1); break;
+        case 'p': case 'P': if(currentLevel > 0) loadLevel(currentLevel-1); break;
+    }
+    e.preventDefault();
+});
+
+// Rendering
+let lastTime = 0;
+let time = 0;
+
+function render() {
+    const now = performance.now();
+    const dt = (now - lastTime) / 1000;
+    lastTime = now;
+    time += dt;
+    
+    // Clear
+    ctx.fillStyle = '#0f0f23';
+    ctx.fillRect(0, 0, W, H);
+    
+    if (gameState === 'start') {
+        renderStartScreen();
+        return;
+    }
+    
+    if (gameState === 'allWin') {
+        allWinTimer += dt;
+        renderAllWin();
+        requestAnimationFrame(render);
+        return;
+    }
+    
+    // Update animations
+    if (animTimer > 0) {
+        animTimer -= dt * 1000;
+        const t = Math.max(0, animTimer / 200);
+        boxes.forEach(b => {
+            b.animX += (b.x - b.animX) * (1 - t) * 0.3 + (1-t)*0.1;
+            b.animY += (b.y - b.animY) * (1 - t) * 0.3 + (1-t)*0.1;
+        });
+        if (animTimer <= 0) {
+            boxes.forEach(b => { b.animX = b.x; b.animY = b.y; });
+        }
+    }
+    
+    // Update particles
+    particles.forEach(p => {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.1;
+        p.life -= dt * 2;
+    });
+    particles = particles.filter(p => p.life > 0);
+    
+    // Shake
+    let shakeX = 0, shakeY = 0;
+    if (shakeTimer > 0) {
+        shakeTimer--;
+        shakeX = (Math.random() - 0.5) * shakeIntensity;
+        shakeY = (Math.random() - 0.5) * shakeIntensity;
+    }
+    
+    ctx.save();
+    ctx.translate(shakeX, shakeY);
+    
+    // Draw grid
+    const cs = cellSize;
+    
+    // Floor
+    for (let y = 0; y < gridSize.h; y++) {
+        for (let x = 0; x < gridSize.w; x++) {
+            if (!isWall(x, y)) {
+                ctx.fillStyle = '#1a1a35';
+                ctx.fillRect(offsetX + x*cs, offsetY + y*cs, cs, cs);
+                // Subtle grid
+                ctx.strokeStyle = '#252545';
+                ctx.lineWidth = 1;
+                ctx.strokeRect(offsetX + x*cs, offsetY + y*cs, cs, cs);
+            }
+        }
+    }
+    
+    // Walls
+    walls.forEach(w => {
+        const px = offsetX + w.x * cs;
+        const py = offsetY + w.y * cs;
+        ctx.fillStyle = '#2a2a4a';
+        ctx.fillRect(px, py, cs, cs);
+        ctx.strokeStyle = '#3a3a6a';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(px+2, py+2, cs-4, cs-4);
+        // Inner detail
+        ctx.fillStyle = '#222244';
+        ctx.fillRect(px + cs*0.2, py + cs*0.2, cs*0.6, cs*0.6);
+    });
+    
+    // Targets
+    targets.forEach(t => {
+        const px = offsetX + (t.x + 0.5) * cs;
+        const py = offsetY + (t.y + 0.5) * cs;
+        const pulse = 0.7 + 0.3 * Math.sin(time * 3);
+        ctx.beginPath();
+        ctx.arc(px, py, cs * 0.25 * pulse, 0, Math.PI*2);
+        ctx.fillStyle = `rgba(180, 200, 255, ${0.4 * pulse})`;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(px, py, cs * 0.15, 0, Math.PI*2);
+        ctx.fillStyle = '#aaccff';
+        ctx.fill();
+    });
+    
+    // Boxes
+    boxes.forEach(b => {
+        const bx = offsetX + (b.animX + 0.5) * cs;
+        const by = offsetY + (b.animY + 0.5) * cs;
+        const onTarget = targets.some(t => t.x === b.x && t.y === b.y);
+        
+        ctx.fillStyle = onTarget ? '#4caf50' : '#ff9800';
+        ctx.fillRect(bx - cs*0.4, by - cs*0.4, cs*0.8, cs*0.8);
+        ctx.strokeStyle = onTarget ? '#81c784' : '#ffb74d';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(bx - cs*0.35, by - cs*0.35, cs*0.7, cs*0.7);
+        
+        // Box detail
+        ctx.fillStyle = onTarget ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.15)';
+        ctx.fillRect(bx - cs*0.2, by - cs*0.2, cs*0.4, cs*0.4);
+    });
+    
+    // Player
+    const ppx = offsetX + (playerPos.x + 0.5) * cs;
+    const ppy = offsetY + (playerPos.y + 0.5) * cs;
+    ctx.beginPath();
+    ctx.arc(ppx, ppy, cs * 0.32, 0, Math.PI*2);
+    ctx.fillStyle = '#4fc3f7';
+    ctx.fill();
+    ctx.strokeStyle = '#81d4fa';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    
+    // Player eye (direction indicator)
+    const pdv = lastMoveDir || {x:0,y:1};
+    ctx.beginPath();
+    ctx.arc(ppx + pdv.x * cs*0.1, ppy + pdv.y * cs*0.1, cs * 0.1, 0, Math.PI*2);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+    
+    // Particles
+    particles.forEach(p => {
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size * p.life, p.size * p.life);
+    });
+    ctx.globalAlpha = 1;
+    
+    // UI
+    ctx.restore();
+    
+    // Level indicator
+    ctx.fillStyle = '#aaa';
+    ctx.font = '16px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Level ${currentLevel + 1} / ${levels.length}`, 20, 30);
+    
+    // Gravity indicator
+    const gravLabel = ['↑ UP', '→ RIGHT', '↓ DOWN', '← LEFT'][gravityDir];
+    ctx.fillStyle = '#ffeb3b';
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(`GRAVITY: ${gravLabel}`, W - 20, 30);
+    
+    // Controls hint (small)
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('[G/Space] Rotate Gravity  [R] Restart  [N/P] Level', W/2, H - 15);
+    
+    // Win overlay
+    if (gameState === 'win') {
+        winTimer += dt;
+        const alpha = Math.min(winTimer * 2, 0.7);
+        ctx.fillStyle = `rgba(15, 15, 35, ${alpha})`;
+        ctx.fillRect(0, 0, W, H);
+        
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('LEVEL COMPLETE!', W/2, H/2 - 30);
+        ctx.font = '24px monospace';
+        ctx.fillStyle = '#aaa';
+        ctx.fillText('Press [G] or [Enter] for next level', W/2, H/2 + 20);
+        
+        if (winTimer > 1) {
+            // Auto-advance hint
+            ctx.fillStyle = 'rgba(255,255,255,0.3)';
+            ctx.font = '16px monospace';
+            ctx.fillText('(or wait...)', W/2, H/2 + 50);
+        }
+    }
+    
+    requestAnimationFrame(render);
+}
+
+let lastMoveDir = {x:0, y:1};
+// Override tryMove to track direction
+const origTryMove = tryMove;
+function trackedMove(dx, dy) {
+    lastMoveDir = {x:dx, y:dy};
+    origTryMove(dx, dy);
+}
+// Patch input
+window.removeEventListener('keydown', arguments.callee);
+
+function renderStartScreen() {
+    // Title
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 52px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('GRAVITY SOKOBAN', W/2, H/2 - 80);
+    
+    // Subtitle
+    ctx.font = '18px monospace';
+    ctx.fillStyle = '#4fc3f7';
+    ctx.fillText('Push boxes to targets. Rotate gravity to slide everything!', W/2, H/2 - 30);
+    
+    // Controls
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#aaa';
+    const lines = [
+        '[WASD / Arrows]  Move & Push',
+        '[G / Space]    Rotate Gravity (slides all objects)',
+        '[R]            Restart Level',
+        '[N / P]        Next / Previous Level'
+    ];
+    lines.forEach((l, i) => {
+        ctx.fillText(l, W/2, H/2 + 20 + i * 28);
+    });
+    
+    // Start prompt
+    const blink = Math.sin(time * 3) > 0;
+    if (blink) {
+        ctx.fillStyle = '#ffeb3b';
+        ctx.font = 'bold 20px monospace';
+        ctx.fillText('Press any key to start', W/2, H/2 + 160);
+    }
+    
+    // Animated gravity arrows in background
+    for (let i = 0; i < 8; i++) {
+        const angle = time * 0.5 + i * Math.PI / 4;
+        const x = W/2 + Math.cos(angle) * 150;
+        const y = H/2 + Math.sin(angle) * 100;
+        ctx.fillStyle = `rgba(79, 195, 247, ${0.3 + 0.2*Math.sin(time*2+i)})`;
+        ctx.font = '20px monospace';
+        const dirs = ['↑','→','↓','←'];
+        ctx.fillText(dirs[i%4], x, y);
+    }
+}
+
+function renderAllWin() {
+    // Confetti
+    for (let i = 0; i < 5; i++) {
+        if (Math.random() < 0.3) {
+            particles.push({
+                x: Math.random() * W, y: -10,
+                vx: (Math.random()-0.5)*4, vy: 2+Math.random()*3,
+                life: 1, color: `hsl(${Math.random()*360},80%,60%)`, size: 6
+            });
+        }
+    }
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('ALL LEVELS COMPLETE!', W/2, H/2 - 40);
+    
+    ctx.font = '24px monospace';
+    ctx.fillStyle = '#4fc3f7';
+    ctx.fillText('You mastered Gravity Sokoban!', W/2, H/2 + 10);
+    
+    const blink = Math.sin(time * 3) > 0;
+    if (blink) {
+        ctx.fillStyle = '#ffeb3b';
+        ctx.font = '18px monospace';
+        ctx.fillText('Press [Enter] to play again', W/2, H/2 + 60);
+    }
+    
+    // Draw particles
+    particles.forEach(p => {
+        p.x += p.vx; p.y += p.vy; p.vy += 0.05; p.life -= 0.01;
+        ctx.globalAlpha = Math.max(0, p.life);
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+    });
+    ctx.globalAlpha = 1;
+    particles = particles.filter(p => p.life > 0 && p.y < H + 20);
+    
+    requestAnimationFrame(render);
+}
+
+// Override keydown for win state
+const origKeyHandler = window.onkeydown;
+window.addEventListener('keydown', (e) => {
+    if (gameState === 'win' && (e.key === 'g' || e.key === 'G' || e.key === 'Enter' || e.key === ' ')) {
+        nextLevel();
+    }
+});
+
+// Init
+resize();
+window.addEventListener('resize', resize);
+parseLevel(0); // Pre-parse for sizing
+gameState = 'start';
+render();
+})();
+</script>
+</body>
+</html>
