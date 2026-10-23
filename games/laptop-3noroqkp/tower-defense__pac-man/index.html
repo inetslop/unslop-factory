@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pac-Man Tower Defense</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W; canvas.height = H;
+    scale = Math.min(W / 900, H / 650);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() { if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)(); }
+function playSound(freq, dur, type='square', vol=0.1) {
+    if (!audioCtx) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+}
+
+// Game constants
+const COLS = 15, ROWS = 12;
+let cellSize, offsetX, offsetY;
+
+function calcLayout() {
+    cellSize = Math.floor(Math.min(W / (COLS + 2), H / (ROWS + 4))) * scale;
+    if (cellSize < 20) cellSize = 20;
+    const gridW = COLS * cellSize, gridH = ROWS * cellSize;
+    offsetX = Math.floor((W - gridW) / 2);
+    offsetY = Math.floor((H - gridH) / 2) - 15;
+}
+
+// Path definition (serpentine)
+function buildPath() {
+    const path = [];
+    // Row 0: left to right
+    for (let c = 0; c < COLS; c++) path.push({r:0, c:c});
+    // Col 14: down rows 1-2
+    for (let r = 1; r <= 2; r++) path.push({r:r, c:COLS-1});
+    // Row 2: right to left
+    for (let c = COLS-2; c >= 0; c--) path.push({r:2, c:c});
+    // Col 0: down rows 3-4
+    for (let r = 3; r <= 4; r++) path.push({r:r, c:0});
+    // Row 4: left to right
+    for (let c = 1; c < COLS; c++) path.push({r:4, c:c});
+    // Col 14: down rows 5-6
+    for (let r = 5; r <= 6; r++) path.push({r:r, c:COLS-1});
+    // Row 6: right to left
+    for (let c = COLS-2; c >= 0; c--) path.push({r:6, c:c});
+    // Col 0: down rows 7-8
+    for (let r = 7; r <= 8; r++) path.push({r:r, c:0});
+    // Row 8: left to right
+    for (let c = 1; c < COLS; c++) path.push({r:8, c:c});
+    // Col 14: down rows 9-10
+    for (let r = 9; r <= 10; r++) path.push({r:r, c:COLS-1});
+    // Row 10: right to left
+    for (let c = COLS-2; c >= 0; c--) path.push({r:10, c:c});
+    // Col 0: down rows 11
+    for (let r = 11; r < ROWS; r++) path.push({r:r, c:0});
+    return path;
+}
+
+// Path set for quick lookup
+const pathSet = new Set();
+function markPath() {
+    pathSet.clear();
+    const p = buildPath();
+    p.forEach(cell => pathSet.add(`${cell.r},${cell.c}`));
+}
+markPath();
+
+// Game state
+let state = 'START'; // START, PLAYING, GAMEOVER
+let score = 0, lives = 3, wave = 0, points = 150;
+let enemies = [], towers = [], projectiles = [], particles = [];
+let spawnTimer = 0, spawnInterval = 0, ghostsInWave = 0, ghostsSpawned = 0;
+let selectedTower = 0; // 0=none, 1=pellet, 2=fruit, 3=cherry, 4=eye
+let hoverCell = null;
+let waveTimer = 0, interWave = true;
+let gameTime = 0;
+
+const TOWER_TYPES = {
+    1: { name: 'Pellet', color: '#FFD700', cost: 50, range: 2.5, type: 'slow', slowFactor: 0.4 },
+    2: { name: 'Fruit', color: '#FF69B4', cost: 80, range: 3, type: 'shoot', dmg: 15, fireRate: 1.2 },
+    3: { name: 'Cherry', color: '#7CFC00', cost: 120, range: 2.5, type: 'shoot', dmg: 40, fireRate: 2.5 },
+    4: { name: 'Eye', color: '#00BFFF', cost: 100, range: 2, type: 'frighten', duration: 3 }
+};
+
+const GHOST_TYPES = [
+    { name: 'Blinky', color: '#FF0000', speed: 1.2, hp: 50 },
+    { name: 'Pinky', color: '#FFB8FF', speed: 1.0, hp: 40 },
+    { name: 'Inky', color: '#00FFFF', speed: 1.4, hp: 30 },
+    { name: 'Clyde', color: '#FFFF77', speed: 0.9, hp: 60 }
+];
+
+function startGame() {
+    state = 'PLAYING';
+    score = 0; lives = 3; wave = 0; points = 150;
+    enemies = []; towers = []; projectiles = []; particles = [];
+    spawnTimer = 0; interWave = true; waveTimer = 2;
+    gameTime = 0;
+}
+
+function startWave() {
+    wave++;
+    ghostsInWave = 3 + wave * 2;
+    ghostsSpawned = 0;
+    spawnInterval = Math.max(1.5, 3.5 - wave * 0.3);
+    spawnTimer = 0;
+    interWave = false;
+}
+
+function spawnGhost() {
+    const type = GHOST_TYPES[ghostsSpawned % GHOST_TYPES.length];
+    const hpMult = 1 + (wave - 1) * 0.3;
+    enemies.push({
+        pathIndex: 0,
+        x: offsetX + cellSize/2,
+        y: offsetY + cellSize/2,
+        speed: type.speed * (1 + wave * 0.05),
+        hp: Math.floor(type.hp * hpMult),
+        maxHp: Math.floor(type.hp * hpMult),
+        color: type.color,
+        name: type.name,
+        slowTimer: 0,
+        frightenTimer: 0,
+        wobble: Math.random() * Math.PI * 2
+    });
+    ghostsSpawned++;
+}
+
+function getCellFromMouse(mx, my) {
+    const c = Math.floor((mx - offsetX) / cellSize);
+    const r = Math.floor((my - offsetY) / cellSize);
+    if (c >= 0 && c < COLS && r >= 0 && r < ROWS) return {r, c};
+    return null;
+}
+
+function canPlace(r, c) {
+    if (!pathSet.has(`${r},${c}`)) {
+        for (let t of towers) if (t.r === r && t.c === c) return false;
+        return true;
+    }
+    return false;
+}
+
+function placeTower(r, c, type) {
+    const info = TOWER_TYPES[type];
+    if (!info || points < info.cost || !canPlace(r, c)) return;
+    points -= info.cost;
+    towers.push({ r, c, type, cooldown: 0 });
+    playSound(440, 0.1);
+}
+
+function update(dt) {
+    if (state !== 'PLAYING') return;
+    gameTime += dt;
+
+    // Wave management
+    if (interWave) {
+        waveTimer -= dt;
+        if (waveTimer <= 0) startWave();
+    } else {
+        spawnTimer -= dt;
+        if (spawnTimer <= 0 && ghostsSpawned < ghostsInWave) {
+            spawnGhost();
+            spawnTimer = spawnInterval;
+        }
+        if (ghostsSpawned >= ghostsInWave && enemies.length === 0) {
+            interWave = true;
+            waveTimer = 3;
+            points += 50 + wave * 10;
+            playSound(660, 0.2, 'sine', 0.15);
+        }
+    }
+
+    // Update enemies
+    const path = buildPath();
+    for (let i = enemies.length - 1; i >= 0; i--) {
+        const e = enemies[i];
+        e.wobble += dt * 5;
+        if (e.slowTimer > 0) e.slowTimer -= dt;
+        if (e.frightenTimer > 0) e.frightenTimer -= dt;
+
+        let spd = e.speed;
+        if (e.slowTimer > 0) spd *= 0.4;
+        if (e.frightenTimer > 0) spd *= 0.5;
+
+        e.pathIndex += spd * dt * 2;
+        const idx = Math.floor(e.pathIndex);
+        const frac = e.pathIndex - idx;
+        if (idx >= path.length - 1) {
+            // Ghost reached end
+            enemies.splice(i, 1);
+            lives--;
+            playSound(200, 0.3, 'sawtooth', 0.15);
+            if (lives <= 0) { state = 'GAMEOVER'; }
+            continue;
+        }
+        const curr = path[idx];
+        const next = path[Math.min(idx + 1, path.length - 1)];
+        e.x = offsetX + (curr.c + 0.5) * cellSize + frac * ((next.c - curr.c) * cellSize);
+        e.y = offsetY + (curr.r + 0.5) * cellSize + frac * ((next.r - curr.r) * cellSize);
+
+        if (e.hp <= 0) {
+            enemies.splice(i, 1);
+            score += 10 + wave * 2;
+            points += 5;
+            for (let p = 0; p < 6; p++) {
+                particles.push({ x: e.x, y: e.y, vx: (Math.random()-0.5)*3, vy: (Math.random()-0.5)*3, life: 0.5, color: e.color });
+            }
+            playSound(880, 0.15, 'sine', 0.12);
+        }
+    }
+
+    // Update towers
+    for (let t of towers) {
+        t.cooldown -= dt;
+        if (t.cooldown > 0) continue;
+        const info = TOWER_TYPES[t.type];
+        const tx = offsetX + (t.c + 0.5) * cellSize;
+        const ty = offsetY + (t.r + 0.5) * cellSize;
+
+        if (info.type === 'slow') {
+            for (let e of enemies) {
+                const dx = e.x - tx, dy = e.y - ty;
+                const dist = Math.sqrt(dx*dx+dy*dy) / cellSize;
+                if (dist <= info.range && e.slowTimer <= 0) {
+                    e.slowTimer = 1.5;
+                }
+            }
+            t.cooldown = 0.8;
+        } else if (info.type === 'shoot') {
+            let target = null, bestDist = Infinity;
+            for (let e of enemies) {
+                const dx = e.x - tx, dy = e.y - ty;
+                const dist = Math.sqrt(dx*dx+dy*dy) / cellSize;
+                if (dist <= info.range && dist < bestDist) { bestDist = dist; target = e; }
+            }
+            if (target) {
+                projectiles.push({ x: tx, y: ty, tx: target.x, ty: target.y, target, dmg: info.dmg, speed: 8, color: info.color });
+                t.cooldown = info.fireRate;
+                playSound(300 + t.type * 50, 0.05);
+            } else { t.cooldown = 0.2; }
+        } else if (info.type === 'frighten') {
+            for (let e of enemies) {
+                const dx = e.x - tx, dy = e.y - ty;
+                const dist = Math.sqrt(dx*dx+dy*dy) / cellSize;
+                if (dist <= info.range && e.frightenTimer <= 0) {
+                    e.frightenTimer = info.duration;
+                    e.hp -= 5;
+                }
+            }
+            t.cooldown = 2;
+        }
+    }
+
+    // Update projectiles
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+        const p = projectiles[i];
+        if (!p.target || p.target.hp <= 0) { projectiles.splice(i, 1); continue; }
+        const dx = p.target.x - p.x, dy = p.target.y - p.y;
+        const dist = Math.sqrt(dx*dx+dy*dy);
+        if (dist < 10) {
+            p.target.hp -= p.dmg;
+            projectiles.splice(i, 1);
+            continue;
+        }
+        p.x += (dx/dist) * p.speed * dt * 60;
+        p.y += (dy/dist) * p.speed * dt * 60;
+    }
+
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx; p.y += p.vy;
+        p.life -= dt;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function draw() {
+    ctx.fillStyle = '#0a0a2e';
+    ctx.fillRect(0, 0, W, H);
+    calcLayout();
+
+    if (state === 'START') {
+        drawStartScreen();
+        return;
+    }
+
+    // Draw path
+    const path = buildPath();
+    for (let p of path) {
+        ctx.fillStyle = '#1a1a4e';
+        ctx.fillRect(offsetX + p.c * cellSize, offsetY + p.r * cellSize, cellSize - 2, cellSize - 2);
+    }
+
+    // Draw grid cells (buildable)
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            if (!pathSet.has(`${r},${c}`)) {
+                ctx.fillStyle = '#151530';
+                ctx.fillRect(offsetX + c * cellSize, offsetY + r * cellSize, cellSize - 2, cellSize - 2);
+            }
+        }
+    }
+
+    // Draw hover highlight
+    if (hoverCell && state === 'PLAYING') {
+        const {r, c} = hoverCell;
+        if (canPlace(r, c)) {
+            ctx.fillStyle = selectedTower ? TOWER_TYPES[selectedTower].color + '44' : '#ffffff22';
+            ctx.fillRect(offsetX + c * cellSize, offsetY + r * cellSize, cellSize - 2, cellSize - 2);
+        } else if (!canPlace(r,c) && !pathSet.has(`${r},${c}`)) {
+            ctx.fillStyle = '#ff000033';
+            ctx.fillRect(offsetX + c * cellSize, offsetY + r * cellSize, cellSize - 2, cellSize - 2);
+        }
+    }
+
+    // Draw towers
+    for (let t of towers) {
+        const tx = offsetX + t.c * cellSize + cellSize/2;
+        const ty = offsetY + t.r * cellSize + cellSize/2;
+        const info = TOWER_TYPES[t.type];
+        ctx.fillStyle = info.color;
+        if (t.type === 1) {
+            // Pellet - circle
+            ctx.beginPath(); ctx.arc(tx, ty, cellSize*0.35, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle = '#fff';
+            ctx.beginPath(); ctx.arc(tx, ty, cellSize*0.15, 0, Math.PI*2); ctx.fill();
+        } else if (t.type === 2) {
+            // Fruit - diamond
+            ctx.save(); ctx.translate(tx, ty); ctx.rotate(Math.PI/4);
+            ctx.fillRect(-cellSize*0.3, -cellSize*0.3, cellSize*0.6, cellSize*0.6);
+            ctx.restore();
+        } else if (t.type === 3) {
+            // Cherry - two circles
+            ctx.beginPath(); ctx.arc(tx - cellSize*0.15, ty + cellSize*0.1, cellSize*0.2, 0, Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.arc(tx + cellSize*0.15, ty + cellSize*0.1, cellSize*0.2, 0, Math.PI*2); ctx.fill();
+            ctx.strokeStyle = '#8B4513'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(tx - cellSize*0.15, ty + cellSize*0.1); ctx.lineTo(tx, ty - cellSize*0.2);
+            ctx.moveTo(tx + cellSize*0.15, ty + cellScore*0.1 || ty + cellSize*0.1); ctx.lineTo(tx, ty - cellSize*0.2);
+            ctx.stroke();
+        } else if (t.type === 4) {
+            // Eye - white with pupil
+            ctx.fillStyle = '#fff';
+            ctx.beginPath(); ctx.ellipse(tx, ty, cellSize*0.35, cellSize*0.25, 0, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle = '#000';
+            ctx.beginPath(); ctx.arc(tx, ty, cellSize*0.12, 0, Math.PI*2); ctx.fill();
+        }
+    }
+
+    // Draw enemies (ghosts)
+    for (let e of enemies) {
+        const bob = Math.sin(e.wobble) * 3;
+        drawGhost(e.x, e.y + bob, cellSize * 0.4, e.color, e.frightenTimer > 0);
+        // HP bar
+        const bw = cellSize * 0.7;
+        ctx.fillStyle = '#333';
+        ctx.fillRect(e.x - bw/2, e.y - cellSize*0.5, bw, 4);
+        ctx.fillStyle = e.hp/e.maxHp > 0.5 ? '#0f0' : e.hp/e.maxHp > 0.25 ? '#ff0' : '#f00';
+        ctx.fillRect(e.x - bw/2, e.y - cellSize*0.5, bw * (e.hp/e.maxHp), 4);
+    }
+
+    // Draw projectiles
+    for (let p of projectiles) {
+        ctx.fillStyle = p.color;
+        ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI*2); ctx.fill();
+    }
+
+    // Draw particles
+    for (let p of particles) {
+        ctx.globalAlpha = p.life * 2;
+        ctx.fillStyle = p.color;
+        ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI*2); ctx.fill();
+        ctx.globalAlpha = 1;
+    }
+
+    // HUD
+    drawHUD();
+
+    if (state === 'GAMEOVER') drawGameOver();
+}
+
+function drawGhost(x, y, size, color, frightened) {
+    const c = frightened ? '#5050FF' : color;
+    ctx.fillStyle = c;
+    ctx.beginPath();
+    ctx.arc(x, y - size*0.2, size*0.5, Math.PI, 0);
+    ctx.lineTo(x + size*0.5, y + size*0.4);
+    // Wavy bottom
+    const waves = 3;
+    for (let i = 0; i < waves; i++) {
+        const wx = x + size*0.5 - (i * size / waves);
+        ctx.lineTo(wx, y + size*0.25);
+        ctx.lineTo(wx - size/waves/2, y + size*0.4);
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // Eyes
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(x - size*0.15, y - size*0.15, size*0.12, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + size*0.15, y - size*0.15, size*0.12, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#00f';
+    ctx.beginPath(); ctx.arc(x - size*0.12, y - size*0.1, size*0.06, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + size*0.18, y - size*0.1, size*0.06, 0, Math.PI*2); ctx.fill();
+}
+
+function drawHUD() {
+    const hudY = offsetY - 40;
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.max(14, cellSize * 0.5)}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillText(`Score: ${score}`, offsetX, hudY);
+    ctx.fillText(`Lives: ${'❤'.repeat(lives)}`, offsetX + 180, hudY);
+    ctx.fillText(`Wave: ${wave}`, offsetX + 320, hudY);
+    ctx.fillText(`Points: ${points}`, offsetX + 430, hudY);
+
+    // Tower shop
+    const shopY = offsetY + ROWS * cellSize + 15;
+    ctx.font = `${Math.max(12, cellSize * 0.4)}px monospace`;
+    ctx.textAlign = 'center';
+    for (let i = 1; i <= 4; i++) {
+        const info = TOWER_TYPES[i];
+        const sx = offsetX + 60 + (i-1) * 180;
+        const active = selectedTower === i;
+        ctx.fillStyle = active ? info.color : '#888';
+        if (points >= info.cost) ctx.fillStyle = active ? info.color : info.color;
+        else ctx.fillStyle = '#555';
+        ctx.fillText(`[${i}] ${info.name} (${info.cost})`, sx, shopY + 10);
+    }
+    ctx.fillStyle = '#888';
+    ctx.fillText('Click grid to place | Keys 1-4 select tower', offsetX + COLS*cellSize/2, shopY + 35);
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#0a0a2e';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title
+    const cx = W/2, cy = H/2;
+    ctx.font = `bold ${Math.min(W*0.08, 60)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#FFD700';
+    ctx.fillText('PAC-MAN', cx, cy - 100);
+    ctx.fillStyle = '#FF69B4';
+    ctx.fillText('TOWER DEFENSE', cx, cy - 50);
+
+    // Ghosts
+    for (let i = 0; i < 4; i++) {
+        drawGhost(cx - 90 + i*60, cy + 20, 20, GHOST_TYPES[i].color, false);
+    }
+
+    ctx.font = `${Math.min(W*0.03, 18)}px monospace`;
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('Defend the maze from ghost invasions!', cx, cy + 70);
+    ctx.fillText('Place towers on blue cells to stop ghosts.', cx, cy + 95);
+    ctx.fillText('[1] Pellet - Slows ghosts in range', cx, cy + 130);
+    ctx.fillText('[2] Fruit - Fires projectiles (medium dmg)', cx, cy + 155);
+    ctx.fillText('[3] Cherry - Fires projectiles (high dmg)', cx, cy + 180);
+    ctx.fillText('[4] Eye - Frightens ghosts (slows + dmg)', cx, cy + 205);
+    ctx.fillText('', cx, cy + 230);
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Click to place towers | Keys 1-4 select type', cx, cy + 255);
+    ctx.fillStyle = '#FFD700';
+    ctx.font = `bold ${Math.min(W*0.035, 22)}px monospace`;
+    const pulse = Math.sin(gameTime * 3) * 0.3 + 0.7;
+    ctx.globalAlpha = pulse;
+    ctx.fillText('>>> CLICK TO START <<<', cx, cy + 310);
+    ctx.globalAlpha = 1;
+}
+
+function drawGameOver() {
+    ctx.fillStyle = '#00000088';
+    ctx.fillRect(0, 0, W, H);
+    const cx = W/2, cy = H/2;
+    ctx.font = `bold ${Math.min(W*0.07, 50)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#FF0000';
+    ctx.fillText('GAME OVER', cx, cy - 40);
+    ctx.font = `${Math.min(W*0.035, 24)}px monospace`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`Final Score: ${score}  |  Waves Survived: ${wave}`, cx, cy + 10);
+    ctx.fillStyle = '#FFD700';
+    const pulse = Math.sin(gameTime * 3) * 0.3 + 0.7;
+    ctx.globalAlpha = pulse;
+    ctx.fillText('Click to Restart', cx, cy + 60);
+    ctx.globalAlpha = 1;
+}
+
+// Input
+let mouseX = 0, mouseY = 0;
+window.addEventListener('mousemove', e => {
+    mouseX = e.clientX; mouseY = e.clientY;
+    hoverCell = getCellFromMouse(mouseX, mouseY);
+});
+
+window.addEventListener('click', e => {
+    initAudio();
+    if (state === 'START') { startGame(); return; }
+    if (state === 'GAMEOVER') { startGame(); return; }
+    if (state === 'PLAYING' && selectedTower > 0) {
+        const cell = getCellFromMouse(e.clientX, e.clientY);
+        if (cell && canPlace(cell.r, cell.c)) {
+            placeTower(cell.r, cell.c, selectedTower);
+        }
+    }
+});
+
+window.addEventListener('keydown', e => {
+    initAudio();
+    const key = e.key;
+    if (key === '1') selectedTower = selectedTower === 1 ? 0 : 1;
+    else if (key === '2') selectedTower = selectedTower === 2 ? 0 : 2;
+    else if (key === '3') selectedTower = selectedTower === 3 ? 0 : 3;
+    else if (key === '4') selectedTower = selectedTower === 4 ? 0 : 4;
+    else if (key === 'Escape') selectedTower = 0;
+});
+
+// Game loop
+let lastTime = 0;
+function loop(time) {
+    const dt = Math.min((time - lastTime) / 1000, 0.05);
+    lastTime = time;
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
