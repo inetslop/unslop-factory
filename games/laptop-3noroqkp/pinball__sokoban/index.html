@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Pinball Sokoban</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a1a; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; width: 100vw; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, SCALE;
+function resize() {
+    const aspect = 0.5;
+    let w = window.innerWidth;
+    let h = window.innerHeight;
+    if (w / h > aspect) { w = h * aspect; } else { h = w / aspect; }
+    canvas.width = Math.floor(w);
+    canvas.height = Math.floor(h);
+    W = 400; H = 800;
+    SCALE = Math.min(canvas.width / W, canvas.height / H);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+function sndBounce() { playSound(220, 0.1, 'sine', 0.2); }
+function sndFlipper() { playSound(440, 0.08, 'square', 0.15); }
+function sndTarget() { playSound(880, 0.3, 'sine', 0.3); playSound(1100, 0.3, 'sine', 0.2); }
+function sndLaunch() { playSound(330, 0.15, 'sawtooth', 0.2); }
+function sndLose() { playSound(150, 0.4, 'sawtooth', 0.25); }
+function sndWin() { for (let i = 0; i < 5; i++) setTimeout(() => playSound(600 + i * 100, 0.2, 'sine', 0.2), i * 100); }
+
+// Game State
+const STATE = { MENU: 0, PLAYING: 1, LEVEL_COMPLETE: 2, GAME_OVER: 3, WIN: 4 };
+let state = STATE.MENU;
+let score = 0;
+let ballsLeft = 3;
+let level = 0;
+let ballLostTimer = 0;
+
+// Ball
+let ball = { x: 0, y: 0, vx: 0, vy: 0, r: 8, active: false, launched: false };
+const GRAVITY = 0.35;
+const FRICTION = 0.999;
+
+// Flippers
+let flipperL = { x: 120, y: 740, len: 60, angle: 0.5, targetAngle: 0.5, restAngle: 0.5, activeAngle: -0.5 };
+let flipperR = { x: 280, y: 740, len: 60, angle: Math.PI - 0.5, targetAngle: Math.PI - 0.5, restAngle: Math.PI - 0.5, activeAngle: Math.PI + 0.5 };
+
+// Plunger
+let plunger = { y: 700, pulling: false, power: 0 };
+
+// Walls (line segments)
+let walls = [];
+// Bumpers (circles)
+let bumpers = [];
+// Targets (rectangles - sokoban pads)
+let targets = [];
+
+function loadLevel(lv) {
+    walls = [];
+    bumpers = [];
+    targets = [];
+    ball.active = false;
+    ball.launched = false;
+    plunger.y = 700;
+    plunger.pulling = false;
+    plunger.power = 0;
+
+    // Outer walls
+    walls.push({ x1: 20, y1: 80, x2: 20, y2: 740 });
+    walls.push({ x1: 380, y1: 80, x2: 380, y2: 740 });
+    walls.push({ x1: 20, y1: 80, x2: 380, y2: 80 });
+
+    // Diagonal guides top left
+    walls.push({ x1: 20, y1: 80, x2: 80, y2: 40 });
+    // Diagonal guides top right
+    walls.push({ x1: 380, y1: 80, x2: 320, y2: 40 });
+
+    if (lv === 0) {
+        // Level 1: Simple
+        bumpers.push({ x: 120, y: 250, r: 25 });
+        bumpers.push({ x: 280, y: 250, r: 25 });
+        bumpers.push({ x: 200, y: 350, r: 25 });
+        targets.push({ x: 60, y: 120, w: 50, h: 20, lit: false });
+        targets.push({ x: 290, y: 120, w: 50, h: 20, lit: false });
+        // Middle shelves
+        walls.push({ x1: 80, y1: 450, x2: 200, y2: 450 });
+        walls.push({ x1: 200, y1: 450, x2: 320, y2: 450 });
+    } else if (lv === 1) {
+        // Level 2: More complex
+        bumpers.push({ x: 100, y: 200, r: 20 });
+        bumpers.push({ x: 300, y: 200, r: 20 });
+        bumpers.push({ x: 200, y: 300, r: 30 });
+        targets.push({ x: 40, y: 150, w: 40, h: 20, lit: false });
+        targets.push({ x: 320, y: 150, w: 40, h: 20, lit: false });
+        targets.push({ x: 175, y: 50, w: 50, h: 20, lit: false });
+        // S-lope walls
+        walls.push({ x1: 60, y1: 400, x2: 180, y2: 400 });
+        walls.push({ x1: 220, y1: 400, x2: 340, y2: 400 });
+        walls.push({ x1: 60, y1: 500, x2: 140, y2: 500 });
+        walls.push({ x1: 260, y1: 500, x2: 340, y2: 500 });
+    } else if (lv === 2) {
+        // Level 3: Hard
+        bumpers.push({ x: 80, y: 180, r: 18 });
+        bumpers.push({ x: 320, y: 180, r: 18 });
+        bumpers.push({ x: 200, y: 250, r: 22 });
+        bumpers.push({ x: 120, y: 350, r: 18 });
+        bumpers.push({ x: 280, y: 350, r: 18 });
+        targets.push({ x: 30, y: 100, w: 40, h: 20, lit: false });
+        targets.push({ x: 330, y: 100, w: 40, h: 20, lit: false });
+        targets.push({ x: 90, y: 50, w: 40, h: 20, lit: false });
+        targets.push({ x: 270, y: 50, w: 40, h: 20, lit: false });
+        // Walls creating channels
+        walls.push({ x1: 100, y1: 430, x2: 200, y2: 430 });
+        walls.push({ x1: 200, y1: 430, x2: 300, y2: 430 });
+        walls.push({ x1: 50, y1: 520, x2: 150, y2: 520 });
+        walls.push({ x1: 250, y1: 520, x2: 350, y2: 520 });
+    } else if (lv === 3) {
+        // Level 4: Expert
+        bumpers.push({ x: 150, y: 200, r: 20 });
+        bumpers.push({ x: 250, y: 200, r: 20 });
+        bumpers.push({ x: 200, y: 320, r: 25 });
+        bumpers.push({ x: 100, y: 420, r: 15 });
+        bumpers.push({ x: 300, y: 420, r: 15 });
+        targets.push({ x: 25, y: 90, w: 35, h: 20, lit: false });
+        targets.push({ x: 340, y: 90, w: 35, h: 20, lit: false });
+        targets.push({ x: 180, y: 50, w: 40, h: 20, lit: false });
+        targets.push({ x: 60, y: 50, w: 35, h: 20, lit: false });
+        targets.push({ x: 305, y: 50, w: 35, h: 20, lit: false });
+        // Complex walls
+        walls.push({ x1: 80, y1: 480, x2: 180, y2: 480 });
+        walls.push({ x1: 220, y1: 480, x2: 320, y2: 480 });
+        walls.push({ x1: 130, y1: 560, x2: 270, y2: 560 });
+    }
+}
+
+function resetBall() {
+    ball.x = 40;
+    ball.y = 700;
+    ball.vx = 0;
+    ball.vy = 0;
+    ball.active = false;
+    ball.launched = false;
+    plunger.y = 700;
+    plunger.pulling = false;
+    plunger.power = 0;
+}
+
+function launchBall() {
+    if (!ball.active && !ball.launched && ballsLeft > 0) {
+        ball.launched = true;
+        ball.vx = (2 + Math.random() * 2);
+        ball.vy = -(12 + plunger.power * 8);
+        ball.active = true;
+        sndLaunch();
+    }
+}
+
+// Input
+let keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (state === STATE.MENU) {
+        initAudio();
+        startGame();
+    } else if (state === STATE.LEVEL_COMPLETE && e.code === 'Space') {
+        level++;
+        if (level >= 4) { state = STATE.WIN; }
+        else { loadLevel(level); state = STATE.PLAYING; }
+    } else if (state === STATE.GAME_OVER && e.code === 'Space') {
+        startGame();
+    } else if (state === STATE.WIN && e.code === 'Space') {
+        startGame();
+    }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function startGame() {
+    score = 0;
+    level = 0;
+    ballsLeft = 3;
+    loadLevel(0);
+    state = STATE.PLAYING;
+}
+
+// Physics
+function circleLineCollision(cx, cy, r, x1, y1, x2, y2) {
+    let dx = x2 - x1, dy = y2 - y1;
+    let len = Math.sqrt(dx * dx + dy * dy);
+    let nx = dy / len, ny = -dx / len;
+
+    // Distance from point to line segment
+    let px = cx - x1, py = cy - y1;
+    let t = px * (x2 - x1) / (len * len) + py * (y2 - y1) / (len * len);
+    t = Math.max(0, Math.min(1, t));
+
+    let closestX = x1 + t * dx;
+    let closestY = y1 + t * dy;
+
+    let distX = cx - closestX;
+    let distY = cy - closestY;
+    let dist = Math.sqrt(distX * distX + distY * distY);
+
+    if (dist < r) {
+        let overlap = r - dist;
+        let pushX = (distX / (dist || 1)) * overlap;
+        let pushY = (distY / (dist || 1)) * overlap;
+        return { hit: true, nx: (distX / (dist || 1)), ny: (distY / (dist || 1)), overlap };
+    }
+    return { hit: false };
+}
+
+function updatePhysics() {
+    if (!ball.active) return;
+
+    ball.vy += GRAVITY;
+    ball.vx *= FRICTION;
+    ball.vy *= FRICTION;
+
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+
+    // Wall collisions
+    for (let w of walls) {
+        let col = circleLineCollision(ball.x, ball.y, ball.r, w.x1, w.y1, w.x2, w.y2);
+        if (col.hit) {
+            ball.x += col.nx * col.overlap;
+            ball.y += col.ny * col.overlap;
+            let dot = ball.vx * col.nx + ball.vy * col.ny;
+            ball.vx -= 1.8 * dot * col.nx;
+            ball.vy -= 1.8 * dot * col.ny;
+            if (Math.abs(dot) > 3) sndBounce();
+        }
+    }
+
+    // Bumper collisions
+    for (let b of bumpers) {
+        let dx = ball.x - b.x, dy = ball.y - b.y;
+        let dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < ball.r + b.r) {
+            let nx = dx / (dist || 1), ny = dy / (dist || 1);
+            let overlap = ball.r + b.r - dist;
+            ball.x += nx * overlap;
+            ball.y += ny * overlap;
+            let dot = ball.vx * nx + ball.vy * ny;
+            if (dot < 0) {
+                ball.vx -= 2.5 * dot * nx;
+                ball.vy -= 2.5 * dot * ny;
+                // Bumper boost
+                ball.vx += nx * 4;
+                ball.vy += ny * 4;
+            }
+            score += 10;
+            sndBounce();
+        }
+    }
+
+    // Target detection
+    for (let t of targets) {
+        if (!t.lit && ball.x + ball.r > t.x && ball.x - ball.r < t.x + t.w &&
+            ball.y + ball.r > t.y && ball.y - ball.r < t.y + t.h) {
+            t.lit = true;
+            score += 100;
+            sndTarget();
+        }
+    }
+
+    // Flipper collisions
+    updateFlipperCollision(flipperL);
+    updateFlipperCollision(flipperR);
+
+    // Ball lost
+    if (ball.y > H + 20) {
+        ball.active = false;
+        ball.launched = false;
+        ballsLeft--;
+        sndLose();
+        if (ballsLeft <= 0) {
+            setTimeout(() => { state = STATE.GAME_OVER; }, 500);
+        }
+    }
+
+    // Level complete check
+    let allLit = targets.every(t => t.lit);
+    if (allLit && ball.active) {
+        state = STATE.LEVEL_COMPLETE;
+        score += 500;
+        sndWin();
+    }
+}
+
+function updateFlipperCollision(flip) {
+    let tipX, tipY;
+    if (flip === flipperL) {
+        tipX = flip.x + Math.cos(flip.angle) * flip.len;
+        tipY = flip.y + Math.sin(flip.angle) * flip.len;
+    } else {
+        tipX = flip.x + Math.cos(flip.angle) * flip.len;
+        tipY = flip.y + Math.sin(flip.angle) * flip.len;
+    }
+
+    let col = circleLineCollision(ball.x, ball.y, ball.r, flip.x, flip.y, tipX, tipY);
+    if (col.hit) {
+        ball.x += col.nx * col.overlap;
+        ball.y += col.ny * col.overlap;
+        let dot = ball.vx * col.nx + ball.vy * col.ny;
+        ball.vx -= 1.9 * dot * col.nx;
+        ball.vy -= 1.9 * dot * col.ny;
+        // Add flipper power if active
+        let isLeft = (flip === flipperL);
+        let isActive = isLeft ? keys['ArrowLeft'] || keys['KeyA'] : keys['ArrowRight'] || keys['KeyD'];
+        if (isActive) {
+            ball.vy -= 3;
+            ball.vx += (isLeft ? 1.5 : -1.5);
+        }
+    }
+}
+
+function updateFlippers() {
+    let lActive = keys['ArrowLeft'] || keys['KeyA'];
+    let rActive = keys['ArrowRight'] || keys['KeyD'];
+
+    if (lActive) {
+        flipperL.angle += (flipperL.activeAngle - flipperL.angle) * 0.4;
+    } else {
+        flipperL.angle += (flipperL.restAngle - flipperL.angle) * 0.3;
+    }
+
+    if (rActive) {
+        flipperR.angle -= (flipperR.activeAngle - flipperR.angle) * 0.4;
+    } else {
+        flipperR.angle += (flipperR.restAngle - flipperR.angle) * 0.3;
+    }
+
+    // Normalize right flipper
+    if (flipperR.angle > Math.PI + 0.6) flipperR.angle = Math.PI + 0.5;
+    if (flipperR.angle < Math.PI - 0.6) flipperR.angle = Math.PI - 0.5;
+
+    // Plunger
+    if (keys['Space'] && !ball.active && !ball.launched) {
+        plunger.pulling = true;
+        plunger.power = Math.min(plunger.power + 0.03, 1);
+        plunger.y -= 2;
+    } else if (!keys['Space'] && plunger.pulling) {
+        plunger.pulling = false;
+        launchBall();
+        plunger.y = 700;
+        plunger.power = 0;
+    }
+}
+
+// Rendering
+function draw() {
+    ctx.save();
+    ctx.scale(SCALE, SCALE);
+    ctx.translate((canvas.width / SCALE - W) / 2, (canvas.height / SCALE - H) / 2);
+
+    // Background
+    ctx.fillStyle = '#0a0a2a';
+    ctx.fillRect(0, 0, W, H);
+
+    if (state === STATE.MENU) {
+        drawMenu();
+        ctx.restore();
+        return;
+    }
+
+    // Draw walls
+    ctx.strokeStyle = '#4a9eff';
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    for (let w of walls) {
+        ctx.beginPath();
+        ctx.moveTo(w.x1, w.y1);
+        ctx.lineTo(w.x2, w.y2);
+        ctx.stroke();
+    }
+
+    // Draw bumpers
+    for (let b of bumpers) {
+        let grad = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, b.r);
+        grad.addColorStop(0, '#ff4444');
+        grad.addColorStop(0.7, '#cc2222');
+        grad.addColorStop(1, '#881111');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#ff6666';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+    }
+
+    // Draw targets (Sokoban pads)
+    for (let t of targets) {
+        if (t.lit) {
+            ctx.fillStyle = '#44ff88';
+            ctx.shadowColor = '#44ff88';
+            ctx.shadowBlur = 15;
+        } else {
+            ctx.fillStyle = '#334455';
+            ctx.strokeStyle = '#66aaff';
+            ctx.shadowBlur = 0;
+        }
+        ctx.fillRect(t.x, t.y, t.w, t.h);
+        if (!t.lit) {
+            ctx.strokeRect(t.x, t.y, t.w, t.h);
+        }
+        // Diamond marker
+        let cx = t.x + t.w / 2, cy = t.y + t.h / 2;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - 5);
+        ctx.lineTo(cx + 5, cy);
+        ctx.lineTo(cx, cy + 5);
+        ctx.lineTo(cx - 5, cy);
+        ctx.closePath();
+        ctx.fillStyle = t.lit ? '#22cc66' : '#4488cc';
+        ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+
+    // Draw flippers
+    drawFlipper(flipperL);
+    drawFlipper(flipperR);
+
+    // Draw ball
+    if (ball.active || ball.launched) {
+        let grad = ctx.createRadialGradient(ball.x - 2, ball.y - 2, 0, ball.x, ball.y, ball.r);
+        grad.addColorStop(0, '#ffffff');
+        grad.addColorStop(0.5, '#cccccc');
+        grad.addColorStop(1, '#888888');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Draw plunger
+    if (!ball.active && !ball.launched) {
+        ctx.fillStyle = '#ffcc00';
+        ctx.fillRect(25, plunger.y - 5, 10, 30);
+        ctx.fillStyle = '#666';
+        ctx.fillRect(20, plunger.y + 25, 20, 8);
+    }
+
+    // HUD
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE: ${score}`, 20, 70);
+    ctx.fillText(`BALLS: ${ballsLeft}`, 150, 70);
+    ctx.fillText(`LEVEL: ${level + 1}/4`, 260, 70);
+
+    // Targets status
+    let litCount = targets.filter(t => t.lit).length;
+    ctx.fillStyle = '#44ff88';
+    ctx.fillText(`TARGETS: ${litCount}/${targets.length}`, 20, 95);
+
+    if (state === STATE.LEVEL_COMPLETE) {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, H / 2 - 80, W, 160);
+        ctx.fillStyle = '#44ff88';
+        ctx.font = 'bold 24px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('LEVEL COMPLETE!', W / 2, H / 2 - 20);
+        ctx.font = '16px monospace';
+        ctx.fillStyle = '#fff';
+        ctx.fillText('Press SPACE for next level', W / 2, H / 2 + 30);
+    }
+
+    if (state === STATE.GAME_OVER) {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, H / 2 - 80, W, 160);
+        ctx.fillStyle = '#ff4444';
+        ctx.font = 'bold 24px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W / 2, H / 2 - 20);
+        ctx.font = '16px monospace';
+        ctx.fillStyle = '#fff';
+        ctx.fillText(`Final Score: ${score}`, W / 2, H / 2 + 15);
+        ctx.fillText('Press SPACE to restart', W / 2, H / 2 + 45);
+    }
+
+    if (state === STATE.WIN) {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, H / 2 - 100, W, 200);
+        ctx.fillStyle = '#ffcc00';
+        ctx.font = 'bold 24px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('YOU WIN!', W / 2, H / 2 - 40);
+        ctx.font = '16px monospace';
+        ctx.fillStyle = '#fff';
+        ctx.fillText(`Final Score: ${score}`, W / 2, H / 2 + 10);
+        ctx.fillText('Press SPACE to play again', W / 2, H / 2 + 50);
+    }
+
+    ctx.restore();
+}
+
+function drawFlipper(f) {
+    let tipX = f.x + Math.cos(f.angle) * f.len;
+    let tipY = f.y + Math.sin(f.angle) * f.len;
+    ctx.strokeStyle = '#ffcc44';
+    ctx.lineWidth = 10;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(f.x, f.y);
+    ctx.lineTo(tipX, tipY);
+    ctx.stroke();
+    // Base circle
+    ctx.fillStyle = '#ffcc44';
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, 8, 0, Math.PI * 2);
+    ctx.fill();
+}
+
+function drawMenu() {
+    ctx.fillStyle = '#1a1a3a';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title
+    ctx.fillStyle = '#ffcc00';
+    ctx.font = 'bold 28px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('PINBALL', W / 2, 150);
+    ctx.fillStyle = '#44ff88';
+    ctx.fillText('SOKOBAN', W / 2, 190);
+
+    // Instructions
+    ctx.fillStyle = '#aaccff';
+    ctx.font = '13px monospace';
+    let lines = [
+        '',
+        'Bounce the ball to light up',
+        'all TARGETS (diamond pads)',
+        '',
+        'Controls:',
+        '  Arrow Left / A - Left flipper',
+        '  Arrow Right / D - Right flipper',
+        '  Hold SPACE - Charge plunger',
+        '  Release SPACE - Launch ball!',
+        '',
+        'Hit all targets before losing',
+        'all 3 balls to clear the level',
+        '',
+        '4 Levels of increasing difficulty',
+        '',
+    ];
+    let y = 250;
+    for (let line of lines) {
+        ctx.fillText(line, W / 2, y);
+        y += 22;
+    }
+
+    // Blinking prompt
+    if (Math.floor(Date.now() / 500) % 2 === 0) {
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 16px monospace';
+        ctx.fillText('Press SPACE to Start', W / 2, H - 80);
+    }
+
+    // Decorative ball
+    let t = Date.now() / 1000;
+    let bx = W / 2 + Math.sin(t * 2) * 50;
+    let by = H - 130 + Math.cos(t * 3) * 10;
+    let grad = ctx.createRadialGradient(bx - 2, by - 2, 0, bx, by, 8);
+    grad.addColorStop(0, '#fff');
+    grad.addColorStop(1, '#888');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(bx, by, 8, 0, Math.PI * 2);
+    ctx.fill();
+}
+
+// Game Loop
+let lastTime = 0;
+function gameLoop(time) {
+    let dt = time - lastTime;
+    lastTime = time;
+
+    if (state === STATE.PLAYING) {
+        updateFlippers();
+        updatePhysics();
+    }
+
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+loadLevel(0);
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
