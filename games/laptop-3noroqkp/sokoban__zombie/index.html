@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zombie Sokoban</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a12; font-family: 'Courier New', monospace; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function(){
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+function resize(){
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W; canvas.height = H;
+  scale = Math.min(W, H) / 50;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio(){
+  if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(type){
+  if(!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  const now = audioCtx.currentTime;
+  if(type === 'move'){
+    osc.type = 'triangle'; osc.frequency.value = 120;
+    gain.gain.setValueAtTime(0.15, now); gain.gain.exponentialRampToValueAtTime(0.001, now+0.1);
+    osc.start(now); osc.stop(now+0.1);
+  } else if(type === 'push'){
+    osc.type = 'square'; osc.frequency.value = 80;
+    gain.gain.setValueAtTime(0.2, now); gain.gain.exponentialRampToValueAtTime(0.001, now+0.15);
+    osc.start(now); osc.stop(now+0.15);
+  } else if(type === 'place'){
+    osc.type = 'sine'; osc.frequency.value = 440;
+    gain.gain.setValueAtTime(0.2, now); gain.gain.exponentialRampToValueAtTime(0.001, now+0.3);
+    osc.start(now); osc.stop(now+0.3);
+    const osc2 = audioCtx.createOscillator();
+    const gain2 = audioCtx.createGain();
+    osc2.connect(gain2); gain2.connect(audioCtx.destination);
+    osc2.type = 'sine'; osc2.frequency.value = 660;
+    gain2.gain.setValueAtTime(0.15, now+0.1); gain2.gain.exponentialRampToValueAtTime(0.001, now+0.4);
+    osc2.start(now+0.1); osc2.stop(now+0.4);
+  } else if(type === 'win'){
+    [523,659,784,1047].forEach((f,i)=>{
+      const o = audioCtx.createOscillator(); const g = audioCtx.createGain();
+      o.connect(g); g.connect(audioCtx.destination);
+      o.type='sine'; o.frequency.value=f;
+      g.gain.setValueAtTime(0.15, now+i*0.12); g.gain.exponentialRampToValueAtTime(0.001, now+i*0.12+0.3);
+      o.start(now+i*0.12); o.stop(now+i*0.12+0.3);
+    });
+  } else if(type === 'fail'){
+    osc.type='sawtooth'; osc.frequency.value=100;
+    gain.gain.setValueAtTime(0.15,now); gain.gain.exponentialRampToValueAtTime(0.001,now+0.4);
+    osc.start(now); osc.stop(now+0.4);
+  }
+}
+
+// Game state
+const LEVELS = [
+  { name:"First Contact", map:[
+    "#######",
+    "#     #",
+    "# $ . #",
+    "# @   #",
+    "#     #",
+    "#######"
+  ]},
+  { name:"Quarantine Zone", map:[
+    "########",
+    "#     #",
+    "# $ . #",
+    "#     #",
+    "# $ . #",
+    "#  @  #",
+    "########"
+  ]},
+  { name:"Outbreak", map:[
+    "#########",
+    "#       #",
+    "# $ .   #",
+    "# $ .   #",
+    "# @     #",
+    "#       #",
+    "#########"
+  ]},
+  { name:"Infection Spread", map:[
+    "##########",
+    "#        #",
+    "# $ ##$  #",
+    "#  .# .  #",
+    "#  #$    #",
+    "#  @     #",
+    "##########"
+  ]},
+  { name:"Final Containment", map:[
+    "###########",
+    "#        #",
+    "# $ ##$  #",
+    "#  .# .  #",
+    "# $ ##$  #",
+    "#  @     #",
+    "#        #",
+    "###########"
+  ]}
+];
+
+let state = 'start'; // start, playing, levelComplete, allComplete
+let currentLevel = 0;
+let grid = [];
+let player = {x:0,y:0};
+let boxes = [];
+let targets = [];
+let moves = 0;
+let pushes = 0;
+let animFrame = 0;
+let particles = [];
+
+function loadLevel(idx){
+  const map = LEVELS[idx].map;
+  grid = [];
+  boxes = [];
+  targets = [];
+  player = {x:0,y:0};
+  moves = 0; pushes = 0;
+  for(let r=0;r<map.length;r++){
+    grid[r]=[];
+    for(let c=0;c<map[r].length;c++){
+      const ch = map[r][c];
+      if(ch==='#') grid[r][c]=1;
+      else if(ch===' ') grid[r][c]=0;
+      else if(ch==='$'){grid[r][c]=0;boxes.push({x:c,y:r});}
+      else if(ch==='.'){grid[r][c]=0;targets.push({x:c,y:y});}
+      else if(ch==='@'){grid[r][c]=0;player={x:c,y:r};}
+      else if(ch==='%'){grid[r][c]=0;boxes.push({x:c,y:r});targets.push({x:c,y:r});}
+      else if(ch==='+'){grid[r][c]=0;player={x:c,y:r};targets.push({x:c,y:r});}
+      else grid[r][c]=0;
+    }
+  }
+  // Fix: use r not y for targets
+  targets = [];
+  for(let r=0;r<map.length;r++){
+    for(let c=0;c<map[r].length;c++){
+      const ch=map[r][c];
+      if(ch==='.') targets.push({x:c,y:r});
+      if(ch==='@'||ch==='+') player={x:c,y:r};
+    }
+  }
+}
+
+function isWall(x,y){
+  if(y<0||y>=grid.length) return true;
+  if(x<0||x>=grid[y].length) return true;
+  return grid[y][x]===1;
+}
+
+function boxAt(x,y){return boxes.find(b=>b.x===x&&b.y===y);}
+function onTarget(x,y){return targets.some(t=>t.x===x&&t.y===y);}
+
+function move(dx,dy){
+  const nx=player.x+dx, ny=player.y+dy;
+  if(isWall(nx,ny)) return;
+  const box = boxAt(nx,ny);
+  if(box){
+    const bx=nx+dx, by=ny+dy;
+    if(isWall(bx,by)||boxAt(bx,by)){ playSound('fail'); return; }
+    box.x=bx; box.y=by;
+    pushes++;
+    playSound('push');
+    if(onTarget(bx,by)){
+      setTimeout(()=>playSound('place'),100);
+      addParticles(bx,by);
+    }
+  } else {
+    playSound('move');
+  }
+  player.x=nx; player.y=ny;
+  moves++;
+  checkWin();
+}
+
+function addParticles(gx,gy){
+  const cellSize = getCellSize();
+  const ox = getGridOffset().x + gx*cellSize+cellSize/2;
+  const oy = getGridOffset().y + gy*cellSize+cellSize/2;
+  for(let i=0;i<8;i++){
+    const a=Math.random()*Math.PI*2;
+    particles.push({x:ox,y:oy,vx:Math.cos(a)*(1+Math.random()*2),vy:Math.sin(a)*(1+Math.random()*2)-1,life:1,color:`hsl(${120+Math.random()*40},80%,50%)`});
+  }
+}
+
+function checkWin(){
+  const allDone = boxes.every(b=>onTarget(b.x,b.y));
+  if(allDone){
+    state='levelComplete';
+    playSound('win');
+  }
+}
+
+function getCellSize(){
+  const rows=grid.length, cols=Math.max(...grid.map(r=>r.length));
+  return Math.min((W*0.85)/cols,(H*0.75)/rows);
+}
+
+function getGridOffset(){
+  const rows=grid.length, cols=Math.max(...grid.map(r=>r.length));
+  const cs=getCellSize();
+  return {x:(W-cols*cs)/2, y:(H-rows*cs)/2 + H*0.05};
+}
+
+function drawZombieFace(cx,cy,size,onTarget){
+  const s=size*0.6;
+  // Body
+  ctx.fillStyle = onTarget ? '#4a9e4a' : '#3d6b3d';
+  ctx.fillRect(cx-s/2,cy-s/2,s,s);
+  ctx.strokeStyle=onTarget?'#8f8':'#5a5';
+  ctx.lineWidth=2;
+  ctx.strokeRect(cx-s/2,cy-s/2,s,s);
+  // Eyes
+  const es=s*0.18;
+  ctx.fillStyle='#ff3333';
+  ctx.fillRect(cx-es- s*0.1,cy-es*0.5,es,es);
+  ctx.fillRect(cx+es*0.1,cy-es*0.5,es,es);
+  // Mouth
+  ctx.strokeStyle='#ff3333';
+  ctx.lineWidth=2;
+  ctx.beginPath();
+  const my=cy+s*0.2;
+  ctx.moveTo(cx-s*0.15,my);
+  ctx.lineTo(cx-s*0.05,my+s*0.08);
+  ctx.lineTo(cx+s*0.05,my);
+  ctx.lineTo(cx+s*0.15,my+s*0.08);
+  ctx.stroke();
+}
+
+function drawPlayer(cx,cy,size){
+  const s=size*0.5;
+  // Body
+  ctx.fillStyle='#c47a3a';
+  ctx.fillRect(cx-s/2,cy,s/2,s);
+  // Head
+  ctx.beginPath();ctx.arc(cx,cy-s*0.1,s*0.3,0,Math.PI*2);ctx.fill();
+  // Eyes
+  ctx.fillStyle='#fff';
+  ctx.fillRect(cx-s*0.15,cy-s*0.2,s*0.1,s*0.1);
+  ctx.fillRect(cx+s*0.05,cy-s*0.2,s*0.1,s*0.1);
+}
+
+function drawTarget(cx,cy,size,pulse){
+  const r=size*0.3;
+  ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);
+  ctx.strokeStyle=`hsla(${120+Math.sin(pulse)*20},70%,50%,${0.5+Math.sin(pulse)*0.3})`;
+  ctx.lineWidth=3;ctx.stroke();
+  ctx.beginPath();ctx.arc(cx,cy,r*0.6,0,Math.PI*2);
+  ctx.strokeStyle=`hsla(140,70%,60%,${0.3+Math.sin(pulse*1.5)*0.2})`;
+  ctx.lineWidth=2;ctx.stroke();
+}
+
+function draw(){
+  animFrame++;
+  const t=animFrame*0.05;
+  ctx.fillStyle='#0a0a12';ctx.fillRect(0,0,W,H);
+
+  if(state==='start'){
+    // Title
+    ctx.textAlign='center';
+    ctx.fillStyle='#4a9e4a';
+    ctx.font=`bold ${Math.min(W*0.08,48)}px Courier New`;
+    ctx.fillText('ZOMBIE SOKOBAN',W/2,H*0.3);
+    // Subtitle
+    ctx.fillStyle='#6a6';
+    ctx.font=`${Math.min(W*0.035,20)}px Courier New`;
+    ctx.fillText('Contain all the zombies before they spread!',W/2,H*0.4);
+    // Controls
+    ctx.fillStyle='#8f8';
+    ctx.font=`${Math.min(W*0.03,16)}px Courier New`;
+    const cx=W/2;
+    let cy=H*0.52;
+    const lh=Math.min(H*0.04,24);
+    ctx.fillText('↑↓←→ / WASD — Move',cx,cy);cy+=lh;
+    ctx.fillText('Push zombies onto containment zones',cx,cy);cy+=lh;
+    ctx.fillText('R — Restart Level',cx,cy);cy+=lh*1.5;
+    // Start prompt
+    ctx.fillStyle=`hsla(120,60%,${50+Math.sin(t*3)*20}%,1)`;
+    ctx.font=`bold ${Math.min(W*0.04,24)}px Courier New`;
+    ctx.fillText('[ PRESS ANY KEY TO START ]',W/2,H*0.8);
+    // Decorative zombies
+    for(let i=0;i<5;i++){
+      const zx=W*0.1+i*W*0.2;
+      const zy=H*0.65+Math.sin(t*2+i)*10;
+      drawZombieFace(zx,zy,Math.min(W*0.04,30),false);
+    }
+  }
+  else if(state==='playing'||state==='levelComplete'){
+    const cs=getCellSize();
+    const off=getGridOffset();
+    const rows=grid.length;
+    const cols=Math.max(...grid.map(r=>r.length));
+
+    // Draw floor and walls
+    for(let r=0;r<rows;r++){
+      for(let c=0;c<grid[r].length;c++){
+        const x=off.x+c*cs, y=off.y+r*cs;
+        if(grid[r][c]===1){
+          ctx.fillStyle='#1a1a2e';
+          ctx.fillRect(x,y,cs,cs);
+          ctx.strokeStyle='#2a2a3e';ctx.lineWidth=1;
+          ctx.strokeRect(x+1,y+1,cs-2,cs-2);
+        } else {
+          ctx.fillStyle=(r+c)%2===0?'#151520':'#121218';
+          ctx.fillRect(x,y,cs,cs);
+        }
+      }
+    }
+
+    // Draw targets
+    for(const t of targets){
+      drawTarget(off.x+t.x*cs+cs/2, off.y+t.y*cs+cs/2, cs, t);
+    }
+
+    // Draw boxes (zombies)
+    for(const b of boxes){
+      const done=onTarget(b.x,b.y);
+      drawZombieFace(off.x+b.x*cs+cs/2, off.y+b.y*cs+cs/2, cs, done);
+      if(done){
+        ctx.fillStyle=`hsla(120,70%,40%,${0.3+Math.sin(t*4)*0.1})`;
+        ctx.fillRect(off.x+b.x*cs,off.y+b.y*cs,cs,cs);
+      }
+    }
+
+    // Draw player
+    drawPlayer(off.x+player.x*cs+cs/2, off.y+player.y*cs+cs/2, cs);
+
+    // Particles
+    for(let i=particles.length-1;i>=0;i--){
+      const p=particles[i];
+      p.x+=p.vx;p.y+=p.vy;p.vy+=0.05;p.life-=0.03;
+      if(p.life<=0){particles.splice(i,1);continue;}
+      ctx.fillStyle=p.color;ctx.globalAlpha=p.life;
+      ctx.fillRect(p.x-2,p.y-2,4,4);
+      ctx.globalAlpha=1;
+    }
+
+    // HUD
+    const doneCount=boxes.filter(b=>onTarget(b.x,b.y)).length;
+    ctx.textAlign='left';
+    ctx.fillStyle='#8f8';
+    ctx.font=`${Math.min(W*0.025,16)}px Courier New`;
+    ctx.fillText(`Level ${currentLevel+1}: ${LEVELS[currentLevel].name}`,off.x, off.y-20);
+    ctx.fillText(`Zombies contained: ${doneCount}/${boxes.length}   Moves: ${moves}   Pushes: ${pushes}`,off.x, off.y-45);
+
+    if(state==='levelComplete'){
+      ctx.fillStyle='rgba(0,0,0,0.7)';ctx.fillRect(0,0,W,H);
+      ctx.textAlign='center';
+      ctx.fillStyle='#4a9e4a';
+      ctx.font=`bold ${Math.min(W*0.06,36)}px Courier New`;
+      ctx.fillText('LEVEL CLEARED!',W/2,H*0.4);
+      ctx.fillStyle='#8f8';
+      ctx.font=`${Math.min(W*0.03,18)}px Courier New`;
+      ctx.fillText(`Moves: ${moves}  |  Pushes: ${pushes}`,W/2,H*0.5);
+      ctx.fillStyle=`hsla(120,60%,${50+Math.sin(t*3)*20}%,1)`;
+      ctx.font=`bold ${Math.min(W*0.035,22)}px Courier New`;
+      if(currentLevel<LEVELS.length-1) ctx.fillText('[ PRESS N FOR NEXT LEVEL ]',W/2,H*0.65);
+      else ctx.fillText('[ ALL ZOMBIES CONTAINED! ]',W/2,H*0.65);
+    }
+  }
+  else if(state==='allComplete'){
+    // This is handled via levelComplete on last level
+  }
+
+  requestAnimationFrame(draw);
+}
+
+// Input
+window.addEventListener('keydown', function(e){
+  initAudio();
+  if(state==='start'){
+    state='playing';
+    currentLevel=0;
+    loadLevel(0);
+    e.preventDefault();
+    return;
+  }
+  if(state==='levelComplete'){
+    if(e.key==='n'||e.key==='N'||e.key===' '){
+      if(currentLevel<LEVELS.length-1){
+        currentLevel++;
+        loadLevel(currentLevel);
+        state='playing';
+      } else {
+        // All complete - back to start
+        state='start';
+      }
+    }
+    if(e.key==='r'||e.key==='R'){loadLevel(currentLevel);state='playing';}
+    e.preventDefault();
+    return;
+  }
+  if(state==='playing'){
+    let dx=0,dy=0;
+    if(e.key==='ArrowUp'||e.key==='w'||e.key==='W') dy=-1;
+    else if(e.key==='ArrowDown'||e.key==='s'||e.key==='S') dy=1;
+    else if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') dx=-1;
+    else if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') dx=1;
+    else if(e.key==='r'||e.key==='R'){loadLevel(currentLevel);e.preventDefault();return;}
+    else return;
+    move(dx,dy);
+    e.preventDefault();
+  }
+});
+
+// Prevent scrolling with arrow keys
+window.addEventListener('keydown',function(e){
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+});
+
+loadLevel(0);
+draw();
+})();
+</script>
+</body>
+</html>
