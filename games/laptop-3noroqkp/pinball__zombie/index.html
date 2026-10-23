@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pinball Zombie</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a0a; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; width: 100vw; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    scale = Math.min(W / 400, H / 700);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Game constants
+const TABLE_W = 380, TABLE_H = 680;
+const BALL_R = 7;
+const GRAVITY = 0.15;
+const FRICTION = 0.998;
+const FLIPPER_LEN = 60;
+const FLIPPER_THICKNESS = 8;
+
+// Game state
+let gameState = 'START'; // START, PLAYING, GAME_OVER, WIN
+let score = 0, lives = 3, ball = null;
+let zombies = [], bumpers = [], particles = [];
+let leftFlipperAngle = -Math.PI * 0.25, rightFlipperAngle = Math.PI * 0.25;
+let leftFlipperVel = 0, rightFlipperVel = 0;
+let plungerPower = 0, plungerActive = false;
+let shakeTime = 0;
+
+// Audio context
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+function playSound(freq, duration, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+
+// Table definition (in table coordinates, centered)
+const TX = 0, TY = -TABLE_H / 2; // top-left of table in world coords
+
+function toWorld(tx, ty) {
+    return { x: tx, y: ty };
+}
+
+function toScreen(wx, wy) {
+    const ox = W / 2 - (TABLE_W / 2) * scale;
+    const oy = H / 2 - (TABLE_H / 2) * scale;
+    return { x: ox + wx * scale, y: oy + wy * scale };
+}
+
+// Walls defined as line segments in table coords (relative to top-left of table area)
+let walls = [];
+function buildWalls() {
+    walls = [
+        // Left wall
+        { x1: 0, y1: 40, x2: 0, y2: TABLE_H - 80 },
+        // Right wall
+        { x1: TABLE_W, y1: 40, x2: TABLE_W, y2: TABLE_H - 80 },
+        // Top left curve approximated
+        { x1: 0, y1: 40, x2: 30, y2: 5 },
+        { x1: 30, y1: 5, x2: TABLE_W - 30, y2: 0 },
+        { x1: TABLE_W - 30, y1: 0, x2: TABLE_W, y2: 40 },
+        // Lower left guide to flippers
+        { x1: 0, y1: TABLE_H - 80, x2: 60, y2: TABLE_H - 50 },
+        // Lower right guide
+        { x1: TABLE_W, y1: TABLE_H - 80, x2: TABLE_W - 60, y2: TABLE_H - 50 },
+        // Launch lane (right side)
+        { x1: TABLE_W - 40, y1: TABLE_H - 120, x2: TABLE_W - 40, y2: TABLE_H - 80 },
+        // Diagonal deflector upper left
+        { x1: 30, y1: 150, x2: 80, y2: 100 },
+        // Diagonal deflector upper right
+        { x1: TABLE_W - 30, y1: 150, x2: TABLE_W - 80, y2: 100 },
+        // Center divider bump area
+        { x1: 120, y1: 250, x2: 170, y2: 230 },
+        { x1: TABLE_W - 120, y1: 250, x2: TABLE_W - 170, y2: 230 },
+    ];
+}
+
+function buildBumpers() {
+    bumpers = [
+        { x: TABLE_W / 2, y: 180, r: 25, hit: 0 },
+        { x: TABLE_W / 2 - 70, y: 220, r: 25, hit: 0 },
+        { x: TABLE_W / 2 + 70, y: 220, r: 25, hit: 0 },
+    ];
+}
+
+function buildZombies() {
+    zombies = [
+        { x: 80, y: 350, r: 18, hp: 2, maxHp: 2, alive: true, wobble: 0 },
+        { x: TABLE_W / 2, y: 400, r: 18, hp: 2, maxHp: 2, alive: true, wobble: 0 },
+        { x: TABLE_W - 80, y: 350, r: 18, hp: 2, maxHp: 2, alive: true, wobble: 0 },
+        { x: 60, y: 480, r: 18, hp: 2, maxHp: 2, alive: true, wobble: 0 },
+        { x: TABLE_W - 60, y: 480, r: 18, hp: 2, maxHp: 2, alive: true, wobble: 0 },
+    ];
+}
+
+function resetBall() {
+    ball = { x: TABLE_W - 20, y: TABLE_H - 60, vx: 0, vy: 0 };
+}
+
+function startGame() {
+    score = 0;
+    lives = 3;
+    buildWalls();
+    buildBumpers();
+    buildZombies();
+    resetBall();
+    gameState = 'PLAYING';
+    plungerPower = 0;
+    plungerActive = false;
+}
+
+// Input
+let keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    initAudio();
+    if (gameState === 'START' && (e.code === 'Space' || e.code === 'Enter')) {
+        startGame();
+    } else if (gameState === 'GAME_OVER' && e.code === 'Space') {
+        startGame();
+    } else if (gameState === 'WIN' && e.code === 'Space') {
+        startGame();
+    }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Physics
+function circleLineCollide(cx, cy, cr, x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    if (len === 0) return null;
+    const nx = dy / len, ny = -dx / len;
+    // Project center onto line
+    const px = cx - x1, py = cy - y1;
+    const t = px * (x2 - x1) + py * (y2 - y1);
+    const tt = Math.max(0, Math.min(len * len, t));
+    const closestX = x1 + (x2 - x1) * (tt / (len * len));
+    const closestY = y1 + (y2 - y1) * (tt / (len * len));
+    const distX = cx - closestX, distY = cy - closestY;
+    const dist = Math.sqrt(distX * distX + distY * distY);
+    if (dist < cr) {
+        const overlap = cr - dist;
+        const nx2 = distX / dist, ny2 = distY / dist;
+        return { nx: nx2, ny: ny2, overlap };
+    }
+    return null;
+}
+
+function updatePhysics() {
+    if (!ball) return;
+
+    // Gravity
+    ball.vy += GRAVITY;
+    // Friction
+    ball.vx *= FRICTION;
+    ball.vy *= FRICTION;
+
+    const substeps = 4;
+    for (let s = 0; s < substeps; s++) {
+        ball.x += ball.vx / substeps;
+        ball.y += ball.vy / substeps;
+
+        // Wall collisions
+        for (const w of walls) {
+            const col = circleLineCollide(ball.x, ball.y, BALL_R, w.x1, w.y1, w.x2, w.y2);
+            if (col) {
+                ball.x += col.nx * col.overlap;
+                ball.y += col.ny * col.overlap;
+                const dot = ball.vx * col.nx + ball.vy * col.ny;
+                ball.vx -= 1.8 * dot * col.nx;
+                ball.vy -= 1.8 * dot * col.ny;
+            }
+        }
+
+        // Bumper collisions
+        for (const b of bumpers) {
+            const dx = ball.x - b.x, dy = ball.y - b.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < BALL_R + b.r) {
+                const nx = dx / dist, ny = dy / dist;
+                ball.x = b.x + nx * (BALL_R + b.r + 1);
+                ball.y = b.y + ny * (BALL_R + b.r + 1);
+                const force = 5;
+                ball.vx += nx * force;
+                ball.vy += ny * force;
+                b.hit = 10;
+                playSound(200, 0.1, 'square', 0.15);
+                score += 10;
+            }
+        }
+
+        // Zombie collisions
+        for (const z of zombies) {
+            if (!z.alive) continue;
+            const dx = ball.x - z.x, dy = ball.y - z.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < BALL_R + z.r) {
+                const nx = dx / dist, ny = dy / dist;
+                ball.vx += nx * 2;
+                ball.vy += ny * 2;
+                z.hp--;
+                z.wobble = 15;
+                shakeTime = 5;
+                score += 100;
+                playSound(100, 0.2, 'sawtooth', 0.2);
+                spawnParticles(z.x, z.y, '#4f4');
+                if (z.hp <= 0) {
+                    z.alive = false;
+                    score += 500;
+                    playSound(60, 0.4, 'sawtooth', 0.3);
+                    spawnParticles(z.x, z.y, '#8f8');
+                }
+            }
+        }
+
+        // Flipper collisions
+        const leftPivot = { x: 70, y: TABLE_H - 50 };
+        const rightPivot = { x: TABLE_W - 70, y: TABLE_H - 50 };
+
+        // Left flipper
+        const lfx = leftPivot.x + Math.cos(leftFlipperAngle) * FLIPPER_LEN;
+        const lfy = leftPivot.y + Math.sin(leftFlipperAngle) * FLIPPER_LEN;
+        const lcol = circleLineCollide(ball.x, ball.y, BALL_R, leftPivot.x, leftPivot.y, lfx, lfy);
+        if (lcol) {
+            ball.x += lcol.nx * lcol.overlap;
+            ball.y += lcol.ny * lcol.overlap;
+            const dot = ball.vx * lcol.nx + ball.vy * lcol.ny;
+            ball.vx -= 1.5 * dot * lcol.nx;
+            ball.vy -= 1.5 * dot * lcol.ny;
+            if (leftFlipperVel > 0) {
+                ball.vy += leftFlipperVel * 3;
+                ball.vx += leftFlipperVel * 1.5;
+            }
+        }
+
+        // Right flipper
+        const rfx = rightPivot.x + Math.cos(rightFlipperAngle) * FLIPPER_LEN;
+        const rfy = rightPivot.y + Math.sin(rightFlipperAngle) * FLIPPER_LEN;
+        const rcol = circleLineCollide(ball.x, ball.y, BALL_R, rfx, rfy);
+        if (rcol) {
+            ball.x += rcol.nx * rcol.overlap;
+            ball.y += rcol.ny * rcol.overlap;
+            const dot = ball.vx * rcol.nx + ball.vy * rcol.ny;
+            ball.vx -= 1.5 * dot * rcol.nx;
+            ball.vy -= 1.5 * dot * rcol.ny;
+            if (rightFlipperVel < 0) {
+                ball.vy += Math.abs(rightFlipperVel) * 3;
+                ball.vx += rightFlipperVel * -1.5;
+            }
+        }
+    }
+
+    // Check ball lost
+    if (ball.y > TABLE_H + 20) {
+        lives--;
+        playSound(80, 0.5, 'sawtooth', 0.3);
+        if (lives <= 0) {
+            gameState = 'GAME_OVER';
+        } else {
+            resetBall();
+        }
+    }
+
+    // Check win
+    if (zombies.every(z => !z.alive)) {
+        gameState = 'WIN';
+        playSound(440, 0.5, 'sine', 0.3);
+    }
+}
+
+function updateFlippers() {
+    const speed = 0.12;
+    // Left flipper
+    if (keys['ArrowLeft'] || keys['KeyA']) {
+        leftFlipperAngle -= speed;
+        leftFlipperVel = -speed;
+        if (leftFlipperAngle < -Math.PI * 0.5) leftFlipperAngle = -Math.PI * 0.5;
+    } else {
+        leftFlipperAngle += speed * 0.7;
+        leftFlipperVel = 0;
+        if (leftFlipperAngle > -Math.PI * 0.15) leftFlipperAngle = -Math.PI * 0.15;
+    }
+
+    // Right flipper
+    if (keys['ArrowRight'] || keys['KeyD']) {
+        rightFlipperAngle += speed;
+        rightFlipperVel = speed;
+        if (rightFlipperAngle > Math.PI * 0.2) rightFlipperAngle = Math.PI * 0.2;
+    } else {
+        rightFlipperAngle -= speed * 0.7;
+        rightFlipperVel = 0;
+        if (rightFlipperAngle < -Math.PI * 0.1) rightFlipperAngle = -Math.PI * 0.1;
+    }
+
+    // Plunger
+    if (keys['Space'] && ball && ball.y > TABLE_H - 70 && ball.x > TABLE_W - 50) {
+        plungerPower = Math.min(plungerPower + 0.08, 1);
+        plungerActive = true;
+    } else if (!keys['Space'] && plungerActive) {
+        if (ball && ball.y > TABLE_H - 70 && ball.x > TABLE_W - 50) {
+            ball.vy = -plungerPower * 12 - 3;
+            ball.vx = -1;
+            playSound(300, 0.15, 'square', 0.2);
+        }
+        plungerActive = false;
+        plungerPower = 0;
+    }
+}
+
+function spawnParticles(x, y, color) {
+    for (let i = 0; i < 8; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 1 + Math.random() * 3;
+        particles.push({ x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed - 2, life: 30, color });
+    }
+}
+
+function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.1;
+        p.life--;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+// Rendering
+function drawZombie(z) {
+    if (!z.alive) return;
+    const sx = toScreen(z.x, z.y);
+    const r = z.r * scale;
+    const wobbleX = Math.sin(z.wobble * 0.5) * 3 * (z.wobble > 0 ? 1 : 0);
+
+    ctx.save();
+    ctx.translate(sx.x + wobbleX, sx.y);
+
+    // Body glow
+    ctx.shadowColor = '#4f4';
+    ctx.shadowBlur = 10;
+
+    // Head
+    ctx.fillStyle = '#3a5a3a';
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Face
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#ff4444';
+    ctx.beginPath();
+    ctx.arc(-r * 0.3, -r * 0.2, r * 0.15, 0, Math.PI * 2);
+    ctx.arc(r * 0.3, -r * 0.2, r * 0.15, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Mouth
+    ctx.strokeStyle = '#ff4444';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, r * 0.3, r * 0.3, 0, Math.PI * 0.8);
+    ctx.stroke();
+
+    // HP indicator
+    ctx.fillStyle = '#fff';
+    for (let i = 0; i < z.hp; i++) {
+        ctx.beginPath();
+        ctx.arc(-r * 0.3 + i * r * 0.4, -r - 8, 3, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    ctx.restore();
+}
+
+function draw() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    if (gameState === 'START') {
+        ctx.fillStyle = '#4f4';
+        ctx.font = `bold ${Math.min(W * 0.08, 48)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('PINBALL ZOMBIE', W / 2, H * 0.3);
+        ctx.fillStyle = '#aaa';
+        ctx.font = `${Math.min(W * 0.035, 18)}px monospace`;
+        ctx.fillText('← → or A/D: Flippers', W / 2, H * 0.45);
+        ctx.fillText('SPACE (hold+release): Launch Ball', W / 2, H * 0.52);
+        ctx.fillText('Hit all zombies to win!', W / 2, H * 0.6);
+        ctx.fillStyle = '#fff';
+        ctx.font = `${Math.min(W * 0.04, 22)}px monospace`;
+        ctx.fillText('Press SPACE or ENTER to start', W / 2, H * 0.75);
+        return;
+    }
+
+    // Shake
+    let shakeX = 0, shakeY = 0;
+    if (shakeTime > 0) {
+        shakeX = (Math.random() - 0.5) * 4;
+        shakeY = (Math.random() - 0.5) * 4;
+        shakeTime--;
+    }
+
+    ctx.save();
+    ctx.translate(shakeX, shakeY);
+
+    // Draw table background
+    const tl = toScreen(0, 0);
+    const tr = toScreen(TABLE_W, TABLE_H);
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(tl.x, tl.y, (tr.x - tl.x), (tr.y - tl.y));
+
+    // Draw walls
+    ctx.strokeStyle = '#636';
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    for (const w of walls) {
+        const p1 = toScreen(w.x1, w.y1);
+        const p2 = toScreen(w.x2, w.y2);
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.stroke();
+    }
+
+    // Draw bumpers
+    for (const b of bumpers) {
+        const sx = toScreen(b.x, b.y);
+        const r = b.r * scale;
+        ctx.fillStyle = b.hit > 0 ? '#ff6' : '#a4f';
+        if (b.hit > 0) b.hit--;
+        ctx.beginPath();
+        ctx.arc(sx.x, sx.y, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        // Inner circle
+        ctx.fillStyle = b.hit > 0 ? '#ffa' : '#c8f';
+        ctx.beginPath();
+        ctx.arc(sx.x, sx.y, r * 0.5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Draw zombies
+    for (const z of zombies) {
+        if (z.wobble > 0) z.wobble--;
+        drawZombie(z);
+    }
+
+    // Draw particles
+    for (const p of particles) {
+        const sx = toScreen(p.x, p.y);
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.life / 30;
+        ctx.beginPath();
+        ctx.arc(sx.x, sx.y, 3 * scale, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Draw flippers
+    const leftPivot = toScreen(70, TABLE_H - 50);
+    const rLeftX = leftPivot.x + Math.cos(leftFlipperAngle) * FLIPPER_LEN * scale;
+    const rLeftY = leftPivot.y + Math.sin(leftFlipperAngle) * FLIPPER_LEN * scale;
+    ctx.strokeStyle = '#ff4';
+    ctx.lineWidth = FLIPPER_THICKNESS * scale;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(leftPivot.x, leftPivot.y);
+    ctx.lineTo(rLeftX, rLeftY);
+    ctx.stroke();
+
+    const rightPivot = toScreen(TABLE_W - 70, TABLE_H - 50);
+    const rRightX = rightPivot.x + Math.cos(rightFlipperAngle) * FLIPPER_LEN * scale;
+    const rRightY = rightPivot.y + Math.sin(rightFlipperAngle) * FLIPPER_LEN * scale;
+    ctx.beginPath();
+    ctx.moveTo(rightPivot.x, rightPivot.y);
+    ctx.lineTo(rRightX, rRightY);
+    ctx.stroke();
+
+    // Draw plunger
+    if (ball && ball.y > TABLE_H - 70 && ball.x > TABLE_W - 50) {
+        const px = toScreen(TABLE_W - 20, TABLE_H - 30);
+        ctx.fillStyle = '#f44';
+        ctx.fillRect(px.x - 5 * scale, px.y - (plungerPower * 30 + 10) * scale, 10 * scale, (plungerPower * 30 + 10) * scale);
+    }
+
+    // Draw ball
+    if (ball) {
+        const sx = toScreen(ball.x, ball.y);
+        ctx.fillStyle = '#fff';
+        ctx.shadowColor = '#fff';
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        ctx.arc(sx.x, sx.y, BALL_R * scale, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+    }
+
+    // HUD
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.min(W * 0.04, 20)}px monospace`;
+    ctx.textAlign = 'left';
+    const hudY = toScreen(0, -35).y;
+    ctx.fillText(`Score: ${score}`, 15, hudY);
+    ctx.fillText(`Lives: ${'●'.repeat(lives)}`, 15, hudY + 25);
+
+    const aliveCount = zombies.filter(z => z.alive).length;
+    ctx.textAlign = 'right';
+    ctx.fillText(`Zombies: ${aliveCount}`, W - 15, hudY);
+    ctx.restore();
+
+    // Game over / Win overlay
+    if (gameState === 'GAME_OVER' || gameState === 'WIN') {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.textAlign = 'center';
+        if (gameState === 'WIN') {
+            ctx.fillStyle = '#4f4';
+            ctx.font = `bold ${Math.min(W * 0.08, 48)}px monospace`;
+            ctx.fillText('ALL ZOMBIES DEFEATED!', W / 2, H * 0.4);
+        } else {
+            ctx.fillStyle = '#f44';
+            ctx.font = `bold ${Math.min(W * 0.08, 48)}px monospace`;
+            ctx.fillText('GAME OVER', W / 2, H * 0.4);
+        }
+        ctx.fillStyle = '#fff';
+        ctx.font = `${Math.min(W * 0.04, 22)}px monospace`;
+        ctx.fillText(`Final Score: ${score}`, W / 2, H * 0.55);
+        ctx.fillText('Press SPACE to play again', W / 2, H * 0.7);
+    }
+}
+
+// Game loop
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = time - lastTime;
+    lastTime = time;
+
+    if (gameState === 'PLAYING') {
+        updateFlippers();
+        updatePhysics();
+        updateParticles();
+    } else {
+        updateParticles();
+    }
+
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
