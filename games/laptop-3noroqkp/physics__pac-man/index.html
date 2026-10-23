@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pac-Man Physics</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a1a; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; width: 100vw; }
+canvas { display: block; max-width: 100vw; max-height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function(){
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+function playSound(freq, type, dur, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+function eatSound() { playSound(880, 'sine', 0.1, 0.15); }
+function bounceSound() { playSound(220, 'triangle', 0.15, 0.1); }
+function deathSound() { playSound(150, 'sawtooth', 0.5, 0.2); }
+function winSound() { playSound(660, 'sine', 0.3, 0.15); setTimeout(()=>playSound(880,'sine',0.3,0.15),200); }
+
+// Game State
+const STATE = { MENU: 0, PLAYING: 1, DEAD: 2, WIN: 3, GAMEOVER: 4 };
+let state = STATE.MENU;
+let score = 0;
+let lives = 3;
+let level = 1;
+let pellets = [];
+let walls = [];
+let ghosts = [];
+let particles = [];
+let pacman = { x: 0, y: 0, vx: 0, vy: 0, r: 12, mouthAngle: 0 };
+let totalPellets = 0;
+let pelletsEaten = 0;
+let shakeTime = 0;
+let gameTime = 0;
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.code] = true; initAudio(); });
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function resetGame() {
+    score = 0;
+    lives = 3;
+    level = 1;
+    loadLevel();
+}
+
+function loadLevel() {
+    pellets = [];
+    walls = generateWalls(level);
+    pacman.x = W / 2;
+    pacman.y = H - 60;
+    pacman.vx = 0;
+    pacman.vy = 0;
+    pacman.mouthAngle = 0;
+    pelletsEaten = 0;
+    
+    // Place pellets in open spaces
+    const cols = Math.floor(W / 50);
+    const rows = Math.floor(H / 50);
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            const px = c * 50 + 25 + (Math.random() - 0.5) * 10;
+            const py = r * 50 + 25 + (Math.random() - 0.5) * 10;
+            if (px > 30 && px < W - 30 && py > 30 && py < H - 60) {
+                if (!wallCollision(px, py, 4)) {
+                    pellets.push({ x: px, y: py, r: 5, power: false });
+                }
+            }
+        }
+    }
+    
+    // Place some power pellets
+    for (let i = 0; i < 3; i++) {
+        if (pellets.length > 0) {
+            const idx = Math.floor(Math.random() * pellets.length);
+            pellets[idx].power = true;
+            pellets[idx].r = 10;
+        }
+    }
+    
+    totalPellets = pellets.length;
+    
+    // Ghosts
+    ghosts = [];
+    const numGhosts = Math.min(2 + level, 6);
+    for (let i = 0; i < numGhosts; i++) {
+        let gx, gy;
+        let attempts = 0;
+        do {
+            gx = Math.random() * (W - 100) + 50;
+            gy = Math.random() * (H - 150) + 50;
+            attempts++;
+        } while ((Math.hypot(gx - pacman.x, gy - pacman.y) < 200 || wallCollision(gx, gy, 14)) && attempts < 100);
+        
+        const colors = ['#ff3333', '#3366ff', '#ff9933', '#cc33cc', '#33cccc', '#ffff33'];
+        ghosts.push({
+            x: gx, y: gy, vx: 0, vy: 0, r: 12,
+            color: colors[i % colors.length],
+            speed: 1.5 + level * 0.3,
+            scared: false, scaredTimer: 0
+        });
+    }
+    
+    particles = [];
+}
+
+function generateWalls(lvl) {
+    const w = [];
+    const margin = 20;
+    
+    // Border walls (with gap at bottom for pac-man start)
+    const t = 8; // wall thickness
+    // Top
+    w.push({ x: 0, y: 0, w: W, h: t });
+    // Left
+    w.push({ x: 0, y: 0, w: t, h: H });
+    // Right
+    w.push({ x: W - t, y: 0, w: t, h: H });
+    // Bottom (with gap)
+    const gapW = 60;
+    const gapX = W / 2 - gapW / 2;
+    w.push({ x: 0, y: H - t, w: gapX, h: t });
+    w.push({ x: gapX + gapW, y: H - t, w: W - gapX - gapW, h: t });
+    
+    // Internal walls based on level
+    const numWalls = 8 + lvl * 3;
+    for (let i = 0; i < numWalls; i++) {
+        let wx, wy, ww, wh;
+        let attempts = 0;
+        do {
+            if (Math.random() < 0.5) {
+                ww = 40 + Math.random() * 120;
+                wh = t;
+            } else {
+                ww = t;
+                wh = 40 + Math.random() * 120;
+            }
+            wx = margin + Math.random() * (W - ww - margin * 2);
+            wy = margin + Math.random() * (H - wh - margin * 2 - 40);
+            attempts++;
+        } while (attempts < 50 && rectOverlap(wx, wy, ww, wh, gapX, H - t - 30, gapW, 30));
+        
+        // Don't place wall right on pac-man start
+        if (Math.hypot(wx + ww/2 - W/2, wy + wh/2 - (H-40)) < 80) continue;
+        
+        w.push({ x: wx, y: wy, w: ww, h: wh });
+    }
+    
+    return w;
+}
+
+function rectOverlap(x1,y1,w1,h1,x2,y2,w2,h2){
+    return x1 < x2+w2 && x1+w1 > x2 && y1 < y2+h2 && y1+h1 > y2;
+}
+
+function wallCollision(px, py, r) {
+    for (let w of walls) {
+        if (px + r > w.x && px - r < w.x + w.w && py + r > w.y && py - r < w.y + w.h) return true;
+    }
+    // Border
+    if (px - r < 8 || px + r > W - 8 || py - r < 8 || py + r > H - 8) return true;
+    return false;
+}
+
+function circleRectCollision(cx, cy, cr, rx, ry, rw, rh) {
+    const closestX = Math.max(rx, Math.min(cx, rx + rw));
+    const closestY = Math.max(ry, Math.min(cy, ry + rh));
+    const dx = cx - closestX;
+    const dy = cy - closestY;
+    return (dx * dx + dy * dy) < cr * cr;
+}
+
+function resolveWallCollision(obj) {
+    // Border
+    if (obj.x - obj.r < 8) { obj.x = 8 + obj.r; obj.vx = Math.abs(obj.vx) * 0.8; }
+    if (obj.x + obj.r > W - 8) { obj.x = W - 8 - obj.r; obj.vx = -Math.abs(obj.vx) * 0.8; }
+    if (obj.y - obj.r < 8) { obj.y = 8 + obj.r; obj.vy = Math.abs(obj.vy) * 0.8; }
+    if (obj.y + obj.r > H - 8) { obj.y = H - 8 - obj.r; obj.vy = -Math.abs(obj.vy) * 0.8; }
+    
+    // Walls
+    for (let w of walls) {
+        if (circleRectCollision(obj.x, obj.y, obj.r, w.x, w.y, w.w, w.h)) {
+            // Determine which side
+            const overlapL = obj.x + obj.r - w.x;
+            const overlapR = w.x + w.w - (obj.x - obj.r);
+            const overlapT = obj.y + obj.r - w.y;
+            const overlapB = w.y + w.h - (obj.y - obj.r);
+            
+            const minOverlap = Math.min(overlapL, overlapR, overlapT, overlapB);
+            
+            if (minOverlap === overlapL) { obj.x = w.x - obj.r; obj.vx = -Math.abs(obj.vx) * 0.85; }
+            else if (minOverlap === overlapR) { obj.x = w.x + w.w + obj.r; obj.vx = Math.abs(obj.vx) * 0.85; }
+            else if (minOverlap === overlapT) { obj.y = w.y - obj.r; obj.vy = -Math.abs(obj.vy) * 0.85; }
+            else if (minOverlap === overlapB) { obj.y = w.y + w.h + obj.r; obj.vy = Math.abs(obj.vy) * 0.85; }
+            
+            bounceSound();
+        }
+    }
+}
+
+function update(dt) {
+    gameTime += dt;
+    
+    if (state === STATE.PLAYING) {
+        // Pac-man input
+        const force = 0.4;
+        if (keys['ArrowLeft'] || keys['KeyA']) pacman.vx -= force;
+        if (keys['ArrowRight'] || keys['KeyD']) pacman.vx += force;
+        if (keys['ArrowUp'] || keys['KeyW']) pacman.vy -= force;
+        if (keys['ArrowDown'] || keys['KeyS']) pacman.vy += force;
+        
+        // Friction
+        pacman.vx *= 0.985;
+        pacman.vy *= 0.985;
+        
+        // Speed cap
+        const maxSpeed = 8;
+        const spd = Math.hypot(pacman.vx, pacman.vy);
+        if (spd > maxSpeed) {
+            pacman.vx = (pacman.vx / spd) * maxSpeed;
+            pacman.vy = (pacman.vy / spd) * maxSpeed;
+        }
+        
+        // Move
+        pacman.x += pacman.vx;
+        pacman.y += pacman.vy;
+        resolveWallCollision(pacman);
+        
+        // Mouth animation
+        if (spd > 1) {
+            const targetAngle = Math.atan2(pacman.vy, pacman.vx);
+            pacman.mouthAngle += (targetAngle - pacman.mouthAngle) * 0.15;
+        }
+        
+        // Pellet collection
+        for (let i = pellets.length - 1; i >= 0; i--) {
+            const p = pellets[i];
+            if (Math.hypot(pacman.x - p.x, pacman.y - p.y) < pacman.r + p.r) {
+                pellets.splice(i, 1);
+                pelletsEaten++;
+                score += p.power ? 50 : 10;
+                eatSound();
+                
+                if (p.power) {
+                    // Scare ghosts
+                    for (let g of ghosts) {
+                        g.scared = true;
+                        g.scaredTimer = 8;
+                    }
+                    spawnParticles(p.x, p.y, '#ffff00', 15);
+                } else {
+                    spawnParticles(p.x, p.y, '#ffffff', 5);
+                }
+                
+                // Win check
+                if (pellets.length === 0) {
+                    state = STATE.WIN;
+                    winSound();
+                }
+            }
+        }
+        
+        // Ghost AI
+        for (let g of ghosts) {
+            if (g.scared) {
+                g.scaredTimer -= dt;
+                if (g.scaredTimer <= 0) g.scared = false;
+            }
+            
+            const dx = pacman.x - g.x;
+            const dy = pacman.y - g.y;
+            const dist = Math.hypot(dx, dy);
+            
+            if (!g.scared) {
+                // Chase with some randomness
+                const chaseForce = 0.15 + level * 0.02;
+                if (dist > 0) {
+                    g.vx += (dx / dist) * chaseForce;
+                    g.vy += (dy / dist) * chaseForce;
+                }
+            } else {
+                // Flee
+                if (dist > 0) {
+                    g.vx -= (dx / dist) * 0.2;
+                    g.vy -= (dy / dist) * 0.2;
+                }
+            }
+            
+            // Random jitter
+            g.vx += (Math.random() - 0.5) * 0.3;
+            g.vy += (Math.random() - 0.5) * 0.3;
+            
+            // Friction
+            g.vx *= 0.97;
+            g.vy *= 0.97;
+            
+            // Speed cap for ghosts
+            const gMax = g.scared ? 4 : g.speed + level * 0.5;
+            const gspd = Math.hypot(g.vx, g.vy);
+            if (gspd > gMax) {
+                g.vx = (g.vx / gspd) * gMax;
+                g.vy = (g.vy / gspd) * gMax;
+            }
+            
+            g.x += g.vx;
+            g.y += g.vy;
+            resolveWallCollision(g);
+            
+            // Ghost-ghost collision (soft push)
+            for (let other of ghosts) {
+                if (other === g) continue;
+                const gd = Math.hypot(g.x - other.x, g.y - other.y);
+                if (gd < g.r + other.r && gd > 0) {
+                    const nx = (g.x - other.x) / gd;
+                    const ny = (g.y - other.y) / gd;
+                    g.vx += nx * 0.5;
+                    g.vy += ny * 0.5;
+                }
+            }
+            
+            // Ghost catches pac-man
+            if (Math.hypot(g.x - pacman.x, g.y - pacman.y) < g.r + pacman.r) {
+                state = STATE.DEAD;
+                deathSound();
+                shakeTime = 0.5;
+                spawnParticles(pacman.x, pacman.y, '#ffff00', 20);
+                lives--;
+                if (lives <= 0) {
+                    setTimeout(() => { if (state === STATE.DEAD) state = STATE.GAMEOVER; }, 1500);
+                } else {
+                    setTimeout(() => { if (state === STATE.DEAD) { loadLevel(); state = STATE.PLAYING; } }, 1200);
+                }
+            }
+        }
+    }
+    
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vx *= 0.9;
+        p.vy *= 0.9;
+        p.life -= dt;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+    
+    // Shake
+    if (shakeTime > 0) shakeTime -= dt;
+}
+
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const spd = 1 + Math.random() * 3;
+        particles.push({
+            x: x, y: y,
+            vx: Math.cos(angle) * spd,
+            vy: Math.sin(angle) * spd,
+            r: 2 + Math.random() * 3,
+            color: color,
+            life: 0.5 + Math.random() * 0.5
+        });
+    }
+}
+
+function draw() {
+    ctx.save();
+    
+    // Screen shake
+    if (shakeTime > 0) {
+        const s = shakeTime * 10;
+        ctx.translate((Math.random()-0.5)*s, (Math.random()-0.5)*s);
+    }
+    
+    // Background
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(-10, -10, W+20, H+20);
+    
+    // Grid dots (subtle)
+    ctx.fillStyle = 'rgba(30, 30, 60, 0.3)';
+    for (let x = 0; x < W; x += 40) {
+        for (let y = 0; y < H; y += 40) {
+            ctx.fillRect(x-1, y-1, 2, 2);
+        }
+    }
+    
+    // Walls
+    for (let w of walls) {
+        ctx.fillStyle = '#1a3a5c';
+        ctx.strokeStyle = '#2a6aaa';
+        ctx.lineWidth = 2;
+        ctx.fillRect(w.x, w.y, w.w, w.h);
+        ctx.strokeRect(w.x, w.y, w.w, w.h);
+        
+        // Glow
+        ctx.shadowColor = '#2a6aaa';
+        ctx.shadowBlur = 5;
+        ctx.strokeRect(w.x, w.y, w.w, w.h);
+        ctx.shadowBlur = 0;
+    }
+    
+    // Pellets
+    for (let p of pellets) {
+        if (p.power) {
+            const pulse = 1 + Math.sin(gameTime * 5) * 0.3;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.r * pulse, 0, Math.PI * 2);
+            ctx.fillStyle = '#ffff00';
+            ctx.shadowColor = '#ffff00';
+            ctx.shadowBlur = 10;
+            ctx.fill();
+            ctx.shadowBlur = 0;
+        } else {
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+            ctx.fillStyle = '#ffffff';
+            ctx.fill();
+        }
+    }
+    
+    // Particles
+    for (let p of particles) {
+        ctx.globalAlpha = p.life / 1;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.fillStyle = p.color;
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    
+    // Pac-man
+    if (state === STATE.PLAYING || state === STATE.WIN) {
+        const mouthOpen = 0.3 + Math.abs(Math.sin(gameTime * 8)) * 0.4;
+        const ma = pacman.mouthAngle;
+        
+        ctx.beginPath();
+        ctx.arc(pacman.x, pacman.y, pacman.r, ma + mouthOpen, ma - mouthOpen + Math.PI * 2);
+        ctx.lineTo(pacman.x, pacman.y);
+        ctx.closePath();
+        ctx.fillStyle = '#ffff00';
+        ctx.shadowColor = '#ffff00';
+        ctx.shadowBlur = 15;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        
+        // Eye
+        const eyeX = pacman.x + Math.cos(ma) * -3;
+        const eyeY = pacman.y + Math.sin(ma) * -3 - 4;
+        ctx.beginPath();
+        ctx.arc(eyeX, eyeY, 2.5, 0, Math.PI * 2);
+        ctx.fillStyle = '#000';
+        ctx.fill();
+    }
+    
+    // Ghosts
+    for (let g of ghosts) {
+        if (state === STATE.DEAD || state === STATE.GAMEOVER) continue;
+        
+        const ghColor = g.scared ? '#3333cc' : g.color;
+        
+        ctx.beginPath();
+        ctx.arc(g.x, g.y - 2, g.r, Math.PI, 0);
+        // Wavy bottom
+        const waveY = g.y + g.r - 4;
+        ctx.lineTo(g.x + g.r, waveY);
+        for (let i = 0; i < 3; i++) {
+            const wx = g.x + g.r - (i+1) * (g.r*2/3);
+            const wy = waveY - 4;
+            ctx.lineTo(wx, wy);
+        }
+        ctx.lineTo(g.x - g.r, waveY);
+        ctx.closePath();
+        
+        ctx.fillStyle = ghColor;
+        ctx.shadowColor = ghColor;
+        ctx.shadowBlur = 8;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        
+        // Eyes
+        const lookX = (pacman.x - g.x) * 0.1;
+        const lookY = (pacman.y - g.y) * 0.1;
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(g.x - 4 + lookX, g.y - 5 + lookY, 3.5, 0, Math.PI*2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(g.x + 4 + lookX, g.y - 5 + lookY, 3.5, 0, Math.PI*2);
+        ctx.fill();
+        
+        // Pupils
+        ctx.fillStyle = g.scared ? '#ff3333' : '#000';
+        ctx.beginPath();
+        ctx.arc(g.x - 4 + lookX*1.5, g.y - 5 + lookY*1.5, 1.5, 0, Math.PI*2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(g.x + 4 + lookX*1.5, g.y - 5 + lookY*1.5, 1.5, 0, Math.PI*2);
+        ctx.fill();
+    }
+    
+    // HUD
+    if (state === STATE.PLAYING || state === STATE.DEAD) {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(10, 10, 250, 70);
+        ctx.strokeStyle = '#2a6aaa';
+        ctx.strokeRect(10, 10, 250, 70);
+        
+        ctx.fillStyle = '#fff';
+        ctx.font = '14px monospace';
+        ctx.fillText('SCORE: ' + score, 20, 32);
+        ctx.fillText('LIVES: ' + '🟡'.repeat(lives), 20, 52);
+        ctx.fillText('LEVEL: ' + level + '  PELLETS: ' + pellets.length + '/' + totalPellets, 20, 72);
+    }
+    
+    // Menu
+    if (state === STATE.MENU) {
+        drawMenu();
+    }
+    
+    // Win screen
+    if (state === STATE.WIN) {
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#ffff00';
+        ctx.font = 'bold 48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('LEVEL COMPLETE!', W/2, H/2 - 30);
+        ctx.font = '24px monospace';
+        ctx.fillStyle = '#fff';
+        ctx.fillText('Score: ' + score, W/2, H/2 + 15);
+        ctx.fillText('Press ENTER for next level', W/2, H/2 + 50);
+        ctx.textAlign = 'left';
+    }
+    
+    // Game Over
+    if (state === STATE.GAMEOVER) {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#ff3333';
+        ctx.font = 'bold 48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W/2, H/2 - 30);
+        ctx.font = '24px monospace';
+        ctx.fillStyle = '#fff';
+        ctx.fillText('Final Score: ' + score, W/2, H/2 + 15);
+        ctx.fillText('Press R to restart', W/2, H/2 + 50);
+        ctx.textAlign = 'left';
+    }
+    
+    // Dead animation
+    if (state === STATE.DEAD) {
+        ctx.fillStyle = 'rgba(255,0,0,0.1)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#ff3333';
+        ctx.font = 'bold 36px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('OUCH!', W/2, H/2);
+        ctx.textAlign = 'left';
+    }
+    
+    ctx.restore();
+}
+
+function drawMenu() {
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Title
+    const titleY = H/2 - 100;
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 56px monospace';
+    ctx.fillStyle = '#ffff00';
+    ctx.shadowColor = '#ffff00';
+    ctx.shadowBlur = 20;
+    ctx.fillText('PAC-MAN', W/2, titleY);
+    ctx.font = 'bold 40px monospace';
+    ctx.fillStyle = '#ff6633';
+    ctx.shadowColor = '#ff6633';
+    ctx.fillText('PHYSICS', W/2, titleY + 50);
+    ctx.shadowBlur = 0;
+    
+    // Animated pac-man
+    const t = gameTime * 3;
+    const mx = W/2 - 150 + Math.sin(t) * 30;
+    const my = H/2 + 20;
+    ctx.beginPath();
+    ctx.arc(mx, my, 20, Math.PI*0.3, Math.PI*1.7);
+    ctx.lineTo(mx, my);
+    ctx.closePath();
+    ctx.fillStyle = '#ffff00';
+    ctx.fill();
+    
+    // Instructions
+    ctx.font = '18px monospace';
+    ctx.fillStyle = '#aaaacc';
+    const lines = [
+        'Use ARROW KEYS / WASD to apply force',
+        'Momentum carries you — use walls to bounce!',',
+        '',
+        'Eat all pellets to clear the level',
+        'Avoid ghosts! Power pellets make them flee',
+        '',
+        'Press ENTER or SPACE to start'
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, W/2, H/2 + 60 + i * 24);
+    });
+    
+    ctx.textAlign = 'left';
+}
+
+let lastTime = 0;
+function loop(time) {
+    const dt = Math.min((time - lastTime) / 1000, 0.05);
+    lastTime = time;
+    
+    update(dt);
+    draw();
+    
+    requestAnimationFrame(loop);
+}
+
+// State transitions
+window.addEventListener('keydown', e => {
+    if (e.code === 'Enter' || e.code === 'Space') {
+        if (state === STATE.MENU) {
+            initAudio();
+            resetGame();
+            state = STATE.PLAYING;
+        } else if (state === STATE.WIN) {
+            level++;
+            loadLevel();
+            state = STATE.PLAYING;
+        }
+    }
+    if (e.code === 'KeyR' && (state === STATE.GAMEOVER || state === STATE.MENU)) {
+        resetGame();
+        state = STATE.PLAYING;
+    }
+});
+
+// Start loop
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
