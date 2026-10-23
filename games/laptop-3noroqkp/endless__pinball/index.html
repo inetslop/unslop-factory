@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Endless Pinball</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { 
+    background: #0a0a1a; 
+    overflow: hidden; 
+    width: 100vw; 
+    height: 100vh; 
+    display: flex; 
+    align-items: center; 
+    justify-content: center;
+}
+canvas { 
+    display: block; 
+    width: 100%; 
+    height: 100%; 
+}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function() {
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+    
+    let W, H;
+    function resize() {
+        W = window.innerWidth;
+        H = window.innerHeight;
+        canvas.width = W;
+        canvas.height = H;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // Game state
+    let gameState = 'start'; // start, playing
+    let score = 0;
+    let highScore = 0;
+    let combo = 0;
+    let comboTimer = 0;
+    let level = 1;
+    let timeAlive = 0;
+
+    try {
+        highScore = parseInt(localStorage.getItem('endlessPinballHigh') || '0') || 0;
+    } catch(e) {}
+
+    // Audio
+    let audioCtx = null;
+    function initAudio() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    function playSound(freq, dur, type, vol) {
+        if (!audioCtx) return;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type || 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(vol || 0.3, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + dur);
+    }
+
+    // Input
+    let keys = {};
+    window.addEventListener('keydown', e => {
+        keys[e.code] = true;
+        if (gameState === 'start' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+        if (e.code === 'KeyR' && gameState === 'playing') restartGame();
+        initAudio();
+    });
+    window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+    // Table dimensions (relative to canvas)
+    function getTable() {
+        const tw = Math.min(W * 0.7, H * 0.5);
+        const th = H * 0.92;
+        const tx = (W - tw) / 2;
+        const ty = (H - th) / 2;
+        return { x: tx, y: ty, w: tw, h: th };
+    }
+
+    // Ball
+    let ball = { x: 0, y: 0, vx: 0, vy: 0, r: 8, active: false };
+    
+    // Flippers
+    function getFlippers(t) {
+        const fw = t.w * 0.25;
+        const fy = t.y + t.h - t.h * 0.04;
+        return {
+            left: { px: t.x + t.w * 0.18, py: fy, len: fw, angle: 0.5, restAngle: 0.5, activeAngle: -0.7, speed: 0.25 },
+            right: { px: t.x + t.w * 0.82, py: fy, len: fw, angle: -0.5, restAngle: -0.5, activeAngle: 0.7, speed: 0.25 }
+        };
+    }
+
+    let flippers;
+    
+    // Bumpers
+    let bumpers = [];
+    function initBumpers(t) {
+        const r = t.w * 0.06;
+        bumpers = [
+            { x: t.x + t.w * 0.5, y: t.y + t.h * 0.35, r: r, points: 100 },
+            { x: t.x + t.w * 0.3, y: t.y + t.h * 0.25, r: r * 0.8, points: 150 },
+            { x: t.x + t.w * 0.7, y: t.y + t.h * 0.25, r: r * 0.8, points: 150 },
+        ];
+    }
+
+    // Obstacles (appear over time)
+    let obstacles = [];
+    
+    // Particles
+    let particles = [];
+    function spawnParticles(x, y, color, count) {
+        for (let i = 0; i < count; i++) {
+            const a = Math.random() * Math.PI * 2;
+            const s = Math.random() * 4 + 1;
+            particles.push({ x, y, vx: Math.cos(a)*s, vy: Math.sin(a)*s - 2, life: 30+Math.random()*20, color });
+        }
+    }
+
+    // Score popups
+    let popups = [];
+
+    function startGame() {
+        gameState = 'playing';
+        score = 0;
+        combo = 0;
+        comboTimer = 0;
+        level = 1;
+        timeAlive = 0;
+        obstacles = [];
+        particles = [];
+        popups = [];
+        const t = getTable();
+        initBumpers(t);
+        flippers = getFlippers(t);
+        launchBall();
+    }
+
+    function restartGame() { startGame(); }
+
+    function launchBall() {
+        const t = getTable();
+        ball.x = t.x + t.w * 0.85;
+        ball.y = t.y + t.h * 0.1;
+        ball.vx = -2;
+        ball.vy = 0;
+        ball.r = Math.max(6, t.w * 0.02);
+        ball.active = true;
+    }
+
+    function update(dt) {
+        if (gameState !== 'playing') return;
+        
+        const t = getTable();
+        timeAlive += dt;
+        
+        // Level up every 30 seconds
+        const newLevel = Math.floor(timeAlive / 30) + 1;
+        if (newLevel > level) {
+            level = newLevel;
+            addObstacle(t);
+        }
+
+        // Update flippers
+        const leftFlip = flippers.left;
+        const rightFlip = flippers.right;
+        
+        if (keys['ArrowLeft'] || keys['KeyA']) {
+            leftFlip.angle += (leftFlip.activeAngle - leftFlip.angle) * 0.4;
+            if (leftFlip.angle < leftFlip.activeAngle + 0.05) leftFlip.angle = leftFlip.activeAngle;
+        } else {
+            leftFlip.angle += (leftFlip.restAngle - leftFlip.angle) * 0.15;
+            if (leftFlip.angle > leftFlip.restAngle - 0.05) leftFlip.angle = leftFlip.restAngle;
+        }
+        
+        if (keys['ArrowRight'] || keys['KeyD']) {
+            rightFlip.angle += (rightFlip.activeAngle - rightFlip.angle) * 0.4;
+            if (rightFlip.angle > rightFlip.activeAngle - 0.05) rightFlip.angle = rightFlip.activeAngle;
+        } else {
+            rightFlip.angle += (rightFlip.restAngle - rightFlip.angle) * 0.15;
+            if (rightFlip.angle < rightFlip.restAngle + 0.05) rightFlip.angle = rightFlip.restAngle;
+        }
+
+        // Combo timer
+        comboTimer -= dt;
+        if (comboTimer <= 0) combo = 0;
+
+        if (!ball.active) return;
+
+        // Gravity
+        ball.vy += 0.35;
+        
+        // Damping
+        ball.vx *= 0.998;
+        ball.vy *= 0.998;
+
+        ball.x += ball.vx;
+        ball.y += ball.vy;
+
+        // Wall collisions
+        const wallL = t.x + 10;
+        const wallR = t.x + t.w - 10;
+        const wallT = t.y + 10;
+        
+        if (ball.x - ball.r < wallL) {
+            ball.x = wallL + ball.r;
+            ball.vx = Math.abs(ball.vx) * 0.8;
+            playSound(200, 0.1, 'sine', 0.2);
+        }
+        if (ball.x + ball.r > wallR) {
+            ball.x = wallR - ball.r;
+            ball.vx = -Math.abs(ball.vx) * 0.8;
+            playSound(200, 0.1, 'sine', 0.2);
+        }
+        if (ball.y - ball.r < wallT) {
+            ball.y = wallT + ball.r;
+            ball.vy = Math.abs(ball.vy) * 0.8;
+            playSound(200, 0.1, 'sine', 0.2);
+        }
+
+        // Top arch (curved top walls)
+        const archCenterX = t.x + t.w / 2;
+        const archRadius = t.w * 0.45;
+        const archCenterY = t.y + t.h * 0.15;
+        
+        // Bumper collisions
+        for (let b of bumpers) {
+            const dx = ball.x - b.x;
+            const dy = ball.y - b.y;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            const minDist = ball.r + b.r;
+            if (dist < minDist) {
+                const nx = dx / dist;
+                const ny = dy / dist;
+                ball.x = b.x + nx * minDist;
+                ball.y = b.y + ny * minDist;
+                const dot = ball.vx * nx + ball.vy * ny;
+                ball.vx -= 2 * dot * nx * 0.8;
+                ball.vy -= 2 * dot * ny * 0.8;
+                // Kick
+                ball.vx += nx * 5;
+                ball.vy += ny * 5;
+                
+                combo++;
+                comboTimer = 2;
+                const pts = b.points * Math.max(1, combo);
+                score += pts;
+                popups.push({ x: ball.x, y: ball.y - 20, text: '+' + pts, life: 60 });
+                spawnParticles(b.x, b.y, '#ff6600', 8);
+                playSound(400 + combo * 100, 0.15, 'square', 0.3);
+            }
+        }
+
+        // Obstacle collisions
+        for (let obs of obstacles) {
+            const dx = ball.x - obs.x;
+            const dy = ball.y - obs.y;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            const minDist = ball.r + obs.r;
+            if (dist < minDist) {
+                const nx = dx / dist;
+                const ny = dy / dist;
+                ball.x = obs.x + nx * minDist;
+                ball.y = obs.y + ny * minDist;
+                const dot = ball.vx * nx + ball.vy * ny;
+                if (dot < 0) {
+                    ball.vx -= 2 * dot * nx;
+                    ball.vy -= 2 * dot * ny;
+                }
+                score += 50;
+                playSound(300, 0.1, 'sine', 0.2);
+            }
+        }
+
+        // Flipper collisions (line segment vs circle)
+        collideFlipper(leftFlip);
+        collideFlipper(rightFlip);
+
+        // Drain check
+        const drainY = t.y + t.h + 30;
+        if (ball.y > drainY) {
+            ball.active = false;
+            combo = 0;
+            playSound(150, 0.3, 'sawtooth', 0.2);
+            setTimeout(launchBall, 800);
+        }
+
+        // Update particles
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const p = particles[i];
+            p.x += p.vx;
+            p.y += p.vy;
+            p.vy += 0.1;
+            p.life--;
+            if (p.life <= 0) particles.splice(i, 1);
+        }
+
+        // Update popups
+        for (let i = popups.length - 1; i >= 0; i--) {
+            popups[i].y -= 1;
+            popups[i].life--;
+            if (popups[i].life <= 0) popups.splice(i, 1);
+        }
+
+        // High score
+        if (score > highScore) {
+            highScore = score;
+            try { localStorage.setItem('endlessPinballHigh', highScore.toString()); } catch(e) {}
+        }
+    }
+
+    function collideFlipper(flip) {
+        const ex = flip.px + Math.cos(flip.angle) * flip.len;
+        const ey = flip.py + Math.sin(flip.angle) * flip.len;
+        
+        // Circle vs line segment
+        const ax = ball.x - flip.px;
+        const ay = ball.y - flip.py;
+        const bx = ex - flip.px;
+        const by = ey - flip.py;
+        const len2 = bx*bx + by*by;
+        let t = (ax*bx + ay*by) / len2;
+        t = Math.max(0, Math.min(1, t));
+        const cx = flip.px + t * bx;
+        const cy = flip.py + t * by;
+        const dx = ball.x - cx;
+        const dy = ball.y - cy;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        
+        if (dist < ball.r + 5) {
+            const nx = dx / (dist || 1);
+            const ny = dy / (dist || 1);
+            ball.x = cx + nx * (ball.r + 5);
+            ball.y = cy + ny * (ball.r + 5);
+            
+            // Add flipper velocity to kick
+            const flipVel = (keys['ArrowLeft'] || keys['KeyA']) && flip === flippers.left ? -8 : 0;
+            const flipVelR = (keys['ArrowRight'] || keys['KeyD']) && flip === flippers.right ? 8 : 0;
+            
+            const dot = ball.vx * nx + ball.vy * ny;
+            if (dot < 0) {
+                ball.vx -= 2 * dot * nx;
+                ball.vy -= 2 * dot * ny;
+            }
+            ball.vy -= 3; // Extra kick up
+            playSound(500, 0.08, 'sine', 0.15);
+        }
+    }
+
+    function addObstacle(t) {
+        const r = t.w * 0.03;
+        let x, y;
+        do {
+            x = t.x + r + Math.random() * (t.w - 2*r);
+            y = t.y + t.h * 0.4 + Math.random() * (t.h * 0.35);
+        } while (obstacles.some(o => Math.hypot(o.x-x, o.y-y) < r*3));
+        obstacles.push({ x, y, r });
+    }
+
+    function draw() {
+        ctx.fillStyle = '#0a0a1a';
+        ctx.fillRect(0, 0, W, H);
+        
+        const t = getTable();
+        
+        // Table background
+        ctx.fillStyle = '#12122a';
+        ctx.beginPath();
+        ctx.roundRect(t.x, t.y, t.w, t.h, 15);
+        ctx.fill();
+        
+        // Table border glow
+        ctx.strokeStyle = '#4466ff';
+        ctx.lineWidth = 3;
+        ctx.shadowColor = '#4466ff';
+        ctx.shadowBlur = 10;
+        ctx.beginPath();
+        ctx.roundRect(t.x + 5, t.y + 5, t.w - 10, t.h - 10, 12);
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+
+        if (gameState === 'start') {
+            drawStartScreen(t);
+            return;
+        }
+
+        // Draw bumpers
+        for (let b of bumpers) {
+            const grad = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, b.r);
+            grad.addColorStop(0, '#ff4400');
+            grad.addColorStop(0.7, '#cc2200');
+            grad.addColorStop(1, '#881100');
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+            ctx.fill();
+            ctx.strokeStyle = '#ffaa00';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+            
+            // Inner ring
+            ctx.strokeStyle = '#ff6633';
+            ctx.beginPath();
+            ctx.arc(b.x, b.y, b.r * 0.6, 0, Math.PI*2);
+            ctx.stroke();
+        }
+
+        // Draw obstacles
+        for (let obs of obstacles) {
+            const grad = ctx.createRadialGradient(obs.x, obs.y, 0, obs.x, obs.y, obs.r);
+            grad.addColorStop(0, '#66ffcc');
+            grad.addColorStop(1, '#226644');
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(obs.x, obs.y, obs.r, 0, Math.PI*2);
+            ctx.fill();
+        }
+
+        // Draw flippers
+        drawFlipper(flippers.left);
+        drawFlipper(flippers.right);
+
+        // Draw ball
+        if (ball.active) {
+            const bg = ctx.createRadialGradient(ball.x - 2, ball.y - 2, 0, ball.x, ball.y, ball.r);
+            bg.addColorStop(0, '#ffffff');
+            bg.addColorStop(0.5, '#cccccc');
+            bg.addColorStop(1, '#888888');
+            ctx.fillStyle = bg;
+            ctx.beginPath();
+            ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI*2);
+            ctx.fill();
+            ctx.strokeStyle = '#aaa';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        }
+
+        // Particles
+        for (let p of particles) {
+            ctx.globalAlpha = p.life / 50;
+            ctx.fillStyle = p.color;
+            ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+        }
+        ctx.globalAlpha = 1;
+
+        // Popups
+        for (let p of popups) {
+            ctx.globalAlpha = p.life / 60;
+            ctx.fillStyle = '#ffcc00';
+            ctx.font = 'bold 18px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(p.text, p.x, p.y);
+        }
+        ctx.globalAlpha = 1;
+
+        // HUD
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 20px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText('SCORE: ' + score, t.x + 15, t.y + t.h - 10);
+        
+        ctx.textAlign = 'right';
+        ctx.fillStyle = '#88aaff';
+        ctx.fillText('HI: ' + highScore, t.x + t.w - 15, t.y + t.h - 10);
+
+        if (combo > 1) {
+            ctx.textAlign = 'center';
+            ctx.fillStyle = '#ffaa00';
+            ctx.font = 'bold 24px monospace';
+            ctx.fillText('x' + combo + ' COMBO!', t.x + t.w/2, t.y + 40);
+        }
+
+        // Level indicator
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#66ffcc';
+        ctx.font = '14px monospace';
+        ctx.fillText('LEVEL ' + level, t.x + t.w/2, t.y + 25);
+    }
+
+    function drawFlipper(flip) {
+        const ex = flip.px + Math.cos(flip.angle) * flip.len;
+        const ey = flip.py + Math.sin(flip.angle) * flip.len;
+        
+        ctx.strokeStyle = '#ffcc00';
+        ctx.lineWidth = 12;
+        ctx.lineCap = 'round';
+        ctx.shadowColor = '#ffcc00';
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        ctx.moveTo(flip.px, flip.py);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+        
+        // Pivot
+        ctx.fillStyle = '#ffaa00';
+        ctx.beginPath();
+        ctx.arc(flip.px, flip.py, 8, 0, Math.PI*2);
+        ctx.fill();
+    }
+
+    function drawStartScreen(t) {
+        ctx.fillStyle = 'rgba(10,10,26,0.85)';
+        ctx.fillRect(0, 0, W, H);
+        
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ffcc00';
+        ctx.font = 'bold ' + Math.min(60, W*0.06) + 'px monospace';
+        ctx.shadowColor = '#ff8800';
+        ctx.shadowBlur = 20;
+        ctx.fillText('ENDLESS PINBALL', W/2, H * 0.3);
+        ctx.shadowBlur = 0;
+        
+        ctx.fillStyle = '#aaccff';
+        ctx.font = '18px monospace';
+        ctx.fillText('LEFT / A  -  Left Flipper', W/2, H * 0.45);
+        ctx.fillText('RIGHT / D  -  Right Flipper', W/2, H * 0.5);
+        ctx.fillText('R  -  Restart', W/2, H * 0.55);
+        
+        ctx.fillStyle = '#66ffcc';
+        ctx.font = '16px monospace';
+        ctx.fillText('Hit bumpers for points. Chain combos for multipliers!', W/2, H * 0.63);
+        ctx.fillText('New obstacles appear every level (30s).', W/2, H * 0.68);
+        
+        if (highScore > 0) {
+            ctx.fillStyle = '#ffaa00';
+            ctx.font = '16px monospace';
+            ctx.fillText('HIGH SCORE: ' + highScore, W/2, H * 0.75);
+        }
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 22px monospace';
+        const blink = Math.sin(Date.now() * 0.005) > 0;
+        if (blink) ctx.fillText('PRESS SPACE TO START', W/2, H * 0.85);
+    }
+
+    let lastTime = 0;
+    function gameLoop(time) {
+        const dt = Math.min((time - lastTime) / 16.67, 3);
+        lastTime = time;
+        
+        update(dt);
+        draw();
+        
+        requestAnimationFrame(gameLoop);
+    }
+
+    // Initialize
+    const t0 = getTable();
+    initBumpers(t0);
+    flippers = getFlippers(t0);
+    requestAnimationFrame(gameLoop);
+})();
+</script>
+</body>
+</html>
