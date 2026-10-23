@@ -1,0 +1,913 @@
+<think>
+The user wants a "Golf Asteroids" game — a mashup of golf and Asteroids. Concept: you're on a spaceship (or ball) in space, hitting a ball toward a hole/flag while avoiding asteroids. Mechanics ideas:
+
+- Ball placed at a starting point; aim with mouse or arrow keys, set power, launch the ball like a putt.
+- Asteroids drift around; they can push the ball, and you can destroy them by shooting (Asteroids-style laser) to clear your path.
+- Goal: get the ball into the hole within a par number of shots. Multiple holes/levels with rising difficulty.
+
+Let's design it:
+
+- Canvas fills the window, resize handler.
+- Start screen: title "GOLF ASTEROIDS", control instructions, click or Enter to start.
+- Controls: mouse to aim (line shows direction), hold mouse/space to charge power, release to fire. Also arrow keys for aiming, up/down or space held down for power. Simpler: mouse only + keyboard alternative. Let's support both: left/right arrows rotate the aim, Up/Space hold to charge, release to fire; mouse aim also works (angle from ball to cursor), click-and-hold to charge, release to launch.
+- Ball physics: friction (putt-like damping), wall bounce with coefficient of restitution.
+- Asteroids: polygonal shapes drifting, bouncing off walls; collision with ball bounces the ball and slows it down; laser destroys asteroids (splits into smaller ones). Laser limited? Unlimited but with cooldown; or a per-hole shot limit like "ammo". Let's do this: unlimited shots at the hole but par-based scoring; laser has a small cooldown. Actually, to add challenge: 10 lasers per hole? Let's do this: each level has a shot count (e.g., 5 strokes) and a laser ammo count (e.g., 8). Score: under par = bonus.
+- Hole: circle with flag; ball must be slow enough to drop in, or always drops if it overlaps the center when velocity is below threshold.
+- Levels: hole position, number of asteroids, and maybe a moving asteroid belt that increases per level.
+- Sound: Web Audio — shot "thunk", laser zap, asteroid explosion, ball-in-hole jingle, wall bounce.
+- Restart: R key or button; game over when out of strokes (or the ball is… the ball never disappears). Game over screen with score and restart.
+
+Implementation details:
+
+Game states: 'start', 'playing', 'aiming' (part of playing), 'holecomplete', 'gameover'.
+
+Ball state: rolling (in motion) / at rest (can aim/launch). Laser can be fired anytime? Let's allow laser firing during aiming or while the ball is in motion.
+
+Laser: from… where? In Asteroids you shoot from your ship. Here there's no ship — the player IS the golfer. Where does the laser come from? Maybe a small ship that follows the cursor? Hmm. Simpler: laser fires from the ball? That feels weird but is fun: "blaster golf". Or, the player controls a small spaceship that hovers and can aim a laser with mouse keys… gets complicated.
+
+Alternative: laser comes from the center of the screen edge in the direction of the cursor? Simplest and most fun: hold Shift or right-click to fire a laser in the direction of the cursor from the ball's position (like a putter-attached blaster). Let's do this: click/hold = charge putt; press L or right-click = fire laser at cursor position. Cooldown 0.3s.
+
+Actually, let's keep it clean:
+- Mouse: aim putt (angle from ball to mouse), hold left button to charge power, release to putt.
+- Right-click (or Shift): fire a laser at the cursor location. preventDefault on contextmenu.
+- Keyboard: arrows to rotate aim, Up/Space hold to charge, release to putt; X or Enter fires laser in the aim direction? For keyboard, laser fires along the aim line. Let's support it: Space = putt (hold/release), X = laser along the aim line.
+
+Ammo: 12 lasers per hole. Strokes: each hole has a par (3 + level). Out of strokes and ball not in hole → game over? Or auto-fire? Game over with score display, restart resets everything.
+
+Level progression: after the hole, show "Hole complete! X strokes", then next level with new layout. Endless levels, difficulty scales: more asteroids, faster, moving obstacles (rotating asteroids are just spinning polygons).
+
+Collision ball-asteroid: circle vs polygon — approximate as circle vs circle using asteroid radius * 0.8. Elastic-ish bounce: reflect ball velocity along the normal, and push the asteroid slightly too.
+
+Laser-asteroid: line segment vs circle; on hit destroy (large → splits into two medium, medium → small, small disappears). Score points for destruction.
+
+Hole capture: dist(ball, hole) < holeR and speed < threshold (e.g., 260 px/s) → drop in. If too fast, passes through with a slight deflection? Just let it pass through; the flag pole gives a small bounce. Keep it simple: only drops when slow enough; if overlapping at high speed, apply a mild "suck" deceleration so it's forgiving.
+
+Rendering: starry background (static stars generated per level), ball = white circle with dimples/glow, hole = dark circle with flagpole and red flag, aim line is dashed with an arrow, power bar near the bottom.
+
+HUD: top-left: HOLE n, STROKES left, PAR, LASERS; top-right score. Power bar.
+
+Audio: AudioContext lazily created on first input. Functions: beep(freq, dur, type, vol), noise for explosion.
+
+Resize: canvas = window size, scale game coordinates? Use logical world = canvas size, and reposition objects proportionally on resize? Simpler: world coords = pixels; on resize just resize the canvas and let walls adapt (clamp positions). Positions are absolute; clamping is fine.
+
+Star field: regenerate on resize/level start based on canvas size.
+
+Let's write the code.
+
+Structure:
+
+```js
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W,H; function resize(){W=cv.width=innerWidth;H=cv.height=innerHeight;}
+window.addEventListener('resize', ()=>{resize(); makeStars(); clampPositions();});
+```
+
+Game object with state.
+
+Ball: {x,y,vx,vy,r:9}
+Asteroids: [{x,y,vx,vy,r,verts:[angles],rot,rotSpeed,hp}]
+Lasers: [{x,y,vx,vy,life}]
+Hole: {x,y,r:16}
+
+Level generation: hole at random position in the right half; ball start on left. Asteroid count = 3 + level (cap ~12), avoid spawning within 120px of ball/hole.
+
+Physics loop with dt from rAF, clamped to 0.033.
+
+Ball friction: v *= Math.pow(0.35, dt) — putt-like damping; stops when speed < 4.
+
+Walls: bounce with restitution 0.8.
+
+Power charge: power grows 0→1 in ~1.2s and oscillates? Just cap at max. Max velocity = 900 * power.
+
+Aim angle: from ball to mouse, or keyboard rotate (aimAngle variable; if mouse moved recently use mouse). Track lastInput type. Simpler: always compute aim from mouse position when mouse has moved; keyboard arrows adjust aimAngle and set inputMode='kb'. Keep both: aimAngle variable updated by either source.
+
+On mousemove: aimAngle = atan2(my-ball.y, mx-ball.x); mode='mouse'.
+On arrow key: adjust aimAngle; mode='kb'.
+
+Charge: on mousedown (left) or Space/Up keydown → charging=true, power=0. On release → if ball is at rest and strokes>0: launch. Can't putt while ball is moving.
+
+Laser: cooldown 0.25s; direction = aimAngle; origin = ball position; speed 700; life until off-screen or hit. Ammo per level: 10 + ? Keep it at 12.
+
+Asteroid splitting: r thresholds: large r>34 → two mediums (r/2), medium >18 → two smalls, small disappears. Speed boost on split.
+
+Score: hole-in-bonus = max(0, par*100 - strokes*? )… simpler: score += (par+1-strokes)*100 if under par, else 50. Plus asteroid points: large 20, medium 50, small 100 (Asteroids style).
+
+Hole complete overlay: "HOLE COMPLETE", strokes vs par, "Press Enter / click for next". State 'holeDone'.
+
+Game over: strokes == 0 and ball at rest and not in hole → state 'gameover', show final score, best score in localStorage with try/catch, R/Enter to restart.
+
+Start screen: title, control list, "Click or press Enter".
+
+Sound:
+- putt: short low-tone thud (oscillator 120Hz decay)
+- laser: square wave 800→200 sweep 0.15s
+- explosion: noise buffer burst with lowpass
+- bounce: short tick
+- hole: arpeggio C-E-G-C
+
+Write a helper sfx object.
+
+HUD drawing in ctx text.
+
+Flag: pole line from the hole, waving flag triangle (sin time animation).
+
+Aim visualization: dashed line from ball along aimAngle, length ∝ power while charging; arrowhead. Power bar at bottom center of screen.
+
+Let's write it all. Keep code moderately compact but complete.
+
+Edge case: firing laser while ball is moving — allow it (fun). Yes.
+
+Ball-asteroid collision:
+```
+dx=b.x-a.x ... d = hypot; minD = b.r + a.r*0.85;
+if d<minD: n=(dx/d,dy/d); push ball out; reflect velocity: dot=v·n; if dot<0 { vx -= 2*dot*nx... } restitution 0.9; also add asteroid velocity influence: subtract asteroid velocity from relative? Keep it simple: treat asteroid as static for reflection, plus a small impulse from asteroid motion: b.vx += a.vx*0.3.
+```
+
+Laser-asteroid: point-to-segment distance, or just check if laser tip is within asteroid radius each frame (laser moves ~12px per frame at 60fps with speed 700 — fine).
+
+Asteroid-asteroid collision: skip (they pass through) to keep it simple. OK.
+
+Ball-laser? None.
+
+Hole suction: if dist < holeR*1.4 and speed<300: pull toward center, decelerate; if dist<holeR*0.7 → drop in.
+
+Actually simpler: if dist(ball,hole)<holeR-2 && speed<280 → drop. Plus mild suction when within 1.5r at low speed.
+
+Flag pole collision: skip.
+
+Clamp ball to walls each frame.
+
+Let's write the HTML now.
+
+Power bar and HUD colors: neon green/cyan, retro vibe. Font: monospace.
+
+Code:
+
+```html
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Golf Asteroids</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000}
+canvas{display:block;width:100vw;height:100vh;cursor:crosshair}
+</style></head><body>
+<canvas id="c"></canvas>
+<script>
+...
+</script></body></html>
+```
+
+Full JS. Let's write carefully.
+
+```js
+'use strict';
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+let W=0,H=0;
+function resize(){W=cv.width=window.innerWidth;H=cv.height=window.innerHeight;}
+resize();
+
+// Audio
+let AC=null;
+function audio(){ if(!AC){ try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){} } if(AC&&AC.state==='suspended')AC.resume(); return AC; }
+function tone(f0,f1,dur,type,vol){ const a=audio(); if(!a)return; const o=a.createOscillator(),g=a.createGain(); o.type=type||'square'; o.frequency.setValueAtTime(f0,a.currentTime); o.frequency.exponentialRampToValueAtTime(Math.max(1,f1),a.currentTime+dur); g.gain.setValueAtTime(vol||0.15,a.currentTime); g.gain.exponentialRampToValueAtTime(0.001,a.currentTime+dur); o.connect(g).connect(a.destination); o.start(); o.stop(a.currentTime+dur); }
+function boom(vol){ const a=audio(); if(!a)return; const n=a.createBufferSource(),len=a.sampleRate*0.3,buf=a.createBuffer(1,len,a.sampleRate),d=buf.getChannelData(0); for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*(1-i/len); n.buffer=buf; const f=a.createBiquadFilter(); f.type='lowpass'; f.frequency.value=900; const g=a.createGain(); g.gain.value=vol||0.3; n.connect(f).connect(g).connect(a.destination); n.start(); }
+```
+
+Game state:
+
+```js
+const G={state:'start',level:1,score:0,best:0,par:3,strokes:0,maxStrokes:5,lasers:12,time:0};
+try{G.best=+localStorage.getItem('golfAstBest')||0;}catch(e){}
+let ball,hole,asteroids=[],lasers=[],stars=[],particles=[];
+let aimAngle=0,charging=false,power=0,mode='mouse',mx=W/2,my=H/2,laserCd=0;
+```
+
+Level setup:
+
+```js
+function makeStars(){ stars=[]; const n=Math.floor(W*H/9000); for(let i=0;i<n;i++)stars.push({x:Math.random()*W,y:Math.random()*H,s:Math.random()*1.5+0.3,tw:Math.random()*6}); }
+function setupLevel(){
+  makeStars(); asteroids=[];lasers=[];particles=[];
+  G.par=Math.min(9,2+G.level);
+  G.maxStrokes=G.par+2; G.strokes=0; G.lasers=12; power=0;charging=false;laserCd=0;
+  const m=60;
+  ball={x:m,y:H/2,vx:0,vy:0,r:9};
+  // hole on the right side
+  let hx,hy;
+  for(let t=0;t<50;t++){hx=W-Math.random()*(W*0.4)-m; hy=m+Math.random()*(H-2*m); if(Math.hypot(hx-ball.x,hy-ball.y)>200)break;}
+  hole={x:hx,y:hy,r:16};
+  const count=Math.min(3+G.level,11);
+  for(let i=0;i<count;i++){
+    let x,y,ok=false,tr=0;
+    while(!ok&&tr<80){tr++; x=m+Math.random()*(W-2*m); y=m+Math.random()*(H-2*m); ok=Math.hypot(x-ball.x,y-ball.y)>160&&Math.hypot(x-hole.x,y-hole.y)>140;}
+    const r=30+Math.random()*18;
+    asteroids.push(makeAst(x,y,r));
+  }
+  aimAngle=0; mode='mouse'; mx=W*0.5; my=H/2;
+}
+function makeAst(x,y,r){
+  const verts=[];const n=8+Math.floor(Math.random()*4);
+  for(let i=0;i<n;i++)verts.push(0.7+Math.random()*0.5);
+  const sp=(30+G.level*8)*(0.5+Math.random());
+  const ang=Math.random()*Math.PI*2;
+  return {x,y,r,verts,rot:Math.random()*6,rs:(Math.random()-0.5)*1.5,vx:Math.cos(ang)*sp,vy:Math.sin(ang)*sp};
+}
+```
+
+Input:
+
+```js
+window.addEventListener('mousemove',e=>{mx=e.clientX;my=e.clientY;if(G.state==='playing'||G.state==='holeDone'){aimAngle=Math.atan2(my-ball.y,mx-ball.x);mode='mouse';}});
+cv.addEventListener('mousedown',e=>{audio(); if(e.button===0){ if(G.state==='start')startGame(); else if(G.state==='playing'){if(ballAtRest())charging=true,power=0;} else if(G.state==='holeDone')nextLevel(); else if(G.state==='gameover')restart(); }
+ else if(e.button===2){ if(G.state==='playing')fireLaser(); }});
+window.addEventListener('mouseup',e=>{ if(e.button===0&&charging){charging=false; if(G.state==='playing'&&ballAtRest())putt();} });
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+```
+
+Keys:
+
+```js
+let keys={};
+window.addEventListener('keydown',e=>{ audio();
+ const k=e.key;
+ if(['ArrowLeft','ArrowRight','ArrowUp',' ','Spacebar'].includes(k))e.preventDefault();
+ if(k==='Enter'||k===' '){ if(G.state==='start')startGame(); else if(G.state==='holeDone'&&!charging)nextLevel(); else if(G.state==='gameover')restart(); }
+ if(k==='r'||k==='R'){ if(G.state!=='start')restart(); }
+ if(G.state==='playing'){
+  if((k==='ArrowLeft')){mode='kb';aimAngle-=0.12;}
+  if(k==='ArrowRight'){mode='kb';aimAngle+=0.12;}
+  if((k===' '||k==='ArrowUp')&&!e.repeat){if(ballAtRest()){charging=true;power=0;}}
+  if(k==='x'||k==='X')fireLaser();
+ }
+});
+window.addEventListener('keyup',e=>{ const k=e.key; if((k===' '||k==='ArrowUp')&&charging){charging=false;if(G.state==='playing'&&ballAtRest())putt();} });
+```
+
+Hmm, on keydown for Enter: also trigger putt? No — Space is putt. Enter is only for transitions. But note: pressing Space during start → startGame; then Space held → charging begins next frame? Charging is set in the same handler… after startGame state becomes 'playing'; the `if(G.state==='playing')` block runs afterward in the same keydown and sets charging=true with ball at rest — fine, holding space charges. Good.
+
+putt():
+
+```js
+function ballAtRest(){return Math.hypot(ball.vx,ball.vy)<5;}
+function putt(){ const sp=120+power*830; ball.vx=Math.cos(aimAngle)*sp; ball.vy=Math.sin(aimAngle)*sp; G.strokes++; tone(140,60,0.15,'sine',0.3); if(G.strokes>=G.maxStrokes){ /* check game over after rest */ } }
+```
+
+Game over check: when strokes used up and ball comes to rest (in update, when speed falls below threshold and not in hole) → gameOver().
+
+fireLaser():
+
+```js
+function fireLaser(){ if(laserCd>0||G.lasers<=0)return; G.lasers--; laserCd=0.25;
+ lasers.push({x:ball.x+Math.cos(aimAngle)*14,y:ball.y+Math.sin(aimAngle)*14,vx:Math.cos(aimAngle)*750,vy:Math.sin(aimAngle)*750,life:1.2});
+ tone(900,180,0.15,'sawtooth',0.12); }
+```
+
+update(dt):
+
+```js
+function update(dt){
+ G.time+=dt; laserCd=Math.max(0,laserCd-dt);
+ if(G.state!=='playing')return;
+ if(charging)power=Math.min(1,power+dt/1.1);
+ // ball
+ const sp=Math.hypot(ball.vx,ball.vy);
+ if(sp>0){
+  ball.x+=ball.vx*dt;ball.y+=ball.vy*dt;
+  const f=Math.pow(0.35,dt); ball.vx*=f;ball.vy*=f;
+  // walls
+  if(ball.x<ball.r){ball.x=ball.r;ball.vx=-ball.vx*0.75;tick();}
+  ... etc
+  // hole
+  const hd=Math.hypot(ball.x-hole.x,ball.y-hole.y);
+  if(hd<hole.r*1.6&&sp<320){ ball.vx+=(hole.x-ball.x)*dt*4; ball.vy+=(hole.y-ball.y)*dt*4; }
+  if(hd<hole.r-4&&sp<300) sinkHole();
+  // asteroid collision
+  for(const a of asteroids){ const dx=ball.x-a.x,dy=ball.y-a.y,d=Math.hypot(dx,dy),minD=ball.r+a.r*0.82;
+   if(d<minD&&d>0){ const nx=dx/d,ny=dy/d; ball.x=a.x+nx*minD;ball.y=a.y+ny*minD; const dot=ball.vx*nx+ball.vy*ny; if(dot<0){ball.vx-=2*dot*nx;ball.vy-=2*dot*ny;ball.vx*=0.85;ball.vy*=0.85;} ball.vx+=a.vx*0.15;ball.vy+=a.vy*0.15; tick(); }
+  }
+  if(Math.hypot(ball.vx,ball.vy)<4){ball.vx=0;ball.vy=0; if(G.strokes>=G.maxStrokes)gameOver();}
+ } else { if(G.strokes>=G.maxStrokes)gameOver(); } // safety net
+```
+
+Wait: gameOver only when out of strokes and at rest. But could trigger repeatedly — check state==='playing' first. Also after putt, ball is moving; only when it comes to rest.
+
+Asteroid update: move, bounce off walls, rotate. Laser update: move, lifetime, collide with asteroids (tip within r*0.85 → destroy). Destroy: score += points by size, spawn particles, split.
+
+```js
+function destroyAst(a,idx){ asteroids.splice(idx,1); boom(0.25); const pts=a.r>34?20:a.r>18?50:100; G.score+=pts;
+ spawnParts(a.x,a.y,'#9fe8ff',14);
+ if(a.r>18){ const nr=a.r*0.55; for(let i=0;i<2;i++){ const c=makeAst(a.x+(i?12:-12),a.y,nr); c.vx+= (Math.random()-0.5)*60; c.vy+=(Math.random()-0.5)*60; asteroids.push(c);} } }
+```
+
+Note: iterating with splice — iterate in reverse.
+
+sinkHole(): ball.x=hole.x…, vy=0, state='holeDone'; score bonus: const s=G.strokes; const par=G.par; let bonus = s<=par? (par-s+1)*100 : 25; G.score+=bonus; save lastBonus for display. Tone arpeggio: setTimeout chain or schedule with start time — use tone with delay param? My tone doesn't have a delay parameter. Add optional delay param:
+
+```js
+function tone(f0,f1,dur,type,vol,delay){...start(a.currentTime+delay)...}
+```
+
+Jingle: tone(523,523,0.1,'square',0.15,0); 659 at .1; 784 at .2; 1046 at .3.
+
+gameOver(): state='gameover'; if score>best → save best with try/catch.
+
+nextLevel(): level++, setupLevel(), state='playing'.
+
+startGame/restart: G.level=1,G.score=0; setupLevel(); state='playing'.
+
+Particles: {x,y,vx,vy,life,col}; update and draw.
+
+Rendering:
+
+- Clear black with a slight gradient? Fill #05070f. Stars twinkle alpha = 0.4+0.6*sin(time*2+tw).
+- Hole: dark circle (#000) with rim glow (shadowBlur cyan), flagpole line from hole center going up 40px, red triangle flag waving.
+- Ball: white circle, subtle shadow/glow; if at rest and strokes<max, draw aim indicator: dashed line length 40+power*160, arrowhead, plus a small "putter" line? Draw an arc for power near the ball? Power bar at bottom center of screen.
+- Asteroids: path with vertices at radius r*verts[i], stroke #b8c7d9, fill rgba(20,30,45,0.6), shadowBlur glow.
+- Laser: line from (x - vx*0.02) to (x,y), color #ff4d6d or green; laser color: use hot pink/red for contrast with cyan ball. Let's make laser neon green (#7dff6a). Ball white, hole rim cyan, flag red, lasers green, asteroids gray.
+
+HUD: top-left text lines: HOLE 3 / PAR 5 / STROKES 2/7 remaining? Show "STROKES LEFT: n". LASERS: n with a small icon or number. Top-right SCORE, BEST.
+
+Bottom center power bar while charging: 200px wide rectangle, gradient fill by power.
+
+Overlays:
+- Start: big title "GOLF ASTEROIDS", subtitle, control list, blinking "CLICK OR PRESS ENTER".
+- holeDone: panel "HOLE COMPLETE — n strokes (par p)", bonus, "ENTER / CLICK FOR NEXT HOLE".
+- gameover: "OUT OF STROKES" final score, best, "PRESS R OR ENTER TO PLAY AGAIN".
+
+Draw with ctx text, monospace font.
+
+Aim indicator only when ball at rest and strokes<max and state playing. Also show faint always-on aim line (length 60) so player sees the direction.
+
+Also if lasers=0 and cd is fine — display "NO LASERS" flashing? Just show in HUD.
+
+Handle resize: clamp ball/hole/asteroids inside.
+
+OK, let's write the final code. Keep it tidy.
+
+One more thing: mouse aim updates even during holeDone state (ball is at the hole) — that's fine.
+
+Putt only when strokes < maxStrokes; if equal, don't allow (game over triggers on rest anyway).
+
+Edge case: after sinkHole, ball is in hole; update returns early since state!=='playing'. Good.
+
+Let me write it all out.
+
+Draw function:
+
+```js
+function draw(){
+ ctx.fillStyle='#04060d';ctx.fillRect(0,0,W,H);
+ // stars
+ for(const s of stars){ctx.globalAlpha=0.3+0.5*(0.5+0.5*Math.sin(G.time*2+s.tw));ctx.fillStyle='#cfe8ff';ctx.fillRect(s.x,s.y,s.s,s.s);}
+ ctx.globalAlpha=1;
+ if(G.state==='start'){drawStart();return;}
+ drawHole();
+ // asteroids
+ for(const a of asteroids) drawAst(a);
+ // lasers
+ ...
+ // ball (skip if in hole? draw small in hole)
+ drawBall();
+ drawAim();
+ drawHUD();
+ if(G.state==='holeDone')drawHoleDone();
+ if(G.state==='gameover')drawGameOver();
+}
+```
+
+drawAst: ctx.save translate rotate; path i<n: ang=i/n*2π, rad=a.r*a.verts[i]; lineTo. closePath; fill rgba(30,42,60,.7); stroke '#aebfd4' lw 1.5; restore. Add subtle glow with shadowColor? Shadow is expensive per asteroid but ~10 or fewer is fine.
+
+drawHole:
+```js
+ctx.save();
+// rim
+ctx.shadowColor='#39d7ff';ctx.shadowBlur=12;ctx.fillStyle='#000';ctx.beginPath();ctx.arc(hole.x,hole.y,hole.r,0,7);ctx.fill();
+ctx.strokeStyle='#39d7ff';ctx.lineWidth=2;ctx.stroke();
+ctx.restore();
+// flag pole
+const fx=hole.x,fy=hole.y-hole.r-46? 
+```
+Pole from hole center going up: (hole.x,hole.y) to (hole.x, hole.y-50). Flag triangle at top with wave offset = sin(time*3)*4.
+
+drawBall: white circle r9, radial gradient; small highlight. If state is holeDone, draw smaller in the hole? Just draw it at rest at the hole center.
+
+Aim line: if ballAtRest && strokes<max:
+```js
+const len=50+power*170; dashed from ball edge to ball + dir*len; arrowhead; color '#ffd23f' (yellow), alpha 0.9.
+```
+Power bar: while charging, bottom center of screen.
+
+HUD text helper: ctx.font='16px monospace'; fillStyle.
+
+Start screen content:
+
+Title in big font 'bold 54px monospace', cyan glow. Controls:
+"MOUSE — aim putt • hold LMB to charge, release to hit"
+"RMB or X — fire laser at asteroids"
+"ARROWS + SPACE — keyboard aim & putt"
+"R — restart"
+"Get the ball in the hole before you run out of strokes."
+
+Blinking prompt: alpha = 0.5+0.5*sin(time*4).
+
+OK let's write it all, double-checking logic.
+
+Also laser collision with ball? None.
+
+Laser update loop reverse:
+```js
+for(let i=lasers.length-1;i>=0;i--){const l=lasers[i];l.x+=l.vx*dt;l.y+=l.vy*dt;l.life-=dt;
+ let dead=l.life<=0||l.x<0||l.x>W||l.y<0||l.y>H;
+ if(!dead)for(let j=asteroids.length-1;j>=0;j--){const a=asteroids[j];if(Math.hypot(l.x-a.x,l.y-a.y)<a.r*0.85){destroyAst(j);dead=true;break;}}
+ if(dead)lasers.splice(i,1);}
+```
+
+Asteroid wall bounce:
+```js
+if(a.x<a.r){a.x=a.r;a.vx=Math.abs(a.vx);} etc.
+```
+
+Particle update: life-=dt, pos+=v*dt, v*=0.98.
+
+spawnParts(x,y,col,n): random angles/speeds 40-260, life 0.4-0.9.
+
+Game over save best:
+```js
+if(G.score>G.best){G.best=G.score;try{localStorage.setItem('golfAstBest',G.best);}catch(e){}}
+```
+
+Also update best live? On game over and on holeDone is fine. Let's do it on both gameOver and nextLevel. Simplify: check in drawHUD? No, just call saveBest() inside sinkHole and gameOver.
+
+Resize clamp:
+```js
+function clampAll(){ if(ball){ball.x=clamp(ball.x,ball.r,W-ball.r);...} for a of asteroids clamp; clamp hole }
+```
+
+Main loop:
+
+```js
+let last=0; function frame(t){ const dt=Math.min(0.033,(t-last)/1000||0.016); last=t; update(dt); draw(); requestAnimationFrame(frame);} requestAnimationFrame(frame);
+```
+
+G.time always increments (for stars/flag on start screen) — put G.time+=dt at the top of update before the state check. Yes, that's how I wrote it.
+
+Draw laser: line from l.x - l.vx*0.025 to l.x. Color '#7dff6a', lw 3, glow.
+
+Power bar:
+```js
+if(charging){const bw=Math.min(240,W*0.5),bx=(W-bw)/2,by=H-40; ctx.strokeStyle='#fff';strokeRect; fill width*bw with gradient hue from green to red by power}
+```
+
+Stroke display: remaining = G.maxStrokes - G.strokes. If 0 and ball in motion → "FINAL SHOT". Show "STROKES LEFT: n" in red when n<=1.
+
+Also show "LASERS: n" with a small green square icon.
+
+OK, let's write the final HTML. Make sure no external resources. Title is set.
+
+Double-check putt launch velocity: max 950 px/s; friction pow(0.35,dt): at dt=1s factor 0.35 — ball travels roughly v/(1-0.35)≈ distance? Integral of v*e… approximately decays fast. Distance ≈ v0 * τ where τ = 1/|ln 0.35| per second ≈ 0.54s → max travel ~515px on a typical screen width (say 1280). Might be too short for full-width putts with obstacles — acceptable, par allows multiple strokes. Maybe make it pow(0.5,dt) → τ≈1.44s → max ~1370px. Let's use damping factor 0.45: |ln|=0.798→τ=1.25, max distance ≈ 1190. Good.
+
+Hole capture speed threshold 300 is fine.
+
+Also add slight random spin? No.
+
+Game over only when strokes used up and ball at rest — but also if player uses last stroke and the ball keeps rolling; check on rest. Also guard: in update, if state playing && !ballAtRest… my code: after zeroing velocity `if(G.strokes>=G.maxStrokes)gameOver()`. The else branch (already at rest): same check — but that would repeatedly call gameOver every frame after game over… state changes to 'gameover' so early return. But before it triggers? Strokes<max until then. Fine, and the check `if(G.state==='playing')` is implicit because update returns otherwise.
+
+Edge case: putt sets strokes++; if strokes==max and ball immediately sinks → holeDone (good). If not, game over on rest.
+
+OK let's write it all out.
+
+</think>
+```html
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Golf Asteroids</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#04060d}
+  canvas{display:block;width:100vw;height:100vh;cursor:crosshair}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+let W=0,H=0;
+function resize(){W=cv.width=window.innerWidth;H=cv.height=window.innerHeight;}
+resize();
+
+/* ---------- audio (Web Audio, started after first input) ---------- */
+let AC=null;
+function audio(){ if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}} if(AC&&AC.state==='suspended')AC.resume(); return AC; }
+function tone(f0,f1,dur,type,vol,delay){
+  const a=audio(); if(!a)return;
+  const t=a.currentTime+(delay||0);
+  const o=a.createOscillator(),g=a.createGain();
+  o.type=type||'square';
+  o.frequency.setValueAtTime(f0,t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(1,f1),t+dur);
+  g.gain.setValueAtTime(vol||0.15,t);
+  g.gain.exponentialRampToValueAtTime(0.001,t+dur);
+  o.connect(g).connect(a.destination); o.start(t); o.stop(t+dur+0.02);
+}
+function boom(vol){
+  const a=audio(); if(!a)return;
+  const len=Math.floor(a.sampleRate*0.3),buf=a.createBuffer(1,len,a.sampleRate),d=buf.getChannelData(0);
+  for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*(1-i/len);
+  const n=a.createBufferSource();n.buffer=buf;
+  const f=a.createBiquadFilter();f.type='lowpass';f.frequency.value=900;
+  const g=a.createGain();g.gain.value=vol||0.3;
+  n.connect(f).connect(g).connect(a.destination);n.start();
+}
+function tick(){tone(220,140,0.05,'triangle',0.1);}
+function jingle(){[523,659,784,1046].forEach((f,i)=>tone(f,f,0.12,'square',0.14,i*0.1));}
+
+/* ---------- state ---------- */
+const G={state:'start',level:1,score:0,best:0,par:3,strokes:0,maxStrokes:5,lasers:12,time:0,lastBonus:0};
+try{G.best=+localStorage.getItem('golfAstBest')||0;}catch(e){}
+
+let ball=null,hole=null,asteroids=[],lasers=[],stars=[],particles=[];
+let aimAngle=0,charging=false,power=0,mx=200,my=200,laserCd=0;
+
+function clamp(v,a,b){return v<a?a:v>b?b:v;}
+
+function makeStars(){
+  stars=[];const n=Math.floor(W*H/9000);
+  for(let i=0;i<n;i++)stars.push({x:Math.random()*W,y:Math.random()*H,s:Math.random()*1.6+0.4,tw:Math.random()*6});
+}
+function makeAst(x,y,r){
+  const verts=[];const n=8+Math.floor(Math.random()*4);
+  for(let i=0;i<n;i++)verts.push(0.7+Math.random()*0.5);
+  const sp=(30+G.level*8)*(0.5+Math.random()),ang=Math.random()*Math.PI*2;
+  return {x,y,r,verts,rot:Math.random()*6,rs:(Math.random()-0.5)*1.5,vx:Math.cos(ang)*sp,vy:Math.sin(ang)*sp};
+}
+function setupLevel(){
+  makeStars();asteroids=[];lasers=[];particles=[];
+  G.par=Math.min(9,2+G.level);
+  G.maxStrokes=G.par+2;G.strokes=0;G.lasers=12;
+  power=0;charging=false;laserCd=0;
+  const m=60;
+  ball={x:m,y:H/2,vx:0,vy:0,r:9};
+  let hx=W-m,hy=H/2;
+  for(let t=0;t<60;t++){
+    hx=W-Math.random()*(W*0.45)-m;hy=m+Math.random()*(H-2*m);
+    if(Math.hypot(hx-ball.x,hy-ball.y)>220)break;
+  }
+  hole={x:hx,y:hy,r:16};
+  const count=Math.min(3+G.level,11);
+  for(let i=0;i<count;i++){
+    let x=W/2,y=H/2,ok=false,tr=0;
+    while(!ok&&tr<90){tr++;
+      x=m+Math.random()*(W-2*m);y=m+Math.random()*(H-2*m);
+      ok=Math.hypot(x-ball.x,y-ball.y)>170&&Math.hypot(x-hole.x,y-hole.y)>150;
+    }
+    asteroids.push(makeAst(x,y,30+Math.random()*18));
+  }
+  aimAngle=0;mx=W*0.5;my=H/2;
+}
+function saveBest(){ if(G.score>G.best){G.best=G.score;try{localStorage.setItem('golfAstBest',G.best);}catch(e){}} }
+
+function startGame(){G.level=1;G.score=0;setupLevel();G.state='playing';}
+function restart(){startGame();}
+function nextLevel(){saveBest();G.level++;setupLevel();G.state='playing';}
+
+/* ---------- actions ---------- */
+function ballAtRest(){return Math.hypot(ball.vx,ball.vy)<5;}
+function putt(){
+  if(G.strokes>=G.maxStrokes)return;
+  const sp=130+power*820;
+  ball.vx=Math.cos(aimAngle)*sp;ball.vy=Math.sin(aimAngle)*sp;
+  G.strokes++;
+  tone(150,55,0.16,'sine',0.3);
+}
+function fireLaser(){
+  if(laserCd>0||G.lasers<=0)return;
+  G.lasers--;laserCd=0.25;
+  lasers.push({x:ball.x+Math.cos(aimAngle)*14,y:ball.y+Math.sin(aimAngle)*14,
+               vx:Math.cos(aimAngle)*760,vy:Math.sin(aimAngle)*760,life:1.2});
+  tone(950,180,0.14,'sawtooth',0.12);
+}
+function spawnParts(x,y,col,n){
+  for(let i=0;i<n;i++){const a=Math.random()*Math.PI*2,s=40+Math.random()*230;
+    particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:0.4+Math.random()*0.5,col});}
+}
+function destroyAst(idx){
+  const a=asteroids[idx];asteroids.splice(idx,1);
+  boom(0.25);
+  G.score+=a.r>34?20:a.r>18?50:100;
+  spawnParts(a.x,a.y,'#9fe8ff',16);
+  if(a.r>18){
+    const nr=a.r*0.55;
+    for(let i=0;i<2;i++){
+      const c=makeAst(clamp(a.x+(i?14:-14),nr,W-nr),clamp(a.y,nr,H-nr),nr);
+      c.vx+=(Math.random()-0.5)*70;c.vy+=(Math.random()-0.5)*70;
+      asteroids.push(c);
+    }
+  }
+}
+function sinkHole(){
+  ball.x=hole.x;ball.y=hole.y;ball.vx=0;ball.vy=0;
+  G.lastBonus=(G.strokes<=G.par)?(G.par-G.strokes+1)*100:25;
+  G.score+=G.lastBonus;
+  spawnParts(hole.x,hole.y,'#ffd23f',24);
+  jingle();saveBest();
+  G.state='holeDone';
+}
+function gameOver(){
+  saveBest();
+  G.state='gameover';
+  tone(300,60,0.7,'sawtooth',0.2);
+}
+
+/* ---------- input ---------- */
+window.addEventListener('mousemove',e=>{
+  mx=e.clientX;my=e.clientY;
+  if(ball&&(G.state==='playing'||G.state==='holeDone'))aimAngle=Math.atan2(my-ball.y,mx-ball.x);
+});
+cv.addEventListener('mousedown',e=>{
+  audio();
+  if(e.button===0){
+    if(G.state==='start')startGame();
+    else if(G.state==='playing'){if(ballAtRest()){charging=true;power=0;}}
+    else if(G.state==='holeDone')nextLevel();
+    else if(G.state==='gameover')restart();
+  }else if(e.button===2){
+    if(G.state==='playing')fireLaser();
+  }
+});
+window.addEventListener('mouseup',e=>{
+  if(e.button===0&&charging){charging=false;if(G.state==='playing'&&ballAtRest())putt();}
+});
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+
+window.addEventListener('keydown',e=>{
+  audio();
+  const k=e.key;
+  if(['ArrowLeft','ArrowRight','ArrowUp',' '].includes(k))e.preventDefault();
+  if(k==='Enter'||k===' '){
+    if(G.state==='start')startGame();
+    else if(G.state==='holeDone'&&!charging)nextLevel();
+    else if(G.state==='gameover')restart();
+  }
+  if(k==='r'||k==='R'){if(G.state!=='start')restart();}
+  if(G.state==='playing'&&ball){
+    if(k==='ArrowLeft')aimAngle-=0.13;
+    if(k==='ArrowRight')aimAngle+=0.13;
+    if((k===' '||k==='ArrowUp')&&!e.repeat&&ballAtRest()){charging=true;power=0;}
+    if(k==='x'||k==='X')fireLaser();
+  }
+});
+window.addEventListener('keyup',e=>{
+  const k=e.key;
+  if((k===' '||k==='ArrowUp')&&charging){charging=false;if(G.state==='playing'&&ballAtRest())putt();}
+});
+
+/* ---------- update ---------- */
+function update(dt){
+  G.time+=dt;laserCd=Math.max(0,laserCd-dt);
+  // particles always animate
+  for(let i=particles.length-1;i>=0;i--){const p=particles[i];p.life-=dt;
+    if(p.life<=0){particles.splice(i,1);continue;}
+    p.x+=p.vx*dt;p.y+=p.vy*dt;p.vx*=0.985;p.vy*=0.985;}
+  if(G.state!=='playing')return;
+
+  if(charging)power=Math.min(1,power+dt/1.1);
+
+  // ball
+  let sp=Math.hypot(ball.vx,ball.vy);
+  if(sp>0){
+    ball.x+=ball.vx*dt;ball.y+=ball.vy*dt;
+    const f=Math.pow(0.45,dt);ball.vx*=f;ball.vy*=f;
+    if(ball.x<ball.r){ball.x=ball.r;ball.vx=-ball.vx*0.75;tick();}
+    if(ball.x>W-ball.r){ball.x=W-ball.r;ball.vx=-ball.vx*0.75;tick();}
+    if(ball.y<ball.r){ball.y=ball.r;ball.vy=-ball.vy*0.75;tick();}
+    if(ball.y>H-ball.r){ball.y=H-ball.r;ball.vy=-ball.vy*0.75;tick();}
+    // hole suction + capture
+    const hd=Math.hypot(ball.x-hole.x,ball.y-hole.y);sp=Math.hypot(ball.vx,ball.vy);
+    if(hd<hole.r*1.6&&sp<330){ball.vx+=(hole.x-ball.x)*dt*4;ball.vy+=(hole.y-ball.y)*dt*4;}
+    if(hd<hole.r-4&&Math.hypot(ball.vx,ball.vy)<300){sinkHole();return;}
+    // asteroid collisions
+    for(const a of asteroids){
+      const dx=ball.x-a.x,dy=ball.y-a.y,d=Math.hypot(dx,dy),minD=ball.r+a.r*0.82;
+      if(d<minD&&d>0.001){
+        const nx=dx/d,ny=dy/d;
+        ball.x=a.x+nx*minD;ball.y=a.y+ny*minD;
+        const dot=ball.vx*nx+ball.vy*ny;
+        if(dot<0){ball.vx-=2*dot*nx;ball.vy-=2*dot*ny;ball.vx*=0.85;ball.vy*=0.85;}
+        ball.vx+=a.vx*0.15;ball.vy+=a.vy*0.15;tick();
+      }
+    }
+    if(Math.hypot(ball.vx,ball.vy)<4){
+      ball.vx=0;ball.vy=0;
+      if(G.strokes>=G.maxStrokes)gameOver();
+    }
+  }else{
+    if(G.strokes>=G.maxStrokes)gameOver();
+  }
+
+  // asteroids
+  for(const a of asteroids){
+    a.x+=a.vx*dt;a.y+=a.vy*dt;a.rot+=a.rs*dt;
+    if(a.x<a.r){a.x=a.r;a.vx=Math.abs(a.vx);}
+    if(a.x>W-a.r){a.x=W-a.r;a.vx=-Math.abs(a.vx);}
+    if(a.y<a.r){a.y=a.r;a.vy=Math.abs(a.vy);}
+    if(a.y>H-a.r){a.y=H-a.r;a.vy=-Math.abs(a.vy);}
+  }
+
+  // lasers
+  for(let i=lasers.length-1;i>=0;i--){
+    const l=lasers[i];l.x+=l.vx*dt;l.y+=l.vy*dt;l.life-=dt;
+    let dead=l.life<=0||l.x<-20||l.x>W+20||l.y<-20||l.y>H+20;
+    if(!dead){
+      for(let j=asteroids.length-1;j>=0;j--){
+        const a=asteroids[j];
+        if(Math.hypot(l.x-a.x,l.y-a.y)<a.r*0.85){destroyAst(j);dead=true;break;}
+      }
+    }
+    if(dead)lasers.splice(i,1);
+  }
+}
+
+/* ---------- drawing ---------- */
+function text(s,x,y,size,col,align,bold){
+  ctx.font=(bold?'bold ':'')+size+'px monospace';
+  ctx.fillStyle=col;ctx.textAlign=align||'left';ctx.fillText(s,x,y);
+}
+function drawHole(){
+  ctx.save();
+  ctx.shadowColor='#39d7ff';ctx.shadowBlur=14;
+  ctx.fillStyle='#000';ctx.beginPath();ctx.arc(hole.x,hole.y,hole.r,0,7);ctx.fill();
+  ctx.strokeStyle='#39d7ff';ctx.lineWidth=2;ctx.stroke();
+  ctx.restore();
+  // flag pole + waving flag
+  const ph=48,wob=Math.sin(G.time*3)*4;
+  ctx.strokeStyle='#e8eef5';ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(hole.x,hole.y);ctx.lineTo(hole.x,hole.y-ph);ctx.stroke();
+  ctx.fillStyle='#ff4d5e';
+  ctx.beginPath();
+  ctx.moveTo(hole.x,hole.y-ph);
+  ctx.lineTo(hole.x+26+wob,hole.y-ph+8);
+  ctx.lineTo(hole.x,hole.y-ph+16);
+  ctx.closePath();ctx.fill();
+}
+function drawAst(a){
+  ctx.save();ctx.translate(a.x,a.y);ctx.rotate(a.rot);
+  ctx.shadowColor='#7fa8d0';ctx.shadowBlur=8;
+  ctx.beginPath();
+  const n=a.verts.length;
+  for(let i=0;i<n;i++){const ang=i/n*Math.PI*2,rad=a.r*a.verts[i];
+    if(i===0)ctx.moveTo(Math.cos(ang)*rad,Math.sin(ang)*rad);
+    else ctx.lineTo(Math.cos(ang)*rad,Math.sin(ang)*rad);}
+  ctx.closePath();
+  ctx.fillStyle='rgba(28,40,58,0.75)';ctx.fill();
+  ctx.strokeStyle='#aebfd4';ctx.lineWidth=1.6;ctx.stroke();
+  ctx.restore();
+}
+function drawBall(){
+  if(G.state==='holeDone'){
+    ctx.fillStyle='rgba(255,255,255,0.7)';
+    ctx.beginPath();ctx.arc(hole.x,hole.y,4,0,7);ctx.fill();return;
+  }
+  ctx.save();
+  ctx.shadowColor='#ffffff';ctx.shadowBlur=12;
+  const g=ctx.createRadialGradient(ball.x-3,ball.y-3,1,ball.x,ball.y,ball.r);
+  g.addColorStop(0,'#ffffff');g.addColorStop(1,'#b9c4d6');
+  ctx.fillStyle=g;
+  ctx.beginPath();ctx.arc(ball.x,ball.y,ball.r,0,7);ctx.fill();
+  ctx.restore();
+}
+function drawAim(){
+  if(!ballAtRest()||G.strokes>=G.maxStrokes)return;
+  const len=55+power*170;
+  const x2=ball.x+Math.cos(aimAngle)*len,y2=ball.y+Math.sin(aimAngle)*len;
+  ctx.save();
+  ctx.strokeStyle='#ffd23f';ctx.lineWidth=2;ctx.setLineDash([7,6]);
+  ctx.globalAlpha=0.55+power*0.45;
+  ctx.beginPath();ctx.moveTo(ball.x+Math.cos(aimAngle)*13,ball.y+Math.sin(aimAngle)*13);
+  ctx.lineTo(x2,y2);ctx.stroke();
+  ctx.setLineDash([]);
+  // arrowhead
+  const ah=9,aa=Math.atan2(y2-ball.y,x2-ball.x);
+  ctx.beginPath();
+  ctx.moveTo(x2,y2);
+  ctx.lineTo(x2-Math.cos(aa-0.45)*ah,y2-Math.sin(aa-0.45)*ah);
+  ctx.lineTo(x2-Math.cos(aa+0.45)*ah,y2-Math.sin(aa+0.45)*ah);
+  ctx.closePath();ctx.fillStyle='#ffd23f';ctx.fill();
+  ctx.restore();
+}
+function drawHUD(){
+  const left=G.maxStrokes-G.strokes;
+  text('HOLE '+G.level,16,28,18,'#39d7ff','left',true);
+  text('PAR '+G.par,16,50,15,'#8fa8c4');
+  text('STROKES LEFT: '+left,16,72,15,left<=1?'#ff4d5e':'#ffffff');
+  // lasers
+  ctx.fillStyle='#7dff6a';ctx.fillRect(16,84,10,10);
+  text('LASERS: '+G.lasers,32,94,15,G.lasers===0?'#ff4d5e':'#ffffff');
+  if(left===0)text('FINAL SHOT',W/2,30,16,'#ffd23f','center',true);
+  text('SCORE '+G.score,W-16,28,18,'#ffffff','right',true);
+  text('BEST '+G.best,W-16,50,14,'#8fa8c4','right');
+  // power bar
+  if(charging){
+    const bw=Math.min(240,W*0.5),bx=(W-bw)/2,by=H-42;
+    ctx.strokeStyle='#ffffff';ctx.lineWidth=1.5;ctx.strokeRect(bx,by,bw,14);
+    const hue=120-power*120;
+    ctx.fillStyle='hsl('+hue+',95%,55%)';
+    ctx.fillRect(bx+2,by+2,(bw-4)*power,10);
+    text('POWER',W/2,by-8,13,'#ffffff','center');
+  }
+}
+function panel(w,h){
+  ctx.fillStyle='rgba(4,8,18,0.85)';
+  const x=(W-w)/2,y=(H-h)/2;
+  ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle='#39d7ff';ctx.lineWidth=2;ctx.strokeRect(x,y,w,h);
+}
+function drawStart(){
+  panel(Math.min(640,W-40),Math.min(420,H-40));
+  const cx=W/2,cy=H/2;
+  ctx.save();ctx.shadowColor='#39d7ff';ctx.shadowBlur=20;
+  text('GOLF',cx,cy-115,58,'#ffffff','center',true);
+  text('ASTEROIDS',cx,cy-62,58,'#39d7ff','center',true);
+  ctx.restore();
+  text('Putt the ball into the hole — but mind the rocks.',cx,cy-18,16,'#cfe0f0','center');
+  text('MOUSE      aim putt \u2022 hold LMB to charge, release to hit',cx,cy+18,14,'#9fb4cc','center');
+  text('RMB / X    fire laser to blast asteroids out of the way',cx,cy+42,14,'#9fb4cc','center');
+  text('ARROWS     rotate aim \u2022 SPACE hold/release to putt',cx,cy+66,14,'#9fb4cc','center');
+  text('R          restart game',cx,cy+90,14,'#9fb4cc','center');
+  if(G.best>0)text('BEST SCORE: '+G.best,cx,cy+122,15,'#ffd23f','center');
+  ctx.globalAlpha=0.5+0.5*Math.sin(G.time*4);
+  text('CLICK OR PRESS ENTER TO START',cx,cy+160,20,'#ffffff','center',true);
+  ctx.globalAlpha=1;
+}
+function drawHoleDone(){
+  panel(Math.min(520,W-40),200);
+  const cx=W/2,cy=H/2,s=G.strokes,p=G.par;
+  let label=s===1?'HOOLEY!':s<=p?['','ONE UNDER PAR','TWO UNDER PAR','THREE UNDER PAR'][Math.min(3,p-s)]:'OVER PAR';
+  text('HOLE COMPLETE',cx,cy-52,30,'#7dff6a','center',true);
+  text(s+' stroke'+(s===1?'':'s')+' (par '+p+') \u2014 '+label,cx,cy-12,18,'#ffffff','center');
+  text('BONUS +'+G.lastBonus,cx,cy+20,16,'#ffd23f','center');
+  ctx.globalAlpha=0.5+0.5*Math.sin(G.time*4);
+  text('CLICK OR PRESS ENTER FOR HOLE '+(G.level+1),cx,cy+62,16,'#ffffff','center',true);
+  ctx.globalAlpha=1;
+}
+function drawGameOver(){
+  panel(Math.min(520,W-40),230);
+  const cx=W/2,cy=H/2;
+  text('OUT OF STROKES',cx,cy-55,34,'#ff4d5e','center',true);
+  text('FINAL SCORE: '+G.score,cx,cy-8,22,'#ffffff','center');
+  text(G.score>=G.best&&G.score>0?'NEW BEST!':'BEST: '+G.best,cx,cy+24,16,G.score>=G.best&&G.score>0?'#ffd23f':'#8fa8c4','center');
+  ctx.globalAlpha=0.5+0.5*Math.sin(G.time*4);
+  text('CLICK OR PRESS ENTER / R TO PLAY AGAIN',cx,cy+70,16,'#ffffff','center',true);
+  ctx.globalAlpha=1;
+}
+function draw(){
+  ctx.fillStyle='#04060d';ctx.fillRect(0,0,W,H);
+  for(const s of stars){
+    ctx.globalAlpha=0.25+0.5*(0.5+0.5*Math.sin(G.time*2+s.tw));
+    ctx.fillStyle='#cfe8ff';ctx.fillRect(s.x,s.y,s.s,s.s);
+  }
+  ctx.globalAlpha=1;
+  if(G.state==='start'){drawStart();return;}
+  drawHole();
+  for(const a of asteroids)drawAst(a);
+  // lasers
+  ctx.save();
+  ctx.strokeStyle='#7dff6a';ctx.lineWidth=3;ctx.shadowColor='#7dff6a';ctx.shadowBlur=10;
+  for(const l of lasers){
+    ctx.beginPath();ctx.moveTo(l.x-l.vx*0.025,l.y-l.vy*0.025);ctx.lineTo(l.x,l.y);ctx.stroke();
+  }
+  ctx.restore();
+  drawBall();
+  drawAim();
+  // particles
+  for(const p of particles){
+    ctx.globalAlpha=Math.min(1,p.life*2);
+    ctx.fillStyle=p.col;ctx.fillRect(p.x-2,p.y-2,4,4);
+  }
+  ctx.globalAlpha=1;
+  drawHUD();
+  if(G.state==='holeDone')drawHoleDone();
+  if(G.state==='gameover')drawGameOver();
+}
+
+/* ---------- resize handling ---------- */
+window.addEventListener('resize',()=>{
+  resize();makeStars();
+  if(ball){ball.x=clamp(ball.x,ball.r,W-ball.r);ball.y=clamp(ball.y,ball.r,H-ball.r);}
+  if(hole){hole.x=clamp(hole.x,40,W-40);hole.y=clamp(hole.y,60,H-40);}
+  for(const a of asteroids){a.x=clamp(a.x,a.r,W-a.r);a.y=clamp(a.y,a.r,H-a.r);}
+});
+
+/* ---------- main loop ---------- */
+let last=0;
+function frame(t){
+  const dt=Math.min(0.033,(t-last)/1000||0.016);last=t;
+  update(dt);draw();
+  requestAnimationFrame(frame);
+}
+makeStars();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
+```
