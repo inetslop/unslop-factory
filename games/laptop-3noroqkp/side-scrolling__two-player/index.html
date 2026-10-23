@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Dual Dash - Two Player Side Scroller</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #1a1a2e; display: flex; align-items: center; justify-content: center; height: 100vh; width: 100vw; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+function playSound(freq, duration, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+function sfxJump() { playSound(400, 0.15, 'square', 0.08); }
+function sfxCollect() { playSound(800, 0.2, 'sine', 0.12); playSound(1200, 0.15, 'sine', 0.08); }
+function sfxHurt() { playSound(150, 0.3, 'sawtooth', 0.15); }
+function sfxWin() { playSound(600, 0.2, 'square', 0.1); setTimeout(()=>playSound(800,0.2,'square',0.1),150); setTimeout(()=>playSound(1000,0.3,'square',0.1),300); }
+function sfxStart() { playSound(500, 0.1, 'square', 0.08); setTimeout(()=>playSound(700,0.2,'square',0.1),120); }
+
+// Game state
+let gameState = 'start'; // start, playing, finished
+let frameCount = 0;
+let winner = null;
+let winTimer = 0;
+
+// Level
+const LEVEL_WIDTH = 4000;
+const GRAVITY = 0.6;
+const TILE = 40;
+
+let platforms = [];
+let gems = [];
+let spikes = [];
+let movingSpikes = [];
+let goalFlag = { x: LEVEL_WIDTH - 120, y: 0, collected: false };
+
+function buildLevel() {
+    platforms = [];
+    gems = [];
+    spikes = [];
+    movingSpikes = [];
+    goalFlag.collected = false;
+
+    // Ground segments with gaps
+    const groundY = H - 60;
+    for (let x = 0; x < LEVEL_WIDTH; x += TILE) {
+        if (x > 400 && x < 520) continue; // gap 1
+        if (x > 1200 && x < 1320) continue; // gap 2
+        if (x > 2200 && x < 2360) continue; // gap 3
+        if (x > 3200 && x < 3320) continue; // gap 4
+        platforms.push({ x: x, y: groundY, w: TILE, h: 60 });
+    }
+
+    // Floating platforms
+    const platData = [
+        { x: 200, y: groundY - 100, w: 120 },
+        { x: 450, y: groundY - 180, w: 100 },
+        { x: 700, y: groundY - 120, w: 160 },
+        { x: 900, y: groundY - 200, w: 80 },
+        { x: 1050, y: groundY - 140, w: 120 },
+        { x: 1300, y: groundY - 100, w: 140 },
+        { x: 1500, y: groundY - 220, w: 100 },
+        { x: 1650, y: groundY - 150, w: 160 },
+        { x: 1900, y: groundY - 180, w: 100 },
+        { x: 2100, y: groundY - 120, w: 140 },
+        { x: 2400, y: groundY - 200, w: 120 },
+        { x: 2600, y: groundY - 140, w: 100 },
+        { x: 2800, y: groundY - 250, w: 80 },
+        { x: 3000, y: groundY - 160, w: 140 },
+        { x: 3400, y: groundY - 120, w: 120 },
+        { x: 3600, y: groundY - 200, w: 100 },
+    ];
+    platData.forEach(p => platforms.push({ x: p.x, y: p.y, w: p.w, h: 20 }));
+
+    // Spikes (static)
+    const spikeData = [350, 850, 1450, 2050, 2700, 3350];
+    spikeData.forEach(sx => spikes.push({ x: sx, y: H - 60 - 20, w: 40, h: 20 }));
+
+    // Moving spikes (horizontal patrol)
+    const moverData = [
+        { x: 600, y: groundY - 40, range: 150, speed: 2 },
+        { x: 1700, y: groundY - 40, range: 200, speed: 2.5 },
+        { x: 2500, y: groundY - 40, range: 180, speed: 3 },
+        { x: 3100, y: groundY - 40, range: 160, speed: 2.5 },
+    ];
+    moverData.forEach(m => movingSpikes.push({ x: m.x, y: m.y, w: 30, h: 30, startX: m.x, range: m.range, speed: m.speed, dir: 1 }));
+
+    // Gems
+    const gemData = [
+        { x: 250, y: groundY - 140 }, { x: 500, y: groundY - 220 },
+        { x: 750, y: groundY - 160 }, { x: 950, y: groundY - 240 },
+        { x: 1100, y: groundY - 180 }, { x: 1350, y: groundY - 140 },
+        { x: 1550, y: groundY - 260 }, { x: 1700, y: groundY - 190 },
+        { x: 1950, y: groundY - 220 }, { x: 2150, y: groundY - 160 },
+        { x: 2450, y: groundY - 240 }, { x: 2650, y: groundY - 180 },
+        { x: 2850, y: groundY - 290 }, { x: 3050, y: groundY - 200 },
+        { x: 3450, y: groundY - 160 }, { x: 3650, y: groundY - 240 },
+        { x: 3900, y: groundY - 80 }, { x: 100, y: groundY - 80 },
+    ];
+    gemData.forEach(g => gems.push({ x: g.x, y: g.y, collected: false }));
+
+    // Goal
+    goalFlag = { x: LEVEL_WIDTH - 120, y: H - 60 - 80, collected: false };
+}
+
+// Players
+function createPlayer(id) {
+    return {
+        id: id,
+        x: id === 1 ? 100 : 160,
+        y: H - 120,
+        vx: 0,
+        vy: 0,
+        w: 30,
+        h: 40,
+        onGround: false,
+        gemsCollected: 0,
+        hurtTimer: 0,
+        dead: false,
+        respawnTimer: 0,
+        color: id === 1 ? '#4fc3f7' : '#ff5252',
+        darkColor: id === 1 ? '#0288d1' : '#b71c1c',
+        score: 0
+    };
+}
+
+let player1, player2;
+let camera = { x: 0, y: 0, zoom: 1 };
+
+function resetGame() {
+    buildLevel();
+    player1 = createPlayer(1);
+    player2 = createPlayer(2);
+    winner = null;
+    winTimer = 0;
+    frameCount = 0;
+}
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'start' && (e.code === 'Space' || e.code === 'Enter')) {
+        initAudio();
+        sfxStart();
+        resetGame();
+        gameState = 'playing';
+    }
+    if (gameState === 'finished' && (e.code === 'KeyR' || e.code === 'Enter' || e.code === 'Space')) {
+        initAudio();
+        sfxStart();
+        resetGame();
+        gameState = 'playing';
+    }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Physics
+function updatePlayer(p) {
+    if (p.dead) {
+        p.respawnTimer--;
+        if (p.respawnTimer <= 0) {
+            p.dead = false;
+            p.x = p.id === 1 ? Math.max(camera.x + 50, camera.x + W/2 - 200) : Math.max(camera.x + 80, camera.x + W/2 - 170);
+            p.y = H - 200;
+            p.vx = 0;
+            p.vy = 0;
+        }
+        return;
+    }
+
+    if (p.hurtTimer > 0) { p.hurtTimer--; return; }
+
+    let left = false, right = false, jump = false;
+    if (p.id === 1) {
+        left = keys['KeyA'];
+        right = keys['KeyD'];
+        jump = keys['KeyW'];
+    } else {
+        left = keys['ArrowLeft'];
+        right = keys['ArrowRight'];
+        jump = keys['ArrowUp'];
+    }
+
+    if (left) p.vx = -5;
+    else if (right) p.vx = 5;
+    else p.vx *= 0.8;
+
+    if (jump && p.onGround) {
+        p.vy = -12;
+        p.onGround = false;
+        sfxJump();
+    }
+
+    p.vy += GRAVITY;
+    if (p.vy > 15) p.vy = 15;
+
+    // Move X
+    p.x += p.vx;
+    if (p.x < 0) p.x = 0;
+    if (p.x + p.w > LEVEL_WIDTH) p.x = LEVEL_WIDTH - p.w;
+
+    // Collide X with platforms
+    for (let plat of platforms) {
+        if (p.x + p.w > plat.x && p.x < plat.x + plat.w && p.y + p.h > plat.y && p.y < plat.y + plat.h) {
+            if (p.vx > 0) p.x = plat.x - p.w;
+            else if (p.vx < 0) p.x = plat.x + plat.w;
+        }
+    }
+
+    // Move Y
+    p.y += p.vy;
+    p.onGround = false;
+
+    for (let plat of platforms) {
+        if (p.x + p.w > plat.x && p.x < plat.x + plat.w && p.y + p.h > plat.y && p.y < plat.y + plat.h) {
+            if (p.vy > 0) {
+                p.y = plat.y - p.h;
+                p.vy = 0;
+                p.onGround = true;
+            } else if (p.vy < 0) {
+                p.y = plat.y + plat.h;
+                p.vy = 0;
+            }
+        }
+    }
+
+    // Fall off screen
+    if (p.y > H + 50) {
+        killPlayer(p);
+    }
+
+    // Spike collisions
+    for (let s of spikes) {
+        if (p.x + p.w > s.x && p.x < s.x + s.w && p.y + p.h > s.y && p.y < s.y + s.h) {
+            killPlayer(p);
+            break;
+        }
+    }
+    for (let ms of movingSpikes) {
+        if (p.x + p.w > ms.x && p.x < ms.x + ms.w && p.y + p.h > ms.y && p.y < ms.y + ms.h) {
+            killPlayer(p);
+            break;
+        }
+    }
+
+    // Gem collection
+    for (let g of gems) {
+        if (!g.collected && Math.abs(p.x + p.w/2 - g.x) < 30 && Math.abs(p.y + p.h/2 - g.y) < 30) {
+            g.collected = true;
+            p.gemsCollected++;
+            sfxCollect();
+        }
+    }
+
+    // Goal
+    if (!goalFlag.collected && p.x + p.w > goalFlag.x && p.x < goalFlag.x + 40 && Math.abs(p.y - goalFlag.y) < 60) {
+        goalFlag.collected = true;
+        winGame(p);
+    }
+}
+
+function killPlayer(p) {
+    if (p.dead) return;
+    p.dead = true;
+    p.respawnTimer = 90;
+    sfxHurt();
+}
+
+function winGame(p) {
+    winner = p.id;
+    gameState = 'finished';
+    winTimer = 0;
+    sfxWin();
+}
+
+function updateMovingSpikes() {
+    for (let ms of movingSpikes) {
+        ms.x += ms.speed * ms.dir;
+        if (ms.x > ms.startX + ms.range) { ms.dir = -1; }
+        if (ms.x < ms.startX - ms.range) { ms.dir = 1; }
+    }
+}
+
+function updateCamera() {
+    let midX = (player1.x + player2.x) / 2;
+    let midY = (player1.y + player2.y) / 2;
+    let dist = Math.abs(player1.x - player2.x);
+
+    // Zoom based on distance
+    let targetZoom = 1;
+    if (dist > W * 0.7) {
+        targetZoom = Math.max(0.5, W * 0.7 / dist);
+    }
+
+    camera.zoom += (targetZoom - camera.zoom) * 0.05;
+    camera.x += (midX - W / (2 * camera.zoom) - camera.x) * 0.1;
+    camera.y += ((midY - H / 2) - camera.y) * 0.08;
+
+    // Clamp
+    camera.x = Math.max(0, Math.min(LEVEL_WIDTH - W / camera.zoom, camera.x));
+    camera.y = Math.max(-100, Math.min(H - H / camera.zoom + 60, camera.y));
+}
+
+// Rendering
+function drawBackground() {
+    // Sky gradient
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, '#16213e');
+    grad.addColorStop(1, '#0f3460');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    // Stars
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    for (let i = 0; i < 60; i++) {
+        let sx = ((i * 137 + 50) % LEVEL_WIDTH) - camera.x * 0.3;
+        let sy = (i * 97 + 20) % (H * 0.6);
+        if (sx > -5 && sx < W + 5) {
+            ctx.beginPath();
+            ctx.arc(sx, sy, i % 3 === 0 ? 2 : 1, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+
+    // Distant mountains (parallax)
+    ctx.fillStyle = '#1a1a3e';
+    for (let i = 0; i < 8; i++) {
+        let mx = i * 600 - camera.x * 0.2;
+        let my = H - 150 + Math.sin(i * 2.3) * 60;
+        ctx.beginPath();
+        ctx.moveTo(mx, H);
+        ctx.lineTo(mx + 300, my);
+        ctx.lineTo(mx + 600, H);
+        ctx.fill();
+    }
+
+    // Nearer hills
+    ctx.fillStyle = '#1f2b4d';
+    for (let i = 0; i < 10; i++) {
+        let mx = i * 500 - camera.x * 0.4;
+        let my = H - 80 + Math.sin(i * 3.7) * 40;
+        ctx.beginPath();
+        ctx.moveTo(mx, H);
+        ctx.lineTo(mx + 250, my);
+        ctx.lineTo(mx + 500, H);
+        ctx.fill();
+    }
+}
+
+function drawWorld() {
+    ctx.save();
+    ctx.translate(W/2, H/2);
+    ctx.scale(camera.zoom, camera.zoom);
+    ctx.translate(-W/2 - camera.x * camera.zoom, -H/2 - camera.y * camera.zoom);
+
+    // Platforms
+    for (let plat of platforms) {
+        if (plat.x + plat.w < camera.x - 50 || plat.x > camera.x + W / camera.zoom + 50) continue;
+        ctx.fillStyle = '#4a6741';
+        ctx.fillRect(plat.x, plat.y, plat.w, plat.h);
+        ctx.fillStyle = '#2e5d2e';
+        ctx.fillRect(plat.x, plat.y, plat.w, 8);
+    }
+
+    // Spikes
+    for (let s of spikes) {
+        if (s.x + s.w < camera.x - 50 || s.x > camera.x + W / camera.zoom + 50) continue;
+        drawSpike(s.x, s.y, s.w, s.h);
+    }
+
+    // Moving spikes
+    for (let ms of movingSpikes) {
+        ctx.fillStyle = '#ff6b35';
+        ctx.fillRect(ms.x, ms.y, ms.w, ms.h);
+        ctx.fillStyle = '#fff';
+        ctx.font = '14px monospace';
+        ctx.fillText('⚠', ms.x + 8, ms.y + 20);
+    }
+
+    // Gems
+    for (let g of gems) {
+        if (g.collected) continue;
+        if (g.x < camera.x - 50 || g.x > camera.x + W / camera.zoom + 50) continue;
+        drawGem(g.x, g.y);
+    }
+
+    // Goal flag
+    drawFlag(goalFlag.x, goalFlag.y);
+
+    // Players
+    drawPlayer(player1);
+    drawPlayer(player2);
+
+    ctx.restore();
+}
+
+function drawSpike(x, y, w, h) {
+    ctx.fillStyle = '#c0c0c0';
+    for (let i = 0; i < w / 10; i++) {
+        let sx = x + i * 10;
+        ctx.beginPath();
+        ctx.moveTo(sx, y + h);
+        ctx.lineTo(sx + 5, y);
+        ctx.lineTo(sx + 10, y + h);
+        ctx.fill();
+    }
+}
+
+function drawGem(x, y) {
+    const t = frameCount * 0.05;
+    const s = Math.sin(t) * 3;
+    ctx.save();
+    ctx.translate(x, y + s);
+    ctx.fillStyle = '#ffd700';
+    ctx.beginPath();
+    ctx.moveTo(0, -12);
+    ctx.lineTo(10, 0);
+    ctx.lineTo(0, 12);
+    ctx.lineTo(-10, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = '#fff8dc';
+    ctx.beginPath();
+    ctx.moveTo(0, -6);
+    ctx.lineTo(5, 0);
+    ctx.lineTo(0, 6);
+    ctx.lineTo(-5, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+}
+
+function drawFlag(x, y) {
+    if (goalFlag.collected && winner) return; // still show
+    // Pole
+    ctx.fillStyle = '#8b4513';
+    ctx.fillRect(x + 15, y, 6, 80);
+    // Flag
+    const wave = Math.sin(frameCount * 0.1) * 5;
+    ctx.fillStyle = '#ff4444';
+    ctx.beginPath();
+    ctx.moveTo(x + 21, y);
+    ctx.lineTo(x + 60 + wave, y + 15);
+    ctx.lineTo(x + 21, y + 30);
+    ctx.closePath();
+    ctx.fill();
+    // Star on flag
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px monospace';
+    ctx.fillText('★', x + 30, y + 20);
+}
+
+function drawPlayer(p) {
+    if (p.dead) {
+        // Flash effect
+        if (Math.floor(frameCount / 5) % 2 === 0) return;
+        ctx.globalAlpha = 0.5;
+    } else {
+        ctx.globalAlpha = p.hurtTimer > 0 && Math.floor(frameCount / 4) % 2 === 0 ? 0.3 : 1;
+    }
+
+    const bx = p.x, by = p.y;
+    // Body
+    ctx.fillStyle = p.color;
+    ctx.fillRect(bx + 5, by + 10, 20, 25);
+    // Head
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(bx + 15, by + 8, 10, 0, Math.PI * 2);
+    ctx.fill();
+    // Eyes
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(bx + 12, by + 6, 3, 0, Math.PI * 2);
+    ctx.arc(bx + 19, by + 6, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(bx + 12, by + 6, 1.5, 0, Math.PI * 2);
+    ctx.arc(bx + 19, by + 6, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+    // Label
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('P' + p.id, bx + 15, by - 5);
+
+    ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+    // Player 1 score
+    ctx.fillStyle = '#4fc3f7';
+    ctx.font = 'bold 16px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('P1: ' + player1.gemsCollected + ' gems', 20, 30);
+
+    // Player 2 score
+    ctx.fillStyle = '#ff5252';
+    ctx.textAlign = 'right';
+    ctx.fillText('P2: ' + player2.gemsCollected + ' gems', W - 20, 30);
+
+    // Progress bar
+    let progress = Math.max(player1.x, player2.x) / LEVEL_WIDTH;
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.fillRect(W/2 - 100, 15, 200, 8);
+    ctx.fillStyle = '#ffd700';
+    ctx.fillRect(W/2 - 100, 15, 200 * progress, 8);
+
+    // Controls hint (fades after start)
+    if (frameCount < 300) {
+        let alpha = Math.min(1, (300 - frameCount) / 100);
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = 'rgba(255,255,255,0.7)';
+        ctx.font = '12px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('P1: WASD  |  P2: Arrow Keys', W/2, H - 20);
+        ctx.globalAlpha = 1;
+    }
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('DUAL DASH', W/2, H/2 - 100);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px monospace';
+    ctx.fillText('A Two-Player Side-Scrolling Race', W/2, H/2 - 60);
+
+    // Controls
+    ctx.fillStyle = '#4fc3f7';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText('PLAYER 1 (Blue)', W/2 - 150, H/2);
+    ctx.fillStyle = '#aaa';
+    ctx.font = '16px monospace';
+    ctx.fillText('W = Jump', W/2 - 150, H/2 + 30);
+    ctx.fillText('A = Left', W/2 - 150, H/2 + 55);
+    ctx.fillText('D = Right', W/2 - 150, H/2 + 80);
+
+    ctx.fillStyle = '#ff5252';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText('PLAYER 2 (Red)', W/2 + 150, H/2);
+    ctx.fillStyle = '#aaa';
+    ctx.font = '16px monospace';
+    ctx.fillText('Up = Jump', W/2 + 150, H/2 + 30);
+    ctx.fillText('Left = Move Left', W/2 + 150, H/2 + 55);
+    ctx.fillText('Right = Move Right', W/2 + 150, H/2 + 80);
+
+    // Instructions
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px monospace';
+    ctx.fillText('Race to the flag! Collect gems for bonus points.', W/2, H/2 + 130);
+    ctx.fillText('Avoid spikes and moving hazards!', W/2, H/2 + 155);
+
+    // Start prompt
+    const pulse = Math.sin(frameCount * 0.08) * 0.4 + 0.6;
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 22px monospace';
+    ctx.fillText('Press SPACE or ENTER to Start', W/2, H/2 + 210);
+    ctx.globalAlpha = 1;
+
+    // Decorative characters
+    drawCharPreview(W/2 - 150, H/2 + 260, '#4fc3f7');
+    drawCharPreview(W/2 + 150, H/2 + 260, '#ff5252');
+}
+
+function drawCharPreview(x, y, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(x - 10, y - 10, 20, 25);
+    ctx.beginPath();
+    ctx.arc(x, y - 18, 10, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px monospace';
+    ctx.textAlign = 'center';
+}
+
+function drawEndScreen() {
+    winTimer++;
+    // Darken
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+
+    const wColor = winner === 1 ? '#4fc3f7' : '#ff5252';
+    const p1Gems = player1.gemsCollected;
+    const p2Gems = player2.gemsCollected;
+
+    // Determine final winner considering gems
+    let finalWinner;
+    if (p1Gems > p2Gems) finalWinner = 1;
+    else if (p2Gems > p1Gems) finalWinner = 2;
+    else finalWinner = winner; // tiebreaker: who reached first
+
+    ctx.fillStyle = wColor;
+    ctx.font = 'bold 42px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('PLAYER ' + finalWinner + ' WINS!', W/2, H/2 - 60);
+
+    // Scores
+    ctx.fillStyle = '#ffd700';
+    ctx.font = '20px monospace';
+    const total1 = p1Gems * 100 + (finalWinner === 1 ? 500 : 0);
+    const total2 = p2Gems * 100 + (finalWinner === 2 ? 500 : 0);
+    ctx.fillText('P1: ' + p1Gems + ' gems (' + total1 + ' pts)', W/2 - 150, H/2);
+    ctx.fillText('P2: ' + p2Gems + ' gems (' + total2 + ' pts)', W/2 + 150, H/2);
+
+    if (p1Gems === p2Gems) {
+        ctx.fillStyle = '#aaa';
+        ctx.font = '14px monospace';
+        ctx.fillText('(Tie broken by finish order)', W/2, H/2 + 30);
+    }
+
+    const pulse = Math.sin(winTimer * 0.08) * 0.4 + 0.6;
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = '#fff';
+    ctx.font = '18px monospace';
+    ctx.fillText('Press R or ENTER to Play Again', W/2, H/2 + 80);
+    ctx.globalAlpha = 1;
+}
+
+// Main loop
+function gameLoop() {
+    frameCount++;
+
+    if (gameState === 'start') {
+        drawStartScreen();
+    } else if (gameState === 'playing') {
+        updatePlayer(player1);
+        updatePlayer(player2);
+        updateMovingSpikes();
+        updateCamera();
+        drawBackground();
+        drawWorld();
+        drawHUD();
+    } else if (gameState === 'finished') {
+        // Still render the world
+        drawBackground();
+        drawWorld();
+        drawHUD();
+        drawEndScreen();
+    }
+
+    requestAnimationFrame(gameLoop);
+}
+
+resetGame();
+gameLoop();
+</script>
+</body>
+</html>
