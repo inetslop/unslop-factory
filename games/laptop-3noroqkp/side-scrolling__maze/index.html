@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Maze Runner</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function() {
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    let W, H;
+    function resize() {
+        W = canvas.width = window.innerWidth;
+        H = canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // Maze config
+    const COLS = 80;
+    const ROWS = 12;
+    const CELL = 40;
+
+    let maze = [];
+    let player = { col: 0, row: 0, x: 0, y: 0, tx: 0, ty: 0, moving: false };
+    let goal = { col: COLS - 1, row: 5 };
+    let cameraX = 0;
+    let gameState = 'start'; // start, playing, won
+    let startTime = 0;
+    let finalTime = 0;
+    let particles = [];
+
+    // Audio
+    let audioCtx = null;
+    function initAudio() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    function playMove() {
+        if (!audioCtx) return;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.type = 'sine';
+        osc.frequency.value = 220;
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.1);
+    }
+    function playWin() {
+        if (!audioCtx) return;
+        const notes = [523, 659, 784, 1047];
+        notes.forEach((f, i) => {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.type = 'sine';
+            osc.frequency.value = f;
+            gain.gain.setValueAtTime(0.15, audioCtx.currentTime + i * 0.12);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + i * 0.12 + 0.3);
+            osc.start(audioCtx.currentTime + i * 0.12);
+            osc.stop(audioCtx.currentTime + i * 0.12 + 0.3);
+        });
+    }
+
+    // Maze generation (recursive backtracker)
+    function generateMaze() {
+        maze = [];
+        for (let r = 0; r < ROWS; r++) {
+            maze[r] = [];
+            for (let c = 0; c < COLS; c++) {
+                maze[r][c] = { top: true, right: true, bottom: true, left: true, visited: false };
+            }
+        }
+
+        const stack = [];
+        let cr = Math.floor(ROWS / 2);
+        let cc = 0;
+        maze[cr][cc].visited = true;
+        stack.push({ r: cr, c: cc });
+
+        while (stack.length > 0) {
+            const cur = stack[stack.length - 1];
+            const neighbors = [];
+            const dirs = [
+                { dr: -1, dc: 0, wall: 'top', opp: 'bottom' },
+                { dr: 0, dc: 1, wall: 'right', opp: 'left' },
+                { dr: 1, dc: 0, wall: 'bottom', opp: 'top' },
+                { dr: 0, dc: -1, wall: 'left', opp: 'right' }
+            ];
+
+            for (const d of dirs) {
+                const nr = cur.r + d.dr;
+                const nc = cur.c + d.dc;
+                if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS && !maze[nr][nc].visited) {
+                    neighbors.push({ r: nr, c: nc, wall: d.wall, opp: d.opp });
+                }
+            }
+
+            if (neighbors.length === 0) {
+                stack.pop();
+            } else {
+                const next = neighbors[Math.floor(Math.random() * neighbors.length)];
+                maze[cur.r][cur.c][next.wall] = false;
+                maze[next.r][next.c][next.opp] = false;
+                maze[next.r][next.c].visited = true;
+                stack.push({ r: next.r, c: next.c });
+            }
+        }
+
+        // Add extra passages to create loops (makes it less frustrating)
+        const extraPassages = Math.floor(COLS * ROWS * 0.05);
+        for (let i = 0; i < extraPassages; i++) {
+            const r = Math.floor(Math.random() * ROWS);
+            const c = Math.floor(Math.random() * COLS);
+            if (c < COLS - 1) {
+                maze[r][c].right = false;
+                maze[r][c + 1].left = false;
+            } else if (r < ROWS - 1) {
+                maze[r][c].bottom = false;
+                maze[r + 1][c].top = false;
+            }
+        }
+
+        // Ensure start and goal are open
+        maze[cr][0].left = true;
+        if (COLS > 1) maze[cr][0].right = false, maze[cr][1].left = false;
+    }
+
+    function canMove(dr, dc) {
+        const r = player.row + dr;
+        const c = player.col + dc;
+        if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return false;
+        if (dr === -1 && maze[player.row][player.col].top) return false;
+        if (dr === 1 && maze[player.row][player.col].bottom) return false;
+        if (dc === -1 && maze[player.row][player.col].left) return false;
+        if (dc === 1 && maze[player.row][player.col].right) return false;
+        return true;
+    }
+
+    function startGame() {
+        generateMaze();
+        player.col = 0;
+        player.row = Math.floor(ROWS / 2);
+        player.x = player.col * CELL + CELL / 2;
+        player.y = player.row * CELL + CELL / 2;
+        player.tx = player.x;
+        player.ty = player.y;
+        player.moving = false;
+        cameraX = 0;
+        startTime = performance.now();
+        finalTime = 0;
+        particles = [];
+        gameState = 'playing';
+    }
+
+    // Particles for win effect
+    function spawnParticles() {
+        for (let i = 0; i < 60; i++) {
+            const angle = Math.random() * Math.PI * 2;
+            const speed = 2 + Math.random() * 4;
+            particles.push({
+                x: goal.col * CELL + CELL / 2,
+                y: goal.row * CELL + CELL / 2,
+                vx: Math.cos(angle) * speed,
+                vy: Math.sin(angle) * speed,
+                life: 1,
+                color: `hsl(${Math.random() * 60}, 100%, 60%)`
+            });
+        }
+    }
+
+    function updateParticles(dt) {
+        for (let i = particles.length - 1; i >= 0; i--) {
+            const p = particles[i];
+            p.x += p.vx;
+            p.y += p.vy;
+            p.vy += 0.1;
+            p.life -= dt * 0.8;
+            if (p.life <= 0) particles.splice(i, 1);
+        }
+    }
+
+    // Input
+    let keys = {};
+    window.addEventListener('keydown', function(e) {
+        keys[e.key] = true;
+        if (gameState === 'start' || gameState === 'won') {
+            initAudio();
+            startGame();
+        }
+        if (gameState !== 'playing') return;
+        if (!player.moving) {
+            let dr = 0, dc = 0;
+            if (e.key === 'ArrowUp' || e.key === 'w' || e.key === 'W') dr = -1;
+            if (e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') dr = 1;
+            if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') dc = -1;
+            if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') dc = 1;
+
+            if ((dr !== 0 || dc !== 0) && canMove(dr, dc)) {
+                player.moving = true;
+                const nr = player.row + dr;
+                const nc = player.col + dc;
+                player.tx = nc * CELL + CELL / 2;
+                player.ty = nr * CELL + CELL / 2;
+                playMove();
+            }
+        }
+    });
+    window.addEventListener('keyup', function(e) { keys[e.key] = false; });
+
+    // Rendering
+    function drawMaze() {
+        const offsetX = -cameraX;
+        ctx.strokeStyle = '#4a9eff';
+        ctx.lineWidth = 3;
+        ctx.lineCap = 'round';
+
+        for (let r = 0; r < ROWS; r++) {
+            for (let c = 0; c < COLS; c++) {
+                const x = c * CELL + offsetX;
+                const y = r * CELL;
+                if (x > W + CELL || x < -CELL) continue;
+
+                const cell = maze[r][c];
+                ctx.beginPath();
+                if (cell.top) { ctx.moveTo(x, y); ctx.lineTo(x + CELL, y); }
+                if (cell.left) { ctx.moveTo(x, y); ctx.lineTo(x, y + CELL); }
+                // Only draw right/bottom if not last to avoid double-draw
+                if (c === COLS - 1 && cell.right) { ctx.moveTo(x + CELL, y); ctx.lineTo(x + CELL, y + CELL); }
+                if (r === ROWS - 1 && cell.bottom) { ctx.moveTo(x, y + CELL); ctx.lineTo(x + CELL, y + CELL); }
+                ctx.stroke();
+            }
+        }
+
+        // Draw right walls for non-last columns and bottom for non-last rows
+        ctx.beginPath();
+        for (let r = 0; r < ROWS; r++) {
+            for (let c = 0; c < COLS - 1; c++) {
+                const x = c * CELL + offsetX;
+                const y = r * CELL;
+                if (x > W + CELL || x < -CELL) continue;
+                if (maze[r][c].right) { ctx.moveTo(x + CELL, y); ctx.lineTo(x + CELL, y + CELL); }
+            }
+        }
+        for (let c = 0; c < COLS; c++) {
+            for (let r = 0; r < ROWS - 1; r++) {
+                const x = c * CELL + offsetX;
+                const y = r * CELL;
+                if (x > W + CELL || x < -CELL) continue;
+                if (maze[r][c].bottom) { ctx.moveTo(x, y + CELL); ctx.lineTo(x + CELL, y + CELL); }
+            }
+        }
+        ctx.stroke();
+    }
+
+    function drawGoal() {
+        const gx = goal.col * CELL + CELL / 2 - cameraX;
+        const gy = goal.row * CELL + CELL / 2;
+        const pulse = Math.sin(performance.now() * 0.005) * 3;
+
+        ctx.beginPath();
+        ctx.arc(gx, gy, 14 + pulse, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffd700';
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(gx, gy, 8, 0, Math.PI * 2);
+        ctx.fillStyle = '#fff';
+        ctx.fill();
+    }
+
+    function drawPlayer() {
+        const px = player.x - cameraX;
+        const py = player.y;
+        const pulse = Math.sin(performance.now() * 0.004) * 2;
+
+        ctx.beginPath();
+        ctx.arc(px, py, 12 + pulse, 0, Math.PI * 2);
+        ctx.fillStyle = '#ff6b6b';
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(px, py, 7, 0, Math.PI * 2);
+        ctx.fillStyle = '#fff';
+        ctx.fill();
+    }
+
+    function drawParticles() {
+        for (const p of particles) {
+            ctx.globalAlpha = p.life;
+            ctx.beginPath();
+            ctx.arc(p.x - cameraX, p.y, 4 * p.life, 0, Math.PI * 2);
+            ctx.fillStyle = p.color;
+            ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+    }
+
+    function drawHUD() {
+        if (gameState === 'playing') {
+            const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+            ctx.font = 'bold 18px monospace';
+            ctx.fillStyle = '#fff';
+            ctx.textAlign = 'left';
+            ctx.fillText(`Time: ${elapsed}s`, 20, 35);
+
+            // Progress bar
+            const progress = player.col / (COLS - 1);
+            const barW = 200;
+            ctx.fillStyle = 'rgba(255,255,255,0.2)';
+            ctx.fillRect(W - barW - 20, 20, barW, 10);
+            ctx.fillStyle = '#4a9eff';
+            ctx.fillRect(W - barW - 20, 20, barW * progress, 10);
+        }
+    }
+
+    function drawStartScreen() {
+        ctx.fillStyle = 'rgba(26, 26, 46, 0.95)';
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 48px monospace';
+        ctx.fillStyle = '#4a9eff';
+        ctx.fillText('MAZE RUNNER', W / 2, H / 3);
+
+        ctx.font = '20px monospace';
+        ctx.fillStyle = '#ccc';
+        ctx.fillText('Navigate the maze from left to right!', W / 2, H / 3 + 60);
+        ctx.fillText('', W / 2, H / 3 + 100);
+        ctx.font = '18px monospace';
+        ctx.fillStyle = '#aaa';
+        ctx.fillText('Controls: Arrow Keys / WASD', W / 2, H / 3 + 140);
+        ctx.fillText('', W / 2, H / 3 + 170);
+
+        const blink = Math.sin(performance.now() * 0.003) > 0;
+        if (blink) {
+            ctx.font = 'bold 22px monospace';
+            ctx.fillStyle = '#fff';
+            ctx.fillText('Press any key to start', W / 2, H / 3 + 220);
+        }
+    }
+
+    function drawWinScreen() {
+        ctx.fillStyle = 'rgba(26, 26, 46, 0.8)';
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 48px monospace';
+        ctx.fillStyle = '#ffd700';
+        ctx.fillText('MAZE COMPLETE!', W / 2, H / 3);
+
+        ctx.font = '24px monospace';
+        ctx.fillStyle = '#fff';
+        ctx.fillText(`Time: ${finalTime.toFixed(1)}s`, W / 2, H / 3 + 60);
+
+        const blink = Math.sin(performance.now() * 0.003) > 0;
+        if (blink) {
+            ctx.font = '20px monospace';
+            ctx.fillStyle = '#aaa';
+            ctx.fillText('Press any key to play again', W / 2, H / 3 + 140);
+        }
+    }
+
+    // Game loop
+    let lastTime = performance.now();
+    function gameLoop(now) {
+        const dt = Math.min((now - lastTime) / 16.67, 3);
+        lastTime = now;
+
+        ctx.fillStyle = '#1a1a2e';
+        ctx.fillRect(0, 0, W, H);
+
+        if (gameState === 'start') {
+            drawStartScreen();
+        } else if (gameState === 'playing') {
+            // Update player position
+            const speed = 8 * dt;
+            if (player.moving) {
+                const dx = player.tx - player.x;
+                const dy = player.ty - player.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist <= speed) {
+                    player.x = player.tx;
+                    player.y = player.ty;
+                    player.col = Math.round((player.tx - CELL / 2) / CELL);
+                    player.row = Math.round((player.ty - CELL / 2) / CELL);
+                    player.moving = false;
+
+                    if (player.col === goal.col && player.row === goal.row) {
+                        finalTime = (performance.now() - startTime) / 1000;
+                        gameState = 'won';
+                        spawnParticles();
+                        playWin();
+                    }
+                } else {
+                    player.x += (dx / dist) * speed;
+                    player.y += (dy / dist) * speed;
+                }
+            }
+
+            // Camera follow
+            const targetCamX = player.x - W / 2 + CELL / 2;
+            cameraX += (targetCamX - cameraX) * 0.08 * dt;
+            if (cameraX < 0) cameraX = 0;
+            const maxCam = COLS * CELL - W;
+            if (cameraX > maxCam) cameraX = maxCam;
+
+            drawMaze();
+            drawGoal();
+            drawPlayer();
+            drawHUD();
+        } else if (gameState === 'won') {
+            updateParticles(dt);
+            drawMaze();
+            drawGoal();
+            drawPlayer();
+            drawParticles();
+            drawWinScreen();
+        }
+
+        requestAnimationFrame(gameLoop);
+    }
+
+    // Try localStorage for best time
+    let bestTime = null;
+    try {
+        const saved = localStorage.getItem('mazeRunnerBest');
+        if (saved) bestTime = parseFloat(saved);
+    } catch(e) {}
+
+    function saveTime(t) {
+        try {
+            if (!bestTime || t < bestTime) {
+                bestTime = t;
+                localStorage.setItem('mazeRunnerBest', bestTime.toString());
+            }
+        } catch(e) {}
+    }
+
+    // Override win to save time
+    const origStartGame = startGame;
+    startGame = function() {
+        generateMaze();
+        player.col = 0;
+        player.row = Math.floor(ROWS / 2);
+        player.x = player.col * CELL + CELL / 2;
+        player.y = player.row * CELL + CELL / 2;
+        player.tx = player.x;
+        player.ty = player.y;
+        player.moving = false;
+        cameraX = 0;
+        startTime = performance.now();
+        finalTime = 0;
+        particles = [];
+        gameState = 'playing';
+    };
+
+    // Patch win detection
+    const _origLoop = gameLoop;
+
+    requestAnimationFrame(gameLoop);
+
+    // Save best time on win (hooked into the loop via interval check)
+    setInterval(function() {
+        if (gameState === 'won' && finalTime > 0) {
+            saveTime(finalTime);
+        }
+    }, 100);
+
+})();
+</script>
+</body>
+</html>
