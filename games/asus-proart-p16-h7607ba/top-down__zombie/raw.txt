@@ -1,0 +1,417 @@
+<think>
+Make a top-down zombie shooter: WASD movement, mouse aiming, click to shoot (or space). Zombies spawn in waves, health, score, start screen, game over with restart. Single HTML file, canvas scaled to the window, Web Audio for sound effects after the first input.
+
+Let's write clean code. Features:
+- Fullscreen canvas, resize handler.
+- Player: position, angle toward mouse, health, speed, weapon cooldown.
+- Bullets.
+- Zombies spawn from edges in waves, chase the player, damage on contact.
+- Score, wave counter, HP bar, ammo optional — keep it simple: unlimited ammo with a fire rate.
+- Start screen overlay (HTML div), game over screen with restart button/key R.
+- Sound: shooting blip sound, zombie hit, player hurt, via WebAudio.
+
+Add a bit of polish: grid background, blood particles, muzzle flash. Keep the code reasonably compact.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Zombie Overrun</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#0a0c0a; font-family:'Courier New',monospace; }
+  #wrap { position:fixed; inset:0; }
+  canvas { display:block; width:100%; height:100%; cursor:crosshair; }
+  .overlay {
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; text-align:center;
+    background:rgba(5,8,5,.82); color:#cfe8cf; z-index:10; padding:20px;
+  }
+  .hidden { display:none !important; }
+  h1 { font-size:min(9vw,64px); letter-spacing:4px; color:#7dff7d; text-shadow:0 0 18px #2f5, 3px 3px 0 #132; margin-bottom:14px; }
+  h1.dead { color:#ff5b5b; text-shadow:0 0 18px #a22, 3px 3px 0 #211; }
+  .sub { font-size:min(4.5vw,20px); line-height:1.7; margin-bottom:26px; color:#9fc79f; }
+  .key { display:inline-block; background:#1c2a1c; border:1px solid #3f5f3f; border-radius:4px; padding:2px 8px; margin:0 2px; color:#dfffe0; }
+  button {
+    font-family:inherit; font-size:min(5vw,22px); letter-spacing:2px; cursor:pointer;
+    background:#16301a; color:#8fff8f; border:2px solid #4caf50; border-radius:6px;
+    padding:12px 34px; transition:all .15s;
+  }
+  button:hover { background:#255c2c; box-shadow:0 0 18px rgba(80,255,120,.5); transform:scale(1.05); }
+  #hud { position:absolute; top:10px; left:14px; z-index:5; color:#dfffe0; font-size:min(3.6vw,17px); pointer-events:none; text-shadow:2px 2px 0 #000; line-height:1.6; }
+  #hpbar { width:min(40vw,220px); height:14px; border:2px solid #555; background:#200; margin-top:3px; }
+  #hpfill { height:100%; width:100%; background:linear-gradient(90deg,#f33,#8f0); transition:width .1s; }
+  #wavebanner { position:absolute; top:16%; left:0; right:0; text-align:center; z-index:5;
+    font-size:min(7vw,42px); color:#ff9d5b; text-shadow:3px 3px 0 #000; pointer-events:none; opacity:0; transition:opacity .4s; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+  <div id="hud" class="hidden">
+    SCORE <span id="score">0</span><br>
+    WAVE <span id="wave">1</span><br>
+    HP <div id="hpbar"><div id="hpfill"></div></div>
+  </div>
+  <div id="wavebanner"></div>
+
+  <div id="startScreen" class="overlay">
+    <h1>ZOMBIE OVERRUN</h1>
+    <div class="sub">
+      The horde is coming. Survive as many waves as you can.<br><br>
+      <span class="key">W</span><span class="key">A</span><span class="key">S</span><span class="key">D</span> Move &nbsp;
+      <span class="key">MOUSE</span> Aim<br>
+      <span class="key">CLICK / HOLD</span> Shoot &nbsp; <span class="key">SHIFT</span> Sprint<br>
+      <span class="key">R</span> Restart
+    </div>
+    <button id="startBtn">START GAME</button>
+  </div>
+
+  <div id="gameOverScreen" class="overlay hidden">
+    <h1 class="dead">YOU DIED</h1>
+    <div class="sub">
+      Final Score: <span id="finalScore" style="color:#fff;font-size:1.4em;">0</span><br>
+      Waves Survived: <span id="finalWave">0</span>
+    </div>
+    <button id="restartBtn">PLAY AGAIN</button>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W=0,H=0;
+function resize(){ W=canvas.width=window.innerWidth; H=canvas.height=window.innerHeight; }
+window.addEventListener('resize', resize); resize();
+
+// ---------- Audio (created on first input) ----------
+let actx=null;
+function audio(){ if(!actx){ try{ actx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } return actx; }
+function beep(freq, dur, type, vol, slide){
+  const a=audio(); if(!a) return;
+  const o=a.createOscillator(), g=a.createGain();
+  o.type=type||'square'; o.frequency.setValueAtTime(freq,a.currentTime);
+  if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(30,freq+slide), a.currentTime+dur);
+  g.gain.setValueAtTime(vol||0.12, a.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, a.currentTime+dur);
+  o.connect(g); g.connect(a.destination);
+  o.start(); o.stop(a.currentTime+dur);
+}
+const sfx = {
+  shoot: ()=>beep(220,0.08,'square',0.07,-140),
+  hit:   ()=>beep(90,0.12,'sawtooth',0.1,-40),
+  hurt:  ()=>beep(65,0.25,'sawtooth',0.18,-30),
+  kill:  ()=>beep(140,0.18,'triangle',0.12,-90),
+  wave:  ()=>{ beep(300,0.15,'square',0.08); setTimeout(()=>beep(450,0.2,'square',0.08),160); },
+  die:   ()=>beep(120,0.7,'sawtooth',0.2,-90)
+};
+
+// ---------- State ----------
+const keys={};
+let mouse={x:W/2,y:H/2,down:false};
+let state='menu'; // menu | playing | dead
+let player, bullets, zombies, particles, score, wave, waveTimer, spawnQueue, spawnTimer, shake;
+
+function reset(){
+  player={x:W/2,y:H/2,r:14,hp:100,maxHp:100,angle:0,speed:230,fireCd:0,recoil:0};
+  bullets=[]; zombies=[]; particles=[];
+  score=0; wave=0; waveTimer=2; spawnQueue=0; spawnTimer=0; shake=0;
+}
+
+function startGame(){
+  reset();
+  state='playing';
+  document.getElementById('startScreen').classList.add('hidden');
+  document.getElementById('gameOverScreen').classList.add('hidden');
+  document.getElementById('hud').classList.remove('hidden');
+  audio(); if(actx && actx.state==='suspended') actx.resume();
+  nextWave();
+}
+
+function gameOver(){
+  state='dead'; sfx.die();
+  document.getElementById('finalScore').textContent=score;
+  document.getElementById('finalWave').textContent=wave;
+  setTimeout(()=>document.getElementById('gameOverScreen').classList.remove('hidden'),700);
+}
+
+function nextWave(){
+  wave++;
+  spawnQueue = 5 + wave*3;
+  spawnTimer = 0;
+  sfx.wave();
+  const b=document.getElementById('wavebanner');
+  b.textContent='WAVE '+wave;
+  b.style.opacity=1;
+  setTimeout(()=>b.style.opacity=0,1600);
+}
+
+function spawnZombie(){
+  const edge=Math.floor(Math.random()*4);
+  let x,y;
+  if(edge===0){x=Math.random()*W; y=-30;}
+  else if(edge===1){x=W+30; y=Math.random()*H;}
+  else if(edge===2){x=Math.random()*W; y=H+30;}
+  else {x=-30; y=Math.random()*H;}
+  const tank = Math.random() < Math.min(0.05+wave*0.015,0.25);
+  zombies.push({
+    x,y,
+    r: tank?24:15,
+    hp: (tank?6:2) + Math.floor(wave*0.6),
+    maxHp:(tank?6:2)+Math.floor(wave*0.6),
+    speed: (tank? 45+wave*3 : 70+wave*6) + Math.random()*25,
+    dmg: tank?18:9,
+    hitCd:0, wob:Math.random()*Math.PI*2,
+    color: tank ? '#4a6b3a' : (['#5d8a4a','#6b7f45','#4e7d5c'][Math.floor(Math.random()*3)])
+  });
+}
+
+// ---------- Input ----------
+window.addEventListener('keydown', e=>{
+  keys[e.key.toLowerCase()]=true;
+  if(e.key==='r'||e.key==='R'){ if(state!=='menu') startGame(); }
+  if((e.key===' '||e.key==='Enter') && state!=='playing') startGame();
+});
+window.addEventListener('keyup', e=>{ keys[e.key.toLowerCase()]=false; });
+canvas.addEventListener('mousemove', e=>{ const r=canvas.getBoundingClientRect(); mouse.x=e.clientX-r.left; mouse.y=e.clientY-r.top; });
+canvas.addEventListener('mousedown', ()=>{ mouse.down=true; audio(); if(actx&&actx.state==='suspended')actx.resume(); });
+window.addEventListener('mouseup', ()=>mouse.down=false);
+canvas.addEventListener('contextmenu', e=>e.preventDefault());
+document.getElementById('startBtn').addEventListener('click', startGame);
+document.getElementById('restartBtn').addEventListener('click', startGame);
+
+// ---------- Update ----------
+function addBlood(x,y,n,color){
+  for(let i=0;i<n;i++){
+    const a=Math.random()*Math.PI*2, s=40+Math.random()*160;
+    particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:0.3+Math.random()*0.4,maxLife:0.7,color:color||'#8a1f1f',size:2+Math.random()*3});
+  }
+}
+
+function update(dt){
+  if(state!=='playing') { // still animate particles on death screen
+    for(let i=particles.length-1;i>=0;i--){ const p=particles[i]; p.life-=dt; p.x+=p.vx*dt; p.y+=p.vy*dt; p.vx*=0.92; p.vy*=0.92; if(p.life<=0)particles.splice(i,1); }
+    shake=Math.max(0,shake-dt*30);
+    return;
+  }
+
+  // player move
+  let dx=0,dy=0;
+  if(keys['w']||keys['arrowup'])dy-=1;
+  if(keys['s']||keys['arrowdown'])dy+=1;
+  if(keys['a']||keys['arrowleft'])dx-=1;
+  if(keys['d']||keys['arrowright'])dx+=1;
+  const sprint = (keys['shift']) ? 1.5 : 1;
+  if(dx||dy){ const l=Math.hypot(dx,dy); player.x+=dx/l*player.speed*sprint*dt; player.y+=dy/l*player.speed*sprint*dt; }
+  player.x=Math.max(player.r,Math.min(W-player.r,player.x));
+  player.y=Math.max(player.r,Math.min(H-player.r,player.y));
+  player.angle=Math.atan2(mouse.y-player.y,mouse.x-player.x);
+  player.recoil=Math.max(0,player.recoil-dt*10);
+
+  // shooting
+  player.fireCd-=dt;
+  if(mouse.down && player.fireCd<=0){
+    player.fireCd=0.13;
+    player.recoil=1;
+    const spread=(Math.random()-0.5)*0.09;
+    const a=player.angle+spread;
+    bullets.push({x:player.x+Math.cos(a)*20, y:player.y+Math.sin(a)*20, vx:Math.cos(a)*720, vy:Math.sin(a)*720, life:1.4});
+    sfx.shoot();
+  }
+
+  // bullets
+  for(let i=bullets.length-1;i>=0;i--){
+    const b=bullets[i];
+    b.x+=b.vx*dt; b.y+=b.vy*dt; b.life-=dt;
+    if(b.life<=0||b.x<-20||b.x>W+20||b.y<-20||b.y>H+20){ bullets.splice(i,1); continue; }
+    for(let j=zombies.length-1;j>=0;j--){
+      const z=zombies[j];
+      if(Math.hypot(b.x-z.x,b.y-z.y) < z.r+3){
+        z.hp--; addBlood(b.x,b.y,5,'#8a1f1f'); sfx.hit();
+        bullets.splice(i,1);
+        if(z.hp<=0){
+          score += (z.r>20?25:10);
+          addBlood(z.x,z.y,14,'#7a1616'); sfx.kill();
+          zombies.splice(j,1);
+        }
+        break;
+      }
+    }
+  }
+
+  // wave spawning
+  if(spawnQueue>0){
+    spawnTimer-=dt;
+    if(spawnTimer<=0){
+      spawnZombie(); spawnQueue--;
+      spawnTimer = Math.max(0.25, 1.1 - wave*0.06);
+    }
+  } else if(zombies.length===0){
+    waveTimer-=dt;
+    if(waveTimer<=0){ waveTimer=2.5; nextWave(); }
+  }
+
+  // zombies
+  for(let i=zombies.length-1;i>=0;i--){
+    const z=zombies[i];
+    z.wob+=dt*6;
+    const a=Math.atan2(player.y-z.y, player.x-z.x);
+    const wobble=Math.sin(z.wob)*0.35;
+    z.x+=Math.cos(a+wobble)*z.speed*dt;
+    z.y+=Math.sin(a+wobble)*z.speed*dt;
+    z.hitCd-=dt;
+    // separation
+    for(let k=0;k<zombies.length;k++){
+      if(k===i)continue;
+      const o=zombies[k], ddx=z.x-o.x, ddy=z.y-o.y, d=Math.hypot(ddx,ddy), min=z.r+o.r;
+      if(d>0 && d<min){ z.x+=ddx/d*(min-d)*0.5; z.y+=ddy/d*(min-d)*0.5; }
+    }
+    // hit player
+    const pd=Math.hypot(player.x-z.x,player.y-z.y);
+    if(pd < z.r+player.r && z.hitCd<=0){
+      z.hitCd=0.7;
+      player.hp-=z.dmg;
+      shake=8; sfx.hurt();
+      addBlood(player.x,player.y,8,'#c22');
+      const ka=Math.atan2(z.y-player.y,z.x-player.x);
+      z.x+=Math.cos(ka)*30; z.y+=Math.sin(ka)*30;
+      if(player.hp<=0){ player.hp=0; addBlood(player.x,player.y,40,'#c22'); gameOver(); return; }
+    }
+  }
+
+  // particles
+  for(let i=particles.length-1;i>=0;i--){ const p=particles[i]; p.life-=dt; p.x+=p.vx*dt; p.y+=p.vy*dt; p.vx*=0.92; p.vy*=0.92; if(p.life<=0)particles.splice(i,1); }
+  shake=Math.max(0,shake-dt*30);
+
+  // hud
+  document.getElementById('score').textContent=score;
+  document.getElementById('wave').textContent=wave;
+  document.getElementById('hpfill').style.width=(player.hp/player.maxHp*100)+'%';
+}
+
+// ---------- Render ----------
+function draw(){
+  ctx.save();
+  if(shake>0) ctx.translate((Math.random()-0.5)*shake,(Math.random()-0.5)*shake);
+
+  // ground
+  ctx.fillStyle='#141a12'; ctx.fillRect(-20,-20,W+40,H+40);
+  ctx.strokeStyle='rgba(60,80,50,0.25)'; ctx.lineWidth=1;
+  const g=64;
+  ctx.beginPath();
+  for(let x=0;x<W;x+=g){ ctx.moveTo(x,0); ctx.lineTo(x,H); }
+  for(let y=0;y<H;y+=g){ ctx.moveTo(0,y); ctx.lineTo(W,y); }
+  ctx.stroke();
+  // subtle ground stains
+  ctx.fillStyle='rgba(40,25,20,0.3)';
+  for(let i=0;i<8;i++){
+    const sx=(i*197)%W, sy=(i*311)%H;
+    ctx.beginPath(); ctx.ellipse(sx,sy,30+(i%3)*14,20+(i%2)*10,i,0,Math.PI*2); ctx.fill();
+  }
+
+  if(state==='menu'){ ctx.restore(); return; }
+
+  // particles under entities
+  for(const p of particles){
+    ctx.globalAlpha=Math.max(0,p.life/p.maxLife);
+    ctx.fillStyle=p.color;
+    ctx.fillRect(p.x-p.size/2,p.y-p.size/2,p.size,p.size);
+  }
+  ctx.globalAlpha=1;
+
+  // bullets
+  for(const b of bullets){
+    const a=Math.atan2(b.vy,b.vx);
+    ctx.save(); ctx.translate(b.x,b.y); ctx.rotate(a);
+    ctx.fillStyle='#ffd97a'; ctx.fillRect(-8,-2,14,4);
+    ctx.fillStyle='rgba(255,200,80,.4)'; ctx.fillRect(-16,-1.5,10,3);
+    ctx.restore();
+  }
+
+  // zombies
+  for(const z of zombies){
+    const a=Math.atan2(player.y-z.y,player.x-z.x);
+    ctx.save(); ctx.translate(z.x,z.y);
+    // shadow
+    ctx.fillStyle='rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(0,z.r*0.6,z.r*0.9,z.r*0.4,0,0,Math.PI*2); ctx.fill();
+    ctx.rotate(a);
+    // arms reaching forward
+    const armSwing=Math.sin(z.wob*1.5)*0.3;
+    ctx.fillStyle=z.color;
+    for(const s of [-1,1]){
+      ctx.save(); ctx.rotate(s*(0.7+armSwing*s));
+      ctx.fillRect(0,-3,z.r*1.4,6);
+      ctx.restore();
+    }
+    // body
+    ctx.beginPath(); ctx.arc(0,0,z.r,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='rgba(0,0,0,.4)'; ctx.lineWidth=2; ctx.stroke();
+    // head
+    ctx.fillStyle='#7ea86d';
+    ctx.beginPath(); ctx.arc(z.r*0.35,0,z.r*0.45,0,Math.PI*2); ctx.fill();
+    // eyes
+    ctx.fillStyle='#ff4444';
+    ctx.beginPath(); ctx.arc(z.r*0.55,-z.r*0.18,2.2,0,Math.PI*2); ctx.arc(z.r*0.55,z.r*0.18,2.2,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+    // hp bar if damaged
+    if(z.hp<z.maxHp){
+      const w=z.r*2;
+      ctx.fillStyle='#300'; ctx.fillRect(z.x-w/2,z.y-z.r-10,w,4);
+      ctx.fillStyle='#d33'; ctx.fillRect(z.x-w/2,z.y-z.r-10,w*(z.hp/z.maxHp),4);
+    }
+  }
+
+  // player
+  if(state==='playing'){
+    const p=player;
+    ctx.save(); ctx.translate(p.x,p.y);
+    ctx.fillStyle='rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(0,p.r*0.6,p.r*0.9,p.r*0.4,0,0,Math.PI*2); ctx.fill();
+    ctx.rotate(p.angle);
+    // gun
+    const rec=p.recoil*4;
+    ctx.fillStyle='#2a2a2e'; ctx.fillRect(6-rec,-3,20,6);
+    // muzzle flash
+    if(p.recoil>0.6){
+      ctx.fillStyle='rgba(255,220,120,'+(p.recoil-0.6)*2+')';
+      ctx.beginPath(); ctx.arc(28-rec,0,7+Math.random()*4,0,Math.PI*2); ctx.fill();
+    }
+    // body
+    ctx.fillStyle='#c9b98a';
+    ctx.beginPath(); ctx.arc(0,0,p.r,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='rgba(0,0,0,.5)'; ctx.lineWidth=2; ctx.stroke();
+    // head
+    ctx.fillStyle='#e8d3a0';
+    ctx.beginPath(); ctx.arc(p.r*0.3,0,p.r*0.45,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  ctx.restore();
+
+  // vignette when hurt
+  if(state==='playing' && player.hp<35){
+    const v=ctx.createRadialGradient(W/2,H/2,Math.min(W,H)*0.3,W/2,H/2,Math.max(W,H)*0.7);
+    v.addColorStop(0,'rgba(120,0,0,0)');
+    v.addColorStop(1,'rgba(120,0,0,'+(0.4*(1-player.hp/35))+')');
+    ctx.fillStyle=v; ctx.fillRect(0,0,W,H);
+  }
+}
+
+// ---------- Loop ----------
+let last=performance.now();
+function loop(t){
+  const dt=Math.min(0.05,(t-last)/1000); last=t;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+reset();
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
+```
