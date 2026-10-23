@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Minesweeper Frogger</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0b1220;font-family:'Courier New',monospace;}
+  #wrap{position:fixed;inset:0;}
+  canvas{display:block;width:100%;height:100%;}
+  .overlay{
+    position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:rgba(5,10,20,.82);color:#eaf6ff;text-align:center;z-index:5;padding:20px;box-sizing:border-box;
+  }
+  .overlay h1{font-size:clamp(28px,6vw,58px);margin:0 0 8px;color:#7CFC00;text-shadow:0 0 18px #3a7d00;letter-spacing:2px;}
+  .overlay h2{font-size:clamp(20px,4vw,36px);margin:0 0 10px;}
+  .overlay p{font-size:clamp(13px,2.2vw,18px);line-height:1.7;margin:6px 0;color:#cfe4ff;max-width:560px;}
+  .big{font-size:clamp(16px,3vw,24px);color:#ffd94a;}
+  button{
+    margin-top:18px;font-family:inherit;font-size:clamp(15px,2.5vw,20px);padding:12px 34px;cursor:pointer;
+    background:#1c3b12;color:#aaff66;border:2px solid #7CFC00;border-radius:8px;letter-spacing:1px;
+  }
+  button:hover{background:#2a5519;}
+  .hidden{display:none !important;}
+  kbd{background:#22344d;padding:2px 7px;border-radius:4px;border:1px solid #46608a;color:#fff;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+
+  <div id="startScreen" class="overlay">
+    <h1>MINE-SWEEPER FROGGER</h1>
+    <p>A frog's crossing, but the land is full of hidden mines.</p>
+    <p>The numbers on each tile tell you how many mines are next to it.<br>
+       Use them to plan a safe path across.</p>
+    <p><kbd>&larr;</kbd> <kbd>&uarr;</kbd> <kbd>&darr;</kbd> <kbd>&rarr;</kbd> / <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> &nbsp;hop one tile<br>
+       Reach the top row and capture all <b>5 pads</b> before time runs out. 3 lives.</p>
+    <button id="startBtn">START HOPPING (ENTER)</button>
+  </div>
+
+  <div id="endScreen" class="overlay hidden">
+    <h2 id="endTitle"></h2>
+    <p id="endMsg"></p>
+    <p class="big" id="endScore"></p>
+    <p id="endBest"></p>
+    <button id="restartBtn">PLAY AGAIN (R)</button>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+/* ---------- setup ---------- */
+var cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+var startScreen=document.getElementById('startScreen'), endScreen=document.getElementById('endScreen');
+var COLS=13, ROWS=9;          // row 0 = goal pads, rows 1..8 = hazard field
+var PAD_COLS=[2,4,6,8,10];
+var MINE_PROB=0.30, TIME_LIMIT=90;
+
+var state='start';            // start | play | over | win
+var grid=[], player={x:6,y:8}, lives=3, timeLeft=TIME_LIMIT, score=0;
+var pads=[];                  // captured flags per PAD_COLS
+var particles=[], hopT=1, hopFrom=null, best=0;
+try{ best=parseInt(localStorage.getItem('mfrog_best')||'0',10)||0; }catch(e){}
+
+/* ---------- audio (starts after first input) ---------- */
+var AC=null;
+function audio(){ if(!AC){ try{ AC=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } if(AC&&AC.state==='suspended')AC.resume(); return AC; }
+function beep(f,d,type,g,slide){
+  var a=audio(); if(!a)return;
+  var o=a.createOscillator(), gn=a.createGain();
+  o.type=type||'square'; o.frequency.value=f;
+  if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(30,f+slide), a.currentTime+d);
+  gn.gain.value=g||0.08; gn.gain.exponentialRampToValueAtTime(0.0001,a.currentTime+d);
+  o.connect(gn); gn.connect(a.destination); o.start(); o.stop(a.currentTime+d);
+}
+function sfxMove(){ beep(340,0.07,'square',0.05,120); }
+function sfxBoom(){ beep(90,0.5,'sawtooth',0.22,-60); beep(55,0.6,'triangle',0.2,-30); }
+function sfxPad(){ beep(660,0.1,'square',0.08,200); setTimeout(function(){beep(990,0.14,'square',0.08,200);},90); }
+function sfxWin(){ [523,659,784,1047].forEach(function(f,i){setTimeout(function(){beep(f,0.18,'square',0.09);},i*130);}); }
+function sfxLose(){ [400,320,240,160].forEach(function(f,i){setTimeout(function(){beep(f,0.22,'sawtooth',0.1,-40);},i*150);}); }
+
+/* ---------- board generation ---------- */
+function neighbors(x,y){ return [[x+1,y],[x-1,y],[x,y+1],[x,y-1]]; }
+function genBoard(){
+  for(var tries=0;tries<80;tries++){
+    grid=[];
+    for(var y=0;y<ROWS;y++){
+      grid[y]=[];
+      for(var x=0;x<COLS;x++){
+        var mine=(y>0)&&Math.random()<MINE_PROB;
+        grid[y][x]={mine:mine,count:0};
+      }
+    }
+    // counts
+    for(y=1;y<ROWS;y++)for(x=0;x<COLS;x++){
+      if(grid[y][x].mine)continue;
+      var c=0;
+      for(var dy=-1;dy<=1;dy++)for(var dx=-1;dx<=1;dx++){
+        if(!dx&&!dy)continue;
+        var nx=x+dx,ny=y+dy;
+        if(nx>=0&&nx<COLS&&ny>=1&&ny<ROWS&&grid[ny][nx].mine)c++;
+      }
+      grid[y][x].count=c;
+    }
+    // find a safe start in bottom row with a path to some pad
+    var startX=-1, found=false;
+    for(x=0;x<COLS&&!found;x++){
+      if(!grid[ROWS-1][x].mine){ startX=x; found=bfsPath(x,ROWS-1); }
+    }
+    if(found){ player.x=startX; return; }
+  }
+  // fallback: clear a column (shouldn't happen)
+  for(y=0;y<ROWS;y++)for(x=0;x<COLS;x++)grid[y][x].mine=false;
+  for(y=1;y<ROWS;y++)for(x=0;x<COLS;x++){
+    var c=0;
+    for(var dy=-1;dy<=1;dy++)for(var dx=-1;dx<=1;dx++){
+      if(!dx&&!dy)continue;
+      var nx=x+dx,ny=y+dy;
+      if(nx>=0&&nx<COLS&&ny>=1&&ny<ROWS&&grid[ny][nx].mine)c++;
+    }
+    grid[y][x].count=c;
+  }
+  player.x=6;
+}
+function bfsPath(sx,sy){
+  var seen=[],q=[[sx,sy]];
+  for(var y=0;y<ROWS;y++)seen[y]=[];
+  while(q.length){
+    var c=q.shift(), x=c[0], y=c[1];
+    if(seen[y][x])continue; seen[y][x]=true;
+    if(y===0&&PAD_COLS.indexOf(x)>=0)return true;
+    for(var i=0;i<4;i++){
+      var nx=x+neighbors(x,y)[i][0], ny=y+neighbors(x,y)[i][1];
+      if(nx<0||nx>=COLS||ny<0||ny>=ROWS)continue;
+      if(ny===0){ if(PAD_COLS.indexOf(nx)>=0&&PAD_COLS.indexOf(nx)!==-1){/*ok*/} else continue; }
+      else if(grid[ny][nx].mine)continue;
+      q.push([nx,ny]);
+    }
+  }
+  return false;
+}
+
+/* ---------- game flow ---------- */
+function startGame(){
+  genBoard();
+  player.y=ROWS-1; lives=3; timeLeft=TIME_LIMIT; score=0;
+  pads=PAD_COLS.map(function(){return false;});
+  particles=[]; state='play';
+  startScreen.classList.add('hidden'); endScreen.classList.add('hidden');
+}
+function capturedCount(){ return pads.filter(Boolean).length; }
+function endGame(won){
+  state=won?'win':'over';
+  score=capturedCount()*500+lives*100+Math.max(0,Math.floor(timeLeft))*10;
+  if(score>best){ best=score; try{localStorage.setItem('mfrog_best',String(best));}catch(e){} }
+  var t=document.getElementById('endTitle'), m=document.getElementById('endMsg');
+  if(won){
+    t.textContent='CROSSING COMPLETE!'; t.style.color='#7CFC00';
+    m.innerHTML='All pads captured with '+lives+' life'+(lives===1?'':'s')+' left.';
+    sfxWin();
+  }else{
+    t.textContent=timeLeft<=0?'TIME UP!':'THE FROG IS BOOMED!'; t.style.color='#ff5c5c';
+    m.innerHTML='Pads captured: '+capturedCount()+' / 5';
+    sfxLose();
+  }
+  document.getElementById('endScore').textContent='SCORE: '+score;
+  document.getElementById('endBest').textContent='BEST: '+best;
+  endScreen.classList.remove('hidden');
+}
+function explode(){
+  sfxBoom();
+  for(var i=0;i<40;i++){
+    var a=Math.random()*Math.PI*2, sp=60+Math.random()*220;
+    particles.push({x:player.x,y:player.y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,
+      life:0.6+Math.random()*0.5,t:0,col:['#ffdd33','#ff8822','#ff4422','#ffffff'][i%4],r:2+Math.random()*4});
+  }
+  lives--;
+  if(lives<=0){ setTimeout(function(){endGame(false);},700); state='dying'; }
+  else{ player.x=playerStartX; player.y=ROWS-1; }
+}
+var playerStartX=6;
+
+/* ---------- input ---------- */
+function tryMove(dx,dy){
+  if(state!=='play')return;
+  var nx=player.x+dx, ny=player.y+dy;
+  if(nx<0||nx>=COLS||ny<0||ny>=ROWS)return;
+  hopFrom={x:player.x,y:player.y}; hopT=0;
+  player.x=nx; player.y=ny;
+  if(ny===0){
+    var pi=PAD_COLS.indexOf(nx);
+    if(pi>=0&&!pads[pi]){ pads[pi]=true; sfxPad(); if(capturedCount()===5){ setTimeout(function(){endGame(true);},350); state='winning'; } }
+  }else{
+    if(grid[ny][nx].mine){ explode(); return; }
+    sfxMove();
+  }
+}
+window.addEventListener('keydown',function(e){
+  var k=e.key.toLowerCase();
+  audio();
+  if(['arrowup','arrowdown','arrowleft','arrowright',' '].indexOf(k)>=0)e.preventDefault();
+  if(state==='start'){ if(k==='enter'||k===' ')startGame(); return; }
+  if(state==='over'||state==='win'){ if(k==='r'||k==='enter'||k===' ')startGame(); return; }
+  if(k==='r'){ startGame(); return; }
+  if(k==='arrowup'||k==='w')tryMove(0,-1);
+  else if(k==='arrowdown'||k==='s')tryMove(0,1);
+  else if(k==='arrowleft'||k==='a')tryMove(-1,0);
+  else if(k==='arrowright'||k==='d')tryMove(1,0);
+});
+document.getElementById('startBtn').addEventListener('click',function(){audio();startGame();});
+document.getElementById('restartBtn').addEventListener('click',function(){audio();startGame();});
+
+/* ---------- sizing ---------- */
+var W=0,H=0,tile=20,ox=0,oy=0,hudH=54;
+function resize(){
+  W=cv.width=window.innerWidth; H=cv.height=window.innerHeight;
+  tile=Math.floor(Math.min((W-20)/COLS,(H-hudH-30)/ROWS));
+  ox=Math.floor((W-tile*COLS)/2);
+  oy=hudH+Math.floor((H-hudH-tile*ROWS)/2)+8;
+}
+window.addEventListener('resize',resize); resize();
+
+/* ---------- rendering ---------- */
+var NUM_COLORS=['','#4da6ff','#5dff7c','#ff6b6b','#c07bff','#ffd23f','#5cffea','#ffffff','#aaaaaa'];
+function draw(ts,dt){
+  ctx.clearRect(0,0,W,H);
+  // bg
+  var g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#0d1a2e'); g.addColorStop(1,'#08101c');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+
+  if(state==='start'){ return; }
+
+  // HUD
+  ctx.textBaseline='middle';
+  ctx.font='bold '+Math.min(26,tile*0.7)+'px Courier New';
+  ctx.fillStyle='#eaf6ff'; ctx.textAlign='left';
+  ctx.fillText('MINE-SWEEPER FROGGER',14,26);
+  // lives
+  for(var i=0;i<3;i++){
+    ctx.beginPath();
+    ctx.arc(W-150+i*38,26,11,0,Math.PI*2);
+    ctx.fillStyle=i<lives?'#7CFC00':'#2a3a4a'; ctx.fill();
+    ctx.fillStyle='#000';
+    ctx.beginPath();ctx.arc(W-150+i*38-4,23,2.4,0,7);ctx.arc(W-150+i*38+4,23,2.4,0,7);ctx.fill();
+  }
+  // timer
+  ctx.textAlign='center';
+  var tcol=timeLeft<15?'#ff5c5c':'#ffd94a';
+  ctx.fillStyle=tcol;
+  ctx.fillText('TIME '+Math.max(0,Math.ceil(timeLeft)), W/2, 26);
+  // pads
+  ctx.textAlign='right'; ctx.fillStyle='#8fd4ff';
+  ctx.font='bold '+Math.min(18,tile*0.5)+'px Courier New';
+  ctx.fillText('PADS '+capturedCount()+'/5', W-20, 50);
+
+  // goal row background
+  ctx.fillStyle='#123047';
+  ctx.fillRect(ox,oy,tile*COLS,tile);
+
+  // hazard tiles
+  for(var y=1;y<ROWS;y++)for(var x=0;x<COLS;x++){
+    var cx=ox+x*tile, cy=oy+y*tile;
+    var c=grid[y][x].count;
+    var shade=26+c*7;
+    ctx.fillStyle='rgb('+(shade-8)+','+(shade+34)+','+(shade-10)+')';
+    ctx.fillRect(cx,cy,tile,tile);
+    // subtle grass speckle
+    ctx.fillStyle='rgba(120,255,90,'+(0.04+c*0.015)+')';
+    ctx.fillRect(cx+((x*7+y*13)%Math.max(1,tile-8)),cy+((x*11+y*5)%Math.max(1,tile-6)),4,2);
+    // border
+    ctx.strokeStyle='rgba(0,0,0,0.35)'; ctx.lineWidth=1;
+    ctx.strokeRect(cx+.5,cy+.5,tile-1,tile-1);
+    if(c>0){
+      ctx.fillStyle=NUM_COLORS[c];
+      ctx.font='bold '+Math.floor(tile*0.42)+'px Courier New';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.fillText(c, cx+tile/2, cy+tile/2+1);
+    }
+  }
+
+  // pads
+  for(var p=0;p<PAD_COLS.length;p++){
+    var px=ox+PAD_COLS[p]*tile, py=oy;
+    ctx.beginPath(); ctx.arc(px+tile/2,py+tile/2,tile*0.36,0,Math.PI*2);
+    if(pads[p]){
+      ctx.fillStyle='#ffe85c'; ctx.shadowColor='#ffd700'; ctx.shadowBlur=14; ctx.fill(); ctx.shadowBlur=0;
+      ctx.strokeStyle='#b8860b'; ctx.lineWidth=3; ctx.stroke();
+    }else{
+      ctx.fillStyle='rgba(255,232,92,0.15)'; ctx.fill();
+      ctx.strokeStyle='#ffe85c'; ctx.lineWidth=2.5; ctx.setLineDash([6,5]); ctx.lineDashOffset=-ts/40; ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+
+  // particles
+  for(var i=particles.length-1;i>=0;i--){
+    var pt=particles[i]; pt.t+=dt;
+    if(pt.t>=pt.life){ particles.splice(i,1); continue; }
+    pt.x+=pt.vx*dt/tile*0.6; pt.y+=pt.vy*dt/tile*0.6; pt.vy+=200*dt/tile*0.6;
+    ctx.globalAlpha=1-pt.t/pt.life;
+    ctx.fillStyle=pt.col;
+    ctx.beginPath(); ctx.arc(ox+pt.x*tile,oy+pt.y*tile,pt.r*(tile/34),0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=1;
+  }
+
+  // frog (skip if fully exploded)
+  if(state!=='dying'||lives>0){
+    var fx=player.x, fy=player.y, lift=0;
+    if(hopT<1&&hopFrom){ hopT=Math.min(1,hopT+dt/0.12); lift=Math.sin(hopT*Math.PI)*tile*0.28; }
+    else lift=0;
+    var cxp=ox+fx*tile+tile/2, cyp=oy+fy*tile+tile/2-lift;
+    var r=tile*0.34;
+    // legs
+    ctx.fillStyle='#2f9e1f';
+    ctx.beginPath();ctx.ellipse(cxp-r*0.9,cyp+r*0.5,r*0.42,r*0.28,-0.5,0,7);ctx.fill();
+    ctx.beginPath();ctx.ellipse(cxp+r*0.9,cyp+r*0.5,r*0.42,r*0.28,0.5,0,7);ctx.fill();
+    // body
+    ctx.fillStyle='#3ecb2a';
+    ctx.beginPath();ctx.ellipse(cxp,cyp,r,r*0.92,0,0,7);ctx.fill();
+    ctx.strokeStyle='#1d6e10';ctx.lineWidth=2;ctx.stroke();
+    // eyes
+    ctx.fillStyle='#fff';
+    ctx.beginPath();ctx.arc(cxp-r*0.45,cyp-r*0.5,r*0.32,0,7);ctx.arc(cxp+r*0.45,cyp-r*0.5,r*0.32,0,7);ctx.fill();
+    ctx.fillStyle='#000';
+    ctx.beginPath();ctx.arc(cxp-r*0.45,cyp-r*0.55,r*0.15,0,7);ctx.arc(cxp+r*0.45,cyp-r*0.55,r*0.15,0,7);ctx.fill();
+    // mouth
+    ctx.strokeStyle='#1d6e10';ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(cxp,cyp+r*0.15,r*0.4,0.3,Math.PI-0.3);ctx.stroke();
+  }
+
+  // timer drain while playing
+  if(state==='play'){
+    timeLeft-=dt;
+    if(timeLeft<=0){ timeLeft=0; endGame(false); }
+  }
+}
+
+/* ---------- main loop ---------- */
+var lastT=performance.now();
+function loop(ts){
+  var dt=Math.min(0.05,(ts-lastT)/1000); lastT=ts;
+  draw(ts,dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* store start x after board gen for respawns */
+var _gen=genBoard;
+genBoard=function(){ _gen(); playerStartX=player.x; };
+})();
+</script>
+</body>
+</html>
