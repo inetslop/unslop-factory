@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Minesweeper Pinball</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+function playSound(freq, duration, type, volume) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(volume || 0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+function playExplosion() {
+    if (!audioCtx) return;
+    const bufferSize = audioCtx.sampleRate * 0.5;
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+        data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / bufferSize, 3);
+    }
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0.5;
+    source.connect(gain);
+    gain.connect(audioCtx.destination);
+    source.start();
+}
+
+// Game state
+let gameState = 'start'; // start, playing, gameover
+let score = 0;
+let lives = 3;
+let highScore = 0;
+try {
+    highScore = parseInt(localStorage.getItem('minesweeperPinballHigh') || '0');
+} catch(e) {}
+
+// Ball
+let ball = { x: 0, y: 0, vx: 0, vy: 0, r: 8 };
+const GRAVITY = 0.4;
+const BOUNCE_DAMPING = 0.75;
+const MAX_SPEED = 12;
+
+// Flippers
+let leftFlipper = { angle: 0.3, targetAngle: 0.3, active: false, x: 0, y: 0, len: 60 };
+let rightFlipper = { angle: -0.3, targetAngle: -0.3, active: false, x: 0, y: 0, len: 60 };
+
+// Mines
+let mines = [];
+const MINE_R = 14;
+
+// Bumpers
+let bumpers = [];
+const BUMPER_R = 20;
+
+// Particles
+let particles = [];
+
+// Grid offset for minesweeper theme
+let gridOffsetX = 0, gridOffsetY = 0;
+
+function initField() {
+    const tableW = Math.min(W * 0.6, 400);
+    const tableH = Math.min(H * 0.85, H - 40);
+    const tableX = (W - tableW) / 2;
+    const tableY = (H - tableH) / 2;
+
+    // Flippers
+    leftFlipper.x = tableX + tableW * 0.35;
+    leftFlipper.y = tableY + tableH - 30;
+    rightFlipper.x = tableX + tableW * 0.65;
+    rightFlipper.y = tableY + tableH - 30;
+    leftFlipper.len = tableW * 0.22;
+    rightFlipper.len = tableW * 0.22;
+
+    // Bumpers
+    bumpers = [
+        { x: tableX + tableW * 0.5, y: tableY + tableH * 0.35 },
+        { x: tableX + tableW * 0.25, y: tableY + tableH * 0.55 },
+        { x: tableX + tableW * 0.75, y: tableY + tableH * 0.55 }
+    ];
+
+    // Mines - scattered in upper portion
+    mines = [];
+    const cols = 4, rows = 3;
+    const cellW = tableW / (cols + 1);
+    const cellH = (tableH * 0.6) / (rows + 1);
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            if (Math.random() < 0.55 && !(r === 0 && c >= 1 && c <= 2)) {
+                mines.push({
+                    x: tableX + cellW * (c + 1),
+                    y: tableY + tableH * 0.1 + cellH * (r + 1),
+                    alive: true,
+                    pulse: Math.random() * Math.PI * 2
+                });
+            }
+        }
+    }
+
+    // Store table bounds
+    game.tableX = tableX;
+    game.tableY = tableY;
+    game.tableW = tableW;
+    game.tableH = tableH;
+}
+
+let game = { tableX: 0, tableY: 0, tableW: 0, tableH: 0 };
+
+function resetBall() {
+    ball.x = W / 2;
+    ball.y = H * 0.15;
+    ball.vx = (Math.random() - 0.5) * 3;
+    ball.vy = 0;
+}
+
+function startGame() {
+    initField();
+    score = 0;
+    lives = 3;
+    particles = [];
+    resetBall();
+    gameState = 'playing';
+}
+
+// Input
+let keys = {};
+window.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    initAudio();
+    if (gameState === 'start' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+    if (gameState === 'gameover' && (e.code === 'Space' || e.code === 'Enter' || e.code === 'KeyR')) startGame();
+});
+window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+// Touch / mouse for flippers
+canvas.addEventListener('mousedown', (e) => {
+    initAudio();
+    if (gameState === 'start') startGame();
+    else if (gameState === 'gameover') startGame();
+});
+canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    initAudio();
+    if (gameState === 'start') startGame();
+    else if (gameState === 'gameover') startGame();
+});
+
+function handleFlipperInput() {
+    const leftActive = keys['KeyA'] || keys['ArrowLeft'];
+    const rightActive = keys['KeyD'] || keys['ArrowRight'];
+
+    if (leftActive) {
+        leftFlipper.targetAngle = -0.8;
+    } else {
+        leftFlipper.targetAngle = 0.3;
+    }
+    if (rightActive) {
+        rightFlipper.targetAngle = 0.8;
+    } else {
+        rightFlipper.targetAngle = -0.3;
+    }
+
+    // Smooth flipper movement
+    leftFlipper.angle += (leftFlipper.targetAngle - leftFlipper.angle) * 0.4;
+    rightFlipper.angle += (rightFlipper.targetAngle - rightFlipper.angle) * 0.4;
+
+    if (leftActive && !leftFlipper.active) { playSound(200, 0.05, 'square', 0.1); }
+    if (rightActive && !rightFlipper.active) { playSound(200, 0.05, 'square', 0.1); }
+    leftFlipper.active = !!leftActive;
+    rightFlipper.active = !!rightActive;
+}
+
+function getFlipperEnd(flipper) {
+    const isLeft = flipper === leftFlipper;
+    const dir = isLeft ? -1 : 1;
+    return {
+        x: flipper.x + Math.cos(flipper.angle) * flipper.len * dir,
+        y: flipper.y + Math.sin(flipper.angle) * flipper.len * dir
+    };
+}
+
+function update() {
+    if (gameState !== 'playing') return;
+
+    handleFlipperInput();
+
+    // Ball physics
+    ball.vy += GRAVITY;
+    ball.vx *= 0.998;
+    ball.vy *= 0.998;
+
+    // Clamp speed
+    const speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+    if (speed > MAX_SPEED) {
+        ball.vx = (ball.vx / speed) * MAX_SPEED;
+        ball.vy = (ball.vy / speed) * MAX_SPEED;
+    }
+
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+
+    // Wall collisions
+    const tx = game.tableX, ty = game.tableY, tw = game.tableW, th = game.tableH;
+
+    if (ball.x - ball.r < tx) { ball.x = tx + ball.r; ball.vx = Math.abs(ball.vx) * BOUNCE_DAMPING; playSound(300, 0.1, 'sine', 0.2); }
+    if (ball.x + ball.r > tx + tw) { ball.x = tx + tw - ball.r; ball.vx = -Math.abs(ball.vx) * BOUNCE_DAMPING; playSound(300, 0.1, 'sine', 0.2); }
+    if (ball.y - ball.r < ty) { ball.y = ty + ball.r; ball.vy = Math.abs(ball.vy) * BOUNCE_DAMPING; playSound(300, 0.1, 'sine', 0.2); }
+
+    // Flipper collisions
+    [leftFlipper, rightFlipper].forEach(flipper => {
+        const end = getFlipperEnd(flipper);
+        const dx = ball.x - flipper.x;
+        const dy = ball.y - flipper.y;
+        const fx = end.x - flipper.x;
+        const fy = end.y - flipper.y;
+        const len2 = fx * fx + fy * fy;
+        let t = (dx * fx + dy * fy) / len2;
+        t = Math.max(0, Math.min(1, t));
+        const closestX = flipper.x + t * fx;
+        const closestY = flipper.y + t * fy;
+        const distX = ball.x - closestX;
+        const distY = ball.y - closestY;
+        const dist = Math.sqrt(distX * distX + distY * distY);
+
+        if (dist < ball.r + 6) {
+            const nx = distX / dist;
+            const ny = distY / dist;
+            ball.x = closestX + nx * (ball.r + 7);
+            ball.y = closestY + ny * (ball.r + 7);
+            const bounceForce = flipper.active ? 8 : 4;
+            ball.vx = nx * bounceForce + (flipper === leftFlipper ? 2 : -2);
+            ball.vy = ny * bounceForce - 3;
+            playSound(400, 0.1, 'square', 0.15);
+        }
+    });
+
+    // Bumper collisions
+    bumpers.forEach(b => {
+        const dx = ball.x - b.x;
+        const dy = ball.y - b.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < ball.r + BUMPER_R) {
+            const nx = dx / dist;
+            const ny = dy / dist;
+            ball.x = b.x + nx * (ball.r + BUMPER_R + 1);
+            ball.y = b.y + ny * (ball.r + BUMPER_R + 1);
+            ball.vx = nx * 7;
+            ball.vy = ny * 7;
+            score += 50;
+            playSound(600, 0.15, 'sine', 0.3);
+            spawnParticles(b.x, b.y, '#ffdd44', 8);
+        }
+    });
+
+    // Mine collisions
+    mines.forEach(mine => {
+        if (!mine.alive) return;
+        const dx = ball.x - mine.x;
+        const dy = ball.y - mine.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < ball.r + MINE_R) {
+            mine.alive = false;
+            lives--;
+            score += 100;
+            playExplosion();
+            spawnParticles(mine.x, mine.y, '#ff4444', 20);
+            if (lives <= 0) {
+                gameState = 'gameover';
+                if (score > highScore) {
+                    highScore = score;
+                    try { localStorage.setItem('minesweeperPinballHigh', highScore.toString()); } catch(e) {}
+                }
+            } else {
+                resetBall();
+            }
+        }
+    });
+
+    // Ball lost (fell off bottom)
+    if (ball.y > H + 50) {
+        lives--;
+        playExplosion();
+        if (lives <= 0) {
+            gameState = 'gameover';
+            if (score > highScore) {
+                highScore = score;
+                try { localStorage.setItem('minesweeperPinballHigh', highScore.toString()); } catch(e) {}
+            }
+        } else {
+            resetBall();
+        }
+    }
+
+    // Score over time
+    if (gameState === 'playing') score += 1;
+
+    // Update particles
+    particles.forEach(p => {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.2;
+        p.life -= 0.02;
+    });
+    particles = particles.filter(p => p.life > 0);
+
+    // Mine pulse
+    mines.forEach(m => m.pulse += 0.05);
+}
+
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 1 + Math.random() * 4;
+        particles.push({
+            x, y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed - 2,
+            life: 1,
+            color: color,
+            r: 2 + Math.random() * 4
+        });
+    }
+}
+
+function drawGrid() {
+    ctx.strokeStyle = 'rgba(100, 120, 180, 0.08)';
+    ctx.lineWidth = 1;
+    const cellSize = 40;
+    for (let x = game.tableX; x < game.tableX + game.tableW; x += cellSize) {
+        ctx.beginPath(); ctx.moveTo(x, game.tableY); ctx.lineTo(x, game.tableY + game.tableH); ctx.stroke();
+    }
+    for (let y = game.tableY; y < game.tableY + game.tableH; y += cellSize) {
+        ctx.beginPath(); ctx.moveTo(game.tableX, y); ctx.lineTo(game.tableX + game.tableW, y); ctx.stroke();
+    }
+}
+
+function drawMines() {
+    mines.forEach(mine => {
+        if (!mine.alive) return;
+        const pulse = 1 + Math.sin(mine.pulse) * 0.1;
+        const r = MINE_R * pulse;
+
+        // Mine body
+        ctx.fillStyle = '#cc2222';
+        ctx.beginPath();
+        ctx.arc(mine.x, mine.y, r, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Cross pattern
+        ctx.strokeStyle = '#991111';
+        ctx.lineWidth = 3;
+        const cr = r * 0.5;
+        ctx.beginPath();
+        ctx.moveTo(mine.x - cr, mine.y); ctx.lineTo(mine.x + cr, mine.y);
+        ctx.moveTo(mine.x, mine.y - cr); ctx.lineTo(mine.x, mine.y + cr);
+        const diag = cr * 0.7;
+        ctx.moveTo(mine.x - diag, mine.y - diag); ctx.lineTo(mine.x + diag, mine.y + diag);
+        ctx.moveTo(mine.x + diag, mine.y - diag); ctx.lineTo(mine.x - diag, mine.y + diag);
+        ctx.stroke();
+
+        // Glow
+        ctx.shadowBlur = 15;
+        ctx.shadowColor = '#ff3333';
+        ctx.beginPath();
+        ctx.arc(mine.x, mine.y, r, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(255, 80, 80, 0.4)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+    });
+}
+
+function drawBumpers() {
+    bumpers.forEach(b => {
+        // Outer ring
+        ctx.fillStyle = '#ffdd44';
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, BUMPER_R, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Inner
+        ctx.fillStyle = '#ffaa00';
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, BUMPER_R * 0.6, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Highlight
+        ctx.fillStyle = 'rgba(255,255,200,0.4)';
+        ctx.beginPath();
+        ctx.arc(b.x - 5, b.y - 5, BUMPER_R * 0.3, 0, Math.PI * 2);
+        ctx.fill();
+    });
+}
+
+function drawFlippers() {
+    [leftFlipper, rightFlipper].forEach(flipper => {
+        const end = getFlipperEnd(flipper);
+        ctx.strokeStyle = flipper.active ? '#44ff88' : '#44aaff';
+        ctx.lineWidth = 12;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(flipper.x, flipper.y);
+        ctx.lineTo(end.x, end.y);
+        ctx.stroke();
+
+        // Tip glow
+        ctx.fillStyle = flipper.active ? '#88ffcc' : '#88ccff';
+        ctx.beginPath();
+        ctx.arc(end.x, end.y, 8, 0, Math.PI * 2);
+        ctx.fill();
+    });
+}
+
+function drawBall() {
+    ctx.fillStyle = '#ffffff';
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = '#aaccff';
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Shine
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.beginPath();
+    ctx.arc(ball.x - 3, ball.y - 3, ball.r * 0.4, 0, Math.PI * 2);
+    ctx.fill();
+}
+
+function drawParticles() {
+    particles.forEach(p => {
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * p.life, 0, Math.PI * 2);
+        ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+    ctx.font = 'bold 16px monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE: ${score}`, 20, 30);
+    ctx.fillText(`LIVES: ${'❤'.repeat(lives) || '—'}`, 20, 55);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#ffdd44';
+    ctx.fillText(`HI: ${highScore}`, W - 20, 30);
+
+    // Table border
+    ctx.strokeStyle = 'rgba(100, 150, 255, 0.3)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(game.tableX, game.tableY, game.tableW, game.tableH);
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#0f0f23';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.min(W * 0.06, 48)}px monospace`;
+    ctx.fillStyle = '#ff4444';
+    ctx.fillText('MINESWEEPER', W / 2, H * 0.25);
+    ctx.fillStyle = '#44aaff';
+    ctx.fillText('PINBALL', W / 2, H * 0.33);
+
+    // Decorative mine
+    const cx = W / 2, cy = H * 0.48;
+    ctx.fillStyle = '#cc2222';
+    ctx.beginPath(); ctx.arc(cx, cy, 25, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#991111';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(cx - 12, cy); ctx.lineTo(cx + 12, cy);
+    ctx.moveTo(cx, cy - 12); ctx.lineTo(cx, cy + 12);
+    ctx.stroke();
+
+    // Controls
+    ctx.font = `${Math.min(W * 0.035, 18)}px monospace`;
+    ctx.fillStyle = '#aaccff';
+    ctx.fillText('A / ←  :  LEFT FLIPPER', W / 2, H * 0.6);
+    ctx.fillText('D / →  :  RIGHT FLIPPER', W / 2, H * 0.65);
+    ctx.fillStyle = '#ffdd44';
+    ctx.fillText('BUMPERS = POINTS   |   MINES = DEATH', W / 2, H * 0.73);
+
+    // Start prompt
+    const blink = Math.sin(Date.now() * 0.005) > 0;
+    if (blink) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `bold ${Math.min(W * 0.04, 22)}px monospace`;
+        ctx.fillText('PRESS SPACE TO START', W / 2, H * 0.85);
+    }
+
+    if (highScore > 0) {
+        ctx.fillStyle = '#ffdd44';
+        ctx.font = '14px monospace';
+        ctx.fillText(`HIGH SCORE: ${highScore}`, W / 2, H * 0.92);
+    }
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.min(W * 0.05, 42)}px monospace`;
+    ctx.fillStyle = '#ff4444';
+    ctx.fillText('BOOM!', W / 2, H * 0.3);
+
+    ctx.font = `${Math.min(W * 0.035, 20)}px monospace`;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(`SCORE: ${score}`, W / 2, H * 0.42);
+    ctx.fillStyle = '#ffdd44';
+    ctx.fillText(`HIGH SCORE: ${highScore}`, W / 2, H * 0.5);
+
+    const blink = Math.sin(Date.now() * 0.005) > 0;
+    if (blink) {
+        ctx.fillStyle = '#aaccff';
+        ctx.font = `bold ${Math.min(W * 0.035, 20)}px monospace`;
+        ctx.fillText('PRESS SPACE TO RESTART', W / 2, H * 0.65);
+    }
+}
+
+function draw() {
+    if (gameState === 'start') {
+        drawStartScreen();
+        return;
+    }
+
+    // Background
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+
+    drawGrid();
+    drawMines();
+    drawBumpers();
+    drawFlippers();
+    drawBall();
+    drawParticles();
+    drawHUD();
+
+    if (gameState === 'gameover') {
+        drawGameOver();
+    }
+}
+
+let lastTime = 0;
+function loop(time) {
+    const dt = Math.min((time - lastTime) / 16.67, 3);
+    lastTime = time;
+
+    update();
+    draw();
+
+    requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
