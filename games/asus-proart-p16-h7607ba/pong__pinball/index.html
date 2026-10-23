@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pong Pinball</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    scale = Math.min(W / 800, H / 900);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+
+// Game state
+const STATE = { START: 0, PLAYING: 1, GAMEOVER: 2 };
+let gameState = STATE.START;
+let score = 0;
+let highScore = 0;
+let lives = 3;
+let combo = 0;
+let comboTimer = 0;
+
+try {
+    highScore = parseInt(localStorage.getItem('pongPinballHigh')) || 0;
+} catch(e) {}
+
+// Ball
+let ball = { x: 400, y: 750, vx: 0, vy: 0, r: 12 };
+let ballLaunched = false;
+
+// Paddle
+let paddle = { x: 400, y: 830, w: 120, h: 16, speed: 8 };
+
+// Bumpers
+let bumpers = [
+    { x: 250, y: 200, r: 35, color: '#ff4466', hit: 0 },
+    { x: 550, y: 200, r: 35, color: '#44aaff', hit: 0 },
+    { x: 400, y: 150, r: 30, color: '#ffcc00', hit: 0 },
+    { x: 200, y: 400, r: 28, color: '#66ff66', hit: 0 },
+    { x: 600, y: 400, r: 28, color: '#cc66ff', hit: 0 },
+    { x: 350, y: 320, r: 25, color: '#ff8844', hit: 0 },
+    { x: 450, y: 320, r: 25, color: '#44ffcc', hit: 0 },
+];
+
+// Walls (angled)
+let walls = [
+    // Top left angled
+    { x1: 100, y1: 100, x2: 180, y2: 50 },
+    // Top right angled
+    { x1: 700, y1: 100, x2: 620, y2: 50 },
+    // Left mid
+    { x1: 100, y1: 450, x2: 160, y2: 500 },
+    // Right mid
+    { x1: 700, y1: 450, x2: 640, y2: 500 },
+    // Bottom left funnel
+    { x1: 100, y1: 750, x2: 200, y2: 800 },
+    // Bottom right funnel
+    { x1: 700, y1: 750, x2: 600, y2: 800 },
+];
+
+// Particles
+let particles = [];
+
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 1 + Math.random() * 4;
+        particles.push({
+            x, y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            life: 1,
+            color: color,
+            size: 2 + Math.random() * 3
+        });
+    }
+}
+
+// Input
+let keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.key] = true;
+    if (gameState === STATE.START && (e.key === 'Enter' || e.key === ' ')) {
+        initAudio();
+        startGame();
+    }
+    if (gameState === STATE.GAMEOVER && (e.key === 'Enter' || e.key === 'r')) {
+        startGame();
+    }
+    if (gameState === STATE.PLAYING && e.key === ' ' && !ballLaunched) {
+        launchBall();
+    }
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+function startGame() {
+    score = 0;
+    lives = 3;
+    combo = 0;
+    resetBall();
+    gameState = STATE.PLAYING;
+}
+
+function resetBall() {
+    ball.x = 400;
+    ball.y = 750;
+    ball.vx = 0;
+    ball.vy = 0;
+    ballLaunched = false;
+}
+
+function launchBall() {
+    ballLaunched = true;
+    ball.vy = -12;
+    ball.vx = (Math.random() - 0.5) * 4;
+    playSound(440, 0.2, 'sine', 0.3);
+}
+
+function loseLife() {
+    lives--;
+    combo = 0;
+    playSound(150, 0.5, 'sawtooth', 0.4);
+    if (lives <= 0) {
+        gameState = STATE.GAMEOVER;
+        if (score > highScore) {
+            highScore = score;
+            try { localStorage.setItem('pongPinballHigh', highScore); } catch(e) {}
+        }
+    } else {
+        resetBall();
+    }
+}
+
+function addScore(pts) {
+    combo++;
+    comboTimer = 60;
+    const multiplier = Math.min(combo, 5);
+    score += pts * multiplier;
+}
+
+// Physics
+const GRAVITY = 0.15;
+const FRICTION = 0.999;
+
+function update() {
+    if (gameState !== STATE.PLAYING) return;
+
+    // Paddle movement
+    if (keys['ArrowLeft'] || keys['a'] || keys['A']) paddle.x -= paddle.speed * scale;
+    if (keys['ArrowRight'] || keys['d'] || keys['D']) paddle.x += paddle.speed * scale;
+    paddle.x = Math.max(100 + paddle.w/2, Math.min(700 - paddle.w/2, paddle.x));
+
+    // Ball physics
+    if (ballLaunched) {
+        ball.vy += GRAVITY;
+        ball.vx *= FRICTION;
+        ball.vy *= FRICTION;
+        ball.x += ball.vx;
+        ball.y += ball.vy;
+
+        // Wall collisions (table boundaries)
+        if (ball.x - ball.r < 100) { ball.x = 100 + ball.r; ball.vx = Math.abs(ball.vx) * 0.8; playSound(300, 0.1, 'square', 0.1); }
+        if (ball.x + ball.r > 700) { ball.x = 700 - ball.r; ball.vx = -Math.abs(ball.vx) * 0.8; playSound(300, 0.1, 'square', 0.1); }
+        if (ball.y - ball.r < 50) { ball.y = 50 + ball.r; ball.vy = Math.abs(ball.vy) * 0.8; playSound(300, 0.1, 'square', 0.1); }
+
+        // Ball falls off bottom
+        if (ball.y > 900) {
+            loseLife();
+            return;
+        }
+
+        // Paddle collision
+        if (ball.vy > 0 && ball.y + ball.r >= paddle.y - paddle.h/2 && ball.y - ball.r <= paddle.y + paddle.h/2 &&
+            ball.x >= paddle.x - paddle.w/2 - ball.r && ball.x <= paddle.x + paddle.w/2 + ball.r) {
+            let hitPos = (ball.x - paddle.x) / (paddle.w / 2);
+            ball.vy = -Math.abs(ball.vy) * 0.9 - 3;
+            ball.vx += hitPos * 4;
+            ball.y = paddle.y - paddle.h/2 - ball.r;
+            playSound(500, 0.15, 'sine', 0.3);
+            spawnParticles(ball.x, ball.y, '#ffffff', 5);
+        }
+
+        // Bumper collisions
+        for (let b of bumpers) {
+            const dx = ball.x - b.x;
+            const dy = ball.y - b.y;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            if (dist < ball.r + b.r) {
+                const nx = dx / dist;
+                const ny = dy / dist;
+                const dot = ball.vx * nx + ball.vy * ny;
+                ball.vx -= 2 * dot * nx;
+                ball.vy -= 2 * dot * ny;
+                // Extra bounce force
+                ball.vx += nx * 4;
+                ball.vy += ny * 4;
+                ball.x = b.x + nx * (ball.r + b.r + 1);
+                ball.y = b.y + ny * (ball.r + b.r + 1);
+                b.hit = 10;
+                addScore(50);
+                playSound(600 + Math.random() * 400, 0.2, 'sine', 0.3);
+                spawnParticles(ball.x, ball.y, b.color, 8);
+            }
+        }
+
+        // Angled wall collisions
+        for (let w of walls) {
+            const ex = w.x2 - w.x1;
+            const ey = w.y2 - w.y1;
+            const len = Math.sqrt(ex*ex + ey*ey);
+            const nx = -ey / len;
+            const ny = ex / len;
+
+            const dx = ball.x - w.x1;
+            const dy = ball.y - w.y1;
+            const proj = dx * (ex/len) + dy * (ey/len);
+            if (proj >= 0 && proj <= len) {
+                const dist = dx * nx + dy * ny;
+                if (Math.abs(dist) < ball.r) {
+                    const sign = Math.sign(dist);
+                    const dot = ball.vx * nx * sign + ball.vy * ny * sign;
+                    if (dot > 0) continue;
+                    ball.vx -= 2 * dot * nx * sign;
+                    ball.vy -= 2 * dot * ny * sign;
+                    ball.x += nx * sign * (ball.r - dist);
+                    ball.y += ny * sign * (ball.r - dist);
+                    playSound(350, 0.1, 'triangle', 0.15);
+                }
+            }
+        }
+
+        // Speed cap
+        const speed = Math.sqrt(ball.vx*ball.vx + ball.vy*ball.vy);
+        if (speed > 15) {
+            ball.vx = (ball.vx / speed) * 15;
+            ball.vy = (ball.vy / speed) * 15;
+        }
+    }
+
+    // Combo timer
+    if (comboTimer > 0) comboTimer--;
+    else combo = 0;
+
+    // Bumper hit decay
+    for (let b of bumpers) {
+        if (b.hit > 0) b.hit--;
+    }
+
+    // Particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.05;
+        p.life -= 0.02;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function draw() {
+    ctx.clearRect(0, 0, W, H);
+
+    // Transform to game coordinates
+    const ox = (W - 800 * scale) / 2;
+    const oy = (H - 900 * scale) / 2;
+    ctx.save();
+    ctx.translate(ox, oy);
+    ctx.scale(scale, scale);
+
+    // Background
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(-50, -50, 900, 1000);
+
+    // Table background
+    const grad = ctx.createLinearGradient(100, 50, 700, 850);
+    grad.addColorStop(0, '#1a1a3a');
+    grad.addColorStop(1, '#0d0d2a');
+    ctx.fillStyle = grad;
+    ctx.fillRect(100, 50, 600, 800);
+
+    // Table border glow
+    ctx.strokeStyle = '#334';
+    ctx.lineWidth = 6;
+    ctx.strokeRect(100, 50, 600, 800);
+    ctx.strokeStyle = '#5566ff';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(100, 50, 600, 800);
+
+    // Angled walls
+    for (let w of walls) {
+        ctx.beginPath();
+        ctx.moveTo(w.x1, w.y1);
+        ctx.lineTo(w.x2, w.y2);
+        ctx.strokeStyle = '#6677ff';
+        ctx.lineWidth = 4;
+        ctx.lineCap = 'round';
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(w.x1, w.y1);
+        ctx.lineTo(w.x2, w.y2);
+        ctx.strokeStyle = 'rgba(100,150,255,0.3)';
+        ctx.lineWidth = 8;
+        ctx.stroke();
+    }
+
+    // Bumpers
+    for (let b of bumpers) {
+        const glow = b.hit > 0 ? 20 : 8;
+        const radius = b.r + (b.hit > 0 ? 5 : 0);
+
+        // Glow
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, radius + glow, 0, Math.PI * 2);
+        ctx.fillStyle = b.color + '22';
+        ctx.fill();
+
+        // Body
+        const bg = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, radius);
+        bg.addColorStop(0, '#fff');
+        bg.addColorStop(0.3, b.color);
+        bg.addColorStop(1, b.color + '88');
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, radius, 0, Math.PI * 2);
+        ctx.fillStyle = bg;
+        ctx.fill();
+
+        // Ring
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, radius - 5, 0, Math.PI * 2);
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Score text on bumper
+        ctx.fillStyle = '#000';
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('50', b.x, b.y);
+    }
+
+    // Paddle
+    const pg = ctx.createLinearGradient(paddle.x - paddle.w/2, 0, paddle.x + paddle.w/2, 0);
+    pg.addColorStop(0, '#4488ff');
+    pg.addColorStop(0.5, '#aaddff');
+    pg.addColorStop(1, '#4488ff');
+    ctx.fillStyle = pg;
+    ctx.beginPath();
+    ctx.roundRect(paddle.x - paddle.w/2, paddle.y - paddle.h/2, paddle.w, paddle.h, 8);
+    ctx.fill();
+    // Paddle glow
+    ctx.shadowColor = '#4488ff';
+    ctx.shadowBlur = 15;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Ball
+    if (gameState === STATE.PLAYING) {
+        // Trail
+        if (ballLaunched) {
+            for (let i = 1; i <= 5; i++) {
+                ctx.beginPath();
+                ctx.arc(ball.x - ball.vx * i * 0.3, ball.y - ball.vy * i * 0.3, ball.r * (1 - i * 0.15), 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(255,255,255,${0.3 - i * 0.05})`;
+                ctx.fill();
+            }
+        }
+
+        // Ball glow
+        ctx.shadowColor = '#ffffff';
+        ctx.shadowBlur = 20;
+        const ballGrad = ctx.createRadialGradient(ball.x - 3, ball.y - 3, 0, ball.x, ball.y, ball.r);
+        ballGrad.addColorStop(0, '#ffffff');
+        ballGrad.addColorStop(1, '#88bbff');
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+        ctx.fillStyle = ballGrad;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        // Launch prompt
+        if (!ballLaunched) {
+            ctx.fillStyle = '#ffffff';
+            ctx.font = '18px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('PRESS SPACE TO LAUNCH', 400, 700);
+        }
+    }
+
+    // Particles
+    for (let p of particles) {
+        ctx.globalAlpha = p.life;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+        ctx.fillStyle = p.color;
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // HUD
+    if (gameState === STATE.PLAYING) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 24px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText('SCORE: ' + score, 110, 85);
+
+        // Combo
+        if (combo > 1) {
+            ctx.fillStyle = '#ffcc00';
+            ctx.font = 'bold 20px monospace';
+            ctx.textAlign = 'right';
+            ctx.fillText('x' + Math.min(combo, 5) + ' COMBO!', 690, 85);
+        }
+
+        // Lives
+        ctx.fillStyle = '#ff4466';
+        ctx.font = '20px monospace';
+        ctx.textAlign = 'right';
+        let lifeStr = '';
+        for (let i = 0; i < lives; i++) lifeStr += '● ';
+        ctx.fillText(lifeStr, 690, 115);
+
+        // High score
+        ctx.fillStyle = '#888';
+        ctx.font = '14px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText('HI: ' + highScore, 110, 110);
+    }
+
+    // Start screen
+    if (gameState === STATE.START) {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, 800, 900);
+
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#4488ff';
+        ctx.font = 'bold 56px monospace';
+        ctx.fillText('PONG PINBALL', 400, 250);
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '20px monospace';
+        ctx.fillText('← → or A/D to move paddle', 400, 380);
+        ctx.fillText('SPACE to launch ball', 400, 420);
+
+        ctx.fillStyle = '#ffcc00';
+        ctx.font = '16px monospace';
+        ctx.fillText('Hit bumpers for points!', 400, 500);
+        ctx.fillText('Build combos for multipliers', 400, 530);
+        ctx.fillText('Don\'t let the ball fall below!', 400, 560);
+
+        if (highScore > 0) {
+            ctx.fillStyle = '#88ff88';
+            ctx.font = '18px monospace';
+            ctx.fillText('HIGH SCORE: ' + highScore, 400, 630);
+        }
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 24px monospace';
+        const blink = Math.sin(Date.now() * 0.005) > 0;
+        if (blink) ctx.fillText('PRESS ENTER TO START', 400, 720);
+    }
+
+    // Game over screen
+    if (gameState === STATE.GAMEOVER) {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(0, 0, 800, 900);
+
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ff4466';
+        ctx.font = 'bold 48px monospace';
+        ctx.fillText('GAME OVER', 400, 300);
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '28px monospace';
+        ctx.fillText('SCORE: ' + score, 400, 400);
+
+        if (score >= highScore && score > 0) {
+            ctx.fillStyle = '#ffcc00';
+            ctx.font = 'bold 22px monospace';
+            ctx.fillText('★ NEW HIGH SCORE! ★', 400, 460);
+        } else {
+            ctx.fillStyle = '#888';
+            ctx.font = '18px monospace';
+            ctx.fillText('HIGH SCORE: ' + highScore, 400, 460);
+        }
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 22px monospace';
+        const blink = Math.sin(Date.now() * 0.005) > 0;
+        if (blink) ctx.fillText('PRESS ENTER OR R TO RESTART', 400, 560);
+    }
+
+    ctx.restore();
+}
+
+function loop() {
+    update();
+    draw();
+    requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
