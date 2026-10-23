@@ -1,0 +1,489 @@
+<think>
+The user is asking for a "Breakout Racing" game — a fusion of Breakout and racing. Ideas: a ball that breaks through bricks while racing, or a Breakout where the paddle is a car on a road, with the track scrolling. Let's design it: "Brick Rush Racer" — the paddle is a race car at the bottom, the ball bounces around, and breaking blocks earns you speed/points; obstacles (rival cars) come down the road? Or a vertical-scrolling highway where the ball breaks through brick walls while racing against a timer.
+
+Simplest, most fun concept: Breakout with a car-themed paddle on a scrolling road background, bricks as "traffic" or barriers, speed increasing per level = "racing". Add a countdown/progress bar to reach the finish line before time runs out. Blocks give points; breaking all blocks in a level advances you one lap, and the ball speed increases. Timer adds racing tension.
+
+Implementation: canvas fills the window and resizes. Start screen with title + control instructions (arrow keys / A,D to move, P to pause, R to restart). Sound via WebAudio after first input. No localStorage needed but a try/catch wrapper is fine; might save high score — keep it simple.
+
+Let's write compact code.
+
+Game details:
+- Canvas fills the whole window, scales with resize (use logical coordinates? Simpler: use actual canvas size and scale positions on resize — or a fixed internal resolution scaled via CSS? Better: set canvas width/height to window size and rebuild relative positions). Use a world coordinate system that adapts to canvas size: paddle at bottom, blocks in top area. On resize, just recompute layout (reposition blocks proportionally?). Simpler: on resize just resize the canvas, keep entities; clamp positions. That works.
+
+- Paddle = car drawn with rectangles and wheels, moves left/right.
+- Ball bounces off walls, paddle (angle based on hit position), and blocks.
+- Blocks: grid at top, brick colors, maybe 3 HP. Destroying blocks adds to "distance" toward finish line; per-level progress bar. Timer counts down; if you clear all blocks before time runs out, level up (speed up, more time). If ball falls below screen, lose a life; 3 lives.
+- Lives = tires? Show car icon.
+- Finish: after N levels, show "Finish!" screen with score and restart.
+
+Controls: ArrowLeft/Right or A/D; Space to launch ball; P to pause; R to restart; Enter/Space to start.
+
+Sound: simple beeps via oscillator — bounce, block break, lose life, level up.
+
+Let's write the HTML.
+
+Code structure:
+- state: 'start', 'playing', 'paused', 'gameover', 'win'
+- ball sticky to paddle until launch.
+- blocks array {x,y,w,h,hp,color,alive}
+- level generation: rows increase with level.
+- speed = base + level*factor.
+- distance progress = destroyed/total per level; overall progress = (level-1 + destroyed/total)/numLevels.
+
+Draw road background: scrolling dashed centerline, dark asphalt, side barriers — moving downward to give a sense of speed.
+
+High score in localStorage with try/catch.
+
+Write the code carefully but concisely.
+
+Key handling on window keydown; preventDefault for arrows/space.
+
+Ball-paddle collision: if ball.y+r >= paddle.y and within x range, reflect with angle based on offset.
+
+Block collision: simple AABB, determine side by overlap amount.
+
+Timer: e.g., 40 seconds per level, display at top.
+
+Lives: 3. Game over screen with score, R to restart.
+
+Win: totalLevels = 5? Let's make it 6 levels. Show "FINISH!" on win.
+
+Now let's write the file. Keep code reasonably tidy.
+
+Resize: canvas.width=innerWidth etc.; if state==='start', reinitialize layout. During play, clamp paddle/ball within bounds; blocks might spill out — acceptable; or scale block positions? Just clamp. Actually simpler: on resize, if playing, leave it; clamp ball/paddle x. Fine.
+
+Car drawing: rounded body rectangle, roof, wheels, headlights.
+
+Road: draw side stripes with scrolling offset (roadOffset += speed*dt).
+
+Let's write it.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Brick Rush Racer</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#111;}
+  canvas{display:block;width:100vw;height:100vh;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+var cv=document.getElementById('c'),ctx=cv.getContext('2d');
+var W=0,H=0;
+
+// ---------- audio ----------
+var actx=null;
+function initAudio(){ if(!actx){ try{ actx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } if(actx&&actx.state==='suspended') actx.resume(); }
+function beep(freq,dur,type,vol,slide){
+  if(!actx) return;
+  try{
+    var o=actx.createOscillator(),g=actx.createGain();
+    o.type=type||'square'; o.frequency.value=freq;
+    if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(30,freq+slide),actx.currentTime+dur);
+    g.gain.value=vol||0.12;
+    g.gain.exponentialRampToValueAtTime(0.0001,actx.currentTime+dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime+dur);
+  }catch(e){}
+}
+
+// ---------- helpers ----------
+function clamp(v,a,b){return v<a?a:(v>b?b:v);}
+function rr(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+
+// ---------- state ----------
+var TOTAL_LEVELS=6, START_TIME=45;
+var state='start'; // start, playing, paused, gameover, win
+var score=0, lives=3, level=1, timeLeft=START_TIME, best=0;
+try{ best=parseInt(localStorage.getItem('brickRushBest')||'0',10)||0; }catch(e){}
+
+var paddle={x:0,y:0,w:110,h:26,vx:0,speed:520};
+var ball={x:0,y:0,r:9,vx:0,vy:0,stuck:true,baseSpeed:380};
+var blocks=[], destroyed=0, total=0;
+var roadOffset=0, shake=0, particles=[];
+var keys={left:false,right:false};
+
+function resize(){
+  W=cv.width=window.innerWidth; H=cv.height=window.innerHeight;
+  paddle.w=clamp(W*0.14,70,150);
+  if(state==='start'||state==='gameover'||state==='win'){ placePaddle(); }
+  else {
+    paddle.y=H-64;
+    paddle.x=clamp(paddle.x,paddle.w/2,W-paddle.w/2);
+    ball.x=clamp(ball.x,ball.r,W-ball.r);
+    ball.y=clamp(ball.y,ball.r,H-ball.r);
+  }
+}
+window.addEventListener('resize',resize);
+
+function placePaddle(){ paddle.x=W/2; paddle.y=H-64; }
+function stickBall(){ ball.stuck=true; ball.vx=0; ball.vy=0; }
+
+function buildLevel(lv){
+  blocks=[]; destroyed=0;
+  var cols=clamp(7+lv,8,13), rows=3+Math.min(lv,4);
+  var bw=Math.min(90,(W-80)/cols), bh=26;
+  var gridW=cols*bw, ox=(W-gridW)/2, oy=70;
+  for(var r=0;r<rows;r++){
+    for(var c=0;c<cols;c++){
+      // skip some cells for shape
+      if(lv>=3 && (r===1&&c%4===1)) continue;
+      var hp=(r<lv-2?2:1);
+      blocks.push({x:ox+c*bw+2,y:oy+r*(bh+6),w:bw-4,h:bh,hp:hp,maxHp:hp,alive:true});
+    }
+  }
+  total=blocks.length;
+  timeLeft=START_TIME-Math.min(15,(lv-1)*3);
+  ball.baseSpeed=380+lv*45;
+  stickBall();
+}
+
+function resetGame(){
+  score=0; lives=3; level=1; particles=[]; shake=0;
+  placePaddle(); buildLevel(1); state='playing';
+}
+
+// ---------- input ----------
+window.addEventListener('keydown',function(e){
+  initAudio();
+  var k=e.key;
+  if(k==='ArrowLeft'||k==='a'||k==='A') keys.left=true;
+  if(k==='ArrowRight'||k==='d'||k==='D') keys.right=true;
+  if(k===' '||k==='Enter'){
+    e.preventDefault();
+    if(state==='start'||state==='gameover'||state==='win'){ resetGame(); beep(440,0.12,'square',0.1); }
+    else if(state==='playing'&&ball.stuck){
+      ball.stuck=false;
+      var a=-Math.PI/2+(Math.random()*0.6-0.3);
+      ball.vx=Math.cos(a)*ball.baseSpeed; ball.vy=Math.sin(a)*ball.baseSpeed;
+      beep(600,0.08,'square',0.1);
+    }
+  }
+  if(k==='p'||k==='P'){ if(state==='playing') state='paused'; else if(state==='paused') state='playing'; }
+  if(k==='r'||k==='R'){ if(state!=='start'){ resetGame(); beep(440,0.12,'square',0.1); } }
+  if(k==='ArrowLeft'||k==='ArrowRight'||k===' ') e.preventDefault();
+});
+window.addEventListener('keyup',function(e){
+  var k=e.key;
+  if(k==='ArrowLeft'||k==='a'||k==='A') keys.left=false;
+  if(k==='ArrowRight'||k==='d'||k==='D') keys.right=false;
+});
+
+// ---------- particles ----------
+function burst(x,y,color,n){
+  for(var i=0;i<n;i++){
+    var a=Math.random()*Math.PI*2,s=60+Math.random()*180;
+    particles.push({x:x,y:y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:0.5+Math.random()*0.3,t:0,color:color});
+  }
+}
+
+// ---------- update ----------
+function spawnParticles(x,y,c){burst(x,y,c,14);}
+
+function loseLife(){
+  lives--; shake=12; beep(160,0.4,'sawtooth',0.18,-120);
+  if(lives<=0){
+    state='gameover';
+    saveBest();
+  } else {
+    stickBall();
+  }
+}
+function saveBest(){
+  if(score>best){ best=score; try{ localStorage.setItem('brickRushBest',String(best)); }catch(e){} }
+}
+
+function nextLevel(){
+  level++;
+  beep(523,0.1,'square',0.12); setTimeout(function(){beep(659,0.1,'square',0.12);},110); setTimeout(function(){beep(784,0.16,'square',0.12);},220);
+  if(level>TOTAL_LEVELS){ state='win'; saveBest(); }
+  else { buildLevel(level); }
+}
+
+function update(dt){
+  // paddle
+  var dir=(keys.right?1:0)-(keys.left?1:0);
+  paddle.vx=dir*paddle.speed;
+  paddle.x=clamp(paddle.x+paddle.vx*dt,paddle.w/2,W-paddle.w/2);
+  paddle.y=H-64;
+
+  // road scroll (visual speed grows with level)
+  roadOffset=(roadOffset+(180+level*60)*dt)%80;
+
+  // timer
+  if(!ball.stuck){
+    timeLeft-=dt;
+    if(timeLeft<=0){ loseLife(); if(state!=='playing') return; buildLevel(level); }
+  }
+
+  // ball
+  if(ball.stuck){
+    ball.x=paddle.x; ball.y=paddle.y-ball.r-14;
+  } else {
+    ball.x+=ball.vx*dt; ball.y+=ball.vy*dt;
+    // walls
+    if(ball.x<ball.r){ ball.x=ball.r; ball.vx=Math.abs(ball.vx); beep(300,0.05,'square',0.07); }
+    if(ball.x>W-ball.r){ ball.x=W-ball.r; ball.vx=-Math.abs(ball.vx); beep(300,0.05,'square',0.07); }
+    if(ball.y<ball.r+40){ ball.y=ball.r+40; ball.vy=Math.abs(ball.vy); beep(300,0.05,'square',0.07); }
+    // bottom
+    if(ball.y>H+30){ loseLife(); return; }
+    // paddle
+    if(ball.vy>0 && ball.y+ball.r>=paddle.y && ball.y-ball.r<=paddle.y+paddle.h &&
+       Math.abs(ball.x-paddle.x)<=paddle.w/2+ball.r){
+      var off=(ball.x-paddle.x)/(paddle.w/2);
+      off=clamp(off,-1,1);
+      var sp=Math.min(Math.hypot(ball.vx,ball.vy)*1.01,700+level*30);
+      var a=-Math.PI/2+off*(Math.PI*0.36);
+      ball.vx=Math.cos(a)*sp; ball.vy=Math.sin(a)*sp;
+      ball.y=paddle.y-ball.r;
+      beep(420,0.06,'square',0.1);
+    }
+    // blocks
+    for(var i=0;i<blocks.length;i++){
+      var b=blocks[i]; if(!b.alive) continue;
+      if(ball.x+ball.r>b.x && ball.x-ball.r<b.x+b.w && ball.y+ball.r>b.y && ball.y-ball.r<b.y+b.h){
+        // resolve side by least penetration
+        var pl=ball.x+ball.r-b.x, pr=b.x+b.w-(ball.x-ball.r);
+        var pt=ball.y+ball.r-b.y, pb=b.y+b.h-(ball.y-ball.r);
+        var m=Math.min(pl,pr,pt,pb);
+        if(m===pl){ ball.x=b.x-ball.r; ball.vx=-Math.abs(ball.vx); }
+        else if(m===pr){ ball.x=b.x+b.w+ball.r; ball.vx=Math.abs(ball.vx); }
+        else if(m===pt){ ball.y=b.y-ball.r; ball.vy=-Math.abs(ball.vy); }
+        else { ball.y=b.y+b.h+ball.r; ball.vy=Math.abs(ball.vy); }
+        b.hp--;
+        if(b.hp<=0){
+          b.alive=false; destroyed++;
+          score+=b.maxHp*10+level*5;
+          spawnParticles(b.x+b.w/2,b.y+b.h/2,blockColor(b.maxHp));
+          beep(700+Math.random()*300,0.07,'square',0.1);
+          shake=Math.min(shake+3,8);
+        } else {
+          score+=5;
+          spawnParticles(ball.x,ball.y,'#999',4);
+          beep(250,0.05,'triangle',0.08);
+        }
+        if(destroyed>=total) nextLevel();
+        break;
+      }
+    }
+  }
+
+  // particles
+  for(var p=particles.length-1;p>=0;p--){
+    var pt2=particles[p];
+    pt2.t+=dt; if(pt2.t>pt2.life){ particles.splice(p,1); continue; }
+    pt2.x+=pt2.vx*dt; pt2.y+=pt2.vy*dt; pt2.vy+=300*dt;
+  }
+  shake=Math.max(0,shake-dt*30);
+}
+
+function blockColor(maxHp){ return maxHp>=2 ? '#e05a3c' : '#f2b134'; }
+
+// ---------- draw ----------
+function drawRoad(){
+  // asphalt
+  ctx.fillStyle='#2b2b33'; ctx.fillRect(0,0,W,H);
+  // side barriers
+  var bw=Math.max(24,W*0.05);
+  for(var s=0;s<2;s++){
+    var x=s===0?0:W-bw;
+    ctx.fillStyle='#c8331f'; ctx.fillRect(x,0,bw,H);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x,0,bw,H); ctx.clip();
+    ctx.fillStyle='#fff';
+    for(var y=-80+roadOffset;y<H+80;y+=80){
+      ctx.beginPath();
+      ctx.moveTo(x,y); ctx.lineTo(x+bw,y-30); ctx.lineTo(x+bw,y); ctx.lineTo(x,y+30); ctx.closePath();
+      // alternate: draw white stripes offset
+    }
+    for(var y2=-80+roadOffset;y2<H+80;y2+=80){
+      ctx.beginPath();
+      ctx.moveTo(x,y2-40); ctx.lineTo(x+bw,y2-70); ctx.lineTo(x+bw,y2-40); ctx.lineTo(x,y2-10); ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+  // center dashes
+  ctx.fillStyle='rgba(255,255,255,0.35)';
+  var lanes=3;
+  for(var l=1;l<lanes;l++){
+    var cx=bw+(W-2*bw)*l/lanes;
+    for(var yd=-80+roadOffset*1.4;yd<H+80;yd+=80){
+      ctx.fillRect(cx-3,yd,6,44);
+    }
+  }
+}
+
+function drawCar(x,y,w,h,tilt){
+  ctx.save();
+  ctx.translate(x,y);
+  ctx.rotate(tilt||0);
+  // shadow
+  ctx.fillStyle='rgba(0,0,0,0.35)'; rr(-w/2+4,-h/2+6,w,h,8); ctx.fill();
+  // body
+  var g=ctx.createLinearGradient(0,-h/2,0,h/2);
+  g.addColorStop(0,'#ff4d4d'); g.addColorStop(1,'#b31f1f');
+  ctx.fillStyle=g; rr(-w/2,-h/2,w,h,9); ctx.fill();
+  // cockpit
+  ctx.fillStyle='#1c2733'; rr(-w*0.22,-h*0.32,w*0.44,h*0.62,5); ctx.fill();
+  // spoiler
+  ctx.fillStyle='#8f1414'; ctx.fillRect(-w/2+4,h/2-7,w-8,5);
+  // wheels
+  ctx.fillStyle='#111';
+  rr(-w/2-4,-h/2-3,10,10,3); ctx.fill();
+  rr(w/2-6,-h/2-3,10,10,3); ctx.fill();
+  rr(-w/2-4,h/2-7,10,10,3); ctx.fill();
+  rr(w/2-6,h/2-7,10,10,3); ctx.fill();
+  // headlights
+  ctx.fillStyle='#fff3b0';
+  ctx.fillRect(-w/2+8,-h/2+2,14,5);
+  ctx.fillRect(w/2-22,-h/2+2,14,5);
+  ctx.restore();
+}
+
+function drawBall(){
+  var g=ctx.createRadialGradient(ball.x-3,ball.y-3,1,ball.x,ball.y,ball.r+3);
+  g.addColorStop(0,'#fff'); g.addColorStop(0.5,'#ffd24d'); g.addColorStop(1,'#e07b1f');
+  ctx.fillStyle=g;
+  ctx.beginPath(); ctx.arc(ball.x,ball.y,ball.r,0,Math.PI*2); ctx.fill();
+}
+
+function drawHUD(){
+  // top bar
+  ctx.fillStyle='rgba(0,0,0,0.55)'; ctx.fillRect(0,0,W,40);
+  ctx.fillStyle='#fff'; ctx.font='bold 16px monospace'; ctx.textBaseline='middle';
+  ctx.textAlign='left';
+  ctx.fillText('SCORE '+score,12,20);
+  ctx.textAlign='center';
+  var tCol=timeLeft<10?'#ff5a4d':'#fff';
+  ctx.fillStyle=tCol;
+  ctx.fillText('TIME '+Math.max(0,timeLeft).toFixed(1),W/2,20);
+  ctx.fillStyle='#fff';
+  ctx.textAlign='right';
+  // lives as mini cars
+  for(var i=0;i<lives;i++){
+    var lx=W-24-i*30;
+    drawCar(lx,20,18,12,0);
+  }
+
+  // progress bar (race distance)
+  var pw=Math.min(560,W-160), px=(W-pw)/2, py=H-18;
+  ctx.fillStyle='rgba(0,0,0,0.55)'; rr(px-8,py-9,pw+16,18,9); ctx.fill();
+  var overall=((level-1)+(total?destroyed/total:0))/TOTAL_LEVELS;
+  ctx.fillStyle='#3a3a44'; rr(px,py-4,pw,8,4); ctx.fill();
+  if(overall>0){ ctx.fillStyle='#7ee24d'; rr(px,py-4,Math.max(10,pw*overall),8,4); ctx.fill(); }
+  // start / finish flags
+  ctx.font='12px monospace'; ctx.textAlign='left'; ctx.fillStyle='#ccc';
+  ctx.fillText('START',px,py+16> H?H-2:py+15);
+  ctx.textAlign='right'; ctx.fillText('FINISH',px+pw,py+15);
+  // checkered finish mark
+  var fx=px+pw*overall;
+  for(var r2=0;r2<2;r2++)for(var c2=0;c2<3;c2++){
+    ctx.fillStyle=(r2+c2)%2?'#fff':'#111';
+    ctx.fillRect(fx-6+r2*4,py-7+c2*4,4,4);
+  }
+
+  // level label
+  ctx.textAlign='left'; ctx.fillStyle='#ffd24d'; ctx.font='bold 13px monospace';
+  ctx.fillText('LAP '+Math.min(level,TOTAL_LEVELS)+'/'+TOTAL_LEVELS,12,56);
+}
+
+function overlay(title,sub,color){
+  ctx.fillStyle='rgba(8,8,14,0.78)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle=color||'#ffd24d';
+  ctx.font='bold '+Math.min(64,W/9)+'px monospace';
+  ctx.fillText(title,W/2,H*0.32);
+  ctx.fillStyle='#fff'; ctx.font=Math.min(18,W/28)+'px monospace';
+  var lines=sub.split('\n');
+  for(var i=0;i<lines.length;i++) ctx.fillText(lines[i],W/2,H*0.46+i*26);
+}
+
+function draw(){
+  ctx.save();
+  if(shake>0) ctx.translate((Math.random()-0.5)*shake,(Math.random()-0.5)*shake);
+  drawRoad();
+
+  if(state!=='start'){
+    // blocks
+    for(var i=0;i<blocks.length;i++){
+      var b=blocks[i]; if(!b.alive) continue;
+      ctx.fillStyle=blockColor(b.maxHp);
+      rr(b.x,b.y,b.w,b.h,4); ctx.fill();
+      ctx.fillStyle='rgba(255,255,255,0.25)';
+      ctx.fillRect(b.x+2,b.y+2,b.w-4,4);
+      if(b.maxHp>=2){
+        ctx.strokeStyle=b.hp>1?'#7a2413':'#4d4d55';
+        ctx.lineWidth=2;
+        ctx.beginPath();
+        ctx.moveTo(b.x+b.w*0.3,b.y+4); ctx.lineTo(b.x+b.w*0.55,b.y+b.h-6);
+        if(b.hp<=1){ ctx.moveTo(b.x+b.w*0.7,b.y+3); ctx.lineTo(b.x+b.w*0.45,b.y+b.h-4); }
+        ctx.stroke();
+      }
+    }
+    // particles
+    for(var p=0;p<particles.length;p++){
+      var pt=particles[p];
+      ctx.globalAlpha=1-pt.t/pt.life;
+      ctx.fillStyle=pt.color;
+      ctx.fillRect(pt.x-3,pt.y-3,6,6);
+    }
+    ctx.globalAlpha=1;
+
+    drawCar(paddle.x,paddle.y,paddle.w,paddle.h,(keys.left?-0.05:0)+(keys.right?0.05:0));
+    drawBall();
+    drawHUD();
+
+    if(ball.stuck&&state==='playing'){
+      ctx.fillStyle='rgba(255,255,255,'+(0.6+0.4*Math.sin(Date.now()/200))+')';
+      ctx.font='bold 15px monospace'; ctx.textAlign='center';
+      ctx.fillText('PRESS SPACE TO LAUNCH',W/2,H-130);
+    }
+  }
+
+  if(state==='start'){
+    overlay('BRICK RUSH RACER',[
+      'Smash every brick on the road to race toward the finish line!',
+      'Break all bricks before time runs out to advance the lap.',
+      '',
+      'ARROWS / A D .... STEER YOUR CAR',
+      'SPACE ............ LAUNCH BALL   P PAUSE   R RESTART',
+      '',
+      'BEST SCORE: '+best,
+      '',
+      'PRESS SPACE OR ENTER TO RACE'
+    ]);
+  } else if(state==='paused'){
+    overlay('PAUSED',['P to resume','R to restart']);
+  } else if(state==='gameover'){
+    overlay('WRECKED!',['Final score: '+score,'Best: '+best,'','Press SPACE or R to race again'],'#ff5a4d');
+  } else if(state==='win'){
+    overlay('FINISH LINE!',['You crushed all '+TOTAL_LEVELS+' laps!','Score: '+score+'   Best: '+best,'','Press SPACE or R to race again'],'#7ee24d');
+  }
+  ctx.restore();
+}
+
+// ---------- loop ----------
+var last=performance.now();
+function loop(now){
+  var dt=Math.min(0.033,(now-last)/1000); last=now;
+  if(state==='playing') update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+resize();
+placePaddle();
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
+```
