@@ -1,0 +1,491 @@
+<think>
+The user is asking for a turn-based top-down game. Let's make a grid-based tactical RPG: player vs. enemies, each takes turns (player moves/attacks, then enemies move). Simple and polished: canvas, start screen, restart, keyboard controls (arrow keys/WASD to move, space/E to attack, R to wait/skip, Enter to confirm). Enemies are simple AI: move toward the player, and attack if adjacent.
+
+Design: 12x9 tile grid, top-down view. Player is a hero, enemies are orcs/slimes. HP bars. Turn counter. Win by defeating all enemies, lose if HP hits 0. Sound via Web Audio after the first input.
+
+Let's write it compact but complete. Canvas scales to fit the window, game area has a fixed logical size (e.g., 960x720), scaled with CSS transform or canvas scaling based on devicePixelRatio… simpler: set canvas width/height to the container, compute tile size from the minimum of width/cols and height/rows, center it.
+
+Game state: 'start', 'playing', 'won', 'lost'. Turn system: player phase — the player can move N tiles (movement points) and attack once per turn; press Enter or Space to end the turn; then enemies act one at a time with a short animation delay.
+
+Simplification: each entity has 3 MP, attacks deal damage when adjacent (melee). Attack key: A or Space — if an enemy is adjacent, attack it. Move with arrow keys/WASD. Enter to end turn. R to restart.
+
+Enemy AI: on its turn, move toward the player as far as possible (BFS or greedy), and if adjacent, attack.
+
+Grid: some obstacles (rocks/trees) for tactical depth. Use BFS pathfinding for enemies; if no path, stay put.
+
+Add simple floating damage text and hit flash. Sound: beeps via oscillator.
+
+Let's write the code.
+
+Tile size is computed on resize. Entities are drawn as circles/shapes with eyes — keep it cute. Player: blue knight-like square; enemy: red slime circle. Health bar above.
+
+Turn flow: playerPhase true → input enabled. After action, if MP is 0 and attack used… just let the player end their turn with Enter anytime; auto-end when MP=0? Better to require Enter for clarity, but auto-end is smoother. Auto-end turn when MP runs out (with a small delay), plus allow early ending with Enter.
+
+Enemy turn: process one enemy at a time with setTimeout animation delays. Each enemy: if adjacent to player → attack; otherwise move up to 3 tiles along the BFS path; after moving, if adjacent → attack once.
+
+Attack range: orthogonal adjacency. Player attacks an adjacent enemy (if multiple… pick the one in the direction they pressed? Simplification: Space attacks the nearest adjacent enemy, or A key attacks). Let's do this: pressing a direction key while MP>0 and there's an enemy in that direction → attack instead of moving. That's good tactical feel. Plus Space to end turn? No — Enter ends the turn.
+
+Controls list on start screen: arrow keys/WASD to move/attack, Enter to end turn, R to restart, M to mute (probably). Add mute with M.
+
+Win: all enemies dead → victory screen with stats, Enter/R to restart.
+
+Let's write it.
+
+Code structure:
+- const canvas, ctx; resize handler sets canvas size = window inner dimensions, computes tile = min(w/COLS, h/ROWS) with an upper cap, offsetX/Y for centering.
+- Game object with reset().
+- Grid obstacles: fixed layout or random? Random per game with player spawn on the left, enemies on the right.
+
+Entities: {x,y,hp,maxHp,mp,isPlayer,color}.
+
+BFS path from enemy to player avoiding other entities and walls.
+
+Floating text array.
+
+Audio: lazy-init AudioContext on first keydown; beep(freq,dur,type).
+
+Draw: background tiles with subtle checker pattern, obstacles as gray rocks (rounded rectangles), entity body + HP bar, highlight the player's reachable tiles during player phase? Nice touch: draw BFS-reachable tiles in a faint blue. Do it — compute the reachable set when MP changes.
+
+Damage flash: entity.flash timer.
+
+Enemy turn animation: use async/await with sleep; guard with a gameToken to invalidate on restart.
+
+Let's write the HTML now. Keep it clean, about 400 lines.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Slime Dungeon: Turn Tactics</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#10131a;}
+  canvas{display:block;position:absolute;left:0;top:0;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+
+let W=0,H=0,tile=48,offX=0,offY=0;
+function resize(){
+  W=window.innerWidth;H=window.innerHeight;
+  const dpr=window.devicePixelRatio||1;
+  canvas.width=W*dpr;canvas.height=H*dpr;
+  canvas.style.width=W+'px';canvas.style.height=H+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  tile=Math.floor(Math.min(W/COLS,(H-70)/ROWS));
+  tile=Math.max(24,Math.min(tile,72));
+  offX=Math.floor((W-tile*COLS)/2);
+  offY=Math.floor((H-tile*ROWS)/2)+30;
+}
+window.addEventListener('resize',resize);
+
+const COLS=13,ROWS=9;
+let state='start'; // start | playing | won | lost
+let grid=[];       // 0 empty, 1 obstacle
+let player=null,enemies=[],turnNum=1,kills=0;
+let floats=[];     // floating texts
+let reachable=new Set();
+let animToken=0;
+let muted=false;
+let bestKills=0;
+try{bestKills=parseInt(localStorage.getItem('slime_best')||'0',10)||0;}catch(e){}
+
+// ---------- audio ----------
+let AC=null;
+function initAudio(){
+  if(AC)return;
+  try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}
+}
+function beep(freq,dur,type,vol){
+  if(!AC||muted)return;
+  const o=AC.createOscillator(),g=AC.createGain();
+  o.type=type||'square';o.frequency.value=freq;
+  g.gain.setValueAtTime(vol||0.08,AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001,AC.currentTime+dur);
+  o.connect(g);g.connect(AC.destination);
+  o.start();o.stop(AC.currentTime+dur);
+}
+
+// ---------- game setup ----------
+function idx(x,y){return y*COLS+x;}
+function inB(x,y){return x>=0&&x<COLS&&y>=0&&y<ROWS;}
+function blocked(x,y,ignores){
+  if(!inB(x,y))return true;
+  if(grid[idx(x,y)]===1)return true;
+  for(const e of ignores)if(e.x===x&&e.y===y)return true;
+  return false;
+}
+
+function newGame(){
+  animToken++;
+  grid=new Array(COLS*ROWS).fill(0);
+  // scatter obstacles (keep spawn columns clear)
+  let placed=0,guard=0;
+  while(placed<10&&guard<300){
+    guard++;
+    const x=2+Math.floor(Math.random()*(COLS-4));
+    const y=Math.floor(Math.random()*ROWS);
+    if(grid[idx(x,y)]===0){grid[idx(x,y)]=1;placed++;}
+  }
+  player={x:1,y:Math.floor(ROWS/2),hp:30,maxHp:30,mp:3,name:'Hero',flash:0,isPlayer:true};
+  enemies=[];
+  const defs=[
+    {x:COLS-2,y:2,hp:10,dmg:4,c:'#e74c3c'},
+    {x:COLS-2,y:ROWS-3,hp:10,dmg:4,c:'#e74c3c'},
+    {x:COLS-1,y:Math.floor(ROWS/2),hp:16,dmg:5,c:'#9b59b6'}
+  ];
+  for(const d of defs){
+    let gx=d.x,gy=d.y,tries=0;
+    while(grid[idx(gx,gy)]===1&&tries<50){gx=Math.max(2,gx-1);tries++;}
+    enemies.push({x:gx,y:gy,hp:d.hp,maxHp:d.hp,dmg:d.dmg,c:d.c,flash:0,name:'Slime'});
+  }
+  kills=0;turnNum=1;floats=[];
+  player.mp=3;
+  computeReachable();
+  state='playing';
+  beep(440,0.12,'triangle',0.1);
+}
+
+function aliveEnemies(){return enemies.filter(e=>e.hp>0);}
+function adjacent(x,y){
+  return [[1,0],[-1,0],[0,1],[0,-1]].some(d=>{
+    const nx=x+d[0],ny=y+d[1];
+    return inB(nx,ny)&&!blocked(nx,ny,[player]);
+  });
+}
+
+function computeReachable(){
+  reachable=new Set();
+  if(!player||state!=='playing'||!player.acting)return;
+  const mp=player.mp;
+  const dist={};dist[idx(player.x,player.y)]=0;
+  const q=[[player.x,player.y]];
+  while(q.length){
+    const [x,y]=q.shift();
+    const d=dist[idx(x,y)];
+    if(d>=mp)continue;
+    for(const dd of [[1,0],[-1,0],[0,1],[0,-1]]){
+      const nx=x+dd[0],ny=y+dd[1];
+      if(!inB(nx,ny))continue;
+      const i=idx(nx,ny);
+      if(grid[i]===1)continue;
+      if(aliveEnemies().some(e=>e.x===nx&&e.y===ny)&&!(player.x===nx&&player.y===ny))continue;
+      if(dist[i]!==undefined)continue;
+      dist[i]=d+1;
+      reachable.add(i);
+      q.push([nx,ny]);
+    }
+  }
+}
+
+function addFloat(x,y,text,color){
+  floats.push({x,y,text,color,life:1});
+}
+
+// ---------- player actions ----------
+function playerAct(dx,dy){
+  if(state!=='playing'||!player.acting)return;
+  const nx=player.x+dx,ny=player.y+dy;
+  // attack?
+  const target=aliveEnemies().find(e=>e.x===nx&&e.y===ny);
+  if(target){
+    doAttack(player,target,12);
+    player.mp=Math.max(0,player.mp-1);
+    checkEnd();
+    return;
+  }
+  // move?
+  if(inB(nx,ny)&&grid[idx(nx,ny)]===0&&player.mp>0){
+    player.x=nx;player.y=ny;
+    player.mp--;
+    beep(220,0.05,'sine',0.04);
+    computeReachable();
+    checkEnd();
+  }else{
+    beep(110,0.08,'sawtooth',0.03);
+  }
+}
+
+function doAttack(attacker,target,dmg){
+  target.hp-=dmg;target.flash=1;
+  addFloat(target.x,target.y,'-'+dmg,'#ffd54a');
+  beep(target.isPlayer?160:320,0.15,'square',0.09);
+  if(target.hp<=0){
+    target.hp=0;
+    addFloat(target.x,target.y-0.4,'K.O.!','#ff7b7b');
+    beep(90,0.3,'sawtooth',0.1);
+    if(!target.isPlayer)kills++;
+  }
+}
+
+function checkEnd(){
+  if(aliveEnemies().length===0){
+    state='won';player.acting=false;
+    if(kills>bestKills){bestKills=kills;try{localStorage.setItem('slime_best',String(bestKills));}catch(e){}}
+    beep(523,0.12,'triangle',0.1);setTimeout(()=>beep(659,0.12,'triangle',0.1),130);setTimeout(()=>beep(784,0.25,'triangle',0.12),260);
+    return;
+  }
+  if(player.hp<=0){state='lost';player.acting=false;beep(80,0.5,'sawtooth',0.12);return;}
+  if(player.mp<=0)endPlayerTurn();
+}
+
+// ---------- enemy turns ----------
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function bfsPath(sx,sy,tx,ty,obstacles){
+  const prev={};prev[idx(sx,sy)]=null;
+  const q=[[sx,sy]];
+  while(q.length){
+    const [x,y]=q.shift();
+    if(x===tx&&y===ty){
+      const path=[];let i=idx(x,y);
+      while(prev[i]!==null){path.unshift([i%COLS,Math.floor(i/COLS)]);i=prev[i];}
+      return path.slice(1);
+    }
+    for(const d of [[1,0],[-1,0],[0,1],[0,-1]]){
+      const nx=x+d[0],ny=y+d[1],ni=idx(nx,ny);
+      if(!inB(nx,ny)||grid[ni]===1)continue;
+      if(obstacles.some(o=>o.x===nx&&o.y===ny))continue;
+      if(prev[ni]!==undefined)continue;
+      prev[ni]=idx(x,y);q.push([nx,ny]);
+    }
+  }
+  return null;
+}
+
+function enemyAdjacentToPlayer(e){
+  return Math.abs(e.x-player.x)+Math.abs(e.y-player.y)===1;
+}
+
+async function enemyTurns(){
+  const token=animToken;
+  player.acting=false;
+  computeReachable();
+  await sleep(450);
+  for(const e of enemies){
+    if(token!==animToken)return;
+    if(e.hp<=0)continue;
+    // attack if adjacent
+    if(enemyAdjacentToPlayer(e)){
+      doAttack(e,player,e.dmg);
+      await sleep(600);
+      continue;
+    }
+    const others=enemies.filter(o=>o!==e&&o.hp>0);
+    const path=bfsPath(e.x,e.y,player.x,player.y,others);
+    let steps=3;
+    if(path){
+      for(const [px,py] of path){
+        if(steps<=0)break;
+        if(enemyAdjacentToPlayer(e))break;
+        e.x=px;e.y=py;steps--;
+        beep(180+Math.random()*60,0.04,'sine',0.03);
+        await sleep(170);
+        if(token!==animToken)return;
+      }
+    }
+    if(enemyAdjacentToPlayer(e)){
+      doAttack(e,player,e.dmg);
+      await sleep(600);
+    }
+    if(player.hp<=0){state='lost';return;}
+  }
+  if(token!==animToken)return;
+  turnNum++;
+  player.mp=3;
+  player.acting=true;
+  computeReachable();
+}
+
+function endPlayerTurn(){
+  if(state!=='playing'||!player.acting)return;
+  player.acting=false;
+  enemyTurns();
+}
+
+// ---------- input ----------
+window.addEventListener('keydown',function(ev){
+  initAudio();
+  const k=ev.key;
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(k))ev.preventDefault();
+  if(k==='m'||k==='M'){muted=!muted;return;}
+  if(k==='r'||k==='R'){newGame();return;}
+  if(state==='start'&&(k==='Enter'||k===' ')){newGame();return;}
+  if((state==='won'||state==='lost')&&(k==='Enter'||k===' ')){newGame();return;}
+  if(state!=='playing')return;
+  switch(k){
+    case 'ArrowUp':case 'w':case 'W':playerAct(0,-1);break;
+    case 'ArrowDown':case 's':case 'S':playerAct(0,1);break;
+    case 'ArrowLeft':case 'a':case 'A':playerAct(-1,0);break;
+    case 'ArrowRight':case 'd':case 'D':playerAct(1,0);break;
+    case 'Enter':endPlayerTurn();break;
+  }
+});
+
+// ---------- drawing ----------
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();
+}
+
+function drawEntity(e){
+  const px=offX+e.x*tile,py=offY+e.y*tile;
+  // shadow
+  ctx.fillStyle='rgba(0,0,0,0.35)';
+  ctx.beginPath();ctx.ellipse(px+tile/2,py+tile*0.82,tile*0.3,tile*0.1,0,0,Math.PI*2);ctx.fill();
+  // body
+  const bob=Math.sin(Date.now()/300+(e.x+e.y))*2;
+  ctx.save();
+  if(e.flash>0){ctx.globalAlpha=0.5+0.5*Math.abs(Math.sin(Date.now()/40));}
+  if(e.isPlayer){
+    ctx.fillStyle='#4a9df8';
+    roundRect(px+tile*0.2,py+tile*0.18+bob,tile*0.6,tile*0.58,8);ctx.fill();
+    // helmet plume
+    ctx.fillStyle='#ffd54a';
+    ctx.fillRect(px+tile*0.44,py+tile*0.08+bob,tile*0.12,tile*0.16);
+    // visor
+    ctx.fillStyle='#1b2a44';
+    roundRect(px+tile*0.27,py+tile*0.34+bob,tile*0.46,tile*0.14,4);ctx.fill();
+  }else{
+    const sq=1+0.06*Math.sin(Date.now()/250+(e.x*3));
+    ctx.fillStyle=e.flash>0?'#ffffff':e.c;
+    ctx.beginPath();
+    ctx.ellipse(px+tile/2,py+tile*0.52+bob,tile*0.34*sq,tile*0.3/sq,0,0,Math.PI*2);
+    ctx.fill();
+    // eyes
+    ctx.fillStyle='#fff';
+    ctx.beginPath();ctx.arc(px+tile*0.4,py+tile*0.46+bob,tile*0.07,0,Math.PI*2);ctx.arc(px+tile*0.6,py+tile*0.46+bob,tile*0.07,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='#222';
+    ctx.beginPath();ctx.arc(px+tile*0.41,py+tile*0.47+bob,tile*0.035,0,Math.PI*2);ctx.arc(px+tile*0.61,py+tile*0.47+bob,tile*0.035,0,Math.PI*2);ctx.fill();
+  }
+  ctx.restore();
+  // hp bar
+  const bw=tile*0.7,bx=px+(tile-bw)/2,by=py+tile*0.02;
+  ctx.fillStyle='rgba(0,0,0,0.6)';ctx.fillRect(bx-1,by-1,bw+2,6);
+  const frac=Math.max(0,e.hp/e.maxHp);
+  ctx.fillStyle=e.isPlayer?'#4cd964':(frac>0.5?'#ffd54a':'#ff5b5b');
+  ctx.fillRect(bx,by,bw*frac,4);
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // bg
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#171c28');g.addColorStop(1,'#0d1017');
+  ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+
+  if(state==='start'){
+    drawTitle('SLIME DUNGEON','#4a9df8');
+    ctx.textAlign='center';
+    ctx.fillStyle='#aab6cf';ctx.font=Math.max(14,tile*0.32)+'px monospace';
+    const lines=[
+      'A turn-based top-down tactics game',
+      '',
+      'Move / Attack : Arrow keys or WASD',
+      '(press toward a slime to strike it)',
+      'End Turn      : Enter',
+      'Restart       : R     Mute : M',
+      '',
+      'Defeat all slimes before they defeat you!',
+      'Best kills: '+bestKills,
+      '',
+      '-- Press ENTER to start --'
+    ];
+    let y=H*0.34;
+    for(const l of lines){ctx.fillText(l,W/2,y);y+=Math.max(22,tile*0.42);}
+    return;
+  }
+
+  // board frame
+  ctx.fillStyle='#1c2333';
+  roundRect(offX-8,offY-8,tile*COLS+16,tile*ROWS+16,10);ctx.fill();
+  for(let y=0;y<ROWS;y++)for(let x=0;x<COLS;x++){
+    ctx.fillStyle=(x+y)%2===0?'#3a4358':'#343d52';
+    ctx.fillRect(offX+x*tile,offY+y*tile,tile,tile);
+  }
+  // reachable
+  if(player.acting){
+    ctx.fillStyle='rgba(90,170,255,0.18)';
+    for(const i of reachable){
+      const x=i%COLS,y=Math.floor(i/COLS);
+      ctx.fillRect(offX+x*tile+3,offY+y*tile+3,tile-6,tile-6);
+    }
+  }
+  // obstacles
+  for(let y=0;y<ROWS;y++)for(let x=0;x<COLS;x++){
+    if(grid[idx(x,y)]!==1)continue;
+    const px=offX+x*tile,py=offY+y*tile;
+    ctx.fillStyle='#5b6478';
+    roundRect(px+tile*0.12,py+tile*0.2,tile*0.76,tile*0.66,tile*0.18);ctx.fill();
+    ctx.fillStyle='#6d7690';
+    roundRect(px+tile*0.2,py+tile*0.14,tile*0.4,tile*0.3,tile*0.12);ctx.fill();
+  }
+  // entities
+  for(const e of enemies)if(e.hp>0)drawEntity(e);
+  if(player&&player.hp>0)drawEntity(player);
+  // floats
+  ctx.textAlign='center';
+  ctx.font='bold '+Math.max(14,tile*0.34)+'px monospace';
+  for(let i=floats.length-1;i>=0;i--){
+    const f=floats[i];f.life-=0.016;
+    if(f.life<=0){floats.splice(i,1);continue;}
+    ctx.globalAlpha=Math.min(1,f.life*2);
+    ctx.fillStyle=f.color;
+    ctx.fillText(f.text,offX+(f.x+0.5)*tile,offY+(f.y+0.3)*tile-fyOffset(f));
+    ctx.globalAlpha=1;
+  }
+  function fyOffset(f){return (1-f.life)*28;}
+
+  // HUD
+  ctx.textAlign='left';
+  ctx.font=Math.max(14,tile*0.3)+'px monospace';
+  ctx.fillStyle='#e8edf7';
+  let hudY=offY-22;
+  if(hudY<24)hudY=offY+tile*ROWS+26;
+  ctx.fillText('Turn '+turnNum, offX, hudY);
+  const mpTxt='MP: '+'●'.repeat(player.mp)+'○'.repeat(3-player.mp);
+  ctx.fillStyle='#7fb8ff';ctx.fillText(mpTxt, offX+110, hudY);
+  ctx.fillStyle=player.acting?'#4cd964':'#ff9d5c';
+  ctx.fillText(player.acting?'Your move — Enter ends turn':'Slimes are moving...', offX+280, hudY);
+
+  if(state==='won'||state==='lost'){
+    ctx.fillStyle='rgba(0,0,0,0.65)';ctx.fillRect(0,0,W,H);
+    drawTitle(state==='won'?'VICTORY!':'DEFEATED', state==='won'?'#4cd964':'#ff5b5b');
+    ctx.textAlign='center';
+    ctx.fillStyle='#cdd6e8';ctx.font=Math.max(15,tile*0.32)+'px monospace';
+    ctx.fillText('Slimes slain: '+kills+'   Best: '+bestKills, W/2, H*0.42);
+    ctx.fillText('Turns used: '+turnNum, W/2, H*0.42+Math.max(24,tile*0.45));
+    ctx.fillStyle='#fff';
+    ctx.fillText('-- Press ENTER to play again --', W/2, H*0.42+Math.max(24,tile*0.45)*2);
+  }
+}
+
+function drawTitle(text,color){
+  ctx.textAlign='center';
+  ctx.font='bold '+Math.max(30,Math.min(W*0.07,64))+'px monospace';
+  ctx.fillStyle=color;
+  ctx.shadowColor=color;ctx.shadowBlur=24;
+  ctx.fillText(text,W/2,H*0.18);
+  ctx.shadowBlur=0;
+}
+
+// ---------- loop ----------
+function tick(){
+  for(const e of enemies)if(e.flash>0)e.flash-=0.03;
+  draw();
+  requestAnimationFrame(tick);
+}
+resize();
+tick();
+})();
+</script>
+</body>
+</html>
+```
