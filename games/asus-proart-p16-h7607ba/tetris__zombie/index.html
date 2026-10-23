@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Zombie Tetris</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#070b07;overflow:hidden;}
+  body{display:flex;align-items:center;justify-content:center;}
+  canvas{box-shadow:0 0 40px rgba(80,200,80,.25);border-radius:6px;background:#0c130c;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+var cvs=document.getElementById('c'), ctx=cvs.getContext('2d');
+var COLS=10, ROWS=20, CELL=30, BW=COLS*CELL, BH=ROWS*CELL;
+cvs.width=BW+180; cvs.height=BH;
+
+function fit(){
+  var s=Math.min(window.innerWidth/cvs.width, window.innerHeight/cvs.height)*0.98;
+  if(s>1)s=1;
+  cvs.style.width=(cvs.width*s)+'px';
+  cvs.style.height=(cvs.height*s)+'px';
+}
+window.addEventListener('resize',fit); fit();
+
+/* ---------- audio ---------- */
+var actx=null;
+function initAudio(){
+  if(!actx){ try{ actx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+  if(actx && actx.state==='suspended'){ try{actx.resume();}catch(e){} }
+}
+function tone(freq,dur,type,vol,slideTo){
+  if(!actx)return;
+  try{
+    var o=actx.createOscillator(), g=actx.createGain(), t=actx.currentTime;
+    o.type=type||'square';
+    o.frequency.setValueAtTime(freq,t);
+    if(slideTo)o.frequency.exponentialRampToValueAtTime(Math.max(20,slideTo),t+dur);
+    g.gain.setValueAtTime(vol||0.12,t);
+    g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(t); o.stop(t+dur+0.02);
+  }catch(e){}
+}
+function sMove(){tone(220,0.05,'square',0.06);}
+function sRotate(){tone(340,0.07,'square',0.08);}
+function sDrop(){tone(120,0.09,'triangle',0.18,60);}
+function sClear(){ [440,660,880].forEach(function(f,i){ setTimeout(function(){tone(f,0.12,'square',0.1);},i*70); }); }
+function sGrowl(){tone(95,0.55,'sawtooth',0.14,38); tone(60,0.5,'sawtooth',0.1,30);}
+function sOver(){ [330,262,196,131].forEach(function(f,i){ setTimeout(function(){tone(f,0.3,'sawtooth',0.12);},i*220); }); }
+function sBite(){tone(700,0.08,'square',0.15,200); tone(150,0.4,'sawtooth',0.16,50);}
+
+/* ---------- shapes ---------- */
+var SHAPES={
+  I:[[0,0,0,0],[1,1,1,1],[0,0,0,0],[0,0,0,0]],
+  O:[[1,1],[1,1]],
+  T:[[0,1,0],[1,1,1],[0,0,0]],
+  S:[[0,1,1],[1,1,0],[0,0,0]],
+  Z:[[1,1,0],[0,1,1],[0,0,0]],
+  J:[[1,0,0],[1,1,1],[0,0,0]],
+  L:[[0,0,1],[1,1,1],[0,0,0]]
+};
+var COLORS={I:'#7ee787',O:'#e6e0c9',T:'#b18cff',S:'#54d372',Z:'#d1493f',J:'#5f8fd9',L:'#e0a84e'};
+var KEYS=Object.keys(SHAPES);
+
+/* ---------- state ---------- */
+var grid, piece, nextType, score, lines, level, zombies;
+var dropTimer, zTimer, state, overReason, clearRows, clearTimer, highScore=0, blink=0;
+
+try{ highScore=parseInt(localStorage.getItem('zombieTetrisHigh')||'0',10)||0; }catch(e){}
+
+function saveHigh(){ try{ localStorage.setItem('zombieTetrisHigh',String(highScore)); }catch(e){} }
+
+function reset(){
+  grid=[]; for(var r=0;r<ROWS;r++){ grid.push(new Array(COLS).fill(0)); }
+  score=0; lines=0; level=1; zombies=0; dropTimer=0; zTimer=0;
+  clearRows=[]; clearTimer=0; overReason='';
+  nextType=randKey();
+  spawn();
+}
+function randKey(){ return KEYS[Math.floor(Math.random()*KEYS.length)]; }
+
+function spawn(){
+  var type = (piece && piece.spawned)?nextType:randKey();
+  nextType=randKey();
+  var mat=SHAPES[type].map(function(r){return r.slice();});
+  piece={type:type,mat:mat,x:Math.floor((COLS-mat[0].length)/2),y:(mat[0].indexOf(1)>=0? -topOffset(mat):0)};
+  if(piece.y<0)piece.y=0;
+  if(collides(piece.mat,piece.x,piece.y)){
+    state='over'; overReason='Stacked up!'; endGame(); return;
+  }
+}
+function topOffset(m){ for(var r=0;r<m.length;r++){ for(var c=0;c<m[r].length;c++){ if(m[r][c])return r; } } return 0; }
+
+function collides(mat,px,py){
+  for(var r=0;r<mat.length;r++)for(var c=0;c<mat[r].length;c++){
+    if(!mat[r][c])continue;
+    var nx=px+c, ny=py+r;
+    if(nx<0||nx>=COLS||ny>=ROWS)return true;
+    if(ny>=0&&grid[ny][nx])return true;
+  }
+  return false;
+}
+function rotateMat(m,dir){
+  var n=m.length, out=[];
+  for(var r=0;r<n;r++){out.push(new Array(n).fill(0));}
+  for(var r=0;r<n;r++)for(var c=0;c<n;c++){
+    if(dir>0)out[c][n-1-r]=m[r][c]; else out[n-1-c][r]=m[r][c];
+  }
+  return out;
+}
+function tryRotate(dir){
+  var m=rotateMat(piece.mat,dir);
+  var kicks=[0,-1,1,-2,2];
+  for(var i=0;i<kicks.length;i++){
+    if(!collides(m,piece.x+kicks[i],piece.y)){ piece.mat=m; piece.x+=kicks[i]; sRotate(); return true; }
+  }
+  return false;
+}
+function move(dx){
+  if(!collides(piece.mat,piece.x+dx,piece.y)){ piece.x+=dx; sMove(); return true; }
+  return false;
+}
+function softDrop(){
+  if(!collides(piece.mat,piece.x,piece.y+1)){ piece.y++; score+=1; dropTimer=0; return true; }
+  lockPiece(); return false;
+}
+function hardDrop(){
+  var d=0;
+  while(!collides(piece.mat,piece.x,piece.y+1)){ piece.y++; d++; }
+  score+=d*2; sDrop(); lockPiece();
+}
+function ghostY(){
+  var y=piece.y;
+  while(!collides(piece.mat,piece.x,y+1))y++;
+  return y;
+}
+function lockPiece(){
+  var bitten=false;
+  for(var r=0;r<piece.mat.length;r++)for(var c=0;c<piece.mat[r].length;c++){
+    if(!piece.mat[r][c])continue;
+    var ny=piece.y+r, nx=piece.x+c;
+    if(ny<0){ state='over'; overReason='Stacked up!'; endGame(); return; }
+    grid[ny][nx]=piece.type;
+    if(ny>=ROWS-zombies)bitten=true;
+  }
+  var full=[];
+  for(var rr=0;rr<ROWS;rr++){ if(grid[rr].every(function(v){return v;})) full.push(rr); }
+  if(bitten){ sBite(); state='over'; overReason='You were bitten!'; endGame(); return; }
+  if(full.length){
+    clearRows=full; clearTimer=0.3; state='clearing';
+    score+=[0,100,300,500,800][full.length]*level;
+    lines+=full.length;
+    level=1+Math.floor(lines/5);
+    sClear();
+  } else {
+    dropTimer=0; spawn();
+  }
+}
+function finishClear(){
+  clearRows.sort(function(a,b){return a-b;}).forEach(function(r){
+    grid.splice(r,1); grid.unshift(new Array(COLS).fill(0));
+  });
+  zombies=Math.max(0,zombies-clearRows.length*2);
+  clearRows=[]; state='play'; dropTimer=0; spawn();
+}
+function endGame(){
+  if(score>highScore){ highScore=score; saveHigh(); }
+  sOver();
+}
+
+/* ---------- update ---------- */
+var lastT=performance.now();
+function loop(now){
+  var dt=Math.min(0.05,(now-lastT)/1000); lastT=now; blink+=dt;
+  if(state==='play'||state==='clearing'){
+    zTimer+=dt;
+    var zInt=Math.max(1.4, 6 - (level-1)*0.38);
+    if(zTimer>=zInt){
+      zTimer=0; zombies++; sGrowl();
+      if(zombies>=ROWS){ state='over'; overReason='The horde reached the top!'; endGame(); }
+    }
+    if(state==='play'){
+      dropTimer+=dt*1000;
+      var spd=Math.max(110, 750-(level-1)*62);
+      if(dropTimer>=spd){
+        if(!collides(piece.mat,piece.x,piece.y+1))piece.y++;
+        else lockPiece();
+        dropTimer=0;
+      }
+    } else if(state==='clearing'){
+      clearTimer-=dt;
+      if(clearTimer<=0)finishClear();
+    }
+  }
+  draw(now/1000);
+  requestAnimationFrame(loop);
+}
+
+/* ---------- drawing ---------- */
+function drawCell(px,py,color,ghost){
+  var x=px*CELL,y=py*CELL;
+  if(ghost){
+    ctx.strokeStyle=color; ctx.globalAlpha=0.35; ctx.lineWidth=2;
+    ctx.strokeRect(x+3,y+3,CELL-6,CELL-6);
+    ctx.globalAlpha=1; return;
+  }
+  ctx.fillStyle=color;
+  ctx.fillRect(x+1,y+1,CELL-2,CELL-2);
+  ctx.fillStyle='rgba(255,255,255,0.25)';
+  ctx.fillRect(x+1,y+1,CELL-2,4);
+  ctx.fillStyle='rgba(0,0,0,0.3)';
+  ctx.fillRect(x+1,y+CELL-6,CELL-2,5);
+  // zombie eyes
+  ctx.fillStyle='rgba(10,20,10,0.85)';
+  ctx.beginPath(); ctx.arc(x+CELL*0.33,y+CELL*0.42,2.6,0,7); ctx.fill();
+  ctx.beginPath(); ctx.arc(x+CELL*0.67,y+CELL*0.42,2.6,0,7); ctx.fill();
+}
+
+function drawZombieHead(x,y,r,t,phase){
+  var bob=Math.sin(t*3+phase)*r*0.18;
+  y+=bob;
+  // shoulders
+  ctx.fillStyle='#2e4a25';
+  ctx.fillRect(x-r*1.15,y+r*0.35,r*2.3,r*0.9);
+  // head
+  ctx.fillStyle='#7fae5a';
+  ctx.strokeStyle='#3f5c2e'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill(); ctx.stroke();
+  // eyes
+  ctx.fillStyle='#efe9d8';
+  ctx.beginPath(); ctx.arc(x-r*0.38,y-r*0.15,r*0.26,0,7); ctx.fill();
+  ctx.beginPath(); ctx.arc(x+r*0.38,y-r*0.15,r*0.26,0,7); ctx.fill();
+  ctx.fillStyle='#a01818';
+  var look=Math.sin(t*1.3+phase)*r*0.08;
+  ctx.beginPath(); ctx.arc(x-r*0.38+look,y-r*0.12,r*0.12,0,7); ctx.fill();
+  ctx.beginPath(); ctx.arc(x+r*0.38+look,y-r*0.12,r*0.12,0,7); ctx.fill();
+  // mouth
+  ctx.strokeStyle='#2c3d1f'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(x-r*0.45,y+r*0.4);
+  for(var i=0;i<4;i++){
+    ctx.lineTo(x-r*0.45+(i+0.5)*(r*0.9/4),y+r*0.4+(i%2? -r*0.12: r*0.12));
+  }
+  ctx.stroke();
+}
+
+function drawBoard(t){
+  // board bg
+  ctx.fillStyle='#101a10';
+  ctx.fillRect(0,0,BW,BH);
+  ctx.strokeStyle='rgba(120,200,120,0.08)'; ctx.lineWidth=1;
+  for(var c=0;c<=COLS;c++){ ctx.beginPath(); ctx.moveTo(c*CELL,0); ctx.lineTo(c*CELL,BH); ctx.stroke(); }
+  for(var r=0;r<=ROWS;r++){ ctx.beginPath(); ctx.moveTo(0,r*CELL); ctx.lineTo(BW,r*CELL); ctx.stroke(); }
+
+  // cells
+  for(var rr=0;rr<ROWS;rr++)for(var cc=0;cc<COLS;cc++){
+    if(grid[rr][cc])drawCell(cc,rr,COLORS[grid[rr][cc]],false);
+  }
+  // clearing flash
+  if(state==='clearing'){
+    ctx.fillStyle='rgba(255,255,220,'+(0.3+0.6*Math.abs(Math.sin(t*25)))+')';
+    clearRows.forEach(function(r){ ctx.fillRect(0,r*CELL,BW,CELL); });
+  }
+  // ghost + piece
+  if(state==='play'&&piece){
+    var gy=ghostY();
+    for(var r=0;r<piece.mat.length;r++)for(var c=0;c<piece.mat[r].length;c++){
+      if(!piece.mat[r][c])continue;
+      if(gy+r>=0)drawCell(piece.x+c,gy+r,COLORS[piece.type],true);
+    }
+    for(var r2=0;r2<piece.mat.length;r2++)for(var c2=0;c2<piece.mat[r2].length;c2++){
+      if(!piece.mat[r2][c2])continue;
+      if(piece.y+r2>=0)drawCell(piece.x+c2,piece.y+r2,COLORS[piece.type],false);
+    }
+  }
+  // zombies
+  for(var z=0;z<zombies;z++){
+    var rowY=BH-(z+1)*CELL+CELL*0.55;
+    ctx.fillStyle='rgba(40,70,30,'+(0.25+z*0.01)+')';
+    ctx.fillRect(0,rowY-CELL*0.55,BW,CELL*0.55);
+    var xs=[0.8,3.2,5.6,8.0];
+    for(var i=0;i<xs.length;i++){
+      drawZombieHead(xs[i]*CELL+CELL/2,rowY,CELL*0.42,t,z*1.7+i*2.1);
+    }
+  }
+  // danger vignette
+  if(zombies>=15&&state!=='over'){
+    ctx.fillStyle='rgba(180,30,30,'+(0.08+0.08*Math.sin(t*6))+')';
+    ctx.fillRect(0,0,BW,BH);
+  }
+  // border
+  ctx.strokeStyle='#3d5c37'; ctx.lineWidth=3;
+  ctx.strokeRect(1.5,1.5,BW-3,BH-3);
+}
+
+function panelText(str,x,y,size,color,align){
+  ctx.font=(size||14)+'px "Courier New",monospace';
+  ctx.fillStyle=color||'#cfe8cf';
+  ctx.textAlign=align||'left';
+  ctx.fillText(str,x,y);
+}
+
+function drawPanel(){
+  var x0=BW+25;
+  panelText('NEXT',x0,30,16,'#7ee787');
+  ctx.strokeStyle='#3d5c37'; ctx.lineWidth=2;
+  ctx.strokeRect(x0-5,40,150,90);
+  if(nextType){
+    var m=SHAPES[nextType], size=Math.min(20,(140/m[0].length)|0);
+    var offX=0,minR=m.length;
+    for(var r=0;r<m.length;r++){ if(m[r].some(function(v){return v;})){offX=r;break;} }
+    minR=offX;
+    var w=m[0].length*size, h=(m.length-minR)*size;
+    var ox=x0+70-w/2, oy=40+(90-h)/2;
+    for(var r2=0;r2<m.length;r2++)for(var c=0;c<m[r2].length;c++){
+      if(!m[r2][c])continue;
+      ctx.fillStyle=COLORS[nextType];
+      ctx.fillRect(ox+c*size+1,oy+(r2-minR)*size+1,size-2,size-2);
+    }
+  }
+  panelText('SCORE',x0,165,13,'#7ee787');
+  panelText(String(score),x0,185,20,'#ffffff');
+  panelText('BEST',x0,220,13,'#7ee787');
+  panelText(String(highScore),x0,240,18,'#ffd97a');
+  panelText('LINES '+lines+'   LVL '+level,x0,280,15,'#cfe8cf');
+
+  // zombie meter
+  panelText('ZOMBIES',x0,330,13,'#d1493f');
+  var mx=x0,mw=150,mh=16,my=342;
+  ctx.fillStyle='#1a1010'; ctx.fillRect(mx,my,mw,mh);
+  var frac=zombies/ROWS;
+  ctx.fillStyle=frac>0.7?'#e03030':'#8fbf5a';
+  ctx.fillRect(mx,my,mw*frac,mh);
+  ctx.strokeStyle='#3d5c37'; ctx.strokeRect(mx,my,mw,mh);
+  // skull at end of meter
+  ctx.fillStyle='#e6e0c9';
+  var sx=mx+mw*frac;
+  ctx.beginPath(); ctx.arc(sx,my-10,7,0,7); ctx.fill();
+  ctx.fillStyle='#111';
+  ctx.beginPath(); ctx.arc(sx-2.5,my-11,1.6,0,7); ctx.fill();
+  ctx.beginPath(); ctx.arc(sx+2.5,my-11,1.6,0,7); ctx.fill();
+
+  panelText('P PAUSE   R RESTART',x0,BH-30,12,'#6f8f6f');
+}
+
+function centerBox(w,h){
+  var x=(cvs.width-w)/2, y=(BH-h)/2;
+  ctx.fillStyle='rgba(5,10,5,0.92)';
+  ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle='#3d5c37'; ctx.lineWidth=3;
+  ctx.strokeRect(x,y,w,h);
+  return {x:x,y:y};
+}
+
+function drawStart(t){
+  var b=centerBox(400,420);
+  drawZombieHead(cvs.width/2,b.y+80,45,t,0);
+  ctx.textAlign='center';
+  ctx.font='bold 44px "Courier New",monospace';
+  ctx.fillStyle='#7ee787';
+  ctx.fillText('ZOMBIE TETRIS',cvs.width/2,b.y+165);
+  ctx.font='14px "Courier New",monospace';
+  ctx.fillStyle='#cfe8cf';
+  var ly=b.y+205;
+  ['Clear lines to smash the horde','back down. Each line kills 2 zombies.','But they keep shuffling up... if','they reach the top, you\'re done!']
+    .forEach(function(s){ ctx.fillText(s,cvs.width/2,ly); ly+=20; });
+  ctx.fillStyle='#8fbf5a';
+  var cy=ly+15;
+  ['\u2190 \u2192 move     \u2191 / X rotate','Z rotate back    \u2193 soft drop',
+   'SPACE hard drop','','P pause     R restart'].forEach(function(s){ ctx.fillText(s,cvs.width/2,cy); cy+=20; });
+  if(Math.sin(t*4)>-0.3){
+    ctx.fillStyle='#ffd97a';
+    ctx.font='bold 18px "Courier New",monospace';
+    ctx.fillText('PRESS ENTER TO PLAY',cvs.width/2,b.y+400);
+  }
+  if(highScore>0){ ctx.fillStyle='#8fbf5a'; ctx.font='13px "Courier New",monospace'; ctx.fillText('BEST: '+highScore,cvs.width/2,b.y+40); }
+}
+
+function drawOver(t){
+  var b=centerBox(400,260);
+  drawZombieHead(cvs.width/2-180,b.y+70,32,t,1);
+  drawZombieHead(cvs.width/2+180,b.y+70,32,t,4);
+  ctx.textAlign='center';
+  ctx.font='bold 40px "Courier New",monospace';
+  ctx.fillStyle='#d1493f';
+  ctx.fillText('GAME OVER',cvs.width/2,b.y+90);
+  ctx.font='16px "Courier New",monospace';
+  ctx.fillStyle='#e6e0c9';
+  ctx.fillText(overReason,cvs.width/2,b.y+130);
+  ctx.fillStyle='#ffffff';
+  ctx.font='bold 22px "Courier New",monospace';
+  ctx.fillText('SCORE '+score,cvs.width/2,b.y+175);
+  if(score>=highScore&&score>0){
+    ctx.fillStyle='#ffd97a'; ctx.font='15px "Courier New",monospace';
+    ctx.fillText('\u2605 NEW BEST \u2605',cvs.width/2,b.y+200);
+  } else {
+    ctx.fillStyle='#8fbf5a'; ctx.font='14px "Courier New",monospace';
+    ctx.fillText('BEST '+highScore,cvs.width/2,b.y+200);
+  }
+  if(Math.sin(t*4)>-0.3){
+    ctx.fillStyle='#ffd97a';
+    ctx.font='bold 16px "Courier New",monospace';
+    ctx.fillText('PRESS ENTER TO RESTART',cvs.width/2,b.y+238);
+  }
+}
+
+function drawPause(){
+  var b=centerBox(280,90);
+  ctx.textAlign='center';
+  ctx.font='bold 32px "Courier New",monospace';
+  ctx.fillStyle='#7ee787';
+  ctx.fillText('PAUSED',cvs.width/2,b.y+55);
+}
+
+function draw(t){
+  ctx.clearRect(0,0,cvs.width,BH);
+  if(state==='start'){
+    ctx.fillStyle='#0c130c'; ctx.fillRect(0,0,cvs.width,BH);
+    // ambient zombies at bottom of start screen
+    for(var i=0;i<6;i++)drawZombieHead(40+i*75,BH-40,26,t,i*1.9);
+    drawStart(t);
+  } else {
+    drawBoard(t);
+    drawPanel();
+    if(state==='over')drawOver(t);
+    if(state==='pause')drawPause();
+  }
+}
+
+/* ---------- input ---------- */
+function startGame(){ reset(); state='play'; }
+
+window.addEventListener('keydown',function(e){
+  initAudio();
+  var k=e.key;
+  if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].indexOf(k)>=0)e.preventDefault();
+
+  if(state==='start'){
+    if(k==='Enter'||k===' ')startGame();
+    return;
+  }
+  if(state==='over'){
+    if(k==='Enter'||k==='r'||k==='R')startGame();
+    return;
+  }
+  if(k==='p'||k==='P'){
+    if(state==='play'||state==='clearing'){ state='pause'; }
+    else if(state==='pause'){ state = clearRows.length? 'clearing':'play'; }
+    return;
+  }
+  if(k==='r'||k==='R'){ startGame(); return; }
+  if(state!=='play')return;
+  switch(k){
+    case 'ArrowLeft': move(-1); break;
+    case 'ArrowRight': move(1); break;
+    case 'ArrowDown': softDrop(); break;
+    case 'ArrowUp': case 'x': case 'X': tryRotate(1); break;
+    case 'z': case 'Z': tryRotate(-1); break;
+    case ' ': hardDrop(); break;
+  }
+});
+cvs.addEventListener('mousedown',function(){
+  initAudio();
+  if(state==='start')startGame();
+  else if(state==='over')startGame();
+});
+
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
