@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Frogger Physics</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0a1428;}
+  canvas{display:block;position:absolute;top:0;left:0;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+const W=480,H=640;
+const cv=document.getElementById('c');
+const ctx=cv.getContext('2d');
+let scale=1,offX=0,offY=0,dpr=1;
+
+function resize(){
+  dpr=window.devicePixelRatio||1;
+  const w=window.innerWidth,h=window.innerHeight;
+  cv.width=w*dpr;cv.height=h*dpr;
+  cv.style.width=w+'px';cv.style.height=h+'px';
+  scale=Math.min(w/W,h/H);
+  offX=(w-W*scale)/2;offY=(h-H*scale)/2;
+}
+window.addEventListener('resize',resize);
+resize();
+
+/* ---------- audio ---------- */
+let AC=null,noiseBuf=null;
+function initAudio(){
+  if(AC)return;
+  try{
+    AC=new (window.AudioContext||window.webkitAudioContext)();
+    const len=AC.sampleRate*0.35;
+    noiseBuf=AC.createBuffer(1,len,AC.sampleRate);
+    const d=noiseBuf.getChannelData(0);
+    for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*(1-i/len);
+  }catch(e){}
+}
+function beep(f,dur,type,vol,slide){
+  if(!AC)return;
+  const o=AC.createOscillator(),g=AC.createGain();
+  o.type=type||'square';o.frequency.value=f;
+  if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(30,f+slide),AC.currentTime+dur);
+  g.gain.setValueAtTime(vol||0.15,AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001,AC.currentTime+dur);
+  o.connect(g);g.connect(AC.destination);
+  o.start();o.stop(AC.currentTime+dur+0.02);
+}
+function splash(){
+  if(!AC||!noiseBuf)return;
+  const s=AC.createBufferSource(),g=AC.createGain(),f=AC.createBiquadFilter();
+  s.buffer=noiseBuf;f.type='lowpass';f.frequency.value=900;
+  g.gain.setValueAtTime(0.3,AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001,AC.currentTime+0.35);
+  s.connect(f);f.connect(g);g.connect(AC.destination);s.start();
+}
+const sJump=()=>beep(520,0.08,'square',0.08,300);
+const sCrash=()=>{beep(110,0.35,'sawtooth',0.2,-70);};
+const sGoal=()=>{[440,660,880].forEach((f,i)=>setTimeout(()=>beep(f,0.12,'triangle',0.15),i*90));};
+const sLevel=()=>{[330,440,550,660,880].forEach((f,i)=>setTimeout(()=>beep(f,0.15,'triangle',0.15),i*110));};
+const sDeath=()=>{beep(200,0.5,'sawtooth',0.15,-160);};
+
+/* ---------- world layout ---------- */
+const TOP=200,RIV=380,BOT=560; // top grass: 0..TOP, river: TOP..RIV, road: RIV..BOT, bottom grass: BOT..H
+const HOLES_N=5,HOLE_W=W/HOLES_N,HOLE_Y=100;
+
+function makeRiverLanes(){
+  const lanes=[];
+  for(let i=0;i<3;i++){
+    const y=TOP+i*((RIV-TOP)/3);
+    const dir=i%2===0?1:-1;
+    const speed=(55+Math.random()*45)*(1+ (level-1)*0.18);
+    const logs=[];let x=0;const total=W+200;
+    while(x<total){
+      const len=80+Math.random()*70;
+      logs.push({x:x,len:len});
+      x+=len+35+Math.random()*40;
+    }
+    lanes.push({y:y,h:(RIV-TOP)/3,dir:dir,speed:speed,logs:logs,span:x});
+  }
+  return lanes;
+}
+function makeRoadLanes(){
+  const lanes=[];
+  const speeds=[130,-95,160,-120];
+  const cols=['#e74c3c','#f1c40f','#3498db','#ecf0f1'];
+  for(let i=0;i<4;i++){
+    const y=RIV+i*((BOT-RIV)/4);
+    const n=4;const step=(W+90)/n;
+    lanes.push({y:y,h:(BOT-RIV)/4,speed:speeds[i],dir:Math.sign(speeds[i]),carLen:76,carH:30,n:n,step:step,offset:Math.random()*step,color:cols[i]});
+  }
+  return lanes;
+}
+
+/* ---------- state ---------- */
+let state='start'; // start, play, dying, levelup, over
+let score=0,lives=3,level=1,combo=0,holeFill=[];
+let riverLanes=[],roadLanes=[];
+let frog={x:W/2,y:H-45,vx:0,vy:0,angle:-Math.PI/2,drownT:0};
+let deathTimer=0,deathKind='crash',levelupT=0;
+let particles=[];
+let best=0;
+try{best=parseInt(localStorage.getItem('frogphys_best')||'0',10)||0;}catch(e){}
+
+function resetLevelWorld(){
+  riverLanes=makeRiverLanes();
+  roadLanes=makeRoadLanes();
+}
+function spawnFrog(){
+  frog.x=W/2;frog.y=H-45;frog.vx=0;frog.vy=0;frog.angle=-Math.PI/2;frog.drownT=0;
+}
+function startGame(){
+  score=0;lives=3;level=1;combo=0;
+  holeFill=[false,false,false,false,false];
+  resetLevelWorld();spawnFrog();particles=[];
+  state='play';
+}
+function nextLevel(){
+  level++;
+  holeFill=[false,false,false,false,false];
+  resetLevelWorld();spawnFrog();
+  particles=[];state='play';sLevel();
+}
+
+/* ---------- input ---------- */
+const keys={};
+window.addEventListener('keydown',e=>{
+  initAudio();
+  if(AC&&AC.state==='suspended')AC.resume();
+  const k=e.key.toLowerCase();
+  if(['arrowup','arrowdown','arrowleft','arrowright',' '].includes(e.key.toLowerCase())||['w','a','s','d'].includes(k))e.preventDefault();
+  keys[k]=true;
+  if(state==='start'&&(k==='enter'||k===' ')){startGame();}
+  else if(state==='over'&&(k==='enter'||k===' '||k==='r')){startGame();}
+  else if(state==='play'&&k==='p'){state='paused';}
+  else if(state==='paused'&&k==='p'){state='play';}
+  else if(k==='r'&&state!=='start'){startGame();}
+});
+window.addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false;});
+
+/* ---------- helpers ---------- */
+function addParticles(x,y,color,n,spd){
+  for(let i=0;i<n;i++){
+    const a=Math.random()*Math.PI*2,s=(0.3+Math.random())*spd;
+    particles.push({x:x,y:y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:0.6+Math.random()*0.4,max:1,color:color,r:2+Math.random()*3});
+  }
+}
+function circleRect(cx,cy,r,rx,ry,rw,rh){
+  const nx=Math.max(rx,Math.min(cx,rx+rw));
+  const ny=Math.max(ry,Math.min(cy,ry+rh));
+  const dx=cx-nx,dy=cy-ny;
+  return dx*dx+dy*dy<r*r;
+}
+
+/* ---------- update ---------- */
+function update(dt){
+  // particles always
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i];
+    p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=300*dt;p.life-=dt;
+    if(p.life<=0)particles.splice(i,1);
+  }
+
+  if(state==='dying'){
+    deathTimer-=dt;
+    if(deathTimer<=0){
+      lives--;combo=0;
+      if(lives<=0){
+        state='over';
+        if(score>best){best=score;try{localStorage.setItem('frogphys_best',''+best);}catch(e){}}
+        sDeath();
+      }else{spawnFrog();state='play';}
+    }
+    return;
+  }
+  if(state==='levelup'){
+    levelupT-=dt;
+    if(levelupT<=0)nextLevel();
+    return;
+  }
+  if(state!=='play')return;
+
+  // frog physics
+  const ACC=1400,MAXV=340;
+  let ax=0,ay=0;
+  if(keys['arrowleft']||keys['a'])ax-=1;
+  if(keys['arrowright']||keys['d'])ax+=1;
+  if(keys['arrowup']||keys['w'])ay-=1;
+  if(keys['arrowdown']||keys['s'])ay+=1;
+  const wasMoving=Math.hypot(frog.vx,frog.vy)>30;
+  frog.vx+=ax*ACC*dt;frog.vy+=ay*ACC*dt;
+  const damp=Math.exp(-5.2*dt);
+  frog.vx*=damp;frog.vy*=damp;
+  const sp=Math.hypot(frog.vx,frog.vy);
+  if(sp>MAXV){frog.vx*=MAXV/sp;frog.vy*=MAXV/sp;}
+  // jump sfx on fresh input
+  if((ax||ay)&&!wasMoving&&(Math.abs(frog.vx)<40&&Math.abs(frog.vy)<40))sJump();
+  frog.x+=frog.vx*dt;frog.y+=frog.vy*dt;
+  if(sp>35)frog.angle=Math.atan2(frog.vy,frog.vx);
+  // bounds
+  const R=15;
+  if(frog.x<R){frog.x=R;if(frog.vx<0)frog.vx*=-0.3;}
+  if(frog.x>W-R){frog.x=W-R;if(frog.vx>0)frog.vx*=-0.3;}
+  if(frog.y<26){frog.y=26;if(frog.vy<0)frog.vy*=-0.3;}
+  if(frog.y>H-24){frog.y=H-24;if(frog.vy>0)frog.vy*=-0.3;}
+
+  // river
+  const inWater=frog.y>TOP+8&&frog.y<RIV-8;
+  let onLog=null;
+  if(inWater){
+    for(const L of riverLanes){
+      if(frog.y>=L.y&&frog.y<=L.y+L.h){
+        for(const log of L.logs){
+          const lx=((log.x%L.span)+L.span)%L.span - (log.x<0?L.span:0); // keep simple below
+        }
+        // check each log with wrap position
+        for(let i=0;i<L.logs.length;i++){
+          const log=L.logs[i];
+          let lx=log.x;
+          if(L.dir>0&&lx>W)lx-=L.span;
+          if(L.dir<0&&lx+log.len<0)lx+=L.span;
+          if(frog.x>lx+6&&frog.x<lx+log.len-6){onLog={log:log,lane:L};}
+        }
+        break;
+      }
+    }
+    if(onLog){
+      frog.drownT=0;
+      frog.x+=onLog.lane.dir*onLog.lane.speed*dt; // carried by log
+      // edge wobble
+      const lx=((onLog.log.x%onLog.lane.span)+onLog.lane.span)%onLog.lane.span - (onLog.log.x<0?onLog.lane.span:0);
+    }else{
+      frog.drownT+=dt;
+      if(frog.drownT>0.55){die('splash');return;}
+    }
+  }else frog.drownT=0;
+
+  // move lanes
+  for(const L of riverLanes)for(const log of L.logs)log.x+=L.dir*L.speed*dt;
+  for(const L of roadLanes)L.offset=(L.offset+L.dir*L.speed*dt)%L.step;
+
+  // car collisions
+  for(const L of roadLanes){
+    const cy=L.y+(L.h-L.carH)/2;
+    for(let i=0;i<L.n;i++){
+      let x=((L.offset+i*L.step)%(W+90))-90;
+      if(circleRect(frog.x,frog.y,R-2,x+6,cy+4,L.carLen-12,L.carH-8)){die('crash');return;}
+    }
+  }
+
+  // goals
+  if(frog.y<HOLE_Y+34&&frog.y>HOLE_Y-34){
+    for(let i=0;i<HOLES_N;i++){
+      const hx=i*HOLE_W+HOLE_W/2;
+      if(!holeFill[i]&&Math.abs(frog.x-hx)<HOLE_W/2-14){
+        holeFill[i]=true;combo++;
+        score+=100*(level)*Math.min(combo,5);
+        addParticles(hx,HOLE_Y,'#7CFC00',20,160);
+        sGoal();
+        spawnFrog();
+        if(holeFill.every(v=>v)){state='levelup';levelupT=1.4;}
+        break;
+      }
+    }
+  }
+}
+
+function die(kind){
+  state='dying';deathTimer=0.9;deathKind=kind;
+  if(kind==='splash'){splash();addParticles(frog.x,frog.y,'#4aa3ff',25,180);}
+  else{sCrash();addParticles(frog.x,frog.y,'#ff5533',25,200);addParticles(frog.x,frog.y,'#ffcc00',15,150);}
+}
+
+/* ---------- drawing ---------- */
+function rr(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();
+}
+
+function drawFrog(x,y,ang,alpha){
+  ctx.save();
+  ctx.translate(x,y);ctx.rotate(ang+Math.PI/2);
+  ctx.globalAlpha=alpha;
+  // legs
+  ctx.fillStyle='#2e8b2e';
+  ctx.beginPath();ctx.ellipse(-13,-4,7,4,0.5,0,7);ctx.fill();
+  ctx.beginPath();ctx.ellipse(13,-4,7,4,-0.5,0,7);ctx.fill();
+  ctx.beginPath();ctx.ellipse(-9,12,6,4,0.6,0,7);ctx.fill();
+  ctx.beginPath();ctx.ellipse(9,12,6,4,-0.6,0,7);ctx.fill();
+  // body
+  ctx.fillStyle='#3cb54a';
+  ctx.beginPath();ctx.ellipse(0,0,11,14,0,0,7);ctx.fill();
+  ctx.fillStyle='#2e8b2e';
+  ctx.beginPath();ctx.ellipse(0,4,8,9,0,0,7);ctx.fill();
+  // eyes
+  ctx.fillStyle='#fff';
+  ctx.beginPath();ctx.arc(-6,-11,5,0,7);ctx.fill();
+  ctx.beginPath();ctx.arc(6,-11,5,0,7);ctx.fill();
+  ctx.fillStyle='#111';
+  ctx.beginPath();ctx.arc(-6,-12,2.4,0,7);ctx.fill();
+  ctx.beginPath();ctx.arc(6,-12,2.4,0,7);ctx.fill();
+  ctx.restore();
+}
+
+let t=0;
+function draw(){
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle='#0a1428';
+  ctx.fillRect(0,0,cv.width/dpr,cv.height/dpr);
+  ctx.setTransform(dpr*scale,0,0,dpr*scale,dpr*offX,dpr*offY);
+
+  // top grass
+  ctx.fillStyle='#1e5c2a';ctx.fillRect(0,0,W,TOP);
+  // road base
+  ctx.fillStyle='#3b3b46';ctx.fillRect(0,RIV,W,BOT-RIV);
+  ctx.strokeStyle='rgba(255,255,255,0.35)';ctx.lineWidth=3;ctx.setLineDash([18,14]);
+  for(let i=1;i<4;i++){
+    const y=RIV+i*(BOT-RIV)/4;
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  // river water
+  ctx.fillStyle='#123f6e';ctx.fillRect(0,TOP,W,RIV-TOP);
+  ctx.strokeStyle='rgba(120,190,255,0.25)';ctx.lineWidth=2;
+  for(let i=0;i<14;i++){
+    const wy=TOP+10+i*((RIV-TOP-20)/14);
+    const wx=((i*67+t*30)%W);
+    ctx.beginPath();ctx.arc(wx,wy,7,0.2,Math.PI-0.2);ctx.stroke();
+  }
+  // bottom grass
+  ctx.fillStyle='#1e5c2a';ctx.fillRect(0,BOT,W,H-BOT);
+
+  // logs
+  for(const L of riverLanes){
+    const cy=L.y+(L.h-34)/2;
+    for(let i=0;i<L.logs.length;i++){
+      const log=L.logs[i];
+      let lx=log.x;
+      if(L.dir>0&&lx>W)lx-=L.span;
+      if(L.dir<0&&lx+log.len<0)lx+=L.span;
+      if(lx>W||lx+log.len<0)continue;
+      ctx.fillStyle='#7a4a21';
+      rr(lx,cy,log.len,34,16);ctx.fill();
+      ctx.fillStyle='#9c6431';
+      rr(lx+5,cy+5,log.len-10,24,12);ctx.fill();
+      ctx.strokeStyle='rgba(0,0,0,0.2)';ctx.lineWidth=2;
+      ctx.beginPath();ctx.moveTo(lx+12,cy+9);ctx.lineTo(lx+log.len-12,cy+9);ctx.stroke();
+      ctx.beginPath();ctx.moveTo(lx+12,cy+25);ctx.lineTo(lx+log.len-12,cy+25);ctx.stroke();
+    }
+  }
+
+  // cars
+  for(const L of roadLanes){
+    const cy=L.y+(L.h-L.carH)/2;
+    for(let i=0;i<L.n;i++){
+      let x=((L.offset+i*L.step)%(W+90))-90;
+      if(x>W||x+L.carLen<0)continue;
+      ctx.fillStyle='rgba(0,0,0,0.3)';rr(x+3,cy+4,L.carLen,L.carH,8);ctx.fill();
+      ctx.fillStyle=L.color;rr(x,cy,L.carLen,L.carH,9);ctx.fill();
+      ctx.fillStyle='rgba(255,255,255,0.75)';
+      rr(x+L.carLen*0.28,cy+5,L.carLen*0.44,L.carH-10,5);ctx.fill();
+    }
+  }
+
+  // goals
+  for(let i=0;i<HOLES_N;i++){
+    const hx=i*HOLE_W+HOLE_W/2;
+    ctx.fillStyle='#0d2c14';
+    ctx.beginPath();ctx.arc(hx,HOLE_Y,34,0,7);ctx.fill();
+    ctx.strokeStyle='#3cb54a';ctx.lineWidth=3;
+    ctx.beginPath();ctx.arc(hx,HOLE_Y,34,0,7);ctx.stroke();
+    if(holeFill[i])drawFrog(hx,HOLE_Y,-Math.PI/2,1);
+    else{
+      ctx.fillStyle='#3cb54a';ctx.font='bold 16px monospace';ctx.textAlign='center';
+      ctx.fillText((i+1)+'',hx,HOLE_Y+6);
+    }
+  }
+
+  // frog
+  if(state==='play'||state==='paused'){
+    const drowny=frog.drownT>0;
+    drawFrog(frog.x,frog.y,frog.angle,drowny?Math.max(0.35,1-frog.drownT):1);
+    if(drowny){
+      ctx.strokeStyle='rgba(80,160,255,'+(0.4+0.3*Math.sin(t*20))+')';
+      ctx.lineWidth=3;
+      ctx.beginPath();ctx.arc(frog.x,frog.y,20+frog.drownT*14,0,7);ctx.stroke();
+    }
+  }else if(state==='dying'&&deathKind!=='crash'){
+    // frog sinks
+    drawFrog(frog.x,frog.y+ (0.9-deathTimer)*18,frog.angle,deathTimer/0.9);
+  }
+
+  // particles
+  for(const p of particles){
+    ctx.globalAlpha=Math.max(0,p.life/p.max);
+    ctx.fillStyle=p.color;
+    ctx.beginPath();ctx.arc(p.x,p.y,p.r,0,7);ctx.fill();
+  }
+  ctx.globalAlpha=1;
+
+  // HUD
+  if(state!=='start'){
+    ctx.fillStyle='rgba(0,0,0,0.5)';rr(8,6,W-16,34,8);ctx.fill();
+    ctx.fillStyle='#fff';ctx.font='bold 16px monospace';ctx.textAlign='left';
+    ctx.fillText('SCORE '+score,18,29);
+    ctx.textAlign='center';
+    if(combo>1)ctx.fillText('COMBO x'+Math.min(combo,5),W/2,29);
+    ctx.textAlign='right';
+    ctx.fillText('LVL '+level+'   BEST '+best,W-18,29);
+    // lives
+    for(let i=0;i<lives-1;i++)drawFrog(28+i*30,62,-Math.PI/2,1);
+  }
+
+  // overlays
+  ctx.textAlign='center';
+  if(state==='start'){
+    panel();
+    ctx.fillStyle='#7CFC00';ctx.font='bold 44px monospace';
+    ctx.fillText('FROGGER',W/2,220);
+    ctx.fillStyle='#fff';ctx.font='bold 30px monospace';
+    ctx.fillText('P H Y S I C S',W/2,262);
+    drawFrog(W/2,330,-Math.PI/2+Math.sin(t*3)*0.4,1);
+    ctx.fillStyle='#cfe8cf';ctx.font='15px monospace';
+    ctx.fillText('Your frog has momentum — it slides!',W/2,400);
+    ctx.fillText('Cross the road. Ride the logs.',W/2,424);
+    ctx.fillText('Fill all 5 holes to level up.',W/2,448);
+    ctx.fillStyle='#fff';ctx.font='bold 16px monospace';
+    ctx.fillText('ARROWS / WASD — move (with inertia)',W/2,495);
+    ctx.fillText('P — pause      R — restart',W/2,520);
+    if(Math.sin(t*4)>-0.3){ctx.fillStyle='#7CFC00';ctx.font='bold 20px monospace';ctx.fillText('PRESS ENTER TO START',W/2,575);}
+    ctx.fillStyle='#9ab';ctx.font='13px monospace';
+    ctx.fillText('BEST: '+best,W/2,605);
+  }else if(state==='over'){
+    panel();
+    ctx.fillStyle='#ff6b4a';ctx.font='bold 42px monospace';
+    ctx.fillText('GAME OVER',W/2,270);
+    ctx.fillStyle='#fff';ctx.font='bold 22px monospace';
+    ctx.fillText('SCORE: '+score,W/2,330);
+    if(score>=best&&score>0){ctx.fillStyle='#ffd93b';ctx.font='bold 18px monospace';ctx.fillText('NEW BEST!',W/2,362);}
+    else{ctx.fillStyle='#9ab';ctx.font='15px monospace';ctx.fillText('BEST: '+best,W/2,362);}
+    if(Math.sin(t*4)>-0.3){ctx.fillStyle='#7CFC00';ctx.font='bold 20px monospace';ctx.fillText('PRESS ENTER TO RESTART',W/2,430);}
+  }else if(state==='paused'){
+    ctx.fillStyle='rgba(0,0,0,0.55)';ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#fff';ctx.font='bold 36px monospace';
+    ctx.fillText('PAUSED',W/2,H/2-10);
+    ctx.font='16px monospace';ctx.fillText('Press P to resume',W/2,H/2+28);
+  }else if(state==='levelup'){
+    ctx.fillStyle='#ffd93b';ctx.font='bold 34px monospace';
+    ctx.fillText('LEVEL '+level+' CLEAR!',W/2,H/2-10);
+    ctx.fillStyle='#fff';ctx.font='16px monospace';
+    ctx.fillText('Speeding up... level '+level+1,W/2,H/2+26);
+  }
+}
+function panel(){
+  ctx.fillStyle='rgba(5,15,30,0.92)';ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle='#7CFC00';ctx.lineWidth=4;
+  rr(W/2-190,180,380,440,16);ctx.stroke();
+}
+
+/* ---------- loop ---------- */
+let last=performance.now();
+function frame(now){
+  let dt=(now-last)/1000;last=now;
+  if(dt>0.05)dt=0.05;
+  t+=dt;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
