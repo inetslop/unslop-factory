@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Frogger Platformer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a2a1a; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function(){
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize(){
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W;
+  canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio(){
+  if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(type){
+  if(!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.type = 'square';
+  switch(type){
+    case 'jump': osc.frequency.value=400; gain.gain.setValueAtTime(0.15, audioCtx.currentTime); gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime+0.15); osc.start(); osc.stop(audioCtx.currentTime+0.15); break;
+    case 'collect': osc.frequency.value=800; gain.gain.setValueAtTime(0.2, audioCtx.currentTime); gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime+0.2); osc.start(); osc.stop(audioCtx.currentTime+0.2); break;
+    case 'hurt': osc.frequency.value=150; gain.gain.setValueAtTime(0.3, audioCtx.currentTime); gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime+0.3); osc.start(); osc.stop(audioCtx.currentTime+0.3); break;
+    case 'win': osc.frequency.value=600; gain.gain.setValueAtTime(0.2, audioCtx.currentTime); gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime+0.5); osc.start(); osc.stop(audioCtx.currentTime+0.5); break;
+    case 'splash': osc.frequency.value=100; gain.gain.setValueAtTime(0.25, audioCtx.currentTime); gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime+0.4); osc.start(); osc.stop(audioCtx.currentTime+0.4); break;
+  }
+}
+
+// Game state
+let gameState = 'start'; // start, playing, gameover, win
+let score = 0;
+let lives = 3;
+let level = 1;
+let time = 0;
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  initAudio();
+  if(gameState === 'start' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+  else if((gameState === 'gameover' || gameState === 'win') && (e.code === 'Space' || e.code === 'Enter')) startGame();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Player
+let player = { x:0, y:0, vx:0, vy:0, w:36, h:36, onGround:false, jumpBuffered:false, coyoteTimer:0, facing:1 };
+
+// Level data
+let platforms = [];
+let collectibles = [];
+let enemies = [];
+let goal = null;
+let particles = [];
+let cameraX = 0;
+
+function generateLevel(lvl){
+  platforms = [];
+  collectibles = [];
+  enemies = [];
+  particles = [];
+  
+  const levelWidth = 2400 + lvl * 600;
+  const groundY = H - 80;
+  
+  // Starting platform
+  platforms.push({x:0, y:groundY, w:200, h:30, type:'lily', moving:false});
+  
+  let lastX = 150;
+  let lastY = groundY;
+  
+  for(let i = 1; i < 20 + lvl * 3; i++){
+    const gap = 80 + Math.random() * (60 + lvl * 10);
+    const w = 80 + Math.random() * 120;
+    let y = lastY + (Math.random() - 0.5) * 140;
+    y = Math.max(100, Math.min(H - 120, y));
+    const x = lastX + gap + w/2;
+    
+    const moving = Math.random() < 0.3 && lvl > 1;
+    const plat = {x: x - w/2, y: y, w: w, h: 24, type:'lily', moving: moving, baseY: y, moveRange: moving ? 40 + Math.random()*40 : 0, moveSpeed: 1 + Math.random(), phase: Math.random() * Math.PI * 2};
+    platforms.push(plat);
+    
+    // Add collectibles on some platforms
+    if(Math.random() < 0.6){
+      collectibles.push({x: x - w/4 + Math.random()*w/2, y: y - 50, w:16, h:16, collected:false, bobPhase: Math.random()*Math.PI*2});
+    }
+    
+    // Add enemies on wider platforms
+    if(w > 100 && Math.random() < 0.4){
+      enemies.push({x: x - w/4, y: y - 30, w:28, h:28, vx: 1 + lvl*0.3, patrolL: x - w/2+10, patrolR: x + w/2-10, dir:1});
+    }
+    
+    lastX = x + w/2;
+    lastY = y;
+  }
+  
+  // Goal platform
+  const goalPlat = {x: lastX + 80, y: groundY, w:150, h:30, type:'goal', moving:false};
+  platforms.push(goalPlat);
+  goal = {x: lastX + 80 + 60, y: groundY - 70, w:30, h:70};
+  
+  // Reset player
+  player.x = 50;
+  player.y = groundY - player.h;
+  player.vx = 0;
+  player.vy = 0;
+  player.onGround = false;
+  player.facing = 1;
+  cameraX = 0;
+}
+
+function startGame(){
+  score = 0;
+  lives = 3;
+  level = 1;
+  generateLevel(level);
+  gameState = 'playing';
+}
+
+// Physics constants
+const GRAVITY = 0.7;
+const JUMP_VEL = -14;
+const MOVE_SPEED = 5;
+const MAX_FALL = 16;
+
+function update(dt){
+  if(gameState !== 'playing') return;
+  
+  time += dt;
+  
+  // Player movement
+  if(keys['ArrowLeft'] || keys['KeyA']){
+    player.vx = -MOVE_SPEED;
+    player.facing = -1;
+  } else if(keys['ArrowRight'] || keys['KeyD']){
+    player.vx = MOVE_SPEED;
+    player.facing = 1;
+  } else {
+    player.vx *= 0.7;
+  }
+  
+  // Jumping with coyote time
+  if(player.onGround){
+    player.coyoteTimer = 8;
+  } else {
+    player.coyoteTimer -= 1;
+  }
+  
+  if((keys['Space'] || keys['ArrowUp'] || keys['KeyW']) && player.coyoteTimer > 0){
+    player.vy = JUMP_VEL;
+    player.onGround = false;
+    player.coyoteTimer = 0;
+    playSound('jump');
+    // Jump particles
+    for(let i=0;i<5;i++){
+      particles.push({x:player.x+player.w/2, y:player.y+player.h, vx:(Math.random()-0.5)*3, vy:-Math.random()*2, life:20, color:'#8f8'});
+    }
+  }
+  
+  // Variable jump height
+  if(!(keys['Space'] || keys['ArrowUp'] || keys['KeyW']) && player.vy < -6){
+    player.vy = -6;
+  }
+  
+  // Gravity
+  player.vy += GRAVITY;
+  if(player.vy > MAX_FALL) player.vy = MAX_FALL;
+  
+  // Move player
+  player.x += player.vx;
+  player.y += player.vy;
+  
+  // Platform collision
+  player.onGround = false;
+  for(let p of platforms){
+    let py = p.y;
+    if(p.moving){
+      py = p.baseY + Math.sin(time * 0.02 * p.moveSpeed + p.phase) * p.moveRange;
+      p.currentY = py;
+    } else {
+      p.currentY = p.y;
+    }
+    
+    // Landing on top
+    if(player.vy >= 0 && 
+       player.x + player.w > p.x && 
+       player.x < p.x + p.w &&
+       player.y + player.h >= py && 
+       player.y + player.h - player.vy <= py + 5){
+      player.y = py - player.h;
+      player.vy = 0;
+      player.onGround = true;
+    }
+    
+    // Side collision (simple push)
+    if(player.vy < 0 && player.y < py && player.y > py - 40){
+      if(player.x + player.w > p.x && player.x < p.x + p.w){
+        // Don't do much for side, just let gravity handle it
+      }
+    }
+  }
+  
+  // Water death
+  if(player.y > H - 30){
+    playSound('splash');
+    lives--;
+    if(lives <= 0){
+      gameState = 'gameover';
+    } else {
+      player.x = Math.max(50, cameraX + 50);
+      player.y = 100;
+      player.vy = 0;
+      // Find nearest platform above
+      let bestPlat = platforms[0];
+      let bestDist = Infinity;
+      for(let p of platforms){
+        const d = Math.abs(p.x - player.x);
+        if(d < bestDist && p.currentY > 50) { bestDist = d; bestPlat = p; }
+      }
+      player.x = bestPlat.x + bestPlat.w/2 - player.w/2;
+      player.y = (bestPlat.currentY || bestPlat.y) - player.h - 60;
+    }
+  }
+  
+  // Collectibles
+  for(let c of collectibles){
+    if(c.collected) continue;
+    const bobY = c.y + Math.sin(time * 0.05 + c.bobPhase) * 8;
+    if(player.x < c.x + c.w && player.x + player.w > c.x && player.y < bobY + c.h && player.y + player.h > bobY){
+      c.collected = true;
+      score += 100;
+      playSound('collect');
+      for(let i=0;i<8;i++){
+        particles.push({x:c.x+c.w/2, y:bobY+c.h/2, vx:(Math.random()-0.5)*4, vy:(Math.random()-0.5)*4, life:25, color:'#ff0'});
+      }
+    }
+  }
+  
+  // Enemies
+  for(let e of enemies){
+    e.x += e.vx * e.dir;
+    if(e.x < e.patrolL) { e.dir = 1; }
+    if(e.x + e.w > e.patrolR) { e.dir = -1; }
+    
+    // Stomp or hurt
+    if(player.x < e.x + e.w && player.x + player.w > e.x && player.y < e.y + e.h && player.y + player.h > e.y){
+      if(player.vy > 0 && player.y + player.h - player.vy <= e.y + 10){
+        // Stomp!
+        e.dead = true;
+        player.vy = -8;
+        score += 200;
+        playSound('collect');
+        for(let i=0;i<6;i++){
+          particles.push({x:e.x+e.w/2, y:e.y+e.h/2, vx:(Math.random()-0.5)*4, vy:-Math.random()*3, life:20, color:'#f80'});
+        }
+      } else {
+        playSound('hurt');
+        lives--;
+        if(lives <= 0){ gameState = 'gameover'; }
+        else { player.vy = -10; player.x -= 30; }
+      }
+    }
+  }
+  enemies = enemies.filter(e => !e.dead);
+  
+  // Goal
+  if(goal && player.x + player.w > goal.x && player.x < goal.x + goal.w && player.y + player.h > goal.y && player.y < goal.y + goal.h){
+    score += 500;
+    playSound('win');
+    level++;
+    generateLevel(level);
+  }
+  
+  // Particles
+  for(let p of particles){
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.2;
+    p.life--;
+  }
+  particles = particles.filter(p => p.life > 0);
+  
+  // Camera
+  const targetCam = player.x - W * 0.35;
+  cameraX += (targetCam - cameraX) * 0.1;
+  if(cameraX < 0) cameraX = 0;
+}
+
+function draw(){
+  // Background gradient
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#1a3a5c');
+  grad.addColorStop(0.5, '#2a5a4a');
+  grad.addColorStop(1, '#0a2a1a');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+  
+  // Stars/fireflies
+  for(let i=0;i<30;i++){
+    const sx = ((i * 173 + 50) % (W+20)) - 10;
+    const sy = (i * 97) % (H*0.6);
+    const flicker = Math.sin(time*0.03 + i)*0.5+0.5;
+    ctx.fillStyle = `rgba(200,255,150,${flicker*0.4})`;
+    ctx.beginPath();
+    ctx.arc(sx, sy, 2+flicker, 0, Math.PI*2);
+    ctx.fill();
+  }
+  
+  if(gameState === 'start'){
+    drawStartScreen();
+    return;
+  }
+  
+  ctx.save();
+  ctx.translate(-cameraX, 0);
+  
+  // Water
+  const waterY = H - 50;
+  ctx.fillStyle = '#1a4a6a';
+  ctx.fillRect(cameraX, waterY, W, H - waterY);
+  // Water waves
+  ctx.strokeStyle = 'rgba(100,200,255,0.3)';
+  ctx.lineWidth = 2;
+  for(let i=0;i<5;i++){
+    ctx.beginPath();
+    const wy = waterY + 10 + i*8;
+    for(let x=cameraX;x<cameraX+W;x+=10){
+      const y = wy + Math.sin(x*0.05+time*0.03+i)*3;
+      if(x===cameraX) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  }
+  
+  // Platforms (lily pads)
+  for(let p of platforms){
+    const py = p.currentY || p.y;
+    // Pad
+    ctx.fillStyle = '#2d7a2d';
+    ctx.beginPath();
+    ctx.ellipse(p.x + p.w/2, py + p.h/2, p.w/2, p.h/2, 0, 0, Math.PI*2);
+    ctx.fill();
+    // Leaf veins
+    ctx.strokeStyle = '#1a5a1a';
+    ctx.lineWidth = 1;
+    for(let i=0;i<Math.floor(p.w/20);i++){
+      ctx.beginPath();
+      ctx.moveTo(p.x + p.w/2, py + p.h/2);
+      const angle = (i / Math.floor(p.w/20)) * Math.PI - Math.PI/2;
+      ctx.lineTo(p.x + p.w/2 + Math.cos(angle)*p.w/3, py + p.h/2 + Math.sin(angle)*p.h/3);
+      ctx.stroke();
+    }
+    // Highlight
+    ctx.fillStyle = 'rgba(100,255,100,0.1)';
+    ctx.beginPath();
+    ctx.ellipse(p.x + p.w/4, py + 3, p.w/3, p.h/4, 0, 0, Math.PI*2);
+    ctx.fill();
+    
+    if(p.type === 'goal'){
+      // Goal flag
+      ctx.fillStyle = '#654';
+      ctx.fillRect(goal.x+10, goal.y, 4, goal.h);
+      ctx.fillStyle = '#ff4444';
+      ctx.beginPath();
+      ctx.moveTo(goal.x+14, goal.y);
+      ctx.lineTo(goal.x+50, goal.y+15);
+      ctx.lineTo(goal.x+14, goal.y+30);
+      ctx.fill();
+    }
+  }
+  
+  // Collectibles (flies)
+  for(let c of collectibles){
+    if(c.collected) continue;
+    const bobY = c.y + Math.sin(time * 0.05 + c.bobPhase) * 8;
+    ctx.fillStyle = '#ffdd44';
+    ctx.beginPath();
+    ctx.arc(c.x+c.w/2, bobY+c.h/2, 6, 0, Math.PI*2);
+    ctx.fill();
+    // Wings
+    ctx.fillStyle = 'rgba(255,255,200,0.5)';
+    const wingFlap = Math.sin(time*0.3)*4;
+    ctx.beginPath();
+    ctx.ellipse(c.x+2, bobY+c.h/2-wingFlap, 6, 3, -0.5, 0, Math.PI*2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(c.x+c.w-2, bobY+c.h/2+wingFlap, 6, 3, 0.5, 0, Math.PI*2);
+    ctx.fill();
+    // Glow
+    ctx.fillStyle = 'rgba(255,220,50,0.15)';
+    ctx.beginPath();
+    ctx.arc(c.x+c.w/2, bobY+c.h/2, 12, 0, Math.PI*2);
+    ctx.fill();
+  }
+  
+  // Enemies (snails)
+  for(let e of enemies){
+    if(e.dead) continue;
+    // Shell
+    ctx.fillStyle = '#8B4513';
+    ctx.beginPath();
+    ctx.arc(e.x+e.w/2, e.y+e.h/2, e.w/2.5, 0, Math.PI*2);
+    ctx.fill();
+    // Spiral
+    ctx.strokeStyle = '#654321';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(e.x+e.w/2, e.y+e.h/2, e.w/5, 0, Math.PI*1.5);
+    ctx.stroke();
+    // Body
+    ctx.fillStyle = '#9a7b4f';
+    ctx.fillRect(e.x - (e.dir>0?-8:8), e.y+e.h-6, e.w + 8, 6);
+    // Eyes
+    const eyeX = e.dir > 0 ? e.x+e.w+2 : e.x-4;
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(eyeX, e.y+e.h-10, 3, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(eyeX+(e.dir>0?1:-1), e.y+e.h-10, 1.5, 0, Math.PI*2);
+    ctx.fill();
+  }
+  
+  // Particles
+  for(let p of particles){
+    ctx.fillStyle = p.color;
+    ctx.globalAlpha = p.life/25;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 3, 0, Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  
+  // Player (Frog)
+  const px = player.x, py = player.y;
+  // Body
+  ctx.fillStyle = '#4a9e2f';
+  ctx.beginPath();
+  ctx.ellipse(px+player.w/2, py+player.h*0.65, player.w/2.2, player.h/2.5, 0, 0, Math.PI*2);
+  ctx.fill();
+  // Head
+  ctx.fillStyle = '#5ab83a';
+  ctx.beginPath();
+  ctx.arc(px+player.w/2, py+player.h*0.4, player.w/2.5, 0, Math.PI*2);
+  ctx.fill();
+  // Eyes (big frog eyes)
+  const eyeOff = player.facing * 4;
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(px+player.w/2-8+eyeOff, py+player.h*0.3, 7, 0, Math.PI*2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(px+player.w/2+8+eyeOff, py+player.h*0.3, 7, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#111';
+  ctx.beginPath();
+  ctx.arc(px+player.w/2-6+eyeOff, py+player.h*0.3, 3, 0, Math.PI*2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(px+player.w/2+10+eyeOff, py+player.h*0.3, 3, 0, Math.PI*2);
+  ctx.fill();
+  // Legs
+  ctx.fillStyle = '#3a8e20';
+  if(player.onGround){
+    // Standing legs
+    ctx.fillRect(px+4, py+player.h-10, 8, 10);
+    ctx.fillRect(px+player.w-12, py+player.h-10, 8, 10);
+  } else {
+    // Jumping legs tucked
+    ctx.fillRect(px+6, py+player.h-8, 10, 6);
+    ctx.fillRect(px+player.w-16, py+player.h-8, 10, 6);
+  }
+  
+  ctx.restore();
+  
+  // HUD
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(10, 10, 220, 90);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 16px monospace';
+  ctx.fillText('SCORE: ' + score, 20, 35);
+  ctx.fillText('LIVES: ' + '🐸'.repeat(lives), 20, 58);
+  ctx.fillText('LEVEL: ' + level, 20, 81);
+  
+  if(gameState === 'gameover'){
+    drawOverlay('FROGGER PLATFORMER', 'GAME OVER', `Final Score: ${score}`, 'Press SPACE to restart');
+  }
+  if(gameState === 'win'){
+    drawOverlay('FROGGER PLATFORMER', 'YOU WIN!', '', 'Press SPACE to play again');
+  }
+}
+
+function drawStartScreen(){
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0,0,W,H);
+  
+  const cx = W/2, cy = H/2;
+  
+  // Title frog
+  ctx.font = 'bold 48px monospace';
+  ctx.fillStyle = '#5ab83a';
+  ctx.textAlign = 'center';
+  ctx.fillText('FROGGER', cx, cy-100);
+  ctx.font = 'bold 28px monospace';
+  ctx.fillStyle = '#8f8';
+  ctx.fillText('PLATFORMER', cx, cy-65);
+  
+  // Instructions box
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(cx-180, cy-30, 360, 160);
+  ctx.strokeStyle = '#4a9e2f';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cx-180, cy-30, 360, 160);
+  
+  ctx.font = '16px monospace';
+  ctx.fillStyle = '#fff';
+  ctx.fillText('← → or A/D: Move', cx, cy+5);
+  ctx.fillText('SPACE / ↑ / W: Jump', cx, cy+30);
+  ctx.fillText('', cx, cy+55);
+  ctx.fillText('Collect flies. Stomp snails.', cx, cy+75);
+  ctx.fillText('Reach the flag to advance!', cx, cy+95);
+  
+  ctx.font = 'bold 20px monospace';
+  ctx.fillStyle = `rgba(255,255,100,${Math.sin(time*0.05)*0.3+0.7})`;
+  ctx.fillText('Press SPACE to Start', cx, cy+180);
+  
+  ctx.textAlign = 'left';
+}
+
+function drawOverlay(title, subtitle, info, action){
+  ctx.fillStyle = 'rgba(0,0,0,0.75)';
+  ctx.fillRect(0,0,W,H);
+  const cx=W/2, cy=H/2;
+  ctx.textAlign='center';
+  ctx.font='bold 36px monospace';
+  ctx.fillStyle='#5ab83a';
+  ctx.fillText(title,cx,cy-60);
+  ctx.font='bold 24px monospace';
+  ctx.fillStyle='#ff6';
+  ctx.fillText(subtitle,cx,cy-20);
+  if(info){ctx.font='18px monospace';ctx.fillStyle='#fff';ctx.fillText(info,cx,cy+15);}
+  ctx.font='bold 18px monospace';
+  ctx.fillStyle=`rgba(255,255,100,${Math.sin(time*0.05)*0.3+0.7})`;
+  ctx.fillText(action,cx,cy+60);
+  ctx.textAlign='left';
+}
+
+// Game loop
+let lastTime = 0;
+function loop(ts){
+  const dt = Math.min((ts - lastTime) / 16, 3);
+  lastTime = ts;
+  
+  update(dt);
+  draw();
+  
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
