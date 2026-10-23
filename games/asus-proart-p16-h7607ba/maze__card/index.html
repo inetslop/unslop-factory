@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Card Maze</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0d3b26;}
+  canvas{display:block;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+let W=0,H=0,DPR=1;
+function resize(){
+  DPR=window.devicePixelRatio||1;
+  W=window.innerWidth;H=window.innerHeight;
+  cv.width=Math.max(1,Math.floor(W*DPR));cv.height=Math.max(1,Math.floor(H*DPR));
+  cv.style.width=W+'px';cv.style.height=H+'px';
+}
+window.addEventListener('resize',resize);resize();
+
+/* ---------------- audio (Web Audio only, after first input) ---------------- */
+let AC=null;
+function ac(){if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}}return AC;}
+function tone(f,d,type,g,when){
+  const a=ac();if(!a)return;type=type||'sine';g=(g==null?0.12:g);when=when||0;
+  const t=a.currentTime+when,o=a.createOscillator(),gn=a.createGain();
+  o.type=type;o.frequency.setValueAtTime(f,t);
+  gn.gain.setValueAtTime(g,t);gn.gain.exponentialRampToValueAtTime(0.0001,t+d);
+  o.connect(gn);gn.connect(a.destination);o.start(t);o.stop(t+d+0.03);
+}
+const S={
+  move(){tone(300,0.04,'triangle',0.035);},
+  flip(){tone(500,0.07,'sine',0.08);tone(760,0.09,'sine',0.07,0.05);},
+  star(){[660,880,1320].forEach((f,i)=>tone(f,0.16,'triangle',0.12,i*0.09));},
+  coin(){tone(988,0.07,'square',0.06);tone(1319,0.14,'square',0.06,0.07);},
+  spike(){tone(120,0.28,'sawtooth',0.15);tone(88,0.35,'sawtooth',0.12,0.05);},
+  clear(){[523,659,784,1047].forEach((f,i)=>tone(f,0.22,'triangle',0.13,i*0.13));},
+  over(){[392,330,262,196].forEach((f,i)=>tone(f,0.3,'sawtooth',0.09,i*0.18));},
+  win(){[523,659,784,1047,1319,1568].forEach((f,i)=>tone(f,0.3,'triangle',0.13,i*0.12));}
+};
+
+/* ---------------- game state ---------------- */
+const MAXLVL=6;
+let state='start';           // start | play | clear | over | win
+let level=1,score=0,hearts=3;
+let cols=0,rows=0,maze=null,cards=[],exitX=0,exitY=0;
+let starsTotal=0,starsGot=0;
+let player={cx:0,cy:0,px:0,py:0};
+let shake=0,msg='',msgT=0,clearT=0,lockCd=0,time=0,bonusShown=0;
+let pops=[];                 // floating score popups
+
+function rnd(n){return Math.floor(Math.random()*n);}
+function shuffle(a){for(let i=a.length-1;i>0;i--){const j=rnd(i+1),t=a[i];a[i]=a[j];a[j]=t;}return a;}
+
+function genMaze(c,r){
+  const cells=[];
+  for(let y=0;y<r;y++){cells[y]=[];for(let x=0;x<c;x++)cells[y][x]={t:1,b:1,l:1,r:1,v:0};}
+  const stack=[[0,0]];cells[0][0].v=1;
+  while(stack.length){
+    const cx=stack[stack.length-1][0],cy=stack[stack.length-1][1];
+    const nb=[];
+    if(cy>0   &&!cells[cy-1][cx].v)nb.push([cx,cy-1,'t','b']);
+    if(cx<c-1 &&!cells[cy][cx+1].v)nb.push([cx+1,cy,'r','l']);
+    if(cy<r-1 &&!cells[cy+1][cx].v)nb.push([cx,cy+1,'b','t']);
+    if(cx>0   &&!cells[cy][cx-1].v)nb.push([cx-1,cy,'l','r']);
+    if(!nb.length){stack.pop();continue;}
+    const p=nb[rnd(nb.length)];
+    cells[cy][cx][p[2]]=0;cells[p[1]][p[0]][p[3]]=0;cells[p[1]][p[0]].v=1;
+    stack.push([p[0],p[1]]);
+  }
+  return cells;
+}
+
+function newLevel(){
+  cols=Math.min(7+level*2,15);
+  rows=Math.min(4+level,10);
+  maze=genMaze(cols,rows);
+  exitX=cols-1;exitY=rows-1;
+  const opts=[];
+  for(let y=0;y<rows;y++)for(let x=0;x<cols;x++){
+    if((x===0&&y===0)||(x===exitX&&y===exitY))continue;opts.push([x,y]);
+  }
+  shuffle(opts);
+  const types=[];
+  for(let i=0;i<2+Math.floor(level/2);i++)types.push('star');
+  for(let i=0;i<3;i++)types.push('coin');
+  for(let i=0;i<level;i++)types.push('spike');
+  cards=[];
+  const n=Math.min(types.length,opts.length);
+  for(let i=0;i<n;i++)cards.push({x:opts[i][0],y:opts[i][1],type:types[i],flip:0,st:'down'});
+  starsTotal=cards.filter(c=>c.type==='star').length;
+  starsGot=0;
+  player.cx=0;player.cy=0;player.px=0;player.py=0;
+  pops=[];
+}
+
+function startGame(){level=1;score=0;hearts=3;newLevel();state='play';msg='Flip every ★ card, then reach the EXIT!';msgT=3.2;}
+
+/* ---------------- input ---------------- */
+const keys={};
+window.addEventListener('keydown',e=>{
+  const k=e.key;
+  if(k==='ArrowUp'||k==='ArrowDown'||k==='ArrowLeft'||k==='ArrowRight'||k===' ')e.preventDefault();
+  ac(); // unlock audio on first input
+  if(k==='r'||k==='R'){startGame();return;}
+  if((k==='Enter'||k===' ')&&state!=='play'){startGame();return;}
+  keys[k.toLowerCase()]=true;
+});
+window.addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false;});
+
+function dirVec(){
+  if(keys['arrowup']||keys['w'])return [0,-1];
+  if(keys['arrowdown']||keys['s'])return [0,1];
+  if(keys['arrowleft']||keys['a'])return [-1,0];
+  if(keys['arrowright']||keys['d'])return [1,0];
+  return null;
+}
+
+/* ---------------- logic ---------------- */
+function addPop(cx,cy,txt,col){pops.push({x:cx,y:cy,txt:txt,col:col,t:1});}
+
+function applyCard(c){
+  const g=geom(),gx=g.ox+(c.x+0.5)*g.cs,gy=g.oy+(c.y+0.5)*g.cs;
+  if(c.type==='star'){starsGot++;score+=250;S.star();addPop(gx,gy,'+250','#ffd75e');}
+  else if(c.type==='coin'){score+=100;S.coin();addPop(gx,gy,'+100','#ffb347');}
+  else{hearts--;shake=10;S.spike();addPop(gx,gy,'-1 ♥','#ff6b5e');
+    if(hearts<=0){state='over';S.over();}}
+}
+
+function onCell(x,y){
+  for(const c of cards)if(c.x===x&&c.y===y&&c.st==='down'){c.st='flipping';S.flip();}
+  if(x===exitX&&y===exitY){
+    if(starsGot>=starsTotal){
+      bonusShown=300+level*100;score+=bonusShown;
+      state='clear';clearT=2.2;S.clear();
+    }else if(lockCd<=0){
+      msg='Locked! Collect all ★ cards ('+starsGot+'/'+starsTotal+')';msgT=1.6;lockCd=1;
+    }
+  }
+}
+
+function update(dt){
+  time+=dt;
+  if(msgT>0)msgT-=dt;
+  if(lockCd>0)lockCd-=dt;
+  shake=Math.max(0,shake-dt*28);
+  for(let i=pops.length-1;i>=0;i--){pops[i].t-=dt/1.1;if(pops[i].t<=0)pops.splice(i,1);}
+
+  if(state==='clear'){
+    clearT-=dt;
+    if(clearT<=0){
+      if(level>=MAXLVL){state='win';S.win();}
+      else{level++;newLevel();state='play';msg='LEVEL '+level+' — shuffle up!';msgT=2;}
+    }
+    return;
+  }
+  if(state!=='play')return;
+
+  // smooth player movement
+  const k=Math.min(1,dt*16);
+  player.px+=(player.cx-player.px)*k;
+  player.py+=(player.cy-player.py)*k;
+  if(Math.abs(player.cx-player.px)<0.002)player.px=player.cx;
+  if(Math.abs(player.cy-player.py)<0.002)player.py=player.cy;
+
+  // card flip animation
+  for(const c of cards)if(c.st==='flipping'){
+    c.flip=Math.min(1,c.flip+dt/0.45);
+    if(c.flip>=1){c.st='up';applyCard(c);}
+  }
+
+  // movement
+  if(Math.abs(player.cx-player.px)<0.15&&Math.abs(player.cy-player.py)<0.15){
+    const d=dirVec();
+    if(d){
+      const cell=maze[player.cy][player.cx];
+      const blocked=(d[0]===1&&cell.r)||(d[0]===-1&&cell.l)||(d[1]===1&&cell.b)||(d[1]===-1&&cell.t);
+      if(!blocked){player.cx+=d[0];player.cy+=d[1];S.move();onCell(player.cx,player.cy);}
+    }
+  }
+}
+
+/* ---------------- drawing helpers ---------------- */
+function geom(){
+  const cs=Math.min(92,(W-30)/cols,(H-115)/rows);
+  return {cs:cs,ox:(W-cs*cols)/2,oy:(H-cs*rows)/2+48};
+}
+function rr(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();
+}
+
+function drawCardBack(cx,cy,s){
+  rr(cx-s/2,cy-s/2,s,s,s*0.12);
+  ctx.fillStyle='#f6efe0';ctx.fill();
+  ctx.lineWidth=Math.max(1.5,s*0.04);ctx.strokeStyle='#a32c2c';ctx.stroke();
+  ctx.save();rr(cx-s/2,cy-s/2,s,s,s*0.12);ctx.clip();
+  ctx.globalAlpha=0.28;ctx.lineWidth=Math.max(1,s*0.05);ctx.strokeStyle='#c0392b';
+  const st=s/6;
+  for(let i=-s;i<s*2;i+=st){ctx.beginPath();ctx.moveTo(cx-s/2+i,cy+s/2);ctx.lineTo(cx-s/2+i+s,cy-s/2);ctx.stroke();}
+  ctx.globalAlpha=1;ctx.restore();
+  ctx.fillStyle='#8e2424';ctx.font='bold '+Math.floor(s*0.5)+'px Georgia, serif';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('?',cx,cy+s*0.03);
+}
+function drawCardFront(cx,cy,s,type){
+  const sym={star:'★',coin:'♦',spike:'♠'}[type];
+  const col ={star:'#e8a013',coin:'#d97b1f',spike:'#5a1420'}[type];
+  rr(cx-s/2,cy-s/2,s,s,s*0.12);
+  ctx.fillStyle='#fdfaf2';ctx.fill();
+  ctx.lineWidth=Math.max(1.5,s*0.04);ctx.strokeStyle=col;ctx.stroke();
+  ctx.fillStyle=col;ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.font='bold '+Math.floor(s*0.5)+'px Georgia, serif';
+  ctx.fillText(sym,cx,cy+s*0.03);
+  ctx.font='bold '+Math.floor(s*0.22)+'px Georgia, serif';
+  ctx.textAlign='left';ctx.textBaseline='top';
+  ctx.fillText('A',cx-s/2+s*0.1,cy-s/2+s*0.08);
+}
+function drawCard(c,g){
+  const cx=g.ox+(c.x+0.5)*g.cs,cy=g.oy+(c.y+0.5)*g.cs,s=g.cs*0.66;
+  let sc=1,front=false;
+  if(c.st!=='down'){sc=Math.max(0.08,Math.abs(Math.cos(c.flip*Math.PI)));front=c.flip>=0.5;}
+  ctx.save();ctx.translate(cx,cy);ctx.scale(sc,1);ctx.translate(-cx,-cy);
+  // soft shadow
+  ctx.globalAlpha=0.25;ctx.fillStyle='#000';
+  rr(cx-s/2+3,cy-s/2+4,s,s,s*0.12);ctx.fill();ctx.globalAlpha=1;
+  if(front)drawCardFront(cx,cy,s,c.type);else drawCardBack(cx,cy,s);
+  ctx.restore();
+}
+
+function drawMaze(g){
+  const {cs,ox,oy}=g;
+  ctx.strokeStyle='#efe4c8';ctx.lineWidth=Math.max(3,cs*0.13);ctx.lineCap='round';
+  for(let y=0;y<rows;y++)for(let x=0;x<cols;x++){
+    const c=maze[y][x],X=ox+x*cs,Y=oy+y*cs;
+    ctx.beginPath();
+    if(c.t){ctx.moveTo(X,Y);ctx.lineTo(X+cs,Y);}
+    if(c.l){ctx.moveTo(X,Y);ctx.lineTo(X,Y+cs);}
+    if(x===cols-1&&c.r){ctx.moveTo(X+cs,Y);ctx.lineTo(X+cs,Y+cs);}
+    if(y===rows-1&&c.b){ctx.moveTo(X,Y+cs);ctx.lineTo(X+cs,Y+cs);}
+    ctx.stroke();
+  }
+}
+
+function drawExit(g){
+  const {cs,ox,oy}=g;
+  const cx=ox+(exitX+0.5)*cs,cy=oy+(exitY+0.5)*cs,s=cs*0.72;
+  const open=starsGot>=starsTotal;
+  if(open){
+    const p=(Math.sin(time*5)+1)/2;
+    ctx.save();ctx.globalAlpha=0.35+p*0.3;
+    ctx.strokeStyle='#7dffa8';ctx.lineWidth=Math.max(2,cs*0.06);
+    ctx.beginPath();ctx.arc(cx,cy,s*0.7+p*4,0,Math.PI*2);ctx.stroke();ctx.restore();
+  }
+  rr(cx-s/2,cy-s/2,s,s,s*0.15);
+  ctx.fillStyle=open?'#1f8a4d':'#7a1f2b';ctx.fill();
+  ctx.lineWidth=Math.max(2,cs*0.05);ctx.strokeStyle='#efe4c8';ctx.stroke();
+  if(open){
+    ctx.fillStyle='#fff';ctx.font='bold '+Math.floor(s*0.3)+'px Georgia, serif';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('EXIT',cx,cy);
+  }else{
+    // padlock
+    const lw=s*0.42,lh=s*0.3;
+    ctx.strokeStyle='#ffd75e';ctx.lineWidth=Math.max(2,s*0.08);
+    ctx.beginPath();ctx.arc(cx,cy-lh*0.1,s*0.16,Math.PI,0);ctx.stroke();
+    rr(cx-lw/2,cy-lh*0.1,lw,lh,lw*0.15);
+    ctx.fillStyle='#ffd75e';ctx.fill();
+    ctx.fillStyle='#7a1f2b';
+    ctx.beginPath();ctx.arc(cx,cy+lh*0.3,s*0.05,0,Math.PI*2);ctx.fill();
+  }
+}
+
+function drawPlayer(g){
+  const cx=g.ox+(player.px+0.5)*g.cs,cy=g.oy+(player.py+0.5)*g.cs,r=g.cs*0.28;
+  ctx.globalAlpha=0.3;ctx.fillStyle='#000';
+  ctx.beginPath();ctx.ellipse(cx,cy+r*0.75,r*0.9,r*0.4,0,0,Math.PI*2);ctx.fill();
+  ctx.globalAlpha=1;
+  const gl=ctx.createRadialGradient(cx,cy,r*0.2,cx,cy,r*1.9);
+  gl.addColorStop(0,'rgba(255,215,94,0.5)');gl.addColorStop(1,'rgba(255,215,94,0)');
+  ctx.fillStyle=gl;ctx.beginPath();ctx.arc(cx,cy,r*1.9,0,Math.PI*2);ctx.fill();
+  const bg=ctx.createRadialGradient(cx-r*0.3,cy-r*0.3,r*0.2,cx,cy,r);
+  bg.addColorStop(0,'#fff8e6');bg.addColorStop(1,'#f2d9a0');
+  ctx.fillStyle=bg;ctx.beginPath();ctx.arc(cx,cy,r,0,Math.PI*2);ctx.fill();
+  ctx.lineWidth=Math.max(2,r*0.22);ctx.strokeStyle='#b3242c';ctx.stroke();
+  ctx.fillStyle='#b3242c';ctx.font='bold '+Math.floor(r*1.15)+'px Georgia, serif';
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText('♠',cx,cy+r*0.06);
+}
+
+function drawHUD(){
+  ctx.textBaseline='middle';
+  // hearts
+  ctx.font='24px Georgia, serif';ctx.textAlign='left';
+  for(let i=0;i<3;i++){
+    ctx.globalAlpha=i<hearts?1:0.22;
+    ctx.fillStyle='#ff5a5a';
+    ctx.fillText('♥',18+i*28,30);
+  }
+  ctx.globalAlpha=1;
+  // stars
+  ctx.font='bold 20px Georgia, serif';ctx.fillStyle='#ffd75e';
+  ctx.fillText('★ '+starsGot+'/'+starsTotal,110,30);
+  // level
+  ctx.textAlign='center';ctx.fillStyle='#efe4c8';
+  ctx.fillText('LEVEL '+level+' / '+MAXLVL,W/2,30);
+  // score
+  ctx.textAlign='right';
+  ctx.fillText('SCORE '+score,W-18,30);
+}
+
+function drawMsg(){
+  if(msgT<=0||!msg)return;
+  ctx.font='bold 17px Georgia, serif';
+  const w=ctx.measureText(msg).width+36;
+  ctx.globalAlpha=Math.min(1,msgT*2);
+  rr(W/2-w/2,58,w,32,10);
+  ctx.fillStyle='rgba(0,0,0,0.45)';ctx.fill();
+  ctx.fillStyle='#fff';ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillText(msg,W/2,75);
+  ctx.globalAlpha=1;
+}
+
+function drawPops(g){
+  for(const p of pops){
+    const x=g.ox+(p.x+0.5)*g.cs,y=g.oy+(p.y+0.5)*g.cs-(1-p.t)*34;
+    ctx.globalAlpha=Math.max(0,p.t);
+    ctx.fillStyle=p.col;ctx.font='bold 18px Georgia, serif';
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(p.txt,x,y);
+  }
+  ctx.globalAlpha=1;
+}
+
+function drawStart(){
+  // decorative fanned cards
+  for(let i=-1;i<=1;i++){
+    ctx.save();
+    ctx.translate(W/2+i*70,H*0.30);ctx.rotate(i*0.28+Math.sin(time*1.5+i)*0.03);
+    drawCardBack(0,0,90);
+    ctx.restore();
+  }
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillStyle='#ffd75e';ctx.font='bold '+Math.min(64,W*0.09)+'px Georgia, serif';
+  ctx.fillText('C A R D   M A Z E',W/2,H*0.52);
+  ctx.fillStyle='#efe4c8';ctx.font='bold 17px Georgia, serif';
+  const lines=[
+    'Move:  Arrow keys  /  WASD',
+    'Flip every ★ card to unlock the EXIT',
+    '♥ lives      ♦ bonus points      ♠ danger!',
+    'R — restart anytime'
+  ];
+  lines.forEach((l,i)=>ctx.fillText(l,W/2,H*0.63+i*28));
+  ctx.fillStyle='#7dffa8';ctx.font='bold 21px Georgia, serif';
+  if(Math.sin(time*4)>-0.3)ctx.fillText('Press ENTER to deal the cards',W/2,H*0.85);
+}
+
+function drawOverlay(title,col,sub,hint){
+  ctx.fillStyle='rgba(0,0,0,0.62)';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillStyle=col;ctx.font='bold '+Math.min(58,W*0.1)+'px Georgia, serif';
+  ctx.fillText(title,W/2,H*0.4);
+  ctx.fillStyle='#efe4c8';ctx.font='bold 22px Georgia, serif';
+  ctx.fillText(sub,W/2,H*0.53);
+  ctx.fillStyle='#7dffa8';ctx.font='bold 19px Georgia, serif';
+  if(Math.sin(time*4)>-0.3)ctx.fillText(hint,W/2,H*0.65);
+}
+
+function drawClearBanner(){
+  ctx.fillStyle='rgba(0,0,0,0.35)';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  ctx.fillStyle='#ffd75e';ctx.font='bold '+Math.min(52,W*0.08)+'px Georgia, serif';
+  ctx.fillText('LEVEL '+level+' CLEAR!',W/2,H*0.45);
+  ctx.fillStyle='#efe4c8';ctx.font='bold 22px Georgia, serif';
+  ctx.fillText('Bonus +'+bonusShown,W/2,H*0.56);
+}
+
+/* ---------------- main draw ---------------- */
+function draw(){
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  const g=ctx.createRadialGradient(W/2,H/2,50,W/2,H/2,Math.max(W,H)*0.75);
+  g.addColorStop(0,'#1e6b45');g.addColorStop(1,'#0c3523');
+  ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+
+  if(state==='start'){drawStart();return;}
+
+  const gm=geom();
+  let sx=0,sy=0;
+  if(shake>0){sx=(Math.random()*2-1)*shake*0.5;sy=(Math.random()*2-1)*shake*0.5;}
+  ctx.save();ctx.translate(sx,sy);
+  drawMaze(gm);
+  drawExit(gm);
+  for(const c of cards)drawCard(c,gm);
+  drawPlayer(gm);
+  drawPops(gm);
+  ctx.restore();
+
+  drawHUD();
+  drawMsg();
+  if(state==='clear')drawClearBanner();
+  else if(state==='over')drawOverlay('GAME OVER','#ff6b5e','Final score: '+score,'Press R to restart');
+  else if(state==='win')drawOverlay('YOU WIN!','#ffd75e','Final score: '+score,'Press R to play again');
+}
+
+/* ---------------- loop ---------------- */
+let last=performance.now();
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000);last=now;
+  update(dt);draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
