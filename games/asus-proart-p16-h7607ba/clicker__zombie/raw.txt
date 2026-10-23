@@ -1,0 +1,617 @@
+<think>
+Create a single HTML file: a clicker-style zombie game. Click to deal damage to zombies, earn brains/coins, buy upgrades, waves spawn, etc. Include a start screen, restart, sound via Web Audio, resize support.
+
+Design: Canvas game. Zombies walk toward the player (or you just click them). Clicking kills zombies and earns "brains". Buy upgrades with brains: auto-attack, damage multiplier, click damage. Waves get harder. Game over when a zombie reaches the house line? Or endless survival — let's go with that: zombies spawn from the right and walk left toward your base; clicking deals damage; if one reaches the base you lose HP; at 0 HP it's game over; restart button.
+
+Keep it reasonably compact and polished. Use canvas, scale to fit the window.
+
+Let's write the code.
+
+Features:
+- Start screen with title "Zombie Clicker" and control instructions (click zombies, 1-5 to buy upgrades, R to restart).
+- Shop panel with buttons (also clickable) at the bottom.
+- HUD: brains, wave, HP, score.
+- Sound: pew shot sound, zombie death, hit, click via WebAudio.
+- Particles for blood splatter.
+- Floating damage numbers.
+
+Implementation:
+
+Game state: menu, playing, gameover.
+
+Zombies: x from canvas width, speed based on wave, hp, size, random color variation. Click detection: distance to zombie's center. Damage = clickDamage * (1+upgrades). Auto-turret shoots the closest zombie every interval.
+
+Upgrades:
+1. Cleaver +damage (cost 25 * 1.6^n)
+2. Turret auto-fire rate/damage (unlock at level 0, cost 100)
+3. Wall repair +max HP & heal
+4. Adrenaline: click combo? Or crit chance. Let's go with "Adrenaline" for increased crit chance.
+
+Keyboard: 1-4 to buy upgrades, R to restart, Space/Enter to start.
+
+Canvas resize: fill the window; use logical coordinates = canvas size in CSS pixels; reposition on resize. Use devicePixelRatio scaling.
+
+Draw the player's base at the left edge: a small house with HP bar.
+
+Let me write it all out. Keep the code clean, about 500 lines or so.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Zombie Clicker</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#0a0d12; font-family:'Courier New', monospace; }
+  #wrap { position:fixed; inset:0; }
+  canvas { display:block; width:100%; height:100%; cursor:crosshair; }
+  .overlay {
+    position:absolute; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; text-align:center;
+    background:rgba(5,8,12,.86); color:#cfe8cf; z-index:10; padding:20px;
+  }
+  .hidden { display:none !important; }
+  h1 {
+    font-size:clamp(34px,8vw,72px); letter-spacing:4px; color:#7CFC00;
+    text-shadow:0 0 18px #2f6b1e, 3px 3px 0 #1a2f12; margin-bottom:14px;
+    animation:pulse 2s infinite ease-in-out;
+  }
+  @keyframes pulse { 50% { text-shadow:0 0 34px #4fae2a, 3px 3px 0 #1a2f12; } }
+  .sub { font-size:clamp(13px,2.4vw,18px); line-height:1.7; color:#9fbf9f; margin-bottom:26px; max-width:640px;}
+  .sub b { color:#d8ffd8; }
+  kbd { background:#1c2a1c; border:1px solid #3e5c3e; border-radius:4px; padding:1px 7px; color:#b9ffb9; font-family:inherit; }
+  button.big {
+    font-family:inherit; font-size:clamp(18px,3vw,26px); letter-spacing:2px;
+    background:#2c4a1e; color:#d0ffc0; border:2px solid #6fbf3f; border-radius:8px;
+    padding:14px 42px; cursor:pointer; transition:.15s;
+  }
+  button.big:hover { background:#3d6b28; transform:scale(1.05); box-shadow:0 0 20px rgba(120,255,80,.35); }
+  #goStats { font-size:clamp(14px,2.6vw,20px); color:#ffd9d9; margin-bottom:24px; line-height:1.8;}
+  .skull { font-size:clamp(40px,7vw,64px); margin-bottom:8px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv"></canvas>
+
+  <div id="startScreen" class="overlay">
+    <h1>ZOMBIE CLICKER</h1>
+    <div class="sub">
+      Night falls on the suburb. Undead shamble toward your house.<br><br>
+      <b>CLICK / TAP</b> zombies to slash them and collect <b>BRAINS 🧠</b>.<br>
+      Spend brains on upgrades — if a zombie reaches your door, you lose HP. Survive as long as you can!<br><br>
+      <kbd>1</kbd>–<kbd>4</kbd> buy upgrades &nbsp;·&nbsp; <kbd>R</kbd> restart &nbsp;·&nbsp; <kbd>SPACE</kbd> start
+    </div>
+    <button class="big" id="startBtn">▶ START SURVIVING</button>
+  </div>
+
+  <div id="gameOverScreen" class="overlay hidden">
+    <div class="skull">💀</div>
+    <h1 style="color:#ff6b6b;text-shadow:0 0 18px #7a1f1f,3px 3px 0 #2f0d0d;">YOU GOT ZOMBIFIED</h1>
+    <div id="goStats"></div>
+    <button class="big" id="restartBtn">↻ TRY AGAIN (R)</button>
+  </div>
+</div>
+
+<script>
+(() => {
+"use strict";
+
+/* ---------- canvas ---------- */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------- audio (created after first input) ---------- */
+let AC = null;
+function ensureAudio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){} }
+  if (AC && AC.state === 'suspended') AC.resume();
+}
+function beep(freq, dur, type='square', vol=0.12, slide=0) {
+  if (!AC) return;
+  try {
+    const t = AC.currentTime;
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, freq + slide), t + dur);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g).connect(AC.destination);
+    o.start(t); o.stop(t + dur + 0.02);
+  } catch(e){}
+}
+const sfx = {
+  hit:   () => beep(320, .08, 'square', .14, -160),
+  crit:  () => { beep(520, .1, 'sawtooth', .16, 260); beep(780,.08,'square',.1,300); },
+  kill:  () => beep(140, .22, 'sawtooth', .18, -90),
+  hurt:  () => { beep(90, .3, 'sawtooth', .22, -40); beep(60,.35,'square',.15,-20); },
+  buy:   () => { beep(440,.08,'triangle',.15); setTimeout(()=>beep(660,.1,'triangle',.15),70); },
+  deny:  () => beep(110, .12, 'square', .12, -30),
+  wave:  () => { beep(220,.15,'square',.12); setTimeout(()=>beep(330,.2,'square',.12),140); },
+  shot:  () => beep(880, .05, 'square', .06, -500)
+};
+
+/* ---------- game state ---------- */
+const G = {
+  state: 'menu',          // menu | play | over
+  brains: 0, totalBrains: 0,
+  hp: 100, maxHp: 100,
+  wave: 0, waveTimer: 0, spawnTimer: 0,
+  zombies: [], particles: [], texts: [], bullets: [],
+  kills: 0, time: 0, shake: 0,
+  turretAngle: 0,
+  up: [
+    { name:'Cleaver',     icon:'🔪', desc:'+4 click dmg',      lvl:0, cost:25 },
+    { name:'Turret',      icon:'🔫', desc:'auto-fires at zombies', lvl:0, cost:120 },
+    { name:'Wall Repair', icon:'🧱', desc:'+30 max HP & heal', lvl:0, cost:80 },
+    { name:'Adrenaline',  icon:'⚡', desc:'+6% crit (x5 dmg)', lvl:0, cost:150 }
+  ]
+};
+
+const baseCost = [25, 120, 80, 150];
+function upCost(i) { return Math.floor(baseCost[i] * Math.pow(1.7, G.up[i].lvl)); }
+function clickDamage() { return 10 + G.up[0].lvl * 4; }
+function critChance()  { return Math.min(0.9, G.up[3].lvl * 0.06); }
+function turretDPS()   { return G.up[1].lvl * 12; }
+
+/* ---------- helpers ---------- */
+const rand = (a,b) => a + Math.random()*(b-a);
+function groundY() { return H * 0.78; }
+function baseX()  { return Math.max(60, W * 0.07); }
+
+function addText(x,y,str,color,size=18) {
+  G.texts.push({x, y, str, color, size, life:1});
+}
+function blood(x,y,n,color='#a83232') {
+  for (let i=0;i<n;i++) {
+    const a = rand(0, Math.PI*2), s = rand(40, 260);
+    G.particles.push({x, y, vx:Math.cos(a)*s, vy:Math.sin(a)*s-80, life:rand(.3,.7), max:.7, r:rand(2,5), color});
+  }
+}
+
+/* ---------- spawning ---------- */
+function spawnZombie() {
+  const w = G.wave;
+  const big = Math.random() < Math.min(0.35, 0.06 + w*0.015);
+  const hpBase = (20 + w*14) * (big ? 3.2 : 1);
+  G.zombies.push({
+    x: W + rand(20, 120),
+    y: groundY() + rand(-8, 40),
+    hp: hpBase, maxHp: hpBase,
+    speed: Math.max(12, rand(26, 46) + w*2.2) * (big ? 0.55 : 1),
+    r: big ? rand(30, 40) : rand(18, 26),
+    big,
+    wob: rand(0, Math.PI*2),
+    hitFlash: 0,
+    color: `hsl(${rand(75,140)}, ${rand(25,45)}%, ${rand(32,48)}%)`
+  });
+}
+
+function startWave() {
+  G.wave++;
+  sfx.wave();
+  addText(W/2, H*0.25, 'WAVE ' + G.wave, '#ffe66b', 40);
+  const count = 3 + Math.floor(G.wave * 1.6);
+  G.spawnTimer = 0;
+  G.toSpawn = count;
+}
+
+function buyUp(i) {
+  const c = upCost(i);
+  if (G.brains >= c) {
+    G.brains -= c;
+    G.up[i].lvl++;
+    if (i === 2) { G.maxHp += 30; G.hp = Math.min(G.maxHp, G.hp + 30); }
+    sfx.buy();
+    addText(baseX()+40, H*0.5, G.up[i].name + ' LV' + G.up[i].lvl + '!', '#7CFC00', 20);
+  } else {
+    sfx.deny();
+  }
+}
+
+/* ---------- input ---------- */
+function canvasPos(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+cv.addEventListener('pointerdown', (e) => {
+  ensureAudio();
+  if (G.state !== 'play') return;
+  const p = canvasPos(e);
+  // find topmost zombie under cursor
+  let best = null, bd = 1e9;
+  for (const z of G.zombies) {
+    const dx = p.x - z.x, dy = p.y - (z.y - z.r);
+    const d = Math.hypot(dx, dy);
+    if (d < z.r * 1.35 && d < bd) { best = z; bd = d; }
+  }
+  const dmg0 = clickDamage();
+  if (best) {
+    const crit = Math.random() < critChance();
+    const dmg = Math.round(dmg0 * (crit ? 5 : 1));
+    best.hp -= dmg;
+    best.hitFlash = 0.12;
+    blood(best.x, best.y - best.r, crit ? 18 : 8, crit ? '#ff5533' : undefined);
+    addText(best.x + rand(-10,10), best.y - best.r*2, (crit?'CRIT ':'') + dmg, crit ? '#ffd94a' : '#ffffff', crit ? 26 : 18);
+    crit ? sfx.crit() : sfx.hit();
+    if (best.hp <= 0) killZombie(best);
+  } else {
+    // whiff spark
+    G.particles.push({x:p.x, y:p.y, vx:rand(-40,40), vy:rand(-40,40), life:.25, max:.25, r:3, color:'#8fae8f'});
+  }
+});
+
+window.addEventListener('keydown', (e) => {
+  ensureAudio();
+  const k = e.key.toLowerCase();
+  if (k === ' ') e.preventDefault();
+  if (G.state === 'menu' && (k === ' ' || k === 'enter')) { startGame(); return; }
+  if (G.state === 'over' && (k === 'r' || k === ' ' || k === 'enter')) { startGame(); return; }
+  if (G.state === 'play') {
+    if (k >= '1' && k <= '4') buyUp(+k - 1);
+    if (k === 'r') startGame();
+  }
+});
+
+document.getElementById('startBtn').addEventListener('click', () => { ensureAudio(); startGame(); });
+document.getElementById('restartBtn').addEventListener('click', () => { ensureAudio(); startGame(); });
+
+/* ---------- game flow ---------- */
+function startGame() {
+  G.state = 'play';
+  G.brains = 0; G.totalBrains = 0;
+  G.hp = 100; G.maxHp = 100;
+  G.wave = 0; G.waveTimer = 1.2; G.spawnTimer = 0; G.toSpawn = 0;
+  G.zombies.length = 0; G.particles.length = 0; G.texts.length = 0; G.bullets.length = 0;
+  G.kills = 0; G.time = 0; G.shake = 0;
+  G.up.forEach((u,i) => { u.lvl = (i===2)?0:0; });
+  document.getElementById('startScreen').classList.add('hidden');
+  document.getElementById('gameOverScreen').classList.add('hidden');
+}
+
+function gameOver() {
+  G.state = 'over';
+  sfx.hurt();
+  const m = Math.floor(G.time/60), s = Math.floor(G.time%60);
+  document.getElementById('goStats').innerHTML =
+    `You survived <b>${m}m ${s}s</b> · reached <b>Wave ${G.wave}</b><br>` +
+    `<b>${G.kills}</b> zombies slain · <b>${Math.floor(G.totalBrains)}</b> brains harvested`;
+  document.getElementById('gameOverScreen').classList.remove('hidden');
+}
+
+function killZombie(z) {
+  const idx = G.zombies.indexOf(z);
+  if (idx >= 0) G.zombies.splice(idx, 1);
+  G.kills++;
+  const reward = Math.round((z.big ? 14 : 5) * (1 + G.wave * 0.08));
+  G.brains += reward; G.totalBrains += reward;
+  blood(z.x, z.y - z.r, z.big ? 26 : 14);
+  addText(z.x, z.y - z.r*2.2, '+' + reward + ' 🧠', '#ff9ecb', 18);
+  sfx.kill();
+}
+
+/* ---------- update ---------- */
+let last = performance.now();
+function update(dt) {
+  if (G.state !== 'play') return;
+  G.time += dt;
+  G.shake = Math.max(0, G.shake - dt*30);
+
+  // waves
+  if (G.toSpawn === undefined || G.toSpawn <= 0) {
+    if (G.zombies.length === 0) {
+      G.waveTimer -= dt;
+      if (G.waveTimer <= 0) startWave();
+    }
+  } else {
+    G.spawnTimer -= dt;
+    if (G.spawnTimer <= 0) {
+      spawnZombie();
+      G.toSpawn--;
+      const interval = Math.max(0.35, 1.6 - G.wave*0.08);
+      G.spawnTimer = interval * rand(0.6, 1.3);
+    }
+  }
+
+  // zombies
+  for (let i = G.zombies.length-1; i >= 0; i--) {
+    const z = G.zombies[i];
+    z.x -= z.speed * dt;
+    z.wob += dt * 8;
+    z.hitFlash = Math.max(0, z.hitFlash - dt);
+    if (z.x <= baseX() + 34) {
+      // hits the house
+      const dmg = z.big ? 25 : 12;
+      G.hp -= dmg;
+      G.shake = 12;
+      blood(z.x, z.y - z.r, 16, '#ff3333');
+      addText(baseX()+50, H*0.4, '-' + dmg + ' HP', '#ff6b6b', 24);
+      sfx.hurt();
+      G.zombies.splice(i,1);
+      if (G.hp <= 0) { G.hp = 0; gameOver(); return; }
+    }
+  }
+
+  // turret
+  const tv = G.up[1].lvl;
+  if (tv > 0 && G.zombies.length) {
+    G.turretCooldown = (G.turretCooldown || 0) - dt;
+    let target = null, tx = -1e9;
+    for (const z of G.zombies) if (z.x < tx) { tx = z.x; target = z; } // closest to base
+    const bx = baseX() + 30, by = groundY() - 70;
+    G.turretAngle = Math.atan2((target.y - target.r) - by, target.x - bx);
+    if (G.turretCooldown <= 0 && target) {
+      G.turretCooldown = Math.max(0.18, 0.6 - tv*0.04);
+      const rateDmg = turretDPS() * (0.6 - Math.min(0.42, tv*0.04));
+      target.hp -= rateDmg;
+      target.hitFlash = 0.1;
+      G.bullets.push({x:bx, y:by, tx:target.x, ty:target.y-target.r, life:.09});
+      blood(target.x, target.y - target.r, 4);
+      sfx.shot();
+      if (target.hp <= 0) killZombie(target);
+    }
+  }
+
+  // particles / texts / bullets
+  for (let i=G.particles.length-1;i>=0;i--) {
+    const p = G.particles[i];
+    p.life -= dt; p.x += p.vx*dt; p.y += p.vy*dt; p.vy += 500*dt;
+    if (p.life <= 0) G.particles.splice(i,1);
+  }
+  for (let i=G.texts.length-1;i>=0;i--) {
+    const t = G.texts[i];
+    t.life -= dt*0.9; t.y -= 40*dt;
+    if (t.life <= 0) G.texts.splice(i,1);
+  }
+  for (let i=G.bullets.length-1;i>=0;i--) {
+    const b = G.bullets[i];
+    b.life -= dt;
+    if (b.life <= 0) G.bullets.splice(i,1);
+  }
+}
+
+/* ---------- render ---------- */
+function drawZombie(z) {
+  const bob = Math.sin(z.wob) * 3;
+  const x = z.x, y = z.y + bob, r = z.r;
+  ctx.save();
+  // shadow
+  ctx.fillStyle = 'rgba(0,0,0,.4)';
+  ctx.beginPath(); ctx.ellipse(x, z.y+8, r*0.9, r*0.28, 0, 0, Math.PI*2); ctx.fill();
+  const flash = z.hitFlash > 0;
+  // legs
+  ctx.strokeStyle = '#2a3d24'; ctx.lineWidth = r*0.28; ctx.lineCap='round';
+  ctx.beginPath();
+  ctx.moveTo(x - r*0.25, y); ctx.lineTo(x - r*0.4 + Math.sin(z.wob)*r*0.25, z.y+8);
+  ctx.moveTo(x + r*0.25, y); ctx.lineTo(x + r*0.4 - Math.sin(z.wob)*r*0.25, z.y+8);
+  ctx.stroke();
+  // body
+  ctx.fillStyle = flash ? '#ffffff' : z.color;
+  ctx.beginPath(); ctx.ellipse(x, y - r*0.9, r*0.75, r*0.95, 0, 0, Math.PI*2); ctx.fill();
+  // arms reaching forward (left)
+  const armWob = Math.sin(z.wob*1.3)*r*0.15;
+  ctx.strokeStyle = flash ? '#ffffff' : z.color; ctx.lineWidth = r*0.3;
+  ctx.beginPath();
+  ctx.moveTo(x - r*0.4, y - r*1.2); ctx.lineTo(x - r*1.4, y - r*1.1 + armWob);
+  ctx.moveTo(x - r*0.4, y - r*0.9); ctx.lineTo(x - r*1.4, y - r*0.8 - armWob);
+  ctx.stroke();
+  // head
+  ctx.fillStyle = flash ? '#ffffff' : z.color;
+  ctx.beginPath(); ctx.arc(x - r*0.25, y - r*1.9, r*0.55, 0, Math.PI*2); ctx.fill();
+  // eyes
+  ctx.fillStyle = '#ff3b3b';
+  ctx.beginPath();
+  ctx.arc(x - r*0.45, y - r*1.95, r*0.09, 0, Math.PI*2);
+  ctx.arc(x - r*0.05, y - r*1.95, r*0.09, 0, Math.PI*2);
+  ctx.fill();
+  // mouth
+  ctx.strokeStyle = '#3a1414'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x - r*0.5, y - r*1.7); ctx.lineTo(x - r*0.15, y - r*1.68); ctx.stroke();
+  // hp bar
+  if (z.hp < z.maxHp) {
+    const w = r*1.6;
+    ctx.fillStyle = 'rgba(0,0,0,.6)';
+    ctx.fillRect(x - w/2, y - r*2.75, w, 5);
+    ctx.fillStyle = '#ff5b5b';
+    ctx.fillRect(x - w/2, y - r*2.75, w * Math.max(0, z.hp/z.maxHp), 5);
+  }
+  if (z.big) {
+    ctx.fillStyle = 'rgba(255,220,80,.9)';
+    ctx.font = `bold ${r*0.4}px Courier New`;
+    ctx.textAlign='center';
+    ctx.fillText('BRUTE', x, y - r*3);
+  }
+  ctx.restore();
+}
+
+function drawHouse() {
+  const bx = baseX(), gy = groundY();
+  ctx.save();
+  // house body
+  ctx.fillStyle = '#5a4634';
+  ctx.fillRect(bx-40, gy-70, 80, 70);
+  ctx.fillStyle = '#4a3929';
+  ctx.beginPath();
+  ctx.moveTo(bx-50, gy-70); ctx.lineTo(bx, gy-105); ctx.lineTo(bx+50, gy-70);
+  ctx.closePath(); ctx.fill();
+  // door
+  ctx.fillStyle = '#2b1f14';
+  ctx.fillRect(bx-12, gy-38, 24, 38);
+  // window with light
+  const flick = 0.75 + Math.sin(G.time*9)*0.1 + Math.random()*0.08;
+  ctx.fillStyle = `rgba(255,210,90,${flick})`;
+  ctx.fillRect(bx+16, gy-58, 14, 14);
+  ctx.strokeStyle = '#2b1f14'; ctx.lineWidth=2;
+  ctx.strokeRect(bx+16, gy-58, 14, 14);
+  // turret
+  const tv = G.up[1].lvl;
+  if (tv > 0) {
+    const tx = bx + 30, ty = gy - 70;
+    ctx.fillStyle = '#555e66';
+    ctx.fillRect(tx-8, ty-14, 16, 16);
+    ctx.save();
+    ctx.translate(tx, ty-10);
+    ctx.rotate(G.turretAngle);
+    ctx.fillStyle = '#7a8590';
+    ctx.fillRect(0, -4, 20 + Math.min(10, tv), 8);
+    ctx.restore();
+  }
+  // hp bar above house
+  const w = 90;
+  ctx.fillStyle = 'rgba(0,0,0,.6)';
+  ctx.fillRect(bx - w/2, gy - 125, w, 8);
+  const frac = G.hp / G.maxHp;
+  ctx.fillStyle = frac > .5 ? '#5bd45b' : frac > .25 ? '#ffd94a' : '#ff5b5b';
+  ctx.fillRect(bx - w/2, gy - 125, w * frac, 8);
+  ctx.strokeStyle = '#000'; ctx.lineWidth=1; ctx.strokeRect(bx - w/2, gy - 125, w, 8);
+  ctx.restore();
+}
+
+function drawShop() {
+  const pad = 8, bh = Math.min(64, H*0.12), bw = (W - pad*2 - pad*3) / 4;
+  for (let i=0;i<4;i++) {
+    const u = G.up[i], c = upCost(i);
+    const x = pad + i*(bw+pad), y = H - bh - pad;
+    const afford = G.brains >= c;
+    ctx.fillStyle = afford ? 'rgba(38,64,30,.92)' : 'rgba(28,30,34,.9)';
+    roundRect(x, y, bw, bh, 8); ctx.fill();
+    ctx.strokeStyle = afford ? '#6fbf3f' : '#3a3f45'; ctx.lineWidth=2;
+    roundRect(x, y, bw, bh, 8); ctx.stroke();
+    const fs = Math.min(15, bw*0.11);
+    ctx.textAlign='left';
+    ctx.fillStyle = afford ? '#d8ffd8' : '#7a8290';
+    ctx.font = `bold ${fs}px Courier New`;
+    ctx.fillText(`${i+1}. ${u.icon} ${u.name} [LV${u.lvl}]`, x+8, y + fs*1.3);
+    ctx.font = `${fs*0.85}px Courier New`;
+    ctx.fillStyle = afford ? '#ffe66b' : '#8a6a4a';
+    ctx.fillText(`🧠 ${c}`, x+8, y + bh - 10);
+  }
+}
+
+function roundRect(x,y,w,h,r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+function render() {
+  ctx.save();
+  if (G.shake > 0) ctx.translate(rand(-G.shake,G.shake), rand(-G.shake,G.shake));
+
+  // sky
+  const grad = ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0,'#0b1226');
+  grad.addColorStop(0.55,'#1a2438');
+  grad.addColorStop(0.78,'#2a2f3a');
+  grad.addColorStop(1,'#1c2418');
+  ctx.fillStyle = grad;
+  ctx.fillRect(-20,-20,W+40,H+40);
+
+  // stars
+  ctx.fillStyle = 'rgba(255,255,255,.5)';
+  for (let i=0;i<40;i++) {
+    const sx = (i*137.5 % W), sy = (i*89.7 % (H*0.5));
+    ctx.fillRect(sx, sy, 2, 2);
+  }
+  // moon
+  ctx.fillStyle = '#e8e6c9';
+  ctx.beginPath(); ctx.arc(W*0.82, H*0.15, Math.min(38, W*0.04), 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = 'rgba(232,230,201,.15)';
+  ctx.beginPath(); ctx.arc(W*0.82, H*0.15, Math.min(60, W*0.06), 0, Math.PI*2); ctx.fill();
+
+  // ground
+  const gy = groundY() + 8;
+  ctx.fillStyle = '#243020';
+  ctx.fillRect(-20, gy, W+40, H - gy + 20);
+  ctx.strokeStyle = 'rgba(120,160,90,.25)';
+  ctx.lineWidth = 1;
+  for (let x=0; x<W; x+=38) {
+    ctx.beginPath(); ctx.moveTo(x, gy+4); ctx.lineTo(x-6, gy+12); ctx.stroke();
+  }
+
+  if (G.state !== 'menu') {
+    drawHouse();
+    // bullets
+    for (const b of G.bullets) {
+      ctx.strokeStyle = 'rgba(255,230,120,.9)';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(b.x, b.y); ctx.lineTo(b.tx, b.ty); ctx.stroke();
+    }
+    const zs = [...G.zombies].sort((a,b)=>a.y-b.y);
+    for (const z of zs) drawZombie(z);
+
+    // particles
+    for (const p of G.particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // floating texts
+    for (const t of G.texts) {
+      ctx.globalAlpha = Math.max(0, t.life);
+      ctx.fillStyle = t.color;
+      ctx.font = `bold ${t.size}px Courier New`;
+      ctx.textAlign = 'center';
+      ctx.fillText(t.str, t.x, t.y);
+    }
+    ctx.globalAlpha = 1;
+
+    drawShop();
+
+    // HUD
+    const fs = Math.min(20, W*0.025);
+    ctx.font = `bold ${fs}px Courier New`;
+    ctx.textAlign='left';
+    ctx.fillStyle = '#ff9ecb';
+    ctx.fillText('🧠 ' + Math.floor(G.brains), 14, fs + 8);
+    ctx.fillStyle = '#cfe8cf';
+    ctx.fillText('WAVE ' + G.wave, 14, fs*2 + 10);
+    const m = Math.floor(G.time/60), s = Math.floor(G.time%60);
+    ctx.fillText(`⏱ ${m}:${s.toString().padStart(2,'0')}   ☠ ${G.kills}`, 14, fs*3 + 12);
+    ctx.textAlign='right';
+    ctx.fillStyle = '#9fbf9f';
+    ctx.font = `${fs*0.8}px Courier New`;
+    ctx.fillText(`click dmg: ${clickDamage()}   crit: ${Math.round(critChance()*100)}%`, W-14, fs + 6);
+    ctx.fillText('[R] restart', W-14, fs*2);
+  } else {
+    // ambient menu zombies
+    ctx.fillStyle = 'rgba(0,0,0,.3)';
+    ctx.fillRect(-20, gy, W+40, H-gy+20);
+  }
+  ctx.restore();
+}
+
+/* ---------- loop ---------- */
+function loop(now) {
+  const dt = Math.min(0.05, (now - last)/1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
+```
