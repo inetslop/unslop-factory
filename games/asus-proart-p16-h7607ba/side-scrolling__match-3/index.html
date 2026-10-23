@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Gem Stream — Side-Scrolling Match-3</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0b0e1a;}
+  #game{display:block;width:100vw;height:100vh;touch-action:none;cursor:pointer;}
+  #overlay{
+    position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:rgba(8,10,24,.82);color:#eaf0ff;font-family:'Segoe UI',Arial,sans-serif;text-align:center;
+    z-index:10;padding:20px;box-sizing:border-box;
+  }
+  #overlay h1{font-size:min(9vw,56px);margin:0 0 8px;letter-spacing:3px;
+    background:linear-gradient(90deg,#ff5e7a,#ffd166,#4dd2ff,#7cf29c);-webkit-background-clip:text;background-clip:text;color:transparent;}
+  #overlay p{font-size:min(4vw,18px);line-height:1.7;max-width:560px;margin:6px 0;color:#c9d4f2;}
+  #overlay .startbtn{margin-top:22px;font-size:min(5vw,22px);padding:12px 34px;border-radius:40px;
+    border:2px solid #4dd2ff;color:#fff;background:rgba(77,210,255,.15);cursor:pointer;animation:pulse 1.4s infinite;}
+  @keyframes pulse{0%,100%{transform:scale(1);box-shadow:0 0 8px rgba(77,210,255,.4)}50%{transform:scale(1.06);box-shadow:0 0 22px rgba(77,210,255,.8)}}
+  .small{font-size:min(3vw,13px);color:#7d8ab8;margin-top:18px;}
+  .hidden{display:none!important;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="overlay">
+  <h1>GEM STREAM</h1>
+  <p id="ovText">
+    Gems flow from right to left.<br>
+    <b>Click a gem, then a neighbor</b> (or tap) to swap them.<br>
+    Line up <b>3 or more</b> of the same color to pop them and score.<br>
+    ⚠ <b style="color:#ff5e7a">Dark spiked gems</b> will cost you a life if they scroll off the left edge — match them first!<br>
+    The stream speeds up as your level rises.
+  </p>
+  <div class="startbtn" id="ovBtn">CLICK TO PLAY</div>
+  <div class="small">Press R to restart at any time · Mouse / touch controls</div>
+</div>
+
+<script>
+(function(){
+"use strict";
+const canvas=document.getElementById('game'), ctx=canvas.getContext('2d');
+const overlay=document.getElementById('overlay'), ovText=document.getElementById('ovText'), ovBtn=document.getElementById('ovBtn');
+const ROWS=5;
+const COLORS=[['#ff5e7a','#ff9db0'],['#ffd166','#ffe8ad'],['#4dd2ff','#b3ecff'],['#7cf29c','#c8fbd2'],['#c084fc','#e4ccff']];
+let W=0,H=0,cell=60;
+let columns=[], xOffset=0, speed=26;
+let score=0, lives=3, level=1, state='start';
+let selected=null, resolving=false, resolveTimer=0, combo=0;
+let particles=[], popups=[], invalids=[];
+let stars=[];
+let lastT=performance.now();
+
+/* ---------- audio ---------- */
+let AC=null;
+function initAudio(){ if(!AC){ try{ AC=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+  if(AC&&AC.state==='suspended') AC.resume(); }
+function tone(freq,dur,type,vol,slideTo){
+  if(!AC) return;
+  try{
+    const o=AC.createOscillator(), g=AC.createGain();
+    o.type=type||'sine'; o.frequency.setValueAtTime(freq,AC.currentTime);
+    if(slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(30,slideTo),AC.currentTime+dur);
+    g.gain.setValueAtTime(vol||0.12,AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+dur);
+    o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime+dur+0.02);
+  }catch(e){}
+}
+const sSwap =()=>tone(300,0.08,'triangle',0.15,420);
+const sBad  =()=>tone(160,0.18,'sawtooth',0.10,90);
+const sPop  =(cb)=>{ tone(440+cb*90,0.14,'square',0.08,660+cb*120); tone(660+cb*90,0.18,'sine',0.10,880+cb*140); };
+const sLife =()=>tone(120,0.5,'sawtooth',0.18,55);
+const sLevel=()=>{ tone(523,0.12,'triangle',0.14); setTimeout(()=>tone(659,0.12,'triangle',0.14),110); setTimeout(()=>tone(784,0.2,'triangle',0.14),220); };
+const sOver =()=>{ tone(392,0.25,'sawtooth',0.15,300); setTimeout(()=>tone(311,0.25,'sawtooth',0.15,240),230); setTimeout(()=>tone(233,0.6,'sawtooth',0.15,110),460); };
+
+/* ---------- helpers ---------- */
+const darkChance=()=>Math.min(0.28, 0.09+(level-1)*0.03);
+function makeGem(color){ return {color:color, dark:Math.random()<darkChance(), oy:0}; }
+
+function makeColumn(avoid){
+  const col=new Array(ROWS).fill(null);
+  for(let r=0;r<ROWS;r++){
+    let opts=[0,1,2,3,4].filter(cl=>{
+      if(!avoid) return true;
+      const L1=columns[columns.length-1], L2=columns[columns.length-2];
+      if(L1&&L2&&L1[r]&&L2[r]&&L1[r].color===cl&&L2[r].color===cl) return false;
+      if(r>=2&&col[r-1]&&col[r-2]&&col[r-1].color===cl&&col[r-2].color===cl) return false;
+      return true;
+    });
+    col[r]=makeGem(opts[(Math.random()*opts.length)|0]);
+  }
+  return col;
+}
+
+function neededCols(){ return Math.ceil(W/cell)+3; }
+
+function resize(){
+  W=window.innerWidth; H=window.innerHeight;
+  canvas.width=W; canvas.height=H;
+  cell=Math.max(34, Math.min(86, Math.floor(Math.min(H/(ROWS+0.7), W/10))));
+  while(columns.length<neededCols()) columns.push(makeColumn(true));
+  if(xOffset>0) xOffset=0;
+  stars=[];
+  for(let i=0;i<70;i++) stars.push({x:Math.random()*W,y:Math.random()*H,z:0.3+Math.random()*0.7});
+}
+window.addEventListener('resize',resize);
+
+function buildBoard(){
+  columns=[];
+  const n=Math.ceil(W/cell)+4;
+  for(let i=0;i<n;i++) columns.push(makeColumn(true));
+  // safety: clear any accidental matches
+  let guard=0;
+  while(guard++<20){
+    const m=findMatches();
+    if(m.size===0) break;
+    m.forEach(key=>{ const [c,r]=key.split(',').map(Number); columns[c][r]=makeGem((Math.random()*5)|0); });
+  }
+}
+
+/* ---------- matching ---------- */
+function findMatches(){
+  const mark=new Set();
+  for(let r=0;r<ROWS;r++){
+    let run=1;
+    for(let c=1;c<=columns.length;c++){
+      const cur=c<columns.length?columns[c][r]:null;
+      const prev=columns[c-1][r];
+      if(cur&&prev&&cur.color===prev.color) run++;
+      else{ if(prev&&run>=3) for(let k=c-run;k<c;k++) mark.add(k+','+r); run=1; }
+    }
+  }
+  for(let c=0;c<columns.length;c++){
+    let run=1;
+    for(let r=1;r<=ROWS;r++){
+      const cur=r<ROWS?columns[c][r]:null;
+      const prev=columns[c][r-1];
+      if(cur&&prev&&cur.color===prev.color) run++;
+      else{ if(prev&&run>=3) for(let k=r-run;k<r;k++) mark.add(c+','+k); run=1; }
+    }
+  }
+  return mark;
+}
+
+function gravityAndRefill(){
+  for(let c=0;c<columns.length;c++){
+    const col=columns[c];
+    let write=ROWS-1;
+    for(let r=ROWS-1;r>=0;r--){
+      if(col[r]){
+        if(write!==r){
+          col[write].oy += (r-write)*cell + col[r].oy; // keep visual position, fall down
+          col[write]=col[r];
+          col[r]=null;
+        }
+        write--;
+      }
+    }
+    for(let r=write;r>=0;r--){
+      const g=makeGem((Math.random()*5)|0);
+      g.oy=-(r+1)*cell - 4;
+      col[r]=g;
+    }
+  }
+}
+
+function tryResolve(){
+  const mark=findMatches();
+  if(mark.size===0){ resolving=false; return; }
+  combo++;
+  score += mark.size*10*combo;
+  sPop(combo);
+  mark.forEach(key=>{
+    const [c,r]=key.split(',').map(Number);
+    const g=columns[c][r]; if(!g) return;
+    const x=c*cell+xOffset+cell/2, y=r*cell+g.oy+cell/2;
+    for(let i=0;i<8;i++){
+      const a=Math.random()*Math.PI*2, sp=60+Math.random()*160;
+      particles.push({x:x,y:y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,t:0.5,max:0.5,col:COLORS[g.color][0]});
+    }
+    columns[c][r]=null;
+  });
+  if(combo>1) popups.push({x:W/2,y:H*0.3,text:'COMBO x'+combo+'!',t:1,max:1,size:cell*0.5,col:'#ffd166'});
+  gravityAndRefill();
+  resolveTimer=0.28;
+}
+
+/* ---------- game flow ---------- */
+function startGame(){
+  score=0; lives=3; level=1; speed=26; combo=0;
+  selected=null; resolving=false; particles=[]; popups=[]; invalids=[];
+  buildBoard(); xOffset=0; state='play';
+  overlay.classList.add('hidden');
+}
+function gameOver(){
+  state='over'; sOver();
+  ovText.innerHTML='💀 <b>The dark gems got through!</b><br>Final score: <b style="font-size:1.4em;color:#ffd166">'+score+'</b> · Level '+level+
+    '<br><br>Gems flow from right to left.<br>Click a gem, then a neighbor to swap and match 3+.<br>Match dark gems before they exit the left edge!';
+  ovBtn.textContent='PLAY AGAIN';
+  overlay.classList.remove('hidden');
+}
+
+/* ---------- input ---------- */
+function cellFromPoint(px,py){
+  const c=Math.floor((px-xOffset)/cell), r=Math.floor(py/cell);
+  if(r<0||r>=ROWS||c<0||c>=columns.length) return null;
+  return {c:c,r:r};
+}
+function handleInput(px,py){
+  initAudio();
+  if(state==='start'||state==='over'){ startGame(); return; }
+  if(resolving) return;
+  const p=cellFromPoint(px,py);
+  if(!p) return;
+  if(selected&&selected.c===p.c&&selected.r===p.r){ selected=null; tone(240,0.05,'sine',0.06); return; }
+  if(selected&&(Math.abs(selected.c-p.c)+Math.abs(selected.r-p.r))===1){
+    // swap
+    const a=columns[selected.c][selected.r], b=columns[p.c][p.r];
+    columns[selected.c][selected.r]=b; columns[p.c][p.r]=a;
+    if(a&&b){ a.oy=0; b.oy=0; }
+    if(findMatches().size>0){
+      sSwap(); selected=null; resolving=true; combo=0; tryResolve();
+    }else{
+      columns[selected.c][selected.r]=a; columns[p.c][p.r]=b;
+      sBad();
+      invalids.push({c:selected.c,r:selected.r,t:0.3},{c:p.c,r:p.r,t:0.3});
+      selected=null;
+    }
+  }else{
+    selected=p; tone(520,0.06,'sine',0.08);
+  }
+}
+canvas.addEventListener('mousedown',e=>handleInput(e.clientX,e.clientY));
+canvas.addEventListener('touchstart',e=>{ e.preventDefault(); const t=e.touches[0]; handleInput(t.clientX,t.clientY); },{passive:false});
+overlay.addEventListener('mousedown',e=>{ initAudio(); startGame(); });
+overlay.addEventListener('touchstart',e=>{ e.preventDefault(); initAudio(); startGame(); },{passive:false});
+window.addEventListener('keydown',e=>{
+  if(e.key==='r'||e.key==='R'){ initAudio(); startGame(); }
+  else if((e.key==='Enter'||e.key===' ')&&(state!=='play')){ initAudio(); startGame(); }
+});
+
+/* ---------- update ---------- */
+function update(dt){
+  // falling animation always
+  for(let c=0;c<columns.length;c++) for(let r=0;r<ROWS;r++){
+    const g=columns[c][r];
+    if(g&&g.oy!==0){
+      g.oy += -g.oy*Math.min(1,dt*14);
+      if(Math.abs(g.oy)<0.5) g.oy=0;
+    }
+  }
+  for(let i=particles.length-1;i>=0;i--){ const p=particles[i]; p.t-=dt; p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy+=380*dt; if(p.t<=0) particles.splice(i,1); }
+  for(let i=popups.length-1;i>=0;i--){ const p=popups[i]; p.t-=dt; p.y-=30*dt; if(p.t<=0) popups.splice(i,1); }
+  for(let i=invalids.length-1;i>=0;i--){ invalids[i].t-=dt; if(invalids[i].t<=0) invalids.splice(i,1); }
+
+  if(state!=='play') return;
+
+  // cascade timing
+  if(resolving&&resolveTimer>0){ resolveTimer-=dt; if(resolveTimer<=0) tryResolve(); }
+
+  // scroll
+  speed=Math.min(95, 26+(level-1)*7);
+  xOffset -= speed*dt;
+  while(xOffset<=-cell){
+    const leaving=columns.shift();
+    let darks=0; for(const g of leaving) if(g&&g.dark) darks++;
+    xOffset+=cell;
+    columns.push(makeColumn(true));
+    if(darks>0){
+      lives-=darks; sLife();
+      popups.push({x:cell*1.2,y:H*0.5,text:'-'+darks+' ♥',t:1,max:1,size:cell*0.6,col:'#ff5e7a'});
+      for(let i=0;i<14;i++) particles.push({x:0,y:Math.random()*H,vx:80+Math.random()*120,vy:(Math.random()-0.5)*200,t:0.6,max:0.6,col:'#ff5e7a'});
+      if(lives<=0){ lives=0; gameOver(); return; }
+    }
+  }
+
+  // level up
+  const nl=Math.floor(score/400)+1;
+  if(nl>level){
+    level=nl; lives=Math.min(5,lives+1); sLevel();
+    popups.push({x:W/2,y:H*0.35,text:'LEVEL '+level+'  ·  +1 ♥',t:1.4,max:1.4,size:cell*0.7,col:'#7cf29c'});
+  }
+}
+
+/* ---------- render ---------- */
+function drawGem(g,x,y){
+  const rad=cell*0.38;
+  if(g.dark){
+    const pulse=0.5+0.5*Math.sin(performance.now()/220);
+    // glow
+    const gl=ctx.createRadialGradient(x,y,rad*0.4,x,y,rad*1.5);
+    gl.addColorStop(0,'rgba(255,60,90,'+(0.35+0.3*pulse)+')'); gl.addColorStop(1,'rgba(255,60,90,0)');
+    ctx.fillStyle=gl; ctx.beginPath(); ctx.arc(x,y,rad*1.5,0,7); ctx.fill();
+    // spikes
+    ctx.save(); ctx.translate(x,y); ctx.rotate(performance.now()/1400);
+    ctx.fillStyle='#1a1030';
+    ctx.beginPath();
+    const n=8;
+    for(let i=0;i<n*2;i++){
+      const rr=(i%2===0)?rad:rad*0.62, a=i/(n*2)*Math.PI*2;
+      if(i===0) ctx.moveTo(Math.cos(a)*rr,Math.sin(a)*rr); else ctx.lineTo(Math.cos(a)*rr,Math.sin(a)*rr);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle=COLORS[g.color][0]; ctx.lineWidth=Math.max(2,cell*0.05); ctx.stroke();
+    // core
+    const cg=ctx.createRadialGradient(x-rad*0.3,y-rad*0.3,rad*0.1,x,y,rad*0.62);
+    cg.addColorStop(0,COLORS[g.color][1]); cg.addColorStop(1,COLORS[g.color][0]);
+    ctx.beginPath(); ctx.arc(x,y,rad*0.58,0,7); ctx.fillStyle=cg; ctx.fill();
+    ctx.restore();
+  }else{
+    const gr=ctx.createRadialGradient(x-rad*0.35,y-rad*0.4,rad*0.15,x,y,rad);
+    gr.addColorStop(0,COLORS[g.color][1]); gr.addColorStop(1,COLORS[g.color][0]);
+    ctx.beginPath(); ctx.arc(x,y,rad,0,7); ctx.fillStyle=gr; ctx.fill();
+    // shine
+    ctx.beginPath(); ctx.ellipse(x-rad*0.32,y-rad*0.4,rad*0.28,rad*0.16,-0.6,0,7);
+    ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.fill();
+  }
+}
+
+function render(){
+  // background
+  const bg=ctx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0,'#141a35'); bg.addColorStop(0.6,'#0b0e1f'); bg.addColorStop(1,'#12081f');
+  ctx.fillStyle=bg; ctx.fillRect(0,0,W,H);
+  // stars
+  for(const s of stars){
+    const sx=((s.x - (xOffset*0.25*s.z))%W+W)%W;
+    ctx.globalAlpha=0.3+0.5*s.z;
+    ctx.fillStyle='#9fb4ff';
+    ctx.fillRect(sx,s.y,s.z*2,s.z*2);
+  }
+  ctx.globalAlpha=1;
+
+  // playfield border
+  const top=Math.max(8,Math.floor((H-ROWS*cell)/2));
+  const fh=ROWS*cell;
+  if(state!=='start'){
+    ctx.fillStyle='rgba(255,255,255,0.04)';
+    ctx.fillRect(-xOffset%cell, top-fh/ (1), 0,0); // noop keep structure
+    ctx.fillRect(xOffset>0?0:0, 0,0,0);
+  }
+
+  if(state!=='start'){
+    // field backdrop
+    ctx.fillStyle='rgba(255,255,255,0.03)';
+    ctx.fillRect(0, top, W, fh);
+    // left danger zone
+    const dz=ctx.createLinearGradient(0,0,cell*1.4,0);
+    dz.addColorStop(0,'rgba(255,60,90,0.30)'); dz.addColorStop(1,'rgba(255,60,90,0)');
+    ctx.fillStyle=dz; ctx.fillRect(0,top,cell*1.4,fh);
+    // grid dots
+    ctx.fillStyle='rgba(255,255,255,0.05)';
+    for(let c=0;c<columns.length;c++){
+      const x=c*cell+xOffset; if(x<-cell||x>W+cell) continue;
+      for(let r=0;r<ROWS;r++) ctx.fillRect(x+cell/2-1,top+r*cell+cell/2-1,2,2);
+    }
+
+    // gems (clip to field)
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0,top,W,fh); ctx.clip();
+    for(let c=0;c<columns.length;c++){
+      const x=c*cell+xOffset; if(x<-cell||x>W+cell) continue;
+      for(let r=0;r<ROWS;r++){
+        const g=columns[c][r]; if(!g) continue;
+        drawGem(g, x+cell/2, top+r*cell+g.oy+cell/2);
+      }
+    }
+    // selection ring
+    if(selected){
+      const sx=selected.c*cell+xOffset+cell/2, sy=top+selected.r*cell+cell/2;
+      ctx.strokeStyle='#ffffff'; ctx.lineWidth=Math.max(3,cell*0.07);
+      ctx.shadowColor='#fff'; ctx.shadowBlur=14;
+      ctx.beginPath(); ctx.arc(sx,sy,cell*0.46,0,7); ctx.stroke();
+      ctx.shadowBlur=0;
+    }
+    // invalid flashes
+    for(const iv of invalids){
+      const ix=iv.c*cell+xOffset+cell/2, iy=top+iv.r*cell+cell/2;
+      ctx.strokeStyle='rgba(255,80,100,'+(iv.t/0.3)+')'; ctx.lineWidth=4;
+      ctx.beginPath(); ctx.arc(ix,iy,cell*0.46,0,7); ctx.stroke();
+    }
+    // particles
+    for(const p of particles){
+      ctx.globalAlpha=Math.max(0,p.t/p.max);
+      ctx.fillStyle=p.col;
+      ctx.fillRect(p.x-3,p.y-3,6,6);
+    }
+    ctx.globalAlpha=1;
+    ctx.restore();
+
+    // HUD
+    ctx.textAlign='left'; ctx.textBaseline='top';
+    ctx.font='bold '+Math.max(20,cell*0.45)+'px Segoe UI, Arial';
+    ctx.fillStyle='#ffd166'; ctx.shadowColor='#000'; ctx.shadowBlur=6;
+    ctx.fillText('SCORE  '+score, 16, 14);
+    ctx.font='bold '+Math.max(14,cell*0.3)+'px Segoe UI, Arial';
+    ctx.fillStyle='#9fb4ff';
+    ctx.fillText('LEVEL '+level+'   SPEED x'+(speed/26).toFixed(1), 16, 14+Math.max(24,cell*0.5));
+    ctx.textAlign='right';
+    ctx.font=Math.max(20,cell*0.45)+'px Segoe UI, Arial';
+    let hearts=''; for(let i=0;i<5;i++) hearts += i<lives?'♥':'♡';
+    ctx.fillStyle='#ff5e7a';
+    ctx.fillText(hearts, W-16, 14);
+    ctx.shadowBlur=0;
+
+    // popups
+    for(const p of popups){
+      ctx.globalAlpha=Math.min(1,p.t/p.max*1.6);
+      ctx.textAlign='center';
+      ctx.font='bold '+p.size+'px Segoe UI, Arial';
+      ctx.fillStyle=p.col; ctx.shadowColor='#000'; ctx.shadowBlur=8;
+      ctx.fillText(p.text,p.x,p.y);
+    }
+    ctx.globalAlpha=1; ctx.shadowBlur=0;
+  }
+}
+
+/* ---------- main loop ---------- */
+function loop(t){
+  const dt=Math.min(0.05,(t-lastT)/1000); lastT=t;
+  update(dt); render();
+  requestAnimationFrame(loop);
+}
+
+resize();
+buildBoard();
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
