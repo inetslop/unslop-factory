@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Par Putt — 3D Golf</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0b2a12;font-family:'Segoe UI',Arial,sans-serif;}
+  #c{display:block;width:100vw;height:100vh;}
+  .overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:radial-gradient(ellipse at center,rgba(10,40,20,.85),rgba(3,15,6,.95));color:#eaffea;text-align:center;z-index:10;}
+  .overlay h1{font-size:min(9vw,64px);margin:0 0 8px;letter-spacing:2px;text-shadow:0 4px 0 #0a3d1c,0 8px 18px rgba(0,0,0,.6);}
+  .overlay h2{font-size:min(5vw,28px);margin:6px 0;color:#bfe9bf;}
+  .overlay p{font-size:min(3.4vw,18px);line-height:1.7;margin:6px 0;color:#d8f5d8;max-width:640px;padding:0 20px;}
+  .key{display:inline-block;border:1px solid #7ec97e;border-radius:6px;padding:1px 9px;margin:0 3px;background:rgba(120,220,120,.15);font-weight:bold;}
+  .btn{margin-top:22px;font-size:min(4vw,22px);padding:12px 40px;border:none;border-radius:10px;cursor:pointer;
+    background:linear-gradient(#7ee08a,#3fae54);color:#06230d;font-weight:bold;box-shadow:0 6px 0 #1e6b31,0 10px 20px rgba(0,0,0,.5);}
+  .btn:active{transform:translateY(4px);box-shadow:0 2px 0 #1e6b31;}
+  .hidden{display:none !important;}
+  table{margin-top:10px;border-collapse:collapse;font-size:min(3.2vw,17px);}
+  td,th{border:1px solid #4c8f58;padding:5px 14px;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="startScreen" class="overlay">
+  <h1>⛳ PAR PUTT</h1>
+  <h2>A Tiny 3D Golf Game</h2>
+  <p>
+    <span class="key">◀</span><span class="key">▶</span> aim &nbsp;•&nbsp; hold <span class="key">SPACE</span> to charge the shot, release to hit<br>
+    Avoid the water (penalty +1), sand slows you down. Sink all 3 holes!<br>
+    <span class="key">ENTER</span> start / next hole &nbsp;•&nbsp; <span class="key">R</span> restart
+  </p>
+  <button class="btn" id="startBtn">TEE OFF</button>
+</div>
+
+<div id="endScreen" class="overlay hidden">
+  <h1 id="endTitle">ROUND COMPLETE</h1>
+  <table id="scoreTable"></table>
+  <p id="finalMsg" style="margin-top:14px;font-size:min(4vw,20px);font-weight:bold;"></p>
+  <button class="btn" id="againBtn">PLAY AGAIN</button>
+</div>
+
+<script>
+(function(){
+"use strict";
+var canvas=document.getElementById('c'), ctx=canvas.getContext('2d');
+var W=0,H=0,DPR=Math.min(window.devicePixelRatio||1,2);
+function resize(){W=window.innerWidth;H=window.innerHeight;canvas.width=W*DPR;canvas.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0);}
+window.addEventListener('resize',resize);resize();
+
+// ---------- audio ----------
+var AC=null, noiseBuf=null;
+function initAudio(){ if(AC)return; try{ AC=new (window.AudioContext||window.webkitAudioContext)();
+  var len=AC.sampleRate*0.4; noiseBuf=AC.createBuffer(1,len,AC.sampleRate);
+  var d=noiseBuf.getChannelData(0); for(var i=0;i<len;i++)d[i]=Math.random()*2-1; }catch(e){} }
+function beep(f,dur,type,vol,when){ if(!AC)return; when=when||0;
+  var t=AC.currentTime+when,o=AC.createOscillator(),g=AC.createGain();
+  o.type=type;o.frequency.value=f; g.gain.setValueAtTime(vol,t);
+  g.gain.exponentialRampToValueAtTime(0.001,t+dur); o.connect(g);g.connect(AC.destination);o.start(t);o.stop(t+dur+0.02);}
+function splash(){ if(!AC||!noiseBuf)return; var t=AC.currentTime,s=AC.createBufferSource(),g=AC.createGain(),fl=AC.createBiquadFilter();
+  s.buffer=noiseBuf; fl.type='lowpass'; fl.frequency.value=900; g.gain.setValueAtTime(0.4,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.5);
+  s.connect(fl);fl.connect(g);g.connect(AC.destination);s.start(t);s.stop(t+0.5);}
+
+// ---------- game state ----------
+var HOLE_COUNT=3;
+var state='start'; // start, play, holeDone, end
+var holeIndex=0, strokes=0, totalStrokes=0, totals=[];
+var par=4, holes=[]; // {x,z}
+var traps=[]; // {x,z,r,type:'sand'|'water'}
+var ball={x:0,y:0,z:0,vx:0,vy:0,vz:0};
+var lastShotPos={x:0,z:0};
+var aimYaw=0, camYaw=0, atRest=true;
+var charging=false, chargeT=0, power=0;
+var message='', msgT=0;
+var holeDoneT=0, nextIsEnd=false;
+
+function genHole(n){
+  var dist=38+n*16+Math.random()*20;
+  par=Math.max(3,Math.round(dist/18));
+  var hx=(Math.random()*40-20), hz=dist;
+  holes=[{x:hx,z:hz}];
+  traps=[];
+  var nSand=1+Math.floor(Math.random()*2)+ (n>0?1:0);
+  for(var i=0;i<nSand;i++){
+    var t=Math.random(), x=hx*0.5+(Math.random()*50-25), z=8+t*(dist-14);
+    if(Math.hypot(x-ball.x,z-ball.z)<9) continue;
+    if(Math.hypot(x-hx,z-hz)<7) continue;
+    traps.push({x:x,z:z,r:3+Math.random()*2.5,type:'sand'});
+  }
+  var nWater=n===0?1:(1+Math.floor(Math.random()*2));
+  for(i=0;i<nWater;i++){
+    t=Math.random(); x=hx*0.5+(Math.random()*60-30); z=10+t*(dist-18);
+    if(Math.hypot(x-hx,z-hz)<7) continue;
+    traps.push({x:x,z:z,r:2.5+Math.random()*2,type:'water'});
+  }
+}
+
+function startHole(n){
+  holeIndex=n; strokes=0;
+  ball.x=0;ball.y=0;ball.z=0;ball.vx=0;ball.vy=0;ball.vz=0;
+  lastShotPos={x:0,z:0};
+  aimYaw=Math.atan2(holes[n].x, holes[n].z); camYaw=aimYaw;
+  atRest=true; charging=false; power=0;
+  genHole(n);
+  state='play';
+}
+
+function startGame(){
+  totalStrokes=0; totals=[];
+  document.getElementById('startScreen').classList.add('hidden');
+  document.getElementById('endScreen').classList.add('hidden');
+  startHole(0);
+}
+
+function endRound(){
+  state='end';
+  var diff=totalStrokes - holesParTotal();
+  var tbl='<tr><th>Hole</th><th>Par</th><th>Strokes</th></tr>';
+  for(var i=0;i<totals.length;i++){
+    tbl+='<tr><td>'+(i+1)+'</td><td>'+iPars[i]+'</td><td>'+totals[i]+'</td></tr>';
+  }
+  document.getElementById('scoreTable').innerHTML=tbl;
+  var t=document.getElementById('endTitle'), m=document.getElementById('finalMsg');
+  if(diff<0){t.textContent='🏆 INCREDIBLE!';m.textContent='You finished '+(-diff)+' UNDER PAR ('+totalStrokes+' strokes).';}
+  else if(diff===0){t.textContent='⛳ GREAT ROUND!';m.textContent='You finished even par with '+totalStrokes+' strokes.';}
+  else {t.textContent='ROUND COMPLETE';m.textContent='You finished +'+diff+' over par ('+totalStrokes+' strokes). Keep practicing!';}
+  document.getElementById('endScreen').classList.remove('hidden');
+}
+var iPars=[];
+function holesParTotal(){return iPars.reduce(function(a,b){return a+b;},0);}
+
+// ---------- input ----------
+var keys={};
+window.addEventListener('keydown',function(e){
+  initAudio(); if(AC&&AC.state==='suspended')AC.resume();
+  var k=e.key;
+  if(k===' '||k==='ArrowLeft'||k==='ArrowRight'||k==='ArrowUp'||k==='ArrowDown')e.preventDefault();
+  if(k==='Enter'){
+    if(state==='start')startGame();
+    else if(state==='holeDone'&&!nextIsEnd)startHole(holeIndex+1);
+    else if(nextIsEnd)endRound();
+    return;
+  }
+  if(k==='r'||k==='R'){ startGame(); return; }
+  if(state!=='play')return;
+  if(k==='ArrowLeft'||k==='a'||k==='A')keys.left=true;
+  if(k==='ArrowRight'||k==='d'||k==='D')keys.right=true;
+  if(k===' '&&!e.repeat&&atRest&&!charging){charging=true;chargeT=0;}
+});
+window.addEventListener('keyup',function(e){
+  var k=e.key;
+  if(k==='ArrowLeft'||k==='a'||k==='A')keys.left=false;
+  if(k==='ArrowRight'||k==='d'||k==='D')keys.right=false;
+  if(k===' '&&charging){
+    charging=false;
+    hitBall();
+  }
+});
+document.getElementById('startBtn').addEventListener('click',function(){initAudio();startGame();});
+document.getElementById('againBtn').addEventListener('click',function(){initAudio();startGame();});
+
+function hitBall(){
+  if(!atRest)return;
+  strokes++;
+  var p=power; // 0..1
+  ball.vx=Math.sin(aimYaw)*(6+p*34);
+  ball.vz=Math.cos(aimYaw)*(6+p*34);
+  ball.vy=p*2.5;
+  lastShotPos={x:ball.x,z:ball.z};
+  atRest=false;
+  beep(90,0.12,'square',0.35); beep(220,0.06,'triangle',0.2);
+}
+
+// ---------- physics ----------
+function inTrap(x,z,type){
+  for(var i=0;i<traps.length;i++){var t=traps[i];if(t.type===type&&Math.hypot(x-t.x,z-t.z)<t.r)return true;}
+  return false;
+}
+function physStep(dt){
+  if(atRest)return;
+  ball.vy-=22*dt;
+  ball.x+=ball.vx*dt; ball.y+=ball.vy*dt; ball.z+=ball.vz*dt;
+  var sand=inTrap(ball.x,ball.z,'sand');
+  if(ball.y<=0){
+    ball.y=0;
+    if(Math.abs(ball.vy)>1.5){ ball.vy=-ball.vy*0.42; beep(70,0.06,'sine',0.15); }
+    else ball.vy=0;
+  }
+  var fr = sand?5.5:1.1;
+  if(ball.y<=0.01){
+    var f=Math.max(0,1-fr*dt);
+    ball.vx*=f; ball.vz*=f;
+  } else {
+    var d=1-0.06*dt; ball.vx*=d;ball.vz*=d;
+  }
+  // water
+  if(ball.y<0.4 && inTrap(ball.x,ball.z,'water')){
+    splash(); strokes++;
+    message='💦 SPLASH! +1 penalty'; msgT=2;
+    ball.x=lastShotPos.x; ball.z=lastShotPos.z; ball.y=0;
+    ball.vx=ball.vy=ball.vz=0; atRest=true; charging=false; power=0;
+    return;
+  }
+  // hole capture
+  var h=holes[0];
+  var dH=Math.hypot(ball.x-h.x,ball.z-h.z);
+  if(dH<0.85 && ball.y<1.2){
+    var sp=Math.hypot(ball.vx,ball.vz);
+    if(sp<9){
+      totalStrokes+=strokes; totals.push(strokes); iPars[holeIndex]=par;
+      var diff=strokes-par;
+      var name = diff<=-2?'EAGLE! 🦅':diff===-1?'BIRDIE! 🐦':diff===0?'PAR ✓':diff===1?'BOGEY':'+'+diff;
+      message=name+'  ('+strokes+' on par '+par+')'; msgT=3;
+      beep(880,0.25,'sine',0.3); beep(1318,0.4,'sine',0.3,0.12);
+      ball.x=h.x;ball.z=h.z;ball.vx=ball.vy=ball.vz=0;atRest=true;
+      state='holeDone'; holeDoneT=0; nextIsEnd=(holeIndex===HOLE_COUNT-1);
+      return;
+    } else { // lip out deflection
+      var ang=Math.atan2(ball.z-h.z,ball.x-h.x);
+      ball.vx=Math.sin(ang)*sp*0.5; ball.vz=Math.cos(ang)*sp*0.5; ball.vy=1.5;
+      beep(300,0.08,'triangle',0.15);
+    }
+  }
+  var spd=Math.hypot(ball.vx,ball.vz);
+  if(spd<0.18 && ball.y<=0.01){ ball.vx=ball.vz=0; atRest=true; charging=false; power=0; }
+}
+
+// ---------- projection ----------
+var camX=0,camY=7,camZ=-12, fxv=1,fzv=0, rxv=0,rzv=1, FOV;
+function updateCamera(dt){
+  var targetYaw = atRest ? aimYaw : Math.atan2(ball.vx,ball.vz);
+  camYaw=lerpAng(camYaw,targetYaw,Math.min(1,dt*4));
+  fxv=Math.sin(camYaw);fzv=Math.cos(camYaw);rxv=Math.cos(camYaw);rzv=-Math.sin(camYaw);
+  var dist=9, height=6.5;
+  camX=ball.x-fxv*dist; camZ=ball.z-fzv*dist; camY=height;
+  FOV=H*1.25;
+}
+function lerpAng(a,b,t){var d=(b-a+Math.PI*3)%(Math.PI*2)-Math.PI;return a+d*t;}
+function project(wx,wy,wz){
+  var dx=wx-camX,dy=wy-camY,dz=wz-camZ;
+  var cz=dx*fxv+dz*fzv;
+  if(cz<0.3)return null;
+  var cx=dx*rxv+dz*rzv;
+  return {x:W/2+cx*FOV/cz, y:H/2-dy*FOV/cz, z:cz};
+}
+
+// ---------- drawing ----------
+function seg(x1,y1,z1,x2,y2,z2,color,w){
+  var a=project(x1,y1,z1), b=project(x2,y2,z2);
+  if(!a||!b)return;
+  ctx.strokeStyle=color;ctx.lineWidth=w||1;
+  ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+}
+function groundCircle(x,z,r,color){
+  var pts=[];
+  for(var i=0;i<=24;i++){var a=i/24*Math.PI*2,p=project(x+Math.cos(a)*r,0,z+Math.sin(a)*r);if(!p)return;pts.push(p);}
+  ctx.fillStyle=color;ctx.beginPath();ctx.moveTo(pts[0].x,pts[0].y);
+  for(i=1;i<pts.length;i++)ctx.lineTo(pts[i].x,pts[i].y);
+  ctx.closePath();ctx.fill();
+}
+
+function draw(){
+  // sky
+  var far=project(ball.x+fxv*600,0,ball.z+fzv*600);
+  var hy=far?far.y:H*0.4;
+  var sky=ctx.createLinearGradient(0,0,0,hy);
+  sky.addColorStop(0,'#7ec8f5');sky.addColorStop(1,'#d8effc');
+  ctx.fillStyle=sky;ctx.fillRect(0,0,W,Math.max(0,hy));
+  var gnd=ctx.createLinearGradient(0,hy,0,H);
+  gnd.addColorStop(0,'#4f9e3f');gnd.addColorStop(1,'#2f7a2c');
+  ctx.fillStyle=gnd;ctx.fillRect(0,Math.max(0,hy),W,H-Math.max(0,hy));
+  // sun
+  ctx.fillStyle='rgba(255,244,200,.9)';ctx.beginPath();ctx.arc(W*0.78,Math.max(30,hy-60),26,0,7);ctx.fill();
+
+  // grid
+  var step=10;
+  for(var i=-8;i<=8;i++){
+    var ox=ball.x+rxv*i*step, oz=ball.z+rzv*i*step;
+    for(var t=-250;t<320;t+=step){
+      seg(ox+fxv*t,0,oz+fzv*t, ox+fxv*(t+step),0,oz+fzv*(t+step),'rgba(255,255,255,.10)',1);
+    }
+  }
+  for(var j=-30;j<=32;j++){
+    var wx=ball.x+fxv*j*step, wz=ball.z+fzv*j*step;
+    for(i=-8;i<8;i++){
+      seg(wx+rxv*i*step,0,wz+rzv*i*step, wx+rxv*(i+1)*step,0,wz+rzv*(i+1)*step,'rgba(255,255,255,.14)',1);
+    }
+    if(j>0&&j%2===0){
+      var mp=project(wx,0.05,wz);
+      if(mp&&mp.z<90){ctx.fillStyle='rgba(255,255,255,.5)';ctx.font=Math.max(10,mp.z*0.4)+'px sans-serif';ctx.textAlign='center';
+        ctx.fillText((j*step- Math.round(Math.hypot(wx-holes[0].x,wz-holes[0].z))===0?'':'')+'', mp.x,mp.y); // placeholder removed below
+      }
+    }
+  }
+
+  // traps
+  for(var ti=0;ti<traps.length;ti++){
+    var tr=traps[ti];
+    groundCircle(tr.x,tr.z,tr.r, tr.type==='sand'?'#e6d28a':'#4aa3e0');
+    groundCircle(tr.x,tr.z,tr.r*0.7, tr.type==='sand'?'#ddc574':'#3b8fc9');
+  }
+
+  // hole + flag
+  var h=holes[0];
+  groundCircle(h.x,h.z,1.1,'#1a1a1a');
+  var base=project(h.x,0,h.z), top=project(h.x,5.2,h.z);
+  if(base&&top){
+    ctx.strokeStyle='#f5f5f5';ctx.lineWidth=Math.max(1.5,top.z*0.35);
+    ctx.beginPath();ctx.moveTo(base.x,base.y);ctx.lineTo(top.x,top.y);ctx.stroke();
+    var fw=project(h.x+rxv*1.4,0,h.z+rzv*1.4);
+    if(fw){var fs=top.z*0.5;
+      ctx.fillStyle='#e33';ctx.beginPath();
+      ctx.moveTo(top.x,top.y);ctx.lineTo(top.x,top.y+fs*0.8);ctx.lineTo(top.x+Math.sign(rxv||1)*fs*1.6, top.y+fs*0.4);
+      ctx.closePath();ctx.fill();}
+  }
+
+  // aim line when at rest
+  if(atRest&&state==='play'){
+    for(var a=0;a<7;a++){
+      seg(ball.x+fxv*(a*1.2),0.05,ball.z+fzv*(a*1.2), ball.x+fxv*(a*1.2+0.9),0.05,ball.z+fzv*(a*1.2+0.9),'rgba(255,255,80,'+(0.7-a*0.09)+')',3);
+    }
+  }
+
+  // ball shadow + ball
+  var sh=project(ball.x,0.02,ball.z);
+  if(sh){ctx.fillStyle='rgba(0,0,0,.3)';ctx.beginPath();
+    ctx.ellipse(sh.x,sh.y,Math.max(1,0.4*FOV/sh.z),Math.max(0.5,0.16*FOV/sh.z),0,0,7);ctx.fill();}
+  var bp=project(ball.x,ball.y+0.32,ball.z);
+  if(bp){var br=Math.max(2,0.34*FOV/bp.z);
+    var bg=ctx.createRadialGradient(bp.x-br*0.35,bp.y-br*0.35,br*0.15,bp.x,bp.y,br);
+    bg.addColorStop(0,'#ffffff');bg.addColorStop(1,'#c9c9c9');
+    ctx.fillStyle=bg;ctx.beginPath();ctx.arc(bp.x,bp.y,br,0,7);ctx.fill();}
+
+  // ---------- HUD ----------
+  ctx.textAlign='left';
+  ctx.font='bold '+Math.max(16,H*0.03)+'px Segoe UI, Arial';
+  ctx.fillStyle='rgba(0,0,0,.45)';
+  roundRect(12,12,Math.max(230,W*0.3),H*0.085,10);ctx.fill();
+  ctx.fillStyle='#fff';
+  ctx.fillText('Hole '+(holeIndex+1)+'/'+HOLE_COUNT+'   Par '+par,26,H*0.045);
+  ctx.fillText('Strokes: '+strokes+'     Total: '+totalStrokes,26,H*0.045+H*0.038);
+
+  // power bar
+  if(charging){
+    var bw=Math.min(420,W*0.6), bx=(W-bw)/2, by=H-52;
+    ctx.fillStyle='rgba(0,0,0,.5)';roundRect(bx-6,by-6,bw+12,34,8);ctx.fill();
+    var pg=ctx.createLinearGradient(bx,0,bx+bw,0);
+    pg.addColorStop(0,'#5be07a');pg.addColorStop(0.6,'#ffd94a');pg.addColorStop(1,'#ff4d4d');
+    ctx.fillStyle=pg;roundRect(bx,by,bw*power,22,6);ctx.fill();
+    ctx.strokeStyle='#fff';ctx.lineWidth=2;roundRect(bx,by,bw,22,6);ctx.stroke();
+    ctx.fillStyle='#fff';ctx.textAlign='center';ctx.font='bold 14px Arial';
+    ctx.fillText('POWER',W/2,by-12);
+  }
+
+  // message
+  if(msgT>0){
+    ctx.textAlign='center';
+    var fs=Math.min(52,W*0.08);
+    ctx.font='bold '+fs+'px Segoe UI, Arial';
+    ctx.fillStyle='rgba(0,0,0,.55)';
+    roundRect(W/2-ctx.measureText(message).width/2-24,H*0.3-40,ctx.measureText(message).width+48,fs+34,14);ctx.fill();
+    ctx.fillStyle='#fff';ctx.fillText(message,W/2,H*0.3);
+  }
+  if(state==='holeDone'){
+    ctx.textAlign='center';ctx.fillStyle='rgba(255,255,255,.9)';
+    ctx.font='bold '+Math.max(16,H*0.028)+'px Arial';
+    var txt=nextIsEnd?'Press ENTER to see your scorecard':'Press ENTER for next hole';
+    ctx.fillText(txt,W/2,H*0.3+fs+34);
+  }
+}
+function roundRect(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+
+// ---------- main loop ----------
+var last=performance.now();
+function frame(now){
+  var dt=Math.min(0.05,(now-last)/1000); last=now;
+  if(state==='play'||state==='holeDone'){
+    if(state==='play'&&atRest){
+      if(keys.left)aimYaw+=2.4*dt;
+      if(keys.right)aimYaw-=2.4*dt;
+      if(charging){chargeT+=dt;power=1-Math.abs(2*(chargeT%1)-1);} // oscillate 0..1
+    }
+    physStep(dt);
+    updateCamera(dt);
+    if(msgT>0)msgT-=dt;
+    if(state==='holeDone'){holeDoneT+=dt;if(holeDoneT>4){ if(nextIsEnd)endRound(); else startHole(holeIndex+1);} }
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// try to persist best score (safe)
+function saveBest(s){try{var b=localStorage.getItem('parputt_best');if(!b||s<+b)localStorage.setItem('parputt_best',s);}catch(e){}}
+})();
+</script>
+</body>
+</html>
