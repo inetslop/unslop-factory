@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Golf Racer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #1a4d2e; display: flex; justify-content: center; align-items: height: 100vh; width: 100vw; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, dur, type='sine', vol=0.3) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+function playHit() { playSound(200, 0.15, 'square', 0.4); }
+function playHoleIn() { playSound(600, 0.3, 'sine', 0.4); setTimeout(()=>playSound(800,0.3,'sine',0.4),100); }
+function playBump() { playSound(100, 0.2, 'sawtooth', 0.3); }
+function playWater() { playSound(300, 0.3, 'sine', 0.2); }
+
+// Game State
+let state = 'start'; // start, playing, putt, holeComplete, gameOver
+let keys = {};
+window.addEventListener('keydown', e => { keys[e.code] = true; if(state==='start') startGame(); if(state==='gameOver') startGame(); });
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Golf Cart
+let cart = { x: 0, y: 0, angle: 0, speed: 0 };
+let camera = { x: 0, y: 0 };
+let timer = 0;
+let currentHole = 0;
+let totalStrokes = 0;
+
+// Putt state
+let ball = null;
+let puttPower = 0;
+let puttCharging = false;
+let puttBallActive = false;
+let holeCompleteTimer = 0;
+
+// Course generation
+let courses = [];
+let hazards = [];
+let flags = [];
+let fairwayPoints = [];
+let totalHoles = 6;
+
+function generateCourse() {
+    courses = [];
+    hazards = [];
+    flags = [];
+    fairwayPoints = [];
+    
+    let x = 0, y = 0;
+    let baseAngle = -Math.PI/2;
+    
+    for (let h = 0; h < totalHoles; h++) {
+        const segLen = 800 + Math.random() * 400;
+        const angleChange = (Math.random() - 0.5) * 1.5;
+        
+        let points = [];
+        for (let i = 0; i <= 20; i++) {
+            const t = i / 20;
+            const px = x + Math.cos(baseAngle + angleChange * t) * segLen * t;
+            const py = y + Math.sin(baseAngle + angleChange * t) * segLen * t;
+            points.push({x: px, y: py});
+        }
+        
+        fairwayPoints.push(points);
+        
+        // Flag at end of segment
+        const lastP = points[points.length - 1];
+        flags.push({ x: lastP.x, y: lastP.y, hole: h + 1 });
+        
+        // Hazards along segment
+        for (let i = 3; i < 17; i += 3) {
+            const p = points[i];
+            const side = (Math.random() > 0.5 ? 1 : -1);
+            const offset = 80 + Math.random() * 60;
+            const perpAngle = baseAngle + angleChange * (i/20) + Math.PI/2 * side;
+            
+            if (Math.random() < 0.4) {
+                hazards.push({ type: 'water', x: p.x + Math.cos(perpAngle)*offset, y: p.y + Math.sin(perpAngle)*offset, w: 60+Math.random()*80, h: 40+Math.random()*60 });
+            } else if (Math.random() < 0.5) {
+                hazards.push({ type: 'sand', x: p.x + Math.cos(perpAngle)*offset, y: p.y + Math.sin(perpAngle)*offset, r: 30+Math.random()*30 });
+            } else {
+                hazards.push({ type: 'tree', x: p.x + Math.cos(perpAngle)*offset, y: p.y + Math.sin(perpAngle)*offset, r: 15 });
+            }
+        }
+        
+        // Side trees
+        for (let i = 0; i < 8; i++) {
+            const t = Math.random() * 20 / 20;
+            const p = points[Math.floor(t*20)];
+            const side = Math.random() > 0.5 ? 1 : -1;
+            const offset = 100 + Math.random() * 150;
+            const perpAngle = baseAngle + angleChange * t + Math.PI/2 * side;
+            hazards.push({ type: 'tree', x: p.x + Math.cos(perpAngle)*offset, y: p.y + Math.sin(perpAngle)*offset, r: 18 });
+        }
+        
+        x = lastP.x;
+        y = lastP.y;
+        baseAngle += angleChange + (Math.random() - 0.5) * 0.8;
+    }
+}
+
+function startGame() {
+    initAudio();
+    generateCourse();
+    cart.x = fairwayPoints[0][0].x;
+    cart.y = fairwayPoints[0][0].y;
+    cart.angle = -Math.PI/2;
+    cart.speed = 0;
+    currentHole = 0;
+    timer = 0;
+    totalStrokes = 0;
+    ball = null;
+    puttPower = 0;
+    puttCharging = false;
+    puttBallActive = false;
+    state = 'playing';
+}
+
+function getSpeedMultiplier(x, y) {
+    for (let hz of hazards) {
+        if (hz.type === 'water') {
+            if (Math.abs(x - hz.x) < hz.w/2 && Math.abs(y - hz.y) < hz.h/2) return 0.3;
+        } else if (hz.type === 'sand') {
+            const dx = x - hz.x, dy = y - hz.y;
+            if (dx*dx + dy*dy < hz.r * hz.r) return 0.5;
+        }
+    }
+    // Check if on fairway
+    let onFairway = false;
+    for (let pts of fairwayPoints) {
+        for (let p of pts) {
+            const dx = x - p.x, dy = y - p.y;
+            if (dx*dx + dy*dy < 120*120) { onFairway = true; break; }
+        }
+    }
+    return onFairway ? 1 : 0.7;
+}
+
+function checkTreeCollision(x, y) {
+    for (let hz of hazards) {
+        if (hz.type === 'tree') {
+            const dx = x - hz.x, dy = y - hz.y;
+            const minDist = hz.r + 12;
+            if (dx*dx + dy*dy < minDist * minDist) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+function update(dt) {
+    if (state !== 'playing' && state !== 'putt') return;
+    
+    timer += dt;
+    
+    if (state === 'playing') {
+        // Steering
+        const steerSpeed = 3.5;
+        let speed = cart.speed;
+        
+        if (keys['ArrowUp'] || keys['KeyW']) speed += 0.8;
+        else if (keys['ArrowDown'] || keys['KeyS']) speed -= 0.6;
+        else speed *= 0.92;
+        
+        speed = Math.max(-3, Math.min(5, speed));
+        
+        const mult = getSpeedMultiplier(cart.x, cart.y);
+        const finalSpeed = speed * mult;
+        
+        if (keys['ArrowLeft'] || keys['KeyA']) cart.angle -= steerSpeed * dt * (finalSpeed > 0 ? 1 : -1);
+        if (keys['ArrowRight'] || keys['KeyD']) cart.angle += steerSpeed * dt * (finalSpeed > 0 ? 1 : -1);
+        
+        const newX = cart.x + Math.cos(cart.angle) * finalSpeed;
+        const newY = cart.y + Math.sin(cart.angle) * finalSpeed;
+        
+        if (!checkTreeCollision(newX, newY)) {
+            cart.x = newX;
+            cart.y = newY;
+            cart.speed = finalSpeed;
+        } else {
+            cart.speed = 0;
+            playBump();
+        }
+        
+        // Check proximity to current flag
+        if (currentHole < flags.length) {
+            const flag = flags[currentHole];
+            const dx = cart.x - flag.x, dy = cart.y - flag.y;
+            if (dx*dx + dy*dy < 100*100 && Math.abs(cart.speed) < 1.5) {
+                // Ready to putt
+                if (keys['Space']) {
+                    state = 'putt';
+                    ball = { x: flag.x, y: flag.y, vx: 0, vy: 0, active: false };
+                    puttPower = 0;
+                    puttCharging = true;
+                    playHit();
+                }
+            }
+        }
+    }
+    
+    if (state === 'putt') {
+        if (puttCharging) {
+            if (keys['Space']) {
+                puttPower += dt * 200;
+                puttPower = Math.min(puttPower, 350);
+            } else {
+                // Release - execute putt
+                puttCharging = false;
+                const flag = flags[currentHole];
+                const dx = flag.x - ball.x;
+                const dy = flag.y - ball.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                if (dist > 1) {
+                    ball.vx = (dx/dist) * puttPower;
+                    ball.vy = (dy/dist) * puttPower;
+                    ball.active = true;
+                    totalStrokes++;
+                    playHit();
+                }
+            }
+        }
+        
+        if (ball && ball.active) {
+            const friction = 0.97;
+            ball.vx *= friction;
+            ball.vy *= friction;
+            ball.x += ball.vx * dt * 60;
+            ball.y += ball.vy * dt * 60;
+            
+            const flag = flags[currentHole];
+            const dx = ball.x - flag.x, dy = ball.y - flag.y;
+            if (dx*dx + dy*dy < 15*15) {
+                // Hole in!
+                state = 'holeComplete';
+                holeCompleteTimer = 0;
+                playHoleIn();
+                currentHole++;
+                ball.active = false;
+                
+                if (currentHole >= totalHoles) {
+                    setTimeout(() => { state = 'gameOver'; }, 2000);
+                }
+            }
+            
+            const speed = Math.sqrt(ball.vx*ball.vx + ball.vy*ball.vy);
+            if (speed < 1 && !ball.active) {
+                // Ball stopped, check distance
+                if (dx*dx + dy*dy > 20*20) {
+                    // Reset putt
+                    state = 'playing';
+                    ball = null;
+                    puttPower = 0;
+                } else {
+                    ball.active = false;
+                    state = 'playing';
+                    ball = null;
+                }
+            }
+        }
+    }
+    
+    if (state === 'holeComplete') {
+        holeCompleteTimer += dt;
+    }
+}
+
+function draw() {
+    ctx.fillStyle = '#2d7a3a';
+    ctx.fillRect(0, 0, W, H);
+    
+    if (state === 'start') {
+        drawStartScreen();
+        return;
+    }
+    
+    if (state === 'gameOver') {
+        drawGameOver();
+        return;
+    }
+    
+    // Camera follows cart
+    camera.x = cart.x - W/2;
+    camera.y = cart.y - H/2;
+    
+    ctx.save();
+    ctx.translate(-camera.x, -camera.y);
+    
+    // Draw fairway path
+    for (let pts of fairwayPoints) {
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i++) {
+            ctx.lineTo(pts[i].x, pts[i].y);
+        }
+        ctx.strokeStyle = '#4a9e3f';
+        ctx.lineWidth = 200;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        ctx.stroke();
+    }
+    
+    // Draw fairway stripes (mowing pattern)
+    for (let pts of fairwayPoints) {
+        for (let i = 0; i < pts.length - 1; i += 2) {
+            const p1 = pts[i], p2 = pts[Math.min(i+1, pts.length-1)];
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.strokeStyle = 'rgba(74, 158, 63, 0.5)';
+            ctx.lineWidth = 200;
+            ctx.lineCap = 'round';
+            ctx.stroke();
+        }
+    }
+    
+    // Draw hazards
+    for (let hz of hazards) {
+        if (hz.type === 'water') {
+            ctx.fillStyle = '#3498db';
+            ctx.beginPath();
+            ctx.ellipse(hz.x, hz.y, hz.w/2, hz.h/2, 0, 0, Math.PI*2);
+            ctx.fill();
+            ctx.strokeStyle = '#2980b9';
+            ctx.lineWidth = 3;
+            ctx.stroke();
+        } else if (hz.type === 'sand') {
+            ctx.fillStyle = '#f4d796';
+            ctx.beginPath();
+            ctx.arc(hz.x, hz.y, hz.r, 0, Math.PI*2);
+            ctx.fill();
+            ctx.strokeStyle = '#e8c56e';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        } else if (hz.type === 'tree') {
+            // Trunk
+            ctx.fillStyle = '#6b4423';
+            ctx.fillRect(hz.x - 4, hz.y - 4, 8, 12);
+            // Foliage
+            ctx.fillStyle = '#1a5c2a';
+            ctx.beginPath();
+            ctx.arc(hz.x, hz.y - 10, hz.r, 0, Math.PI*2);
+            ctx.fill();
+            ctx.fillStyle = '#2d7a3a';
+            ctx.beginPath();
+            ctx.arc(hz.x - 5, hz.y - 15, hz.r * 0.7, 0, Math.PI*2);
+            ctx.fill();
+        }
+    }
+    
+    // Draw flags/greens
+    for (let i = 0; i < currentHole + 1 && i < flags.length; i++) {
+        const f = flags[i];
+        // Green circle
+        ctx.fillStyle = '#8bc34a';
+        ctx.beginPath();
+        ctx.arc(f.x, f.y, 60, 0, Math.PI*2);
+        ctx.fill();
+        
+        // Flag
+        if (i === currentHole) {
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.moveTo(f.x, f.y);
+            ctx.lineTo(f.x, f.y - 40);
+            ctx.stroke();
+            
+            ctx.fillStyle = '#e74c3c';
+            ctx.beginPath();
+            ctx.moveTo(f.x, f.y - 40);
+            ctx.lineTo(f.x + 25, f.y - 30);
+            ctx.lineTo(f.x, f.y - 20);
+            ctx.closePath();
+            ctx.fill();
+            
+            // Hole
+            ctx.fillStyle = '#1a1a1a';
+            ctx.beginPath();
+            ctx.arc(f.x, f.y, 8, 0, Math.PI*2);
+            ctx.fill();
+        } else {
+            ctx.fillStyle = '#666';
+            ctx.beginPath();
+            ctx.arc(f.x, f.y, 5, 0, Math.PI*2);
+            ctx.fill();
+        }
+    }
+    
+    // Draw ball
+    if (ball) {
+        ctx.fillStyle = '#fff';
+        ctx.strokeStyle = '#ccc';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, 6, 0, Math.PI*2);
+        ctx.fill();
+        ctx.stroke();
+        
+        // Putt power indicator
+        if (puttCharging && state === 'putt') {
+            const barH = puttPower / 350 * 100;
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(ball.x - 2, ball.y - 60 - barH, 4, barH);
+            ctx.strokeStyle = '#ff0';
+            ctx.strokeRect(ball.x - 4, ball.y - 65 - 100, 8, 100);
+        }
+    }
+    
+    // Draw cart
+    ctx.save();
+    ctx.translate(cart.x, cart.y);
+    ctx.rotate(cart.angle + Math.PI/2);
+    
+    // Cart body
+    ctx.fillStyle = '#ff5722';
+    ctx.fillRect(-10, -14, 20, 28);
+    // Windshield
+    ctx.fillStyle = '#90caf9';
+    ctx.fillRect(-8, -14, 16, 8);
+    // Wheels
+    ctx.fillStyle = '#333';
+    ctx.fillRect(-12, -12, 4, 8);
+    ctx.fillRect(8, -12, 4, 8);
+    ctx.fillRect(-12, 8, 4, 8);
+    ctx.fillRect(8, 8, 4, 8);
+    
+    // Driver head
+    ctx.fillStyle = '#ffcc80';
+    ctx.beginPath();
+    ctx.arc(0, 5, 5, 0, Math.PI*2);
+    ctx.fill();
+    
+    ctx.restore();
+    
+    ctx.restore();
+    
+    // HUD
+    drawHUD();
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#1a4d2e';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Decorative golf elements
+    for (let i = 0; i < 8; i++) {
+        ctx.fillStyle = `rgba(76, 175, 80, ${0.2 + Math.random()*0.3})`;
+        ctx.beginPath();
+        ctx.arc(Math.random()*W, Math.random()*H, 30+Math.random()*50, 0, Math.PI*2);
+        ctx.fill();
+    }
+    
+    // Title
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 72px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('⛳ GOLF RACER', W/2, H/2 - 100);
+    
+    ctx.font = '24px Arial';
+    ctx.fillStyle = '#a5d6a7';
+    ctx.fillText('Race your golf cart through the course!', W/2, H/2 - 40);
+    ctx.fillText('Stop at each flag and putt the ball in.', W/2, H/2 - 10);
+    
+    ctx.font = '20px Arial';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('↑ / W - Drive Forward', W/2, H/2 + 50);
+    ctx.fillText('↓ / S - Reverse', W/2, H/2 + 80);
+    ctx.fillText('← → / A D - Steer', W/2, H/2 + 110);
+    ctx.fillText('SPACE (hold) - Charge Putt | Release to Putt', W/2, H/2 + 140);
+    
+    ctx.fillStyle = '#ffeb3b';
+    ctx.font = 'bold 28px Arial';
+    const blink = Math.sin(Date.now() * 0.005) > 0;
+    if (blink) ctx.fillText('Press any key to start!', W/2, H/2 + 210);
+}
+
+function drawGameOver() {
+    ctx.fillStyle = '#1a4d2e';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 60px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('🏆 ROUND COMPLETE!', W/2, H/2 - 80);
+    
+    const min = Math.floor(timer / 60);
+    const sec = (timer % 60).toFixed(1);
+    ctx.font = '32px Arial';
+    ctx.fillStyle = '#a5d6a7';
+    ctx.fillText(`Time: ${min}:${sec.padStart(4, '0')}`, W/2, H/2 - 10);
+    ctx.fillText(`Total Putts: ${totalStrokes}`, W/2, H/2 + 40);
+    
+    let rating = totalStrokes <= 8 ? '🌟 MIGHTY GOLF! 🌟' : totalStrokes <= 12 ? '⭐ Great Round! ⭐' : 'Keep Practicing!';
+    ctx.font = '28px Arial';
+    ctx.fillStyle = '#ffeb3b';
+    ctx.fillText(rating, W/2, H/2 + 100);
+    
+    ctx.font = '24px Arial';
+    ctx.fillStyle = '#fff';
+    const blink = Math.sin(Date.now() * 0.005) > 0;
+    if (blink) ctx.fillText('Press any key to play again', W/2, H/2 + 170);
+}
+
+function drawHUD() {
+    // Timer
+    const min = Math.floor(timer / 60);
+    const sec = (timer % 60).toFixed(1);
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(10, 10, 200, 90);
+    ctx.fillStyle = '#fff';
+    ctx.font = '18px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`⏱ ${min}:${sec.padStart(4,'0')}`, 20, 35);
+    ctx.fillText(`🏁 Hole: ${Math.min(currentHole+1, totalHoles)}/${totalHoles}`, 20, 60);
+    ctx.fillText(`⛳ Putts: ${totalStrokes}`, 20, 85);
+    
+    // Speed indicator
+    const speedPct = Math.abs(cart.speed) / 5;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(W - 160, 10, 150, 30);
+    ctx.fillStyle = '#4caf50';
+    ctx.fillRect(W - 155, 15, speedPct * 140, 20);
+    ctx.strokeStyle = '#fff';
+    ctx.strokeRect(W - 155, 15, 140, 20);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('SPEED', W - 155, 70);
+    
+    // Hole complete overlay
+    if (state === 'holeComplete') {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(0, H/2 - 60, W, 120);
+        ctx.fillStyle = '#4caf50';
+        ctx.font = 'bold 48px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('🕳️ HOLE IN! 🎉', W/2, H/2 + 15);
+    }
+    
+    // Putt prompt
+    if (state === 'playing' && currentHole < flags.length) {
+        const flag = flags[currentHole];
+        const dx = cart.x - flag.x, dy = cart.y - flag.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist < 120) {
+            ctx.fillStyle = 'rgba(0,0,0,0.7)';
+            ctx.fillRect(W/2 - 150, H - 60, 300, 40);
+            ctx.fillStyle = '#ffeb3b';
+            ctx.font = '18px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText('Press SPACE to Putt!', W/2, H - 32);
+        }
+    }
+}
+
+let lastTime = 0;
+function gameLoop(timestamp) {
+    const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+    lastTime = timestamp;
+    
+    update(dt);
+    draw();
+    
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
