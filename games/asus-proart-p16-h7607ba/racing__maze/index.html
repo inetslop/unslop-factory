@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Maze Racer</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0d1021;font-family:'Courier New',monospace;}
+  #game{display:block;position:absolute;inset:0;}
+  #overlay{
+    position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:rgba(8,10,25,.86);color:#eaf2ff;text-align:center;z-index:5;
+  }
+  #overlay.hidden{display:none;}
+  h1{font-size:min(9vw,56px);margin:0 0 .2em;letter-spacing:.12em;color:#ffd54a;
+     text-shadow:0 0 18px rgba(255,213,74,.55),3px 3px 0 #b3402e;}
+  .sub{font-size:min(3.4vw,18px);color:#9fb4dd;margin:0 0 1.4em;}
+  .keys{display:inline-block;text-align:left;font-size:min(3vw,16px);line-height:1.9;
+        background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.18);
+        padding:14px 26px;border-radius:10px;margin-bottom:1.6em;}
+  .keys b{color:#ffd54a;display:inline-block;min-width:74px;text-align:right;margin-right:10px;}
+  button{
+    font-family:inherit;font-size:min(4vw,20px);letter-spacing:.1em;cursor:pointer;
+    background:#ffd54a;color:#231a00;border:none;border-radius:8px;padding:12px 34px;
+    box-shadow:0 4px 0 #b3902a,0 0 22px rgba(255,213,74,.35);
+  }
+  button:active{transform:translateY(3px);box-shadow:0 1px 0 #b3902a;}
+  .timeBig{font-size:min(8vw,44px);color:#6dffb0;margin:.2em 0;text-shadow:0 0 16px rgba(109,255,176,.5);}
+  .best{color:#9fb4dd;font-size:min(3.4vw,18px);margin-bottom:1.4em;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="overlay">
+  <h1>MAZE RACER</h1>
+  <p class="sub" id="ovSub">Race from START to the checkered flag — beat your best time!</p>
+  <div class="keys" id="ovKeys">
+    <b>&uarr; / W</b> accelerate<br>
+    <b>&darr; / S</b> brake / reverse<br>
+    <b>&larr;&rarr; / A D</b> steer<br>
+    <b>R</b> new maze &amp; restart
+  </div>
+  <button id="ovBtn">START — ENTER</button>
+</div>
+
+<script>
+(function(){
+"use strict";
+const canvas=document.getElementById('game'), ctx=canvas.getContext('2d');
+const overlay=document.getElementById('overlay'), ovSub=document.getElementById('ovSub'),
+      ovKeys=document.getElementById('ovKeys'), ovBtn=document.getElementById('ovBtn');
+
+const COLS=15, ROWS=9;
+let state='start';           // start | play | finish
+let maze=[], walls=[];
+let W=0,H=0,cs=40,ox=0,oy=0,wt=5;
+let car={x:0,y:0,a:0,speed:0};
+let raceTime=0, finished=false;
+let best=null;
+try{ const b=localStorage.getItem('mazeRacerBest'); if(b) best=parseFloat(b); }catch(e){}
+
+const keys={};
+window.addEventListener('keydown',e=>{
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+  keys[e.key.toLowerCase()]=true;
+  initAudio(); if(actx&&actx.state==='suspended') actx.resume();
+  if(state==='start'&&(e.key==='Enter'||e.key===' ')) startRace();
+  else if(state==='finish'&&(e.key==='Enter'||e.key===' '||e.key.toLowerCase()==='r')) newMazeStart();
+  else if(e.key.toLowerCase()==='r'&&state!=='start') newMazeStart();
+});
+window.addEventListener('keyup',e=>{ keys[e.key.toLowerCase()]=false; });
+ovBtn.addEventListener('click',()=>{ initAudio(); if(actx&&actx.state==='suspended') actx.resume();
+  if(state==='start') startRace(); else if(state==='finish') newMazeStart(); });
+
+/* ---------- audio ---------- */
+let actx=null, engineOsc=null, engineGain=null, engineLp=null;
+function initAudio(){
+  if(actx) return;
+  try{
+    actx=new (window.AudioContext||window.webkitAudioContext)();
+    engineOsc=actx.createOscillator(); engineOsc.type='sawtooth';
+    engineLp=actx.createBiquadFilter(); engineLp.type='lowpass'; engineLp.frequency.value=380;
+    engineGain=actx.createGain(); engineGain.gain.value=0;
+    engineOsc.connect(engineLp); engineLp.connect(engineGain); engineGain.connect(actx.destination);
+    engineOsc.start();
+  }catch(e){}
+}
+function beep(f,d,type,vol){
+  if(!actx) return;
+  try{
+    const o=actx.createOscillator(), g=actx.createGain();
+    o.type=type||'square'; o.frequency.value=f;
+    g.gain.setValueAtTime(vol||0.12, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime+d);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime+d);
+  }catch(e){}
+}
+
+/* ---------- maze ---------- */
+function genMaze(){
+  const g=[];
+  for(let j=0;j<ROWS;j++){ g[j]=[]; for(let i=0;i<COLS;i++) g[j][i]={n:true,e:true,s:true,w:true,v:false}; }
+  const st=[[0,0]]; g[0][0].v=true;
+  while(st.length){
+    const ci=st[st.length-1][0], cj=st[st.length-1][1];
+    const nb=[];
+    if(cj>0     && !g[cj-1][ci].v)   nb.push([0,-1,'n','s']);
+    if(ci<COLS-1&& !g[cj][ci+1].v)   nb.push([1,0,'e','w']);
+    if(cj<ROWS-1&& !g[cj+1][ci].v)   nb.push([0,1,'s','n']);
+    if(ci>0     && !g[cj][ci-1].v)   nb.push([-1,0,'w','e']);
+    if(nb.length){
+      const c=nb[(Math.random()*nb.length)|0];
+      g[cj][ci][c[2]]=false; g[cj+c[1]][ci+c[0]][c[3]]=false;
+      g[cj+c[1]][ci+c[0]].v=true; st.push([ci+c[0],cj+c[1]]);
+    } else st.pop();
+  }
+  return g;
+}
+
+function layout(){
+  W=window.innerWidth; H=window.innerHeight;
+  canvas.width=W; canvas.height=H;
+  cs=Math.min((W-50)/COLS,(H-70)/ROWS);
+  ox=(W-cs*COLS)/2; oy=(H-cs*ROWS)/2+18;
+  wt=Math.max(3,cs*0.07);
+  walls=[];
+  for(let j=0;j<ROWS;j++)for(let i=0;i<COLS;i++){
+    if(maze[j][i].n) walls.push({x:ox+i*cs, y:oy+j*cs-wt/2, w:cs, h:wt});
+    if(maze[j][i].w) walls.push({x:ox+i*cs-wt/2, y:oy+j*cs, w:wt, h:cs});
+  }
+  walls.push({x:ox, y:oy+ROWS*cs-wt/2, w:COLS*cs, h:wt});   // bottom
+  walls.push({x:ox+COLS*cs-wt/2, y:oy, w:wt, h:ROWS*cs});    // right
+}
+
+function resetCar(){
+  car.x=ox+cs*0.5; car.y=oy+cs*0.5; car.a=-Math.PI/2; car.speed=0;
+}
+
+function newMazeStart(){
+  maze=genMaze(); layout(); resetCar();
+  raceTime=0; finished=false; state='play';
+  overlay.classList.add('hidden');
+  beep(440,0.1,'square',0.1); setTimeout(()=>beep(660,0.15,'square',0.1),110);
+}
+function startRace(){ newMazeStart(); }
+
+/* ---------- physics ---------- */
+function circleRect(cx,cy,r,rc){
+  const nx=Math.max(rc.x,Math.min(cx,rc.x+rc.w));
+  const ny=Math.max(rc.y,Math.min(cy,rc.y+rc.h));
+  const dx=cx-nx, dy=cy-ny;
+  return dx*dx+dy*dy < r*r;
+}
+function collides(x,y){
+  const len=cs*0.5, wid=cs*0.34;
+  const cos=Math.cos(car.a), sin=Math.sin(car.a);
+  const pts=[ [len*0.28,-wid/2],[len*0.28,wid/2],[-len*0.28,-wid/2],[-len*0.28,wid/2],[0,0] ];
+  for(let i=0;i<walls.length;i++){
+    const rc=walls[i];
+    for(let p=0;p<pts.length;p++){
+      const px=x+cos*pts[p][0]-sin*pts[p][1];
+      const py=y+sin*pts[p][0]+cos*pts[p][1];
+      if(circleRect(px,py,wid*0.42,rc)) return true;
+    }
+  }
+  return false;
+}
+
+function update(dt){
+  if(state!=='play') { if(engineGain) engineGain.gain.value=0; return; }
+  raceTime+=dt;
+  const maxF=cs*6.5, maxR=cs*2.8, acc=cs*16, fric=cs*9;
+
+  if(keys['arrowup']||keys['w']) car.speed+=acc*dt;
+  else if(keys['arrowdown']||keys['s']) car.speed-=acc*dt;
+  else {
+    if(car.speed>0) car.speed=Math.max(0,car.speed-fric*dt);
+    else car.speed=Math.min(0,car.speed+fric*dt);
+  }
+  car.speed=Math.max(-maxR,Math.min(maxF,car.speed));
+
+  const steer=2.9*Math.max(-1,Math.min(1,car.speed/(cs*3)));
+  if(keys['arrowleft']||keys['a']) car.a+=steer*dt;
+  if(keys['arrowright']||keys['d']) car.a-=steer*dt;
+
+  const nx=car.x+Math.cos(car.a)*car.speed*dt;
+  const ny=car.y+Math.sin(car.a)*car.speed*dt;
+  let hit=false;
+  if(!collides(nx,car.y)) car.x=nx; else hit=true;
+  if(!collides(car.x,ny)) car.y=ny; else hit=true;
+  if(hit){
+    car.speed*=-0.25;
+    beep(120,0.08,'sawtooth',0.08);
+  }
+
+  // finish check
+  const gi=Math.floor((car.x-ox)/cs), gj=Math.floor((car.y-oy)/cs);
+  if(gi===COLS-1 && gj===ROWS-1 && !finished){
+    finished=true; state='finish';
+    beep(523,0.12,'square',0.14); setTimeout(()=>beep(659,0.12,'square',0.14),130);
+    setTimeout(()=>beep(784,0.25,'square',0.14),260);
+    let isBest=false;
+    if(best===null||raceTime<best){ best=raceTime; isBest=true;
+      try{ localStorage.setItem('mazeRacerBest',String(best)); }catch(e){} }
+    showFinish(isBest);
+  }
+
+  if(engineGain&&engineOsc){
+    const s=Math.abs(car.speed)/cs;
+    engineGain.gain.value=Math.min(0.06,0.015+s*0.012);
+    engineLp.frequency.value=300+s*380;
+    engineOsc.frequency.value=70+s*42;
+  }
+}
+
+/* ---------- drawing ---------- */
+function fmt(t){
+  const m=Math.floor(t/60), s=t-m*60;
+  return m+':'+(s<10?'0':'')+s.toFixed(2);
+}
+
+function draw(){
+  ctx.fillStyle='#0d1021'; ctx.fillRect(0,0,W,H);
+
+  // maze floor
+  ctx.fillStyle='#151a33';
+  ctx.fillRect(ox-wt/2,oy-wt/2,COLS*cs+wt,ROWS*cs+wt);
+  // subtle grid dots
+  ctx.fillStyle='rgba(255,255,255,0.06)';
+  for(let j=0;j<ROWS;j++)for(let i=0;i<COLS;i++){
+    ctx.beginPath(); ctx.arc(ox+i*cs+cs/2,oy+j*cs+cs/2,1.6,0,7); ctx.fill();
+  }
+
+  // goal checker
+  const gx=ox+(COLS-1)*cs, gy=oy+(ROWS-1)*cs, q=cs/4;
+  for(let a=0;a<4;a++)for(let b=0;b<4;b++){
+    ctx.fillStyle=((a+b)%2===0)?'#f5f5f5':'#111';
+    ctx.fillRect(gx+a*q,gy+b*q,q,q);
+  }
+  const pulse=0.35+0.25*Math.sin(performance.now()/280);
+  ctx.strokeStyle='rgba(109,255,176,'+pulse+')'; ctx.lineWidth=3;
+  ctx.strokeRect(gx-4,gy-4,cs+8,cs+8);
+
+  // start marker
+  const sg=0.5+0.2*Math.sin(performance.now()/300);
+  ctx.fillStyle='rgba(120,180,255,'+sg+')';
+  ctx.beginPath(); ctx.arc(ox+cs/2,oy+cs/2,cs*0.16,0,7); ctx.fill();
+  ctx.fillStyle='#fff'; ctx.font='bold '+(cs*0.22)+'px Courier New';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('S',ox+cs/2,oy+cs/2+1);
+
+  // walls
+  ctx.fillStyle='#4a5aa8';
+  for(const r of walls) ctx.fillRect(r.x,r.y,r.w,r.h);
+  ctx.fillStyle='rgba(160,190,255,0.35)';
+  for(const r of walls) ctx.fillRect(r.x,r.y,r.w,Math.max(1,r.h*0.3));
+
+  // car
+  const len=cs*0.5, wid=cs*0.34;
+  ctx.save();
+  ctx.translate(car.x,car.y); ctx.rotate(car.a);
+  // shadow
+  ctx.fillStyle='rgba(0,0,0,0.4)';
+  ctx.fillRect(-len/2+3,-wid/2+4,len,wid);
+  // wheels
+  ctx.fillStyle='#1a1a1a';
+  ctx.fillRect(len*0.2-wt*0.9,-wid/2-2,wt*1.8,5);
+  ctx.fillRect(len*0.2-wt*0.9, wid/2-3,wt*1.8,5);
+  ctx.fillRect(-len*0.28-wt*0.9,-wid/2-2,wt*1.8,5);
+  ctx.fillRect(-len*0.28-wt*0.9, wid/2-3,wt*1.8,5);
+  // body
+  const grad=ctx.createLinearGradient(-len/2,0,len/2,0);
+  grad.addColorStop(0,'#c62b2b'); grad.addColorStop(1,'#ff7a4d');
+  ctx.fillStyle=grad;
+  ctx.beginPath();
+  if(ctx.roundRect) ctx.roundRect(-len/2,-wid/2,len,wid,5); else ctx.rect(-len/2,-wid/2,len,wid);
+  ctx.fill();
+  ctx.strokeStyle='#7e1414'; ctx.lineWidth=1.5; ctx.stroke();
+  // cockpit
+  ctx.fillStyle='#bfe6ff';
+  ctx.beginPath();
+  if(ctx.roundRect) ctx.roundRect(-len*0.12,-wid*0.3,len*0.3,wid*0.6,3); else ctx.rect(-len*0.12,-wid*0.3,len*0.3,wid*0.6);
+  ctx.fill();
+  // headlights
+  ctx.fillStyle='#fff7c4';
+  ctx.fillRect(len/2-3,-wid/2+2,3,5);
+  ctx.fillRect(len/2-3,wid/2-7,3,5);
+  ctx.restore();
+
+  // HUD
+  if(state!=='start'){
+    ctx.textAlign='left'; ctx.textBaseline='top';
+    ctx.font='bold '+Math.max(16,cs*0.42)+'px Courier New';
+    ctx.fillStyle='#eaf2ff';
+    ctx.fillText('TIME  '+fmt(raceTime),16,12);
+    ctx.font=Math.max(12,cs*0.3)+'px Courier New';
+    ctx.fillStyle='#9fb4dd';
+    ctx.fillText('BEST  '+(best!==null?fmt(best):'--:--'),16,12+Math.max(20,cs*0.5));
+    // speed bar
+    const sp=Math.abs(car.speed)/(cs*6.5);
+    ctx.fillStyle='rgba(255,255,255,0.12)';
+    ctx.fillRect(W-180,18,164,14);
+    ctx.fillStyle=sp>0.75?'#ff5a5a':'#ffd54a';
+    ctx.fillRect(W-180,18,164*sp,14);
+    ctx.strokeStyle='rgba(255,255,255,0.3)'; ctx.strokeRect(W-180,18,164,14);
+    ctx.fillStyle='#9fb4dd'; ctx.font=Math.max(11,cs*0.26)+'px Courier New';
+    ctx.textAlign='right'; ctx.fillText('SPEED',W-16,38);
+  }
+}
+
+function showFinish(isBest){
+  ovSub.innerHTML=(isBest?'<span style="color:#ffd54a">&#9733; NEW BEST TIME! &#9733;</span><br>':'')+'You reached the flag!';
+  ovKeys.style.display='none';
+  const t=document.createElement('div'); t.className='timeBig'; t.textContent=fmt(raceTime);
+  const b=document.createElement('div'); b.className='best'; b.textContent='Best: '+(best!==null?fmt(best):'--');
+  overlay.innerHTML='';
+  overlay.appendChild(document.querySelector('h1')||mkH1());
+  ovSub=overlay.querySelector('.sub'); ovKeys=null;
+  overlay.appendChild(ovSub);
+  overlay.appendChild(t); overlay.appendChild(b);
+  const btn=document.createElement('button'); btn.id='ovBtn'; btn.textContent='NEW RACE — R / ENTER';
+  btn.addEventListener('click',()=>{ initAudio(); newMazeStart(); });
+  overlay.appendChild(btn); ovBtn=btn;
+  overlay.classList.remove('hidden');
+}
+function mkH1(){ const h=document.createElement('h1'); h.textContent='MAZE RACER'; return h; }
+
+/* ---------- main loop ---------- */
+let last=performance.now();
+function loop(now){
+  const dt=Math.min(0.033,(now-last)/1000); last=now;
+  update(dt); draw();
+  requestAnimationFrame(loop);
+}
+
+window.addEventListener('resize',layout);
+
+// initial state
+maze=genMaze(); layout(); resetCar();
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
