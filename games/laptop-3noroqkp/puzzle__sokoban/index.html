@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sokoban</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+let gameState = 'start'; // start, playing, levelComplete, allComplete
+let currentLevel = 0;
+let moves = 0;
+let totalMoves = 0;
+let undoStack = [];
+let animTimer = 0;
+let animActive = false;
+let particles = [];
+
+const LEVELS = [
+[
+"  #######  "
+,"  #     # "
+,"  # $ # # "
+,"  # @ $ # "
+,"  #   . # "
+,"  # $$*# "
+,"  #   ## "
+,"  #####  "
+],
+[
+" ######## "
+," #      # "
+," # **$**# "
+," #  $  $  #"
+," #  ###  #"
+," # @  .  #"
+," #       #"
+," ######## "
+],
+[
+"    #####   "
+,"    #     # "
+,"    # $ # # "
+,"    #   # #"
+,"  ####### # "
+,"  #.  $.# #"
+,"  ## $@## # "
+,"  #     .  #"
+,"  ######### "
+],
+[
+" ######  "
+," #    #  "
+," # $*$ # "
+," # $$$ # "
+," # ..$@# "
+," # . $.# "
+," #   ### "
+," ####### "
+],
+[
+"  ####  "
+,"  #  @# "
+,"  ##$## "
+,"  # #.# "
+,"  # $ # "
+,"  # #$# "
+,"  #..#$#"
+,"  # $ # "
+,"  #   # "
+,"  ######"
+],
+[
+"  #######  "
+,"  # @ . # "
+,"  #   # # "
+,"  # $ $ # "
+,"  # $ * # "
+,"  ##  # # "
+,"  ##### # "
+,"  #     # "
+,"  #######"
+],
+[
+" ######### "
+," #       #"
+," # $$ . . #"
+," # $@$$  #"
+," #   .$. #"
+," # $$ *  #"
+," #   ... #"
+," #########"
+],
+[
+"    #######   "
+,"    #     #  "
+,"    #  o$  # "
+,"  ##  # # # "
+,"  # $ # # # "
+,"  # $ *#*# "
+,"  # $  #  # "
+,"  # @  #   #"
+,"  ##########"
+].map(r => r.replace('o','.'))
+];
+
+function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+    scale = Math.min(W, H) / 20;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function parseLevel(levelData) {
+    const grid = [];
+    let rows = levelData.length;
+    let cols = Math.max(...levelData.map(r => r.length));
+    
+    let player = {x:0, y:0};
+    for (let y = 0; y < rows; y++) {
+        grid[y] = [];
+        const row = levelData[y];
+        for (let x = 0; x < cols; x++) {
+            const c = x < row.length ? row[x] : ' ';
+            let cell = 'floor';
+            if (c === '#') cell = 'wall';
+            if (c === '@' || c === '+') { player = {x, y}; }
+            if (c === '$' || c === '*') cell = 'box';
+            if (c === '.' || c === '+' || c === '*') cell += ':target';
+            
+            grid[y][x] = cell;
+        }
+    }
+    
+    // Separate boxes from floor
+    const boxes = [];
+    for (let y = 0; y < rows; y++) {
+        for (let x = 0; x < cols; x++) {
+            if (grid[y][x] === 'box') {
+                boxes.push({x, y});
+                grid[y][x] = 'floor';
+            } else if (grid[y][x] === 'box:target') {
+                boxes.push({x, y});
+                grid[y][x] = 'floor';
+            }
+        }
+    }
+    
+    // Mark targets
+    for (let y = 0; y < rows; y++) {
+        for (let x = 0; x < cols; x++) {
+            if (grid[y][x] === 'floor:target') grid[y][x] = 'target';
+        }
+    }
+    
+    return { grid, player, boxes, rows, cols };
+}
+
+let level = null;
+
+function loadLevel(idx) {
+    level = parseLevel(LEVELS[idx]);
+    undoStack = [];
+    moves = 0;
+}
+
+function getCell(x, y) {
+    if (y < 0 || y >= level.rows) return 'wall';
+    if (x < 0 || x >= level.cols) return 'wall';
+    return level.grid[y][x];
+}
+
+function isBoxAt(x, y) {
+    return level.boxes.some(b => b.x === x && b.y === y);
+}
+
+function saveState() {
+    undoStack.push({
+        player: {...level.player},
+        boxes: level.boxes.map(b => ({...b}))
+    });
+}
+
+function undo() {
+    if (undoStack.length === 0) return;
+    const prev = undoStack.pop();
+    level.player = prev.player;
+    level.boxes = prev.boxes;
+    moves--;
+}
+
+function tryMove(dx, dy) {
+    if (!level) return;
+    
+    const nx = level.player.x + dx;
+    const ny = level.player.y + dy;
+    const cell = getCell(nx, ny);
+    
+    if (cell === 'wall') return;
+    
+    if (isBoxAt(nx, ny)) {
+        const bx = nx + dx;
+        const by = ny + dy;
+        const bcell = getCell(bx, by);
+        if (bcell === 'wall') return;
+        if (isBoxAt(bx, by)) return;
+        
+        saveState();
+        level.boxes.forEach((b, i) => {
+            if (b.x === nx && b.y === ny) {
+                level.boxes[i] = {x: bx, y: by};
+            }
+        });
+    } else {
+        saveState();
+    }
+    
+    level.player = {x: nx, y: ny};
+    moves++;
+    totalMoves++;
+    
+    spawnParticles(nx, ny, dx, dy);
+    
+    checkWin();
+}
+
+function checkWin() {
+    const won = level.boxes.every(b => getCell(b.x, b.y) === 'target');
+    if (won) {
+        gameState = 'levelComplete';
+        animTimer = 0;
+    }
+}
+
+function spawnParticles(x, y, dx, dy) {
+    for (let i = 0; i < 4; i++) {
+        particles.push({
+            x: (x + 0.5) * scale,
+            y: (y + 0.5) * scale,
+            vx: -dx * 20 + (Math.random() - 0.5) * 30,
+            vy: -dy * 20 + (Math.random() - 0.5) * 30,
+            life: 1
+        });
+    }
+}
+
+function drawGame() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+    
+    if (!level) return;
+    
+    const cellSize = Math.min(scale * 1.5, (W - 40) / level.cols, (H - 80) / level.rows);
+    const ox = (W - level.cols * cellSize) / 2;
+    const oy = (H - level.rows * cellSize) / 2;
+    
+    // Draw cells
+    for (let y = 0; y < level.rows; y++) {
+        for (let x = 0; x < level.cols; x++) {
+            const cx = ox + x * cellSize;
+            const cy = oy + y * cellSize;
+            const cell = getCell(x, y);
+            
+            if (cell === 'wall') {
+                ctx.fillStyle = '#4a4a6a';
+                ctx.fillRect(cx, cy, cellSize, cellSize);
+                ctx.fillStyle = '#5a5a7a';
+                ctx.fillRect(cx + 2, cy + 2, cellSize - 4, cellSize - 4);
+                // Brick pattern
+                ctx.strokeStyle = '#3a3a5a';
+                ctx.lineWidth = 1;
+                ctx.strokeRect(cx + 2, cy + 2, cellSize - 4, cellSize - 4);
+            } else if (cell === 'target') {
+                ctx.fillStyle = '#2a2a4e';
+                ctx.fillRect(cx, cy, cellSize, cellSize);
+                // Target diamond
+                const cx2 = cx + cellSize/2;
+                const cy2 = cy + cellSize/2;
+                const r = cellSize * 0.25;
+                ctx.beginPath();
+                ctx.moveTo(cx2, cy2 - r);
+                ctx.lineTo(cx2 + r, cy2);
+                ctx.lineTo(cx2, cy2 + r);
+                ctx.lineTo(cx2 - r, cy2);
+                ctx.closePath();
+                ctx.fillStyle = '#e8c547';
+                ctx.fill();
+                ctx.strokeStyle = '#fff8d0';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+            } else {
+                // Floor
+                ctx.fillStyle = (x + y) % 2 === 0 ? '#2a2a4e' : '#252546';
+                ctx.fillRect(cx, cy, cellSize, cellSize);
+            }
+        }
+    }
+    
+    // Draw boxes
+    level.boxes.forEach(b => {
+        const cx = ox + b.x * cellSize;
+        const cy = oy + b.y * cellSize;
+        const onTarget = getCell(b.x, b.y) === 'target';
+        
+        const pad = cellSize * 0.15;
+        const bx = cx + pad;
+        const by = cy + pad;
+        const bs = cellSize - pad * 2;
+        
+        ctx.fillStyle = onTarget ? '#4ecb71' : '#e8a838';
+        ctx.fillRect(bx, by, bs, bs);
+        ctx.strokeStyle = onTarget ? '#2d9e50' : '#c08020';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(bx, by, bs, bs);
+        
+        // Box inner detail
+        ctx.fillStyle = onTarget ? '#3aad5a' : '#d09028';
+        const ip = bs * 0.15;
+        ctx.fillRect(bx + ip, by + ip, bs - ip*2, bs - ip*2);
+        
+        // Highlight if on target
+        if (onTarget) {
+            ctx.fillStyle = 'rgba(78, 203, 113, 0.3)';
+            ctx.beginPath();
+            ctx.arc(cx + cellSize/2, cy + cellSize/2, cellSize * 0.45, 0, Math.PI*2);
+            ctx.fill();
+        }
+    });
+    
+    // Draw player
+    const px = ox + level.player.x * cellSize;
+    const py = oy + level.player.y * cellSize;
+    const pcx = px + cellSize/2;
+    const pcy = py + cellSize/2;
+    const pr = cellSize * 0.35;
+    
+    // Body
+    ctx.fillStyle = '#6c9ff4';
+    ctx.beginPath();
+    ctx.arc(pcx, pcy, pr, 0, Math.PI*2);
+    ctx.fill();
+    ctx.strokeStyle = '#4a7fd4';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    
+    // Face
+    ctx.fillStyle = '#1a1a2e';
+    const eyeR = pr * 0.15;
+    ctx.beginPath();
+    ctx.arc(pcx - pr*0.3, pcy - pr*0.15, eyeR, 0, Math.PI*2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(pcx + pr*0.3, pcy - pr*0.15, eyeR, 0, Math.PI*2);
+    ctx.fill();
+    
+    // Smile
+    ctx.strokeStyle = '#1a1a2e';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(pcx, pcy + pr*0.1, pr*0.35, 0.2, Math.PI - 0.2);
+    ctx.stroke();
+    
+    // Particles
+    particles.forEach(p => {
+        ctx.fillStyle = `rgba(108, 159, 244, ${p.life * 0.6})`;
+        ctx.beginPath();
+        ctx.arc(p.x + ox, p.y + oy, 3 * p.life, 0, Math.PI*2);
+        ctx.fill();
+    });
+    
+    // HUD
+    ctx.fillStyle = '#e8c547';
+    ctx.font = `bold ${Math.max(14, scale * 0.6)}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillText(`Level ${currentLevel + 1}/${LEVELS.length}`, 20, 30);
+    ctx.fillStyle = '#aaa';
+    ctx.font = `${Math.max(12, scale * 0.5)}px monospace`;
+    ctx.fillText(`Moves: ${moves}  Total: ${totalMoves}`, 20, 50);
+    
+    // Undo count
+    if (undoStack.length > 0) {
+        ctx.fillStyle = '#666';
+        ctx.textAlign = 'right';
+        ctx.fillText(`Undo (${undoStack.length})`, W - 20, 30);
+    }
+}
+
+function drawStart() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+    
+    const cx = W/2;
+    const cy = H/2;
+    
+    // Title
+    ctx.fillStyle = '#e8c547';
+    ctx.font = `bold ${Math.max(36, scale * 2.5)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('SOKOBAN', cx, cy - 60);
+    
+    // Subtitle
+    ctx.fillStyle = '#888';
+    ctx.font = `${Math.max(14, scale * 0.7)}px monospace`;
+    ctx.fillText('Push all boxes onto the targets!', cx, cy - 20);
+    
+    // Controls
+    ctx.fillStyle = '#aaa';
+    ctx.font = `${Math.max(13, scale * 0.6)}px monospace`;
+    const lines = [
+        '↑ ↓ ← →  /  W A S D  — Move',
+        'U — Undo move',
+        'R — Restart level',
+        'N — Next level (on win)'
+    ];
+    lines.forEach((l, i) => {
+        ctx.fillText(l, cx, cy + 30 + i * 28);
+    });
+    
+    // Start prompt
+    const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 500);
+    ctx.fillStyle = `rgba(108, 159, 244, ${pulse})`;
+    ctx.font = `bold ${Math.max(16, scale * 0.8)}px monospace`;
+    ctx.fillText('Press ENTER to Start', cx, cy + 170);
+}
+
+function drawLevelComplete() {
+    animTimer += 0.02;
+    const alpha = Math.min(1, animTimer * 2);
+    
+    ctx.fillStyle = `rgba(26, 26, 46, ${alpha * 0.7})`;
+    ctx.fillRect(0, 0, W, H);
+    
+    const cx = W/2;
+    const cy = H/2;
+    
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#4ecb71';
+    ctx.font = `bold ${Math.max(28, scale * 2)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('LEVEL COMPLETE!', cx, cy - 20);
+    
+    ctx.fillStyle = '#aaa';
+    ctx.font = `${Math.max(14, scale * 0.7)}px monospace`;
+    ctx.fillText(`Solved in ${moves} moves`, cx, cy + 25);
+    
+    const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 500);
+    ctx.fillStyle = `rgba(108, 159, 244, ${pulse})`;
+    ctx.font = `${Math.max(14, scale * 0.7)}px monospace`;
+    if (currentLevel < LEVELS.length - 1) {
+        ctx.fillText('Press N for next level', cx, cy + 70);
+    } else {
+        ctx.fillStyle = '#e8c547';
+        ctx.font = `bold ${Math.max(20, scale * 1.2)}px monospace`;
+        ctx.fillText('ALL LEVELS COMPLETE!', cx, cy + 60);
+        ctx.fillStyle = '#aaa';
+        ctx.font = `${Math.max(13, scale * 0.6)}px monospace`;
+        ctx.fillText(`Total moves: ${totalMoves}`, cx, cy + 95);
+        ctx.fillText('Press R to restart from level 1', cx, cy + 125);
+    }
+    ctx.globalAlpha = 1;
+}
+
+function update(dt) {
+    particles.forEach(p => {
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.life -= dt * 3;
+    });
+    particles = particles.filter(p => p.life > 0);
+}
+
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = Math.min((time - lastTime) / 1000, 0.05);
+    lastTime = time;
+    
+    update(dt);
+    
+    if (gameState === 'start') {
+        drawStart();
+    } else if (gameState === 'playing') {
+        drawGame();
+    } else if (gameState === 'levelComplete') {
+        drawGame();
+        drawLevelComplete();
+    }
+    
+    requestAnimationFrame(gameLoop);
+}
+
+window.addEventListener('keydown', e => {
+    const key = e.key;
+    
+    if (gameState === 'start') {
+        if (key === 'Enter' || key === ' ') {
+            gameState = 'playing';
+            currentLevel = 0;
+            totalMoves = 0;
+            loadLevel(currentLevel);
+        }
+        return;
+    }
+    
+    if (gameState === 'levelComplete') {
+        if (key === 'n' || key === 'N' || key === 'Enter') {
+            if (currentLevel < LEVELS.length - 1) {
+                currentLevel++;
+                loadLevel(currentLevel);
+                gameState = 'playing';
+            } else {
+                // All complete, restart
+                currentLevel = 0;
+                totalMoves = 0;
+                loadLevel(0);
+                gameState = 'playing';
+            }
+        }
+        if (key === 'r' || key === 'R') {
+            loadLevel(currentLevel);
+            gameState = 'playing';
+        }
+        return;
+    }
+    
+    // Playing state
+    switch(key) {
+        case 'ArrowUp': case 'w': case 'W': tryMove(0, -1); break;
+        case 'ArrowDown': case 's': case 'S': tryMove(0, 1); break;
+        case 'ArrowLeft': case 'a': case 'A': tryMove(-1, 0); break;
+        case 'ArrowRight': case 'd': case 'D': tryMove(1, 0); break;
+        case 'u': case 'U': undo(); break;
+        case 'r': case 'R': loadLevel(currentLevel); break;
+    }
+    
+    e.preventDefault();
+});
+
+loadLevel(0);
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
