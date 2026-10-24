@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gravity Roll</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    
+    if (type === 'bounce') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(80, audioCtx.currentTime + 0.15);
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.15);
+    } else if (type === 'crash') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(30, audioCtx.currentTime + 0.4);
+        gain.gain.setValueAtTime(0.4, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.4);
+    } else if (type === 'score') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(600, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(900, audioCtx.currentTime + 0.1);
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.1);
+    }
+}
+
+// Game State
+let state = 'start'; // start, playing, gameover
+let score = 0;
+let highScore = 0;
+try {
+    highScore = parseInt(localStorage.getItem('gravityRollHigh') || '0');
+} catch(e) { highScore = 0; }
+
+// Ball
+const ball = { x: 200, y: 0, vx: 0, vy: 0, radius: 18, rotation: 0 };
+let speed = 4;
+let baseSpeed = 4;
+let time = 0;
+let particles = [];
+let trailParticles = [];
+let screenShake = { x: 0, y: 0, intensity: 0 };
+
+// Terrain
+let terrainPoints = [];
+const TERRAIN_INTERVAL = 60;
+let terrainOffset = 0;
+
+function generateTerrain() {
+    terrainPoints = [];
+    for (let i = 0; i < Math.ceil(W / TERRAIN_INTERVAL) + 10; i++) {
+        addTerrainPoint(i);
+    }
+}
+
+function addTerrainPoint(index) {
+    let x = index * TERRAIN_INTERVAL - terrainOffset;
+    let baseY = H * 0.65;
+    let y = baseY + Math.sin(index * 0.3) * 80 + Math.sin(index * 0.7) * 40 + Math.cos(index * 0.15) * 60;
+    
+    // Gaps (pits)
+    if (index > 5 && index % 12 === 0 && Math.random() < 0.3) {
+        y = H + 100; // pit
+    }
+    
+    // Platforms (raised sections)
+    if (index > 5 && index % 8 === 3 && Math.random() < 0.2) {
+        y -= 100;
+    }
+    
+    terrainPoints.push({ x: index * TERRAIN_INTERVAL, y: y, originalIndex: index });
+}
+
+function getTerrainY(x) {
+    let idx = Math.floor(x / TERRAIN_INTERVAL);
+    if (idx < 0 || idx >= terrainPoints.length - 1) return H + 200;
+    
+    let p0 = terrainPoints[idx];
+    let p1 = terrainPoints[idx + 1];
+    let t = (x - p0.x) / (p1.x - p0.x);
+    // Smooth interpolation
+    t = t * t * (3 - 2 * t);
+    return p0.y + (p1.y - p0.y) * t;
+}
+
+function getTerrainNormal(x) {
+    let dx = 5;
+    let y0 = getTerrainY(x - dx);
+    let y1 = getTerrainY(x + dx);
+    let nx = -(y1 - y0);
+    let ny = (x + dx) - (x - dx);
+    let len = Math.sqrt(nx * nx + ny * ny);
+    return { x: nx / len, y: ny / len };
+}
+
+function resetGame() {
+    ball.x = 200;
+    ball.y = H * 0.4;
+    ball.vx = 0;
+    ball.vy = 0;
+    ball.rotation = 0;
+    score = 0;
+    speed = baseSpeed;
+    time = 0;
+    particles = [];
+    trailParticles = [];
+    screenShake.intensity = 0;
+    generateTerrain();
+}
+
+// Particles
+function spawnParticles(x, y, count, color) {
+    for (let i = 0; i < count; i++) {
+        let angle = Math.random() * Math.PI * 2;
+        let spd = Math.random() * 5 + 2;
+        particles.push({
+            x: x, y: y,
+            vx: Math.cos(angle) * spd,
+            vy: Math.sin(angle) * spd - 2,
+            life: 1,
+            decay: 0.02 + Math.random() * 0.03,
+            size: Math.random() * 4 + 2,
+            color: color
+        });
+    }
+}
+
+function spawnTrail(x, y) {
+    trailParticles.push({ x: x, y: y, life: 1, size: ball.radius * 0.6 });
+    if (trailParticles.length > 30) trailParticles.shift();
+}
+
+// Input
+let inputDown = false;
+function handleInput() {
+    if (state === 'start') {
+        initAudio();
+        state = 'playing';
+        resetGame();
+    } else if (state === 'playing') {
+        if (!inputDown) {
+            ball.vy = -12;
+            inputDown = true;
+            playSound('bounce');
+            spawnParticles(ball.x, ball.y + ball.radius, 5, '#ff6b35');
+            screenShake.intensity = 3;
+        }
+    } else if (state === 'gameover') {
+        initAudio();
+        state = 'playing';
+        resetGame();
+    }
+}
+
+window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+        e.preventDefault();
+        handleInput();
+    }
+});
+window.addEventListener('keyup', (e) => {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+        inputDown = false;
+    }
+});
+canvas.addEventListener('mousedown', (e) => { e.preventDefault(); handleInput(); });
+canvas.addEventListener('mouseup', () => { inputDown = false; });
+canvas.addEventListener('touchstart', (e) => { e.preventDefault(); handleInput(); });
+canvas.addEventListener('touchend', () => { inputDown = false; });
+
+// Stars background
+let stars = [];
+for (let i = 0; i < 100; i++) {
+    stars.push({ x: Math.random(), y: Math.random() * 0.5, size: Math.random() * 2 + 0.5, speed: Math.random() * 0.5 + 0.2 });
+}
+
+// Update
+function update() {
+    if (state !== 'playing') return;
+    
+    time++;
+    speed = baseSpeed + time * 0.003;
+    score = Math.floor(time / 10);
+    
+    // Move world
+    terrainOffset += speed;
+    
+    // Generate more terrain as needed
+    let maxX = terrainOffset + W + TERRAIN_INTERVAL * 5;
+    let lastX = (terrainPoints.length - 1) * TERRAIN_INTERVAL;
+    while (lastX < maxX) {
+        addTerrainPoint(terrainPoints.length);
+        lastX += TERRAIN_INTERVAL;
+    }
+    
+    // Remove old terrain points
+    while (terrainPoints.length > 0 && terrainPoints[0].x < terrainOffset - TERRAIN_INTERVAL * 2) {
+        terrainPoints.shift();
+    }
+    
+    // Physics
+    ball.vy += 0.6; // gravity
+    ball.x += speed;
+    ball.y += ball.vy;
+    ball.rotation += speed / ball.radius * 0.5;
+    
+    // Trail
+    if (time % 3 === 0) spawnTrail(ball.x - terrainOffset, ball.y);
+    
+    // Collision with terrain
+    let groundY = getTerrainY(terrainOffset + ball.x);
+    
+    if (ball.y + ball.radius > groundY) {
+        // On ground
+        ball.y = groundY - ball.radius;
+        
+        if (ball.vy > 5) {
+            playSound('bounce');
+            spawnParticles(ball.x, ball.y + ball.radius, 8, '#ffd700');
+            screenShake.intensity = Math.min(ball.vy * 0.3, 8);
+        }
+        
+        ball.vy = -ball.vy * 0.4; // bounce with energy loss
+        if (Math.abs(ball.vy) < 2) ball.vy = 0;
+        
+        // Check if in a pit (ground below screen)
+        if (groundY > H + 50) {
+            gameOver();
+            return;
+        }
+    }
+    
+    // Fell off screen
+    if (ball.y > H + 100) {
+        gameOver();
+        return;
+    }
+    
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        let p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.2;
+        p.life -= p.decay;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+    
+    // Update trail
+    for (let i = trailParticles.length - 1; i >= 0; i--) {
+        trailParticles[i].life -= 0.05;
+        if (trailParticles[i].life <= 0) trailParticles.splice(i, 1);
+    }
+    
+    // Screen shake decay
+    screenShake.intensity *= 0.85;
+    if (screenShake.intensity < 0.1) screenShake.intensity = 0;
+    screenShake.x = (Math.random() - 0.5) * screenShake.intensity;
+    screenShake.y = (Math.random() - 0.5) * screenShake.intensity;
+    
+    // Score sound every 10 points
+    if (score > 0 && score % 10 === 0 && time % 10 === 0) {
+        playSound('score');
+    }
+}
+
+function gameOver() {
+    state = 'gameover';
+    playSound('crash');
+    spawnParticles(ball.x, ball.y, 20, '#ff4444');
+    screenShake.intensity = 10;
+    
+    if (score > highScore) {
+        highScore = score;
+        try { localStorage.setItem('gravityRollHigh', highScore.toString()); } catch(e) {}
+    }
+}
+
+// Render
+function drawBackground() {
+    let grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, '#0a0a2e');
+    grad.addColorStop(0.5, '#1a1a4e');
+    grad.addColorStop(1, '#2a1a3e');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+    
+    // Stars
+    ctx.fillStyle = '#ffffff';
+    for (let s of stars) {
+        let sx = ((s.x * W - terrainOffset * s.speed * 0.1) % W + W) % W;
+        let twinkle = Math.sin(time * 0.05 + s.x * 10) * 0.5 + 0.5;
+        ctx.globalAlpha = twinkle;
+        ctx.beginPath();
+        ctx.arc(sx, s.y * H, s.size, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+}
+
+function drawTerrain() {
+    ctx.beginPath();
+    let started = false;
+    
+    for (let x = -TERRAIN_INTERVAL; x < W + TERRAIN_INTERVAL; x += 10) {
+        let worldX = terrainOffset + x;
+        let y = getTerrainY(worldX);
+        
+        if (y > H + 50) continue; // skip pits
+        
+        if (!started) {
+            ctx.moveTo(x, y);
+            started = true;
+        } else {
+            ctx.lineTo(x, y);
+        }
+    }
+    
+    // Close path to bottom
+    ctx.lineTo(W + TERRAIN_INTERVAL, H + 100);
+    ctx.lineTo(-TERRAIN_INTERVAL, H + 100);
+    ctx.closePath();
+    
+    let tGrad = ctx.createLinearGradient(0, H * 0.4, 0, H);
+    tGrad.addColorStop(0, '#2d5a27');
+    tGrad.addColorStop(0.3, '#1e3a1c');
+    tGrad.addColorStop(1, '#0d1f0d');
+    ctx.fillStyle = tGrad;
+    ctx.fill();
+    
+    // Terrain top edge glow
+    ctx.beginPath();
+    started = false;
+    for (let x = -TERRAIN_INTERVAL; x < W + TERRAIN_INTERVAL; x += 5) {
+        let worldX = terrainOffset + x;
+        let y = getTerrainY(worldX);
+        if (y > H + 50) continue;
+        if (!started) { ctx.moveTo(x, y); started = true; }
+        else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = 'rgba(100, 255, 100, 0.3)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+}
+
+function drawBall() {
+    let bx = ball.x - terrainOffset + 200; // fixed screen x
+    let by = ball.y;
+    
+    // Trail
+    for (let t of trailParticles) {
+        let tx = t.x - terrainOffset + 200;
+        ctx.globalAlpha = t.life * 0.5;
+        ctx.fillStyle = '#ff6b35';
+        ctx.beginPath();
+        ctx.arc(tx, t.y, t.size * t.life, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    
+    // Ball glow
+    let glowGrad = ctx.createRadialGradient(bx, by, 0, bx, by, ball.radius * 2);
+    glowGrad.addColorStop(0, 'rgba(255, 107, 53, 0.3)');
+    glowGrad.addColorStop(1, 'rgba(255, 107, 53, 0)');
+    ctx.fillStyle = glowGrad;
+    ctx.beginPath();
+    ctx.arc(bx, by, ball.radius * 2, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Ball body
+    let ballGrad = ctx.createRadialGradient(bx - 5, by - 5, 0, bx, by, ball.radius);
+    ballGrad.addColorStop(0, '#ff9a56');
+    ballGrad.addColorStop(0.7, '#ff6b35');
+    ballGrad.addColorStop(1, '#cc4400');
+    ctx.fillStyle = ballGrad;
+    ctx.beginPath();
+    ctx.arc(bx, by, ball.radius, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Ball pattern (rotation indicator)
+    ctx.save();
+    ctx.translate(bx, by);
+    ctx.rotate(ball.rotation);
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 3; i++) {
+        let angle = (i / 3) * Math.PI * 2;
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(Math.cos(angle) * ball.radius * 0.7, Math.sin(angle) * ball.radius * 0.7);
+        ctx.stroke();
+    }
+    // Center dot
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+    ctx.beginPath();
+    ctx.arc(0, 0, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+}
+
+function drawParticles() {
+    for (let p of particles) {
+        let px = p.x - terrainOffset + 200;
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(px, p.y, p.size * p.life, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+    // Score
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 24px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE: ${score}`, 20, 40);
+    
+    // High score
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#aaaaaa';
+    ctx.fillText(`BEST: ${highScore}`, 20, 65);
+    
+    // Speed indicator
+    let speedPct = Math.min((speed - baseSpeed) / 3, 1);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+    ctx.fillRect(W - 120, 30, 100, 8);
+    ctx.fillStyle = speedPct > 0.7 ? '#ff4444' : '#44ff44';
+    ctx.fillRect(W - 120, 30, 100 * speedPct, 8);
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#aaaaaa';
+    ctx.fillText('SPEED', W - 20, 55);
+}
+
+function drawStartScreen() {
+    drawBackground();
+    
+    let titleY = H * 0.3;
+    
+    // Title
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 64px monospace';
+    let titleGrad = ctx.createLinearGradient(W/2 - 150, 0, W/2 + 150, 0);
+    titleGrad.addColorStop(0, '#ff6b35');
+    titleGrad.addColorStop(0.5, '#ffd700');
+    titleGrad.addColorStop(1, '#ff6b35');
+    ctx.fillStyle = titleGrad;
+    ctx.fillText('GRAVITY ROLL', W/2, titleY);
+    
+    // Ball preview
+    let by = H * 0.45 + Math.sin(time * 0.05) * 10;
+    let bGrad = ctx.createRadialGradient(W/2 - 5, by - 5, 0, W/2, by, 30);
+    bGrad.addColorStop(0, '#ff9a56');
+    bGrad.addColorStop(1, '#cc4400');
+    ctx.fillStyle = bGrad;
+    ctx.beginPath();
+    ctx.arc(W/2, by, 30, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Instructions
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#cccccc';
+    ctx.fillText('SPACE / CLICK / TAP to bounce', W/2, H * 0.6);
+    ctx.fillText('Keep rolling! Avoid falling into pits!', W/2, H * 0.65);
+    
+    // High score
+    if (highScore > 0) {
+        ctx.font = '18px monospace';
+        ctx.fillStyle = '#ffd700';
+        ctx.fillText(`HIGH SCORE: ${highScore}`, W/2, H * 0.73);
+    }
+    
+    // Start prompt
+    let pulse = Math.sin(time * 0.08) * 0.3 + 0.7;
+    ctx.globalAlpha = pulse;
+    ctx.font = 'bold 24px monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('PRESS SPACE TO START', W/2, H * 0.85);
+    ctx.globalAlpha = 1;
+}
+
+function drawGameOver() {
+    // Darken
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 48px monospace';
+    ctx.fillStyle = '#ff4444';
+    ctx.fillText('GAME OVER', W/2, H * 0.3);
+    
+    ctx.font = '28px monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(`Score: ${score}`, W/2, H * 0.45);
+    
+    if (score >= highScore && score > 0) {
+        ctx.font = '20px monospace';
+        ctx.fillStyle = '#ffd700';
+        ctx.fillText('NEW HIGH SCORE!', W/2, H * 0.53);
+    } else {
+        ctx.font = '18px monospace';
+        ctx.fillStyle = '#aaaaaa';
+        ctx.fillText(`Best: ${highScore}`, W/2, H * 0.53);
+    }
+    
+    let pulse = Math.sin(time * 0.08) * 0.3 + 0.7;
+    ctx.globalAlpha = pulse;
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('PRESS SPACE TO RESTART', W/2, H * 0.7);
+    ctx.globalAlpha = 1;
+}
+
+// Main Loop
+function render() {
+    time++;
+    
+    if (state === 'start') {
+        drawStartScreen();
+    } else {
+        update();
+        
+        ctx.save();
+        ctx.translate(screenShake.x, screenShake.y);
+        
+        drawBackground();
+        drawTerrain();
+        drawBall();
+        drawParticles();
+        drawHUD();
+        
+        ctx.restore();
+        
+        if (state === 'gameover') {
+            drawGameOver();
+        }
+    }
+    
+    requestAnimationFrame(render);
+}
+
+// Init
+generateTerrain();
+render();
+</script>
+</body>
+</html>
