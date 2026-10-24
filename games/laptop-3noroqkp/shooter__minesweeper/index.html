@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shooter Minesweeper</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; font-family: 'Courier New', monospace; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    const now = audioCtx.currentTime;
+    if (type === 'shoot') {
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(200, now);
+        osc.frequency.exponentialRampToValueAtTime(80, now + 0.15);
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+        osc.start(now); osc.stop(now + 0.15);
+    } else if (type === 'hit') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(600, now);
+        osc.frequency.exponentialRampToValueAtTime(200, now + 0.2);
+        gain.gain.setValueAtTime(0.25, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
+        osc.start(now); osc.stop(now + 0.2);
+    } else if (type === 'explosion') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(150, now);
+        osc.frequency.exponentialRampToValueAtTime(30, now + 0.5);
+        gain.gain.setValueAtTime(0.4, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.5);
+        osc.start(now); osc.stop(now + 0.5);
+    } else if (type === 'win') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(400, now);
+        osc.frequency.setValueAtTime(500, now + 0.1);
+        osc.frequency.setValueAtTime(600, now + 0.2);
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.4);
+        osc.start(now); osc.stop(now + 0.4);
+    } else if (type === 'flag') {
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(300, now);
+        gain.gain.setValueAtTime(0.15, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
+        osc.start(now); osc.stop(now + 0.1);
+    }
+}
+
+// Game state
+let gameState = 'start'; // start, playing, gameover, win
+let grid = [];
+let rows, cols, cellSize;
+let mines = [], safeCells = 0, revealedCount = 0, flaggedCount = 0;
+let lives = 3, score = 0, level = 1;
+let mouse = { x: 0, y: 0 };
+let projectiles = [];
+let particles = [];
+let shakeTime = 0, shakeIntensity = 0;
+let gridOffsetX = 0, gridOffsetY = 0;
+let animFrame = 0;
+
+function getGridSize() {
+    const maxW = W * 0.85;
+    const maxH = H * 0.7;
+    cols = Math.min(12 + level, 16);
+    rows = Math.min(8 + level, 14);
+    cellSize = Math.min(Math.floor(maxW / cols), Math.floor(maxH / rows), 50);
+    gridOffsetX = (W - cols * cellSize) / 2;
+    gridOffsetY = H * 0.12;
+}
+
+function placeMines() {
+    const mineCount = Math.floor(rows * cols * 0.22) + level;
+    mines = [];
+    const indices = [];
+    for (let i = 0; i < rows * cols; i++) indices.push(i);
+    // Shuffle
+    for (let i = indices.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+    for (let i = 0; i < mineCount; i++) mines.push(indices[i]);
+}
+
+function initLevel() {
+    getGridSize();
+    grid = [];
+    placeMines();
+    for (let r = 0; r < rows; r++) {
+        grid[r] = [];
+        for (let c = 0; c < cols; c++) {
+            const idx = r * cols + c;
+            grid[r][c] = {
+                isMine: mines.includes(idx),
+                revealed: false,
+                flagged: false,
+                adjacentMines: 0,
+                revealAnim: 0
+            };
+        }
+    }
+    // Count adjacent mines
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            if (!grid[r][c].isMine) {
+                let count = 0;
+                for (let dr = -1; dr <= 1; dr++) {
+                    for (let dc = -1; dc <= 1; dc++) {
+                        if (dr === 0 && dc === 0) continue;
+                        const nr = r + dr, nc = c + dc;
+                        if (nr >= 0 && nr < rows && nc >= 0 && nc < cols && grid[nr][nc].isMine) count++;
+                    }
+                }
+                grid[r][c].adjacentMines = count;
+            }
+        }
+    }
+    safeCells = rows * cols - mines.length;
+    revealedCount = 0;
+    flaggedCount = 0;
+}
+
+function startGame() {
+    level = 1;
+    lives = 3;
+    score = 0;
+    projectiles = [];
+    particles = [];
+    initLevel();
+    gameState = 'playing';
+}
+
+function nextLevel() {
+    level++;
+    initLevel();
+    playSound('win');
+}
+
+// Input
+window.addEventListener('mousemove', (e) => {
+    mouse.x = e.clientX;
+    mouse.y = e.clientY;
+});
+
+window.addEventListener('mousedown', (e) => {
+    if (!audioCtx) initAudio();
+    if (gameState === 'start') { startGame(); return; }
+    if (gameState === 'gameover' || gameState === 'win') { startGame(); return; }
+    if (gameState !== 'playing') return;
+
+    const cell = getCellAt(mouse.x, mouse.y);
+    if (cell) {
+        if (e.button === 2) {
+            // Flag
+            if (!grid[cell.r][cell.c].revealed && !grid[cell.r][cell.c].flagged) {
+                grid[cell.r][cell.c].flagged = true;
+                flaggedCount++;
+                playSound('flag');
+                spawnParticles(gridOffsetX + (cell.c + 0.5) * cellSize, gridOffsetY + (cell.r + 0.5) * cellSize, '#ffcc00', 5);
+            } else if (!grid[cell.r][cell.c].revealed && grid[cell.r][cell.c].flagged) {
+                grid[cell.r][cell.c].flagged = false;
+                flaggedCount--;
+            }
+        } else if (e.button === 0) {
+            // Shoot
+            fireProjectile(cell);
+        }
+    }
+});
+
+window.addEventListener('contextmenu', (e) => e.preventDefault());
+
+function getCellAt(px, py) {
+    const cx = Math.floor((px - gridOffsetX) / cellSize);
+    const cy = Math.floor((py - gridOffsetY) / cellSize);
+    if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) return { r: cy, c: cx };
+    return null;
+}
+
+function fireProjectile(cell) {
+    const targetX = gridOffsetX + (cell.c + 0.5) * cellSize;
+    const targetY = gridOffsetY + (cell.r + 0.5) * cellSize;
+    const startX = W / 2;
+    const startY = H - 30;
+    projectiles.push({ x: startX, y: startY, tx: targetX, ty: targetY, speed: 12, cell: cell, trail: [] });
+    playSound('shoot');
+}
+
+function updateProjectiles() {
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+        const p = projectiles[i];
+        const dx = p.tx - p.x;
+        const dy = p.ty - p.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < p.speed) {
+            // Hit!
+            p.x = p.tx;
+            p.y = p.ty;
+            hitCell(p.cell.r, p.cell.c);
+            projectiles.splice(i, 1);
+        } else {
+            p.trail.push({ x: p.x, y: p.y });
+            if (p.trail.length > 8) p.trail.shift();
+            p.x += (dx / dist) * p.speed;
+            p.y += (dy / dist) * p.speed;
+        }
+    }
+}
+
+function hitCell(r, c) {
+    const cell = grid[r][c];
+    if (cell.revealed || cell.flagged) return;
+    
+    if (cell.isMine) {
+        // Explosion!
+        lives--;
+        shakeTime = 20;
+        shakeIntensity = 8;
+        playSound('explosion');
+        const px = gridOffsetX + (c + 0.5) * cellSize;
+        const py = gridOffsetY + (r + 0.5) * cellSize;
+        spawnExplosion(px, py);
+        // Reveal all mines
+        for (let rr = 0; rr < rows; rr++) {
+            for (let cc = 0; cc < cols; cc++) {
+                if (grid[rr][cc].isMine) { grid[rr][cc].revealed = true; grid[rr][cc].revealAnim = 1; }
+            }
+        }
+        cell.revealed = true;
+        cell.revealAnim = 1;
+        if (lives <= 0) gameState = 'gameover';
+    } else {
+        // Safe reveal
+        cell.revealed = true;
+        cell.revealAnim = 1;
+        revealedCount++;
+        score += 10 + level * 5;
+        playSound('hit');
+        const px = gridOffsetX + (c + 0.5) * cellSize;
+        const py = gridOffsetY + (r + 0.5) * cellSize;
+        spawnParticles(px, py, '#00ffcc', 12);
+        
+        // Check win
+        if (revealedCount >= safeCells - countFlagsOnMines()) {
+            gameState = 'win';
+            score += 100 * level;
+            playSound('win');
+        }
+    }
+}
+
+function countFlagsOnMines() {
+    let count = 0;
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            if (grid[r][c].flagged && grid[r][c].isMine) count++;
+        }
+    }
+    return count;
+}
+
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 1 + Math.random() * 4;
+        particles.push({
+            x, y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed - 2,
+            life: 1,
+            color,
+            size: 2 + Math.random() * 3
+        });
+    }
+}
+
+function spawnExplosion(x, y) {
+    for (let i = 0; i < 40; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 2 + Math.random() * 8;
+        particles.push({
+            x, y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            life: 1,
+            color: Math.random() > 0.5 ? '#ff4400' : '#ffaa00',
+            size: 3 + Math.random() * 5
+        });
+    }
+}
+
+function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.2;
+        p.life -= 0.025;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function updateShake() {
+    if (shakeTime > 0) shakeTime--;
+}
+
+// Render
+function render() {
+    ctx.save();
+    
+    // Shake
+    if (shakeTime > 0) {
+        const sx = (Math.random() - 0.5) * shakeIntensity;
+        const sy = (Math.random() - 0.5) * shakeIntensity;
+        ctx.translate(sx, sy);
+    }
+
+    // Background
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+
+    if (gameState === 'start') {
+        renderStartScreen();
+    } else {
+        renderGrid();
+        renderProjectiles();
+        renderParticles();
+        renderHUD();
+        renderCrosshair();
+        if (gameState === 'gameover') renderGameOver();
+        if (gameState === 'win') renderWin();
+    }
+
+    ctx.restore();
+}
+
+function renderStartScreen() {
+    ctx.fillStyle = '#00ffcc';
+    ctx.font = `bold ${Math.min(W * 0.06, 48)}px Courier New`;
+    ctx.textAlign = 'center';
+    ctx.fillText('SHOOTER MINESWEEPER', W / 2, H * 0.3);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `${Math.min(W * 0.025, 18)}px Courier New`;
+    ctx.fillText('Aim with mouse. Click to shoot at grid cells.', W / 2, H * 0.45);
+    ctx.fillText('Right-click to flag suspected mines.', W / 2, H * 0.5);
+    ctx.fillText('Clear all safe cells without hitting a mine!', W / 2, H * 0.55);
+    ctx.fillText('3 lives per game. Mines get denser each level.', W / 2, H * 0.6);
+
+    const pulse = Math.sin(Date.now() * 0.005) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(0, 255, 204, ${pulse})`;
+    ctx.font = `bold ${Math.min(W * 0.03, 24)}px Courier New`;
+    ctx.fillText('CLICK TO START', W / 2, H * 0.75);
+
+    // Decorative mines
+    for (let i = 0; i < 6; i++) {
+        const x = W * 0.1 + (W * 0.8) * (i / 5);
+        const y = H * 0.82 + Math.sin(Date.now() * 0.003 + i) * 10;
+        drawMine(x, y, 12);
+    }
+}
+
+function renderGrid() {
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            const x = gridOffsetX + c * cellSize;
+            const y = gridOffsetY + r * cellSize;
+            const cell = grid[r][c];
+
+            if (cell.revealed) {
+                // Revealed cell
+                ctx.fillStyle = '#1a2a3a';
+                ctx.fillRect(x + 1, y + 1, cellSize - 2, cellSize - 2);
+                
+                if (cell.isMine) {
+                    drawMine(x + cellSize / 2, y + cellSize / 2, cellSize * 0.35);
+                } else {
+                    ctx.fillStyle = '#4a9';
+                    ctx.font = `bold ${cellSize * 0.6}px Courier New`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    if (cell.adjacentMines > 0) {
+                        const colors = ['#fff', '#4af', '#f8f', '#ff8', '#faa', '#afa', '#aff', '#fff'];
+                        ctx.fillStyle = colors[cell.adjacentMines - 1] || '#fff';
+                        ctx.fillText(cell.adjacentMines, x + cellSize / 2, y + cellSize / 2);
+                    }
+                }
+            } else {
+                // Hidden cell
+                const hover = getCellAt(mouse.x, mouse.y);
+                const isHover = hover && hover.r === r && hover.c === c;
+                ctx.fillStyle = isHover ? '#2a4a5a' : '#1e3040';
+                ctx.fillRect(x + 1, y + 1, cellSize - 2, cellSize - 2);
+                
+                // Cell border glow on hover
+                if (isHover) {
+                    ctx.strokeStyle = '#00ffcc';
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(x + 1, y + 1, cellSize - 2, cellSize - 2);
+                }
+
+                if (cell.flagged) {
+                    // Flag
+                    const fx = x + cellSize / 2;
+                    const fy = y + cellSize / 2;
+                    ctx.strokeStyle = '#ffcc00';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.moveTo(fx, fy - cellSize * 0.3);
+                    ctx.lineTo(fx, fy + cellSize * 0.25);
+                    ctx.stroke();
+                    ctx.fillStyle = '#ff4444';
+                    ctx.beginPath();
+                    ctx.moveTo(fx, fy - cellSize * 0.3);
+                    ctx.lineTo(fx + cellSize * 0.2, fy - cellSize * 0.2);
+                    ctx.lineTo(fx, fy - cellSize * 0.1);
+                    ctx.fill();
+                }
+            }
+
+            // Grid lines
+            ctx.strokeStyle = '#2a3a4a';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x, y, cellSize, cellSize);
+        }
+    }
+}
+
+function drawMine(x, y, size) {
+    ctx.fillStyle = '#ff3333';
+    ctx.beginPath();
+    ctx.arc(x, y, size, 0, Math.PI * 2);
+    ctx.fill();
+    // Spikes
+    for (let i = 0; i < 8; i++) {
+        const angle = (i / 8) * Math.PI * 2;
+        ctx.strokeStyle = '#ff3333';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x + Math.cos(angle) * size * 0.5, y + Math.sin(angle) * size * 0.5);
+        ctx.lineTo(x + Math.cos(angle) * size * 1.2, y + Math.sin(angle) * size * 1.2);
+        ctx.stroke();
+    }
+}
+
+function renderProjectiles() {
+    for (const p of projectiles) {
+        // Trail
+        for (let i = 0; i < p.trail.length; i++) {
+            const alpha = i / p.trail.length * 0.6;
+            ctx.fillStyle = `rgba(0, 255, 204, ${alpha})`;
+            ctx.beginPath();
+            ctx.arc(p.trail[i].x, p.trail[i].y, 3, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        // Bullet
+        ctx.fillStyle = '#00ffcc';
+        ctx.shadowColor = '#00ffcc';
+        ctx.shadowBlur = 10;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+    }
+}
+
+function renderParticles() {
+    for (const p of particles) {
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+        ctx.globalAlpha = 1;
+    }
+}
+
+function renderCrosshair() {
+    if (gameState !== 'playing') return;
+    const mx = mouse.x, my = mouse.y;
+    ctx.strokeStyle = '#00ffcc';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(mx - 15, my);
+    ctx.lineTo(mx - 5, my);
+    ctx.moveTo(mx + 5, my);
+    ctx.lineTo(mx + 15, my);
+    ctx.moveTo(mx, my - 15);
+    ctx.lineTo(mx, my - 5);
+    ctx.moveTo(mx, my + 5);
+    ctx.lineTo(mx, my + 15);
+    ctx.stroke();
+    
+    // Center dot
+    ctx.fillStyle = '#00ffcc';
+    ctx.beginPath();
+    ctx.arc(mx, my, 2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Cannon at bottom
+    const cannonAngle = Math.atan2(my - (H - 30), mx - W / 2);
+    ctx.save();
+    ctx.translate(W / 2, H - 30);
+    ctx.rotate(cannonAngle + Math.PI / 2);
+    ctx.fillStyle = '#4a6a8a';
+    ctx.fillRect(-5, -20, 10, 25);
+    ctx.restore();
+}
+
+function renderHUD() {
+    // Top bar
+    ctx.fillStyle = 'rgba(10, 10, 26, 0.9)';
+    ctx.fillRect(0, 0, W, H * 0.08 + 10);
+
+    ctx.font = `bold ${Math.min(W * 0.025, 18)}px Courier New`;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#ff4444';
+    let hearts = '';
+    for (let i = 0; i < lives; i++) hearts += '❤';
+    ctx.fillText('LIVES: ' + hearts, 20, H * 0.04);
+
+    ctx.fillStyle = '#00ffcc';
+    ctx.fillText(`LEVEL: ${level}`, 20 + W * 0.2, H * 0.04);
+
+    ctx.fillStyle = '#ffcc00';
+    ctx.fillText(`SCORE: ${score}`, 20 + W * 0.35, H * 0.04);
+
+    const remaining = safeCells - revealedCount;
+    ctx.fillStyle = '#aaa';
+    ctx.fillText(`REMAINING: ${remaining}`, 20 + W * 0.5, H * 0.04);
+}
+
+function renderGameOver() {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#ff3333';
+    ctx.font = `bold ${Math.min(W * 0.05, 48)}px Courier New`;
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', W / 2, H * 0.4);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `${Math.min(W * 0.03, 24)}px Courier New`;
+    ctx.fillText(`Final Score: ${score}`, W / 2, H * 0.5);
+    const pulse = Math.sin(Date.now() * 0.005) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(255, 255, 255, ${pulse})`;
+    ctx.fillText('CLICK TO RESTART', W / 2, H * 0.65);
+}
+
+function renderWin() {
+    if (level < 3) return; // Show win only after level 3+
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#00ff88';
+    ctx.font = `bold ${Math.min(W * 0.05, 48)}px Courier New`;
+    ctx.textAlign = 'center';
+    ctx.fillText('ALL CLEARED!', W / 2, H * 0.4);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `${Math.min(W * 0.03, 24)}px Courier New`;
+    ctx.fillText(`Final Score: ${score}`, W / 2, H * 0.5);
+    const pulse = Math.sin(Date.now() * 0.005) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(255, 255, 255, ${pulse})`;
+    ctx.fillText('CLICK TO PLAY AGAIN', W / 2, H * 0.65);
+}
+
+// Main loop
+function gameLoop() {
+    animFrame++;
+    if (gameState === 'playing') {
+        updateProjectiles();
+        updateParticles();
+        updateShake();
+    } else {
+        updateParticles();
+    }
+    render();
+    requestAnimationFrame(gameLoop);
+}
+
+initLevel();
+gameState = 'start';
+gameLoop();
+</script>
+</body>
+</html>
