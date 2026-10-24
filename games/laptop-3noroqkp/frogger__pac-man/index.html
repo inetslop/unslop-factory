@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pac-Man Frogger</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; width: 100vw; font-family: monospace; }
+canvas { display: block; image-rendering: pixelated; }
+#ui { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; pointer-events: none; }
+#hud { width: 100%; display: flex; justify-content: space-between; padding: 8px 20px; color: #fff; font-size: 14px; }
+#overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(0,0,0,0.85); pointer-events: all; }
+#overlay h1 { color: #ffdd00; font-size: 42px; text-shadow: 0 0 20px #ffdd00; margin-bottom: 20px; }
+#overlay p { color: #fff; font-size: 16px; margin: 5px 0; }
+#overlay .controls { color: #aaa; font-size: 13px; margin-top: 15px; }
+#restartBtn { margin-top: 25px; padding: 12px 30px; background: #ffdd00; color: #000; border: none; font-size: 18px; font-family: monospace; cursor: pointer; pointer-events: all; }
+#restartBtn:hover { background: #fff; }
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="ui">
+  <div id="hud" class="hidden">
+    <span id="scoreDisplay">SCORE: 0</span>
+    <span id="livesDisplay">LIVES: 3</span>
+    <span id="homesDisplay">HOMES: 0/5</span>
+  </div>
+  <div id="overlay">
+    <h1>PAC-MAN FROGGER</h1>
+    <p>Guide Pac-Man across the road and river to fill all 5 homes!</p>
+    <p class="controls">↑ ↓ ← → or WASD to move</p>
+    <button id="restartBtn">START GAME</button>
+  </div>
+</div>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const hud = document.getElementById('hud');
+const scoreDisplay = document.getElementById('scoreDisplay');
+const livesDisplay = document.getElementById('livesDisplay');
+const homesDisplay = document.getElementById('homesDisplay');
+const restartBtn = document.getElementById('restartBtn');
+
+let W, H, cellSize;
+const COLS = 13, ROWS = 12;
+let score = 0, lives = 3, homesFilled = 0;
+let gameRunning = false, gameOver = false, won = false;
+let pacX, pacY, pacMouth = 0, pacFacing = 'right';
+let enemies = [];
+let pellets = [];
+let animFrame = 0;
+let audioCtx = null;
+
+const GHOST_COLORS = ['#ff0000', '#ffb8ff', '#00ffff', '#ff8000'];
+const RIVER_SPEEDS = [1.5, -2, 2.5, -1.5];
+const ROAD_SPEEDS = [3, -4, 4, -3];
+
+function resize() {
+  const maxW = window.innerWidth;
+  const maxH = window.innerHeight;
+  cellSize = Math.min(Math.floor(maxW / COLS), Math.floor((maxH - 40) / ROWS));
+  W = COLS * cellSize;
+  H = ROWS * cellSize + 40;
+  canvas.width = W;
+  canvas.height = H;
+}
+
+function initAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function playSound(freq, duration, type) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || 'square';
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+function playEat() { playSound(500, 0.1, 'square'); }
+function playDeath() { playSound(200, 0.4, 'sawtooth'); }
+function playHome() { playSound(800, 0.3, 'sine'); setTimeout(()=>playSound(1200,0.3,'sine'),150); }
+function playWin() { for(let i=0;i<5;i++) setTimeout(()=>playSound(400+i*200,0.2,'sine'),i*100); }
+
+function spawnEnemies() {
+  enemies = [];
+  // River ghosts (rows 1-4)
+  for (let r = 0; r < 4; r++) {
+    const row = r + 1;
+    const count = 2 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < count; i++) {
+      enemies.push({
+        x: (i / count) * W + Math.random() * cellSize,
+        row: row,
+        speed: RIVER_SPEEDS[r] * (cellSize / 20),
+        color: GHOST_COLORS[Math.floor(Math.random() * 4)],
+        type: 'river'
+      });
+    }
+  }
+  // Road ghosts (rows 6-9)
+  for (let r = 0; r < 4; r++) {
+    const row = r + 6;
+    const count = 2 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < count; i++) {
+      enemies.push({
+        x: (i / count) * W + Math.random() * cellSize,
+        row: row,
+        speed: ROAD_SPEEDS[r] * (cellSize / 20),
+        color: GHOST_COLORS[Math.floor(Math.random() * 4)],
+        type: 'road'
+      });
+    }
+  }
+}
+
+function spawnPellets() {
+  pellets = [];
+  for (let r = 1; r <= 9; r++) {
+    if (r === 5) continue;
+    for (let c = 0; c < COLS; c++) {
+      if (Math.random() < 0.3) {
+        pellets.push({ col: c, row: r, eaten: false });
+      }
+    }
+  }
+}
+
+function resetGame() {
+  score = 0; lives = 3; homesFilled = 0;
+  pacX = Math.floor(COLS / 2); pacY = 10;
+  pacFacing = 'up';
+  gameOver = false; won = false;
+  spawnEnemies();
+  spawnPellets();
+  updateHUD();
+}
+
+function resetLife() {
+  pacX = Math.floor(COLS / 2); pacY = 10;
+  pacFacing = 'up';
+}
+
+function updateHUD() {
+  scoreDisplay.textContent = 'SCORE: ' + score;
+  livesDisplay.textContent = 'LIVES: ' + lives;
+  homesDisplay.textContent = 'HOMES: ' + homesFilled + '/5';
+}
+
+function drawPac(x, y, facing) {
+  const cx = x * cellSize + cellSize / 2;
+  const cy = (y + 1) * cellSize + cellSize / 2; // +1 for HUD offset
+  const r = cellSize * 0.4;
+  const mouthAngle = Math.abs(Math.sin(pacMouth)) * 0.8;
+
+  let startA, endA;
+  if (facing === 'right') { startA = -mouthAngle; endA = mouthAngle + Math.PI; }
+  else if (facing === 'left') { startA = Math.PI - mouthAngle; endA = 2 * Math.PI + mouthAngle; }
+  else if (facing === 'up') { startA = -Math.PI/2 - mouthAngle; endA = -Math.PI/2 + mouthAngle + Math.PI; }
+  else { startA = Math.PI/2 - mouthAngle; endA = Math.PI/2 + mouthAngle + Math.PI; }
+
+  ctx.fillStyle = '#ffdd00';
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, r, startA, endA);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawGhost(x, y, color, size) {
+  const s = size || cellSize * 0.8;
+  const cx = x * cellSize + cellSize / 2;
+  const cy = (y + 1) * cellSize + cellSize / 2;
+
+  ctx.fillStyle = color;
+  // Body
+  ctx.beginPath();
+  ctx.arc(cx, cy - s * 0.1, s * 0.45, Math.PI, 0);
+  ctx.lineTo(cx + s * 0.45, cy + s * 0.35);
+  // Wavy bottom
+  const wave = s * 0.12;
+  ctx.lineTo(cx + s * 0.3, cy + s * 0.2);
+  ctx.lineTo(cx + s * 0.15, cy + s * 0.35);
+  ctx.lineTo(cx - s * 0.15, cy + s * 0.2);
+  ctx.lineTo(cx - s * 0.3, cy + s * 0.35);
+  ctx.lineTo(cx - s * 0.45, cy + s * 0.35);
+  ctx.closePath();
+  ctx.fill();
+
+  // Eyes
+  ctx.fillStyle = '#fff';
+  const eyeY = cy - s * 0.1;
+  ctx.beginPath(); ctx.arc(cx - s * 0.18, eyeY, s * 0.12, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + s * 0.18, eyeY, s * 0.12, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#00f';
+  ctx.beginPath(); ctx.arc(cx - s * 0.15, eyeY, s * 0.06, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + s * 0.21, eyeY, s * 0.06, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawGrid() {
+  // Background
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  // HUD area
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, W, cellSize);
+
+  // Home row
+  const homeCols = [2, 4, 6, 8, 10];
+  for (let i = 0; i < homeCols.length; i++) {
+    const hx = homeCols[i] * cellSize;
+    ctx.strokeStyle = '#ffdd00';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(hx + 3, cellSize * 1 + 3, cellSize - 6, cellSize - 6);
+    if (i < homesFilled) {
+      drawPac(homeCols[i], 0, 'right');
+    }
+  }
+
+  // River area
+  ctx.fillStyle = '#002244';
+  ctx.fillRect(0, cellSize * 5, W, cellSize * 4);
+
+  // Road area
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(0, cellSize * 9, W, cellSize * 4);
+
+  // Median (safe row)
+  ctx.fillStyle = '#333';
+  ctx.fillRect(0, cellSize * 5 + cellSize * 4, W, cellSize);
+  ctx.strokeStyle = '#ffdd00';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < COLS; i++) {
+    ctx.beginPath();
+    ctx.arc(i * cellSize + cellSize / 2, cellSize * 9 + cellSize / 2, cellSize * 0.15, 0, Math.PI);
+    ctx.stroke();
+  }
+
+  // Grid lines (subtle)
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  for (let r = 1; r < ROWS; r++) {
+    ctx.beginPath(); ctx.moveTo(0, cellSize * (r + 1)); ctx.lineTo(W, cellSize * (r + 1)); ctx.stroke();
+  }
+  for (let c = 1; c < COLS; c++) {
+    ctx.beginPath(); ctx.moveTo(c * cellSize, cellSize); ctx.lineTo(c * cellSize, H); ctx.stroke();
+  }
+
+  // Pellets
+  for (const p of pellets) {
+    if (!p.eaten) {
+      ctx.fillStyle = '#ffdd00';
+      ctx.beginPath();
+      ctx.arc(p.col * cellSize + cellSize / 2, (p.row + 1) * cellSize + cellSize / 2, cellSize * 0.1, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+function draw() {
+  drawGrid();
+
+  // Draw enemies
+  for (const e of enemies) {
+    const ex = e.x / cellSize;
+    drawGhost(ex, e.row - 1, e.color);
+  }
+
+  // Draw Pac-Man
+  drawPac(pacX, pacY, pacFacing);
+}
+
+function update() {
+  animFrame++;
+  pacMouth += 0.2;
+
+  for (const e of enemies) {
+    e.x += e.speed;
+    if (e.x < -cellSize) e.x = W;
+    if (e.x > W) e.x = -cellSize;
+  }
+
+  // Check collision with enemies
+  const pacPixelX = pacX * cellSize + cellSize / 2;
+  const pacPixelY = (pacY + 1) * cellSize + cellSize / 2;
+
+  for (const e of enemies) {
+    const ex = e.x + cellSize / 2;
+    const ey = e.row * cellSize + cellSize / 2;
+    const dx = Math.abs(pacPixelX - ex);
+    const dy = Math.abs(pacPixelY - ey);
+    if (dx < cellSize * 0.4 && dy < cellSize * 0.4) {
+      // Death!
+      lives--;
+      playDeath();
+      updateHUD();
+      if (lives <= 0) {
+        gameOver = true;
+        showGameOver();
+      } else {
+        resetLife();
+      }
+      return;
+    }
+  }
+
+  // Check pellets
+  for (const p of pellets) {
+    if (!p.eaten && p.col === pacX && p.row === pacY) {
+      p.eaten = true;
+      score += 10;
+      playEat();
+      updateHUD();
+    }
+  }
+
+  // Check home row
+  const homeCols = [2, 4, 6, 8, 10];
+  if (pacY === 0 && homeCols.includes(pacX)) {
+    homesFilled++;
+    score += 100;
+    playHome();
+    updateHUD();
+    if (homesFilled >= 5) {
+      won = true;
+      playWin();
+      showWin();
+    } else {
+      resetLife();
+    }
+  }
+}
+
+function showGameOver() {
+  gameRunning = false;
+  overlay.classList.remove('hidden');
+  overlay.querySelector('h1').textContent = 'GAME OVER';
+  overlay.querySelector('h1').style.color = '#ff0000';
+  const p1 = overlay.querySelectorAll('p')[0];
+  if (p1) p1.textContent = 'Final Score: ' + score;
+  restartBtn.textContent = 'PLAY AGAIN';
+}
+
+function showWin() {
+  gameRunning = false;
+  overlay.classList.remove('hidden');
+  overlay.querySelector('h1').textContent = 'YOU WIN!';
+  overlay.querySelector('h1').style.color = '#00ff88';
+  const p1 = overlay.querySelectorAll('p')[0];
+  if (p1) p1.textContent = 'All homes filled! Score: ' + score;
+  restartBtn.textContent = 'PLAY AGAIN';
+}
+
+function startGame() {
+  initAudio();
+  resetGame();
+  gameRunning = true;
+  overlay.classList.add('hidden');
+  hud.classList.remove('hidden');
+  loop();
+}
+
+let lastTime = 0;
+let moveCooldown = 0;
+
+function loop(timestamp) {
+  if (!gameRunning) return;
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function handleKey(e) {
+  if (!gameRunning) return;
+  let dx = 0, dy = 0;
+  switch (e.key) {
+    case 'ArrowUp': case 'w': case 'W': dy = -1; pacFacing = 'up'; break;
+    case 'ArrowDown': case 's': case 'S': dy = 1; pacFacing = 'down'; break;
+    case 'ArrowLeft': case 'a': case 'A': dx = -1; pacFacing = 'left'; break;
+    case 'ArrowRight': case 'd': case 'D': dx = 1; pacFacing = 'right'; break;
+    default: return;
+  }
+  e.preventDefault();
+
+  const nx = pacX + dx, ny = pacY + dy;
+  if (nx < 0 || nx >= COLS || ny < 0 || ny > 10) return;
+  if (ny === 5) return; // Can't walk on median
+
+  pacX = nx;
+  pacY = ny;
+}
+
+restartBtn.addEventListener('click', startGame);
+window.addEventListener('keydown', handleKey);
+window.addEventListener('resize', () => { resize(); });
+
+resize();
+drawGrid();
+</script>
+</body>
+</html>
