@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Minesweeper Sokoban</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, cellSize, offsetX, offsetY;
+let gameState = 'start'; // start, playing, dead, won, gameover
+let currentLevel = 0;
+let player = { x: 0, y: 0 };
+let boxes = [];
+let targets = [];
+let mines = [];
+let walls = [];
+let gridW = 9, gridH = 9;
+let numbers = []; // 2D array of number values (0 = none)
+let deadMines = [];
+let score = 0;
+let moves = 0;
+let animFrame = 0;
+let audioCtx = null;
+
+// Level definitions: # wall, . floor, @ player, $ box, * target, M mine
+const levels = [
+[
+"#########",
+"#@.....B#".replace('B','$'),
+"#........",
+"#...M....",
+"#..*...*.",
+"#........",
+"#........",
+"#.$......",
+"#########"
+].map(r => r.padEnd(9,'#')),
+
+[
+"##########",
+"#@...$...#",
+"#.#.....#.",
+"#.M.*..M.#",
+"#.#.....#.",
+"#.......$.",
+"#....*...#",
+"#...M....#",
+"#........#",
+"##########"
+].map(r => r.padEnd(10,'#')),
+
+[
+"###########",
+"#@.......##",
+"#..$...$.##",
+"#..#.#.#.##",
+"#..M.*.*.##",
+"#..#.#.#.##",
+"#..$...*..#",
+"#..#.#.#.##",
+"#.....M...#",
+"#........##",
+"###########"
+].map(r => r.padEnd(11,'#')),
+
+[
+"############",
+"#@....$....#",
+"#..#..#..#.#",
+"#..M.*..M..#",
+"#..#..#..#.#",
+"#.$......$.#",
+"#..#..#..#.#",
+"#..*...*.#.##".slice(0,12),
+"#..#..#..#.#",
+"#....M.....#",
+"#..$.......#",
+"############"
+].map(r => r.padEnd(12,'#')),
+
+[
+"#############",
+"#@.....$...#",
+"#..#...#...#",
+"#..M.*.M...#",
+"#..#...#...#",
+"#.$......$.#",
+"#..#...#...#",
+"#....*.....#",
+"#..#...#...#",
+"#..M.....M.#",
+"#..#...#...#",
+"#.$.......$#",
+"#############"
+].map(r => r.padEnd(13,'#'))
+];
+
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+
+function playTone(freq, duration, type='square', volume=0.1) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(volume, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+
+function playMove() { playTone(220, 0.08, 'square', 0.05); }
+function playPush() { playTone(180, 0.1, 'triangle', 0.08); }
+function playWin() { playTone(440, 0.15, 'sine', 0.1); setTimeout(()=>playTone(660,0.15,'sine',0.1),150); setTimeout(()=>playTone(880,0.2,'sine',0.1),300); }
+function playDead() { playTone(150, 0.3, 'sawtooth', 0.12); setTimeout(()=>playTone(100,0.4,'sawtooth',0.12),100); }
+
+function parseLevel(idx) {
+    const lvl = levels[idx];
+    gridH = lvl.length;
+    gridW = Math.max(...lvl.map(r => r.length));
+    
+    player = {x:0, y:0};
+    boxes = [];
+    targets = [];
+    mines = [];
+    walls = [];
+    numbers = Array.from({length:gridH}, () => Array(gridW).fill(0));
+    deadMines = [];
+    moves = 0;
+
+    for (let y = 0; y < gridH; y++) {
+        for (let x = 0; x < gridW; x++) {
+            const ch = lvl[y][x] || '#';
+            if (ch === '#' || ch === undefined) {
+                walls.push({x, y});
+            }
+            if (ch === '@') player = {x, y};
+            if (ch === '$') boxes.push({x, y});
+            if (ch === '*') targets.push({x, y});
+            if (ch === 'M') mines.push({x, y});
+        }
+    }
+
+    // Compute numbers: for each non-wall, non-mine cell, count adjacent mines
+    for (let y = 0; y < gridH; y++) {
+        for (let x = 0; x < gridW; x++) {
+            const isWall = walls.some(w => w.x===x && w.y===y);
+            if (isWall) continue;
+            let count = 0;
+            for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    if (dx === 0 && dy === 0) continue;
+                    const nx = x+dx, ny = y+dy;
+                    if (nx>=0 && nx<gridW && ny>=0 && ny<gridH) {
+                        if (mines.some(m => m.x===nx && m.y===ny)) count++;
+                    }
+                }
+            }
+            numbers[y][x] = count;
+        }
+    }
+}
+
+function isWall(x, y) {
+    return walls.some(w => w.x === x && w.y === y);
+}
+
+function isMine(x, y) {
+    return mines.some(m => m.x === x && m.y === y);
+}
+
+function boxAt(x, y) {
+    return boxes.find(b => b.x === x && b.y === y);
+}
+
+function canMove(x, y) {
+    if (x < 0 || x >= gridW || y < 0 || y >= gridH) return false;
+    return !isWall(x, y);
+}
+
+function tryMove(dx, dy) {
+    initAudio();
+    const nx = player.x + dx;
+    const ny = player.y + dy;
+    
+    if (!canMove(nx, ny)) return;
+
+    const box = boxAt(nx, ny);
+    
+    if (box) {
+        const bx = nx + dx;
+        const by = ny + dy;
+        // Can push only if target cell is empty (not wall, not another box)
+        if (!canMove(bx, by)) return;
+        if (boxAt(bx, by)) return;
+        
+        // Move box
+        box.x = bx;
+        box.y = by;
+        // Move player
+        player.x = nx;
+        player.y = ny;
+        moves++;
+        playPush();
+    } else {
+        // Check for mine
+        if (isMine(nx, ny)) {
+            deadMines.push({x: nx, y: ny});
+            gameState = 'dead';
+            playDead();
+            return;
+        }
+        player.x = nx;
+        player.y = ny;
+        moves++;
+        playMove();
+    }
+
+    checkWin();
+}
+
+function checkWin() {
+    const allDone = boxes.every(b => targets.some(t => t.x === b.x && t.y === b.y));
+    if (allDone) {
+        gameState = 'won';
+        score += Math.max(0, 100 - moves * 2);
+        playWin();
+        setTimeout(() => {
+            if (currentLevel >= levels.length - 1) {
+                gameState = 'gameover';
+            } else {
+                currentLevel++;
+                parseLevel(currentLevel);
+                gameState = 'playing';
+            }
+        }, 1500);
+    }
+}
+
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * devicePixelRatio;
+    canvas.height = H * devicePixelRatio;
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+}
+
+window.addEventListener('resize', resize);
+resize();
+
+function drawGrid() {
+    // Calculate cell size to fit grid in available space
+    const margin = 40;
+    const availW = W - margin * 2;
+    const availH = H - 80 - margin;
+    cellSize = Math.min(availW / gridW, availH / gridH);
+    cellSize = Math.floor(cellSize);
+    offsetX = (W - gridW * cellSize) / 2;
+    offsetY = 60 + (availH - gridH * cellSize) / 2;
+
+    // Draw floor and cells
+    for (let y = 0; y < gridH; y++) {
+        for (let x = 0; x < gridW; x++) {
+            const px = offsetX + x * cellSize;
+            const py = offsetY + y * cellSize;
+
+            if (isWall(x, y)) {
+                ctx.fillStyle = '#2d2d44';
+                ctx.fillRect(px, py, cellSize, cellSize);
+                // Brick pattern
+                ctx.strokeStyle = '#3d3d5c';
+                ctx.lineWidth = 1;
+                ctx.strokeRect(px+2, py+2, cellSize-4, cellSize/2-2);
+                ctx.strokeRect(px+2, py+cellSize/2+2, cellSize-4, cellSize/2-2);
+            } else {
+                // Floor
+                const shade = (x + y) % 2 === 0 ? '#3a3a5c' : '#363654';
+                ctx.fillStyle = shade;
+                ctx.fillRect(px, py, cellSize, cellSize);
+                
+                // Target marker
+                if (targets.some(t => t.x===x && t.y===y)) {
+                    ctx.fillStyle = 'rgba(0, 255, 180, 0.15)';
+                    ctx.fillRect(px+2, py+2, cellSize-4, cellSize-4);
+                    ctx.strokeStyle = 'rgba(0, 255, 180, 0.6)';
+                    ctx.lineWidth = 2;
+                    const cx = px + cellSize/2, cy = py + cellSize/2;
+                    const r = cellSize * 0.25;
+                    ctx.beginPath();
+                    ctx.moveTo(cx, cy - r);
+                    ctx.lineTo(cx + r, cy);
+                    ctx.lineTo(cx, cy + r);
+                    ctx.lineTo(cx - r, cy);
+                    ctx.closePath();
+                    ctx.stroke();
+                }
+
+                // Number display
+                const num = numbers[y][x];
+                if (num > 0 && !isWall(x,y)) {
+                    ctx.font = `bold ${cellSize * 0.45}px monospace`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    const numColors = ['#4fc3f7','#81c784','#e57373','#7986cb','#fff176','#a1887f','#f06292','#64ffda'];
+                    ctx.fillStyle = numColors[(num-1) % numColors.length];
+                    ctx.fillText(num, px + cellSize/2, py + cellSize/2);
+                }
+            }
+
+            // Grid lines
+            ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(px, py, cellSize, cellSize);
+        }
+    }
+
+    // Draw revealed mines (on death)
+    if (gameState === 'dead') {
+        for (const m of deadMines) {
+            const px = offsetX + m.x * cellSize;
+            const py = offsetY + m.y * cellSize;
+            drawMine(px, py, true);
+        }
+    }
+
+    // Draw boxes
+    for (const b of boxes) {
+        const px = offsetX + b.x * cellSize;
+        const py = offsetY + b.y * cellSize;
+        ctx.fillStyle = '#e8a040';
+        ctx.fillRect(px + 3, py + 3, cellSize - 6, cellSize - 6);
+        ctx.strokeStyle = '#c87f20';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(px + 3, py + 3, cellSize - 6, cellSize - 6);
+        // Cross pattern
+        ctx.beginPath();
+        ctx.moveTo(px+8, py+8);
+        ctx.lineTo(px+cellSize-8, py+cellSize-8);
+        ctx.moveTo(px+cellSize-8, py+8);
+        ctx.lineTo(px+8, py+cellSize-8);
+        ctx.strokeStyle = '#c87f20';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        // Check if on target
+        if (targets.some(t => t.x===b.x && t.y===b.y)) {
+            ctx.fillStyle = 'rgba(0,255,180,0.3)';
+            ctx.fillRect(px+3, py+3, cellSize-6, cellSize-6);
+        }
+    }
+
+    // Draw player
+    if (gameState !== 'dead') {
+        const px = offsetX + player.x * cellSize;
+        const py = offsetY + player.y * cellSize;
+        ctx.fillStyle = '#4fc3f7';
+        ctx.beginPath();
+        ctx.arc(px + cellSize/2, py + cellSize/2, cellSize*0.35, 0, Math.PI*2);
+        ctx.fill();
+        ctx.strokeStyle = '#81d4fa';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        // Eyes
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(px + cellSize/2 - cellSize*0.1, py + cellSize/2 - cellSize*0.05, cellSize*0.08, 0, Math.PI*2);
+        ctx.arc(px + cellSize/2 + cellSize*0.1, py + cellSize/2 - cellSize*0.05, cellSize*0.08, 0, Math.PI*2);
+        ctx.fill();
+    } else {
+        // Dead player (X eyes)
+        const px = offsetX + player.x * cellSize;
+        const py = offsetY + player.y * cellSize;
+        ctx.fillStyle = '#ef5350';
+        ctx.beginPath();
+        ctx.arc(px + cellSize/2, py + cellSize/2, cellSize*0.35, 0, Math.PI*2);
+        ctx.fill();
+        ctx.strokeStyle = '#ff8a80';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        // X eyes
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        const ex = cellSize * 0.1, ey = cellSize * 0.05;
+        ctx.beginPath();
+        ctx.moveTo(px+cellSize/2-ex, py+cellSize/2-ey);
+        ctx.lineTo(px+cellSize/2-ex+ex*2, py+cellSize/2-ey+ex*2);
+        ctx.moveTo(px+cellSize/2-ex+ex*2, py+cellSize/2-ey);
+        ctx.lineTo(px+cellSize/2-ex, py+cellSize/2-ey+ex*2);
+        ctx.moveTo(px+cellSize/2+ex, py+cellSize/2-ey);
+        ctx.lineTo(px+cellSize/2+ex-ex*2, py+cellSize/2-ey+ex*2);
+        ctx.moveTo(px+cellSize/2+ex-ex*2, py+cellSize/2-ey);
+        ctx.lineTo(px+cellSize/2+ex, py+cellSize/2-ey+ex*2);
+        ctx.stroke();
+    }
+
+    // HUD
+    ctx.font = `bold ${Math.min(18, cellSize*0.5)}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#e0e0e0';
+    ctx.fillText(`Level ${currentLevel + 1}/${levels.length}`, offsetX, 30);
+    const doneCount = boxes.filter(b => targets.some(t=>t.x===b.x&&t.y===b.y)).length;
+    ctx.fillText(`Boxes: ${doneCount}/${boxes.length}  Moves: ${moves}  Score: ${score}`, offsetX + 200, 30);
+}
+
+function drawMine(px, py, revealed) {
+    const cx = px + cellSize/2, cy = py + cellSize/2;
+    const r = cellSize * 0.3;
+    ctx.fillStyle = revealed ? '#4a4a4a' : '#333';
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI*2);
+    ctx.fill();
+    // Spikes
+    ctx.strokeStyle = revealed ? '#666' : '#555';
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 8; i++) {
+        const angle = (i / 8) * Math.PI * 2;
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(angle)*r*0.5, cy + Math.sin(angle)*r*0.5);
+        ctx.lineTo(cx + Math.cos(angle)*r, cy + Math.sin(angle)*r);
+        ctx.stroke();
+    }
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+    
+    const cx = W/2, cy = H/2;
+    
+    ctx.font = `bold ${Math.min(48, W*0.05)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#4fc3f7';
+    ctx.fillText('MINESWEEPER', cx, cy - 120);
+    ctx.fillStyle = '#e8a040';
+    ctx.fillText('SOKOBAN', cx, cy - 80);
+
+    ctx.font = `${Math.min(16, W*0.02)}px monospace`;
+    ctx.fillStyle = '#ccc';
+    const lines = [
+        'Push boxes onto target spots.',
+        'But be careful — hidden mines will kill you!',
+        '',
+        'Numbers show how many mines are adjacent',
+        'to that cell. Use logic to find safe paths.',
+        '',
+        'CONTROLS:',
+        'Arrow Keys / WASD — Move & Push',
+        'R — Restart Level',
+        'Enter/Space — Start / Next'
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, cx, cy - 30 + i * 24);
+    });
+
+    // Blinking prompt
+    if (Math.floor(Date.now() / 500) % 2 === 0) {
+        ctx.font = `bold ${Math.min(20, W*0.025)}px monospace`;
+        ctx.fillStyle = '#81c784';
+        ctx.fillText('Press ENTER or SPACE to Start', cx, cy + lines.length * 24 + 30);
+    }
+}
+
+function drawDeadScreen() {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+    const cx = W/2, cy = H/2;
+    ctx.font = `bold ${Math.min(36, W*0.04)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ef5350';
+    ctx.fillText('BOOM! You hit a mine!', cx, cy - 20);
+    ctx.font = `${Math.min(18, W*0.02)}px monospace`;
+    ctx.fillStyle = '#ccc';
+    ctx.fillText('Press R to restart level', cx, cy + 30);
+}
+
+function drawWonScreen() {
+    const cx = W/2;
+    ctx.font = `bold ${Math.min(28, W*0.03)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#81c784';
+    if (currentLevel < levels.length - 1) {
+        ctx.fillText('Level Complete! Loading next...', cx, H - 30);
+    } else {
+        ctx.fillText('All Levels Complete!', cx, H - 50);
+        ctx.font = `${Math.min(20, W*0.02)}px monospace`;
+        ctx.fillStyle = '#e8a040';
+        ctx.fillText(`Final Score: ${score}`, cx, H - 25);
+    }
+}
+
+function drawGameOverScreen() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    const cx = W/2, cy = H/2;
+    ctx.font = `bold ${Math.min(40, W*0.05)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#81c784';
+    ctx.fillText('YOU WIN!', cx, cy - 40);
+    ctx.font = `${Math.min(22, W*0.03)}px monospace`;
+    ctx.fillStyle = '#e8a040';
+    ctx.fillText(`Final Score: ${score}`, cx, cy + 10);
+    ctx.font = `${Math.min(18, W*0.02)}px monospace`;
+    ctx.fillStyle = '#ccc';
+    ctx.fillText('Press ENTER to play again', cx, cy + 60);
+}
+
+function render() {
+    ctx.clearRect(0, 0, W, H);
+    
+    if (gameState === 'start') {
+        drawStartScreen();
+    } else {
+        ctx.fillStyle = '#1a1a2e';
+        ctx.fillRect(0, 0, W, H);
+        drawGrid();
+        
+        if (gameState === 'dead') drawDeadScreen();
+        if (gameState === 'won') drawWonScreen();
+        if (gameState === 'gameover') drawGameOverScreen();
+    }
+
+    requestAnimationFrame(render);
+}
+
+function startGame() {
+    currentLevel = 0;
+    score = 0;
+    parseLevel(0);
+    gameState = 'playing';
+}
+
+function restartLevel() {
+    parseLevel(currentLevel);
+    gameState = 'playing';
+}
+
+window.addEventListener('keydown', (e) => {
+    if (gameState === 'start') {
+        if (e.key === 'Enter' || e.key === ' ') {
+            initAudio();
+            startGame();
+        }
+        return;
+    }
+
+    if (gameState === 'gameover') {
+        if (e.key === 'Enter' || e.key === ' ') {
+            gameState = 'start';
+        }
+        return;
+    }
+
+    if (gameState === 'dead') {
+        if (e.key.toLowerCase() === 'r') restartLevel();
+        return;
+    }
+
+    if (gameState === 'won') return; // auto-advances
+
+    if (gameState !== 'playing') return;
+
+    let dx = 0, dy = 0;
+    switch(e.key) {
+        case 'ArrowUp': case 'w': case 'W': dy = -1; break;
+        case 'ArrowDown': case 's': case 'S': dy = 1; break;
+        case 'ArrowLeft': case 'a': case 'A': dx = -1; break;
+        case 'ArrowRight': case 'd': case 'D': dx = 1; break;
+        case 'r': case 'R': e.preventDefault(); restartLevel(); return;
+        default: return;
+    }
+    e.preventDefault();
+    tryMove(dx, dy);
+});
+
+// Touch/click support for mobile
+let touchStartX = 0, touchStartY = 0;
+canvas.addEventListener('touchstart', (e) => {
+    initAudio();
+    const t = e.touches[0];
+    touchStartX = t.clientX;
+    touchStartY = t.clientY;
+});
+canvas.addEventListener('touchend', (e) => {
+    if (gameState === 'start' || gameState === 'gameover') { 
+        if(gameState==='start') startGame(); else gameState='start';
+        return; 
+    }
+    const t = e.changedTouches[0];
+    const dx = t.clientX - touchStartX;
+    const dy = t.clientY - touchStartY;
+    if (Math.abs(dx) > 20 || Math.abs(dy) > 20) {
+        if (Math.abs(dx) > Math.abs(dy)) {
+            tryMove(dx > 0 ? 1 : -1, 0);
+        } else {
+            tryMove(0, dy > 0 ? 1 : -1);
+        }
+    }
+});
+
+// Start rendering
+render();
+</script>
+</body>
+</html>
