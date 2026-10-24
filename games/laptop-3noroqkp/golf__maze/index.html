@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Maze Golf</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #1a1a2e; display: flex; align-items: center; justify-content: center; height: 100vh; font-family: 'Segoe UI', sans-serif; }
+canvas { display: block; cursor: crosshair; }
+#ui { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); color: #fff; text-align: center; pointer-events: none; z-index: 10; }
+#ui h2 { font-size: 1.2em; margin-bottom: 4px; }
+#ui p { font-size: 0.9em; opacity: 0.7; }
+#startScreen { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(10,10,30,0.95); z-index: 20; }
+#startScreen h1 { color: #4fc3f7; font-size: 2.5em; margin-bottom: 10px; text-shadow: 0 0 20px rgba(79,195,247,0.5); }
+#startScreen p { color: #aaa; font-size: 1em; margin: 5px 0; max-width: 400px; text-align: center; line-height: 1.5; }
+#startScreen button { margin-top: 20px; padding: 12px 36px; font-size: 1.2em; background: #4fc3f7; color: #0a0a1e; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; transition: all 0.2s; }
+#startScreen button:hover { background: #81d4fa; transform: scale(1.05); }
+#hud { position: absolute; top: 10px; right: 20px; color: #fff; font-size: 1em; text-align: right; z-index: 10; pointer-events: none; }
+#restartBtn { position: absolute; bottom: 15px; right: 20px; padding: 8px 20px; background: rgba(255,255,255,0.1); color: #aaa; border: 1px solid rgba(255,255,255,0.2); border-radius: 6px; cursor: pointer; font-size: 0.9em; z-index: 10; }
+#restartBtn:hover { background: rgba(255,255,255,0.2); color: #fff; }
+</style>
+</head>
+<body>
+<div id="startScreen">
+<h1>⛳ Maze Golf</h1>
+<p>Click and drag from the ball to aim. Release to launch!</p>
+<p>Navigate the ball through the maze into the hole.</p>
+<p>Fewer strokes = better score. Good luck!</p>
+<button id="startBtn">Play</button>
+</div>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<button id="restartBtn" style="display:none">↺ Restart</button>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H;
+
+function resize() {
+W = window.innerWidth; H = window.innerHeight;
+canvas.width = W; canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+function playSound(type) {
+if (!audioCtx) return;
+const osc = audioCtx.createOscillator();
+const gain = audioCtx.createGain();
+osc.connect(gain); gain.connect(audioCtx.destination);
+if (type === 'launch') {
+osc.type = 'sine'; osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+osc.frequency.exponentialRampToValueAtTime(400, audioCtx.currentTime + 0.1);
+gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.2);
+osc.start(); osc.stop(audioCtx.currentTime + 0.2);
+} else if (type === 'bounce') {
+osc.type = 'triangle'; osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+} else if (type === 'hole') {
+osc.type = 'sine'; osc.frequency.setValueAtTime(600, audioCtx.currentTime);
+osc.frequency.exponentialRampToValueAtTime(200, audioCtx.currentTime + 0.5);
+gain.gain.setValueAtTime(0.4, audioCtx.currentTime);
+gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.5);
+osc.start(); osc.stop(audioCtx.currentTime + 0.5);
+} else if (type === 'levelup') {
+osc.type = 'sine'; osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+osc.frequency.exponentialRampToValueAtTime(800, audioCtx.currentTime + 0.3);
+gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.4);
+osc.start(); osc.stop(audioCtx.currentTime + 0.4);
+}
+}
+
+// Game state
+let gameState = 'start'; // start, playing, aiming, ballMoving, holeIn, levelComplete, gameComplete
+let currentLevel = 0;
+let strokes = 0;
+let totalStrokes = 0;
+let ball = { x: 0, y: 0, vx: 0, vy: 0, r: 10 };
+let hole = { x: 0, y: 0, r: 14 };
+let walls = [];
+let dragStart = null;
+let dragEnd = null;
+let animFrame = 0;
+let levelTransition = 0;
+let particles = [];
+
+const BALL_RADIUS = 10;
+const HOLE_RADIUS = 14;
+const FRICTION = 0.985;
+const MIN_SPEED = 0.3;
+const MAX_POWER = 12;
+const HOLE_CAPTURE_SPEED = 4;
+
+// Level definitions (normalized 0-1, scaled to canvas)
+const levels = [
+{
+name: "Level 1",
+ball: { x: 0.15, y: 0.5 },
+hole: { x: 0.85, y: 0.5 },
+walls: []
+},
+{
+name: "Level 2",
+ball: { x: 0.15, y: 0.5 },
+hole: { x: 0.85, y: 0.3 },
+walls: [
+{ x: 0.4, y: 0.2, w: 0.06, h: 0.6 },
+{ x: 0.65, y: 0.5, w: 0.06, h: 0.5 }
+]
+},
+{
+name: "Level 3",
+ball: { x: 0.15, y: 0.8 },
+hole: { x: 0.85, y: 0.15 },
+walls: [
+{ x: 0.3, y: 0.4, w: 0.06, h: 0.6 },
+{ x: 0.55, y: 0.2, w: 0.06, h: 0.5 },
+{ x: 0.75, y: 0.6, w: 0.06, h: 0.4 }
+]
+},
+{
+name: "Level 4",
+ball: { x: 0.12, y: 0.85 },
+hole: { x: 0.88, y: 0.12 },
+walls: [
+{ x: 0.25, y: 0.5, w: 0.06, h: 0.5 },
+{ x: 0.45, y: 0.3, w: 0.06, h: 0.7 },
+{ x: 0.65, y: 0.1, w: 0.06, h: 0.5 },
+{ x: 0.82, y: 0.5, w: 0.06, h: 0.5 }
+]
+},
+{
+name: "Level 5",
+ball: { x: 0.1, y: 0.9 },
+hole: { x: 0.5, y: 0.5 },
+walls: [
+{ x: 0.2, y: 0.6, w: 0.3, h: 0.06 },
+{ x: 0.5, y: 0.3, w: 0.3, h: 0.06 },
+{ x: 0.7, y: 0.6, w: 0.06, h: 0.4 },
+{ x: 0.3, y: 0.3, w: 0.06, h: 0.4 },
+{ x: 0.55, y: 0.7, w: 0.2, h: 0.06 },
+{ x: 0.4, y: 0.1, w: 0.06, h: 0.2 }
+]
+}
+];
+
+function loadLevel(idx) {
+currentLevel = idx;
+strokes = 0;
+const lvl = levels[idx];
+ball.x = lvl.ball.x * W;
+ball.y = lvl.ball.y * H;
+ball.vx = 0; ball.vy = 0;
+hole.x = lvl.hole.x * W;
+hole.y = lvl.hole.y * H;
+walls = lvl.walls.map(w => ({ x: w.x * W, y: w.y * H, w: Math.max(w.w * W, 20), h: Math.max(w.h * H, 20) }));
+gameState = 'playing';
+particles = [];
+}
+
+function resetBall() {
+const lvl = levels[currentLevel];
+ball.x = lvl.ball.x * W;
+ball.y = lvl.ball.y * H;
+ball.vx = 0; ball.vy = 0;
+strokes = 0;
+gameState = 'playing';
+particles = [];
+}
+
+// Collision detection: circle vs rectangle
+function collideCircleRect(cx, cy, cr, rx, ry, rw, rh) {
+const closestX = Math.max(rx, Math.min(cx, rx + rw));
+const closestY = Math.max(ry, Math.min(cy, ry + rh));
+const dx = cx - closestX;
+const dy = cy - closestY;
+const dist = Math.sqrt(dx * dx + dy * dy);
+if (dist < cr) {
+return { hit: true, dx, dy, dist };
+}
+return { hit: false };
+}
+
+function resolveWallCollision() {
+for (let wall of walls) {
+const result = collideCircleRect(ball.x, ball.y, BALL_RADIUS, wall.x, wall.y, wall.w, wall.h);
+if (result.hit) {
+const dx = result.dx / result.dist;
+const dy = result.dy / result.dist;
+const overlap = BALL_RADIUS - result.dist;
+ball.x += dx * overlap;
+ball.y += dy * overlap;
+const dot = ball.vx * dx + ball.vy * dy;
+if (dot < 0) {
+ball.vx -= 2 * dot * dx;
+ball.vy -= 2 * dot * dy;
+ball.vx *= 0.85;
+ball.vy *= 0.85;
+playSound('bounce');
+spawnParticles(ball.x, ball.y, 3);
+}
+}
+}
+// Canvas boundaries
+if (ball.x - BALL_RADIUS < 0) { ball.x = BALL_RADIUS; ball.vx = Math.abs(ball.vx) * 0.85; playSound('bounce'); }
+if (ball.x + BALL_RADIUS > W) { ball.x = W - BALL_RADIUS; ball.vx = -Math.abs(ball.vx) * 0.85; playSound('bounce'); }
+if (ball.y - BALL_RADIUS < 0) { ball.y = BALL_RADIUS; ball.vy = Math.abs(ball.vy) * 0.85; playSound('bounce'); }
+if (ball.y + BALL_RADIUS > H) { ball.y = H - BALL_RADIUS; ball.vy = -Math.abs(ball.vy) * 0.85; playSound('bounce'); }
+}
+
+function spawnParticles(x, y, count) {
+for (let i = 0; i < count; i++) {
+const angle = Math.random() * Math.PI * 2;
+const speed = 1 + Math.random() * 3;
+particles.push({ x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, life: 1 });
+}
+}
+
+function updateParticles() {
+for (let i = particles.length - 1; i >= 0; i--) {
+const p = particles[i];
+p.x += p.vx; p.y += p.vy;
+p.vx *= 0.95; p.vy *= 0.95;
+p.life -= 0.03;
+if (p.life <= 0) particles.splice(i, 1);
+}
+}
+
+function update() {
+if (gameState !== 'ballMoving') return;
+ball.vx *= FRICTION;
+ball.vy *= FRICTION;
+ball.x += ball.vx;
+ball.y += ball.vy;
+resolveWallCollision();
+
+const speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+if (speed < MIN_SPEED) {
+ball.vx = 0; ball.vy = 0;
+gameState = 'playing';
+}
+
+// Check hole
+const hdx = hole.x - ball.x;
+const hdy = hole.y - ball.y;
+const hdist = Math.sqrt(hdx * hdx + hdy * hdy);
+if (hdist < HOLE_RADIUS && speed < HOLE_CAPTURE_SPEED) {
+ball.vx = 0; ball.vy = 0;
+ball.x += hdx * 0.1; ball.y += hdy * 0.1;
+gameState = 'holeIn';
+playSound('hole');
+spawnParticles(hole.x, hole.y, 15);
+levelTransition = 60;
+}
+}
+
+function drawMaze() {
+// Background
+ctx.fillStyle = '#1a2a1a';
+ctx.fillRect(0, 0, W, H);
+
+// Grid lines (subtle)
+ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+ctx.lineWidth = 1;
+for (let x = 0; x < W; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+for (let y = 0; y < H; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+// Walls
+for (let wall of walls) {
+ctx.fillStyle = '#37474f';
+ctx.fillRect(wall.x, wall.y, wall.w, wall.h);
+ctx.strokeStyle = '#546e7a';
+ctx.lineWidth = 2;
+ctx.strokeRect(wall.x, wall.y, wall.w, wall.h);
+// Wall highlight
+ctx.fillStyle = 'rgba(255,255,255,0.1)';
+ctx.fillRect(wall.x + 2, wall.y + 2, Math.max(wall.w - 4, 2), Math.max(wall.h - 4, 2));
+}
+
+// Hole
+ctx.beginPath();
+ctx.arc(hole.x, hole.y, HOLE_RADIUS, 0, Math.PI * 2);
+ctx.fillStyle = '#111';
+ctx.fill();
+ctx.strokeStyle = '#4fc3f7';
+ctx.lineWidth = 2;
+ctx.stroke();
+// Flag
+ctx.beginPath();
+ctx.moveTo(hole.x, hole.y - HOLE_RADIUS);
+ctx.lineTo(hole.x, hole.y - HOLE_RADIUS - 25);
+ctx.lineTo(hole.x + 15, hole.y - HOLE_RADIUS - 18);
+ctx.closePath();
+ctx.fillStyle = '#f44336';
+ctx.fill();
+
+// Particles
+for (let p of particles) {
+ctx.beginPath();
+ctx.arc(p.x, p.y, 2 * p.life, 0, Math.PI * 2);
+ctx.fillStyle = `rgba(79,195,247,${p.life})`;
+ctx.fill();
+}
+
+// Ball
+if (gameState !== 'holeIn' || levelTransition > 30) {
+ctx.beginPath();
+ctx.arc(ball.x + 2, ball.y + 2, BALL_RADIUS, 0, Math.PI * 2);
+ctx.fillStyle = 'rgba(0,0,0,0.3)';
+ctx.fill();
+
+const grad = ctx.createRadialGradient(ball.x - 3, ball.y - 3, 1, ball.x, ball.y, BALL_RADIUS);
+grad.addColorStop(0, '#fff');
+grad.addColorStop(1, '#ccc');
+ctx.beginPath();
+ctx.arc(ball.x, ball.y, BALL_RADIUS, 0, Math.PI * 2);
+ctx.fillStyle = grad;
+ctx.fill();
+}
+
+// Aim line
+if (gameState === 'aiming' && dragStart && dragEnd) {
+const dx = dragStart.x - dragEnd.x;
+const dy = dragStart.y - dragEnd.y;
+const dist = Math.sqrt(dx * dx + dy * dy);
+const power = Math.min(dist / 15, MAX_POWER);
+
+ctx.beginPath();
+ctx.moveTo(ball.x, ball.y);
+ctx.lineTo(ball.x + dx * 0.5, ball.y + dy * 0.5);
+ctx.strokeStyle = `rgba(255,255,255,${Math.min(dist / 100, 0.8)})`;
+ctx.lineWidth = 3;
+ctx.setLineDash([5, 5]);
+ctx.stroke();
+ctx.setLineDash([]);
+
+// Power indicator
+const powerPct = power / MAX_POWER;
+ctx.beginPath();
+ctx.arc(ball.x, ball.y, BALL_RADIUS + 8, -Math.PI / 2, -Math.PI / 2 + powerPct * Math.PI * 2);
+ctx.strokeStyle = powerPct > 0.7 ? '#f44336' : powerPct > 0.4 ? '#ff9800' : '#4fc3f7';
+ctx.lineWidth = 3;
+ctx.stroke();
+}
+}
+
+function drawHUD() {
+const hud = document.getElementById('hud');
+if (gameState === 'holeIn') {
+hud.innerHTML = `<div style="font-size:1.5em;color:#4fc3f7;">Hole in ${strokes}!</div>`;
+} else if (gameState === 'levelComplete' || gameState === 'gameComplete') {
+hud.innerHTML = '';
+} else {
+hud.innerHTML = `<div>${levels[currentLevel].name}</div><div style="font-size:0.8em;opacity:0.7;">Strokes: ${strokes}</div>`;
+}
+}
+
+function draw() {
+drawMaze();
+drawHUD();
+}
+
+function gameLoop() {
+animFrame++;
+update();
+updateParticles();
+if (levelTransition > 0 && gameState === 'holeIn') {
+levelTransition--;
+ball.x += (hole.x - ball.x) * 0.1;
+ball.y += (hole.y - ball.y) * 0.1;
+if (levelTransition <= 30) ball.r = BALL_RADIUS * (levelTransition / 30);
+if (levelTransition <= 0) {
+gameState = 'playing';
+totalStrokes += strokes;
+if (currentLevel < levels.length - 1) {
+loadLevel(currentLevel + 1);
+playSound('levelup');
+} else {
+gameState = 'gameComplete';
+document.getElementById('restartBtn').style.display = 'block';
+}
+}
+}
+draw();
+requestAnimationFrame(gameLoop);
+}
+
+// Input
+canvas.addEventListener('mousedown', (e) => {
+if (gameState !== 'playing') return;
+const rect = canvas.getBoundingClientRect();
+const mx = e.clientX - rect.left;
+const my = e.clientY - rect.top;
+const dx = mx - ball.x;
+const dy = my - ball.y;
+if (Math.sqrt(dx * dx + dy * dy) < 50) {
+dragStart = { x: mx, y: my };
+dragEnd = { x: mx, y: my };
+gameState = 'aiming';
+}
+});
+
+canvas.addEventListener('mousemove', (e) => {
+if (gameState !== 'aiming') return;
+const rect = canvas.getBoundingClientRect();
+dragEnd = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+});
+
+canvas.addEventListener('mouseup', (e) => {
+if (gameState !== 'aiming') return;
+const dx = dragStart.x - dragEnd.x;
+const dy = dragStart.y - dragEnd.y;
+const dist = Math.sqrt(dx * dx + dy * dy);
+if (dist > 10) {
+const power = Math.min(dist / 15, MAX_POWER);
+ball.vx = (dx / dist) * power;
+ball.vy = (dy / dist) * power;
+strokes++;
+gameState = 'ballMoving';
+playSound('launch');
+} else {
+gameState = 'playing';
+}
+dragStart = null;
+dragEnd = null;
+});
+
+// Touch support
+canvas.addEventListener('touchstart', (e) => {
+e.preventDefault();
+if (gameState !== 'playing') return;
+const t = e.touches[0];
+const rect = canvas.getBoundingClientRect();
+const mx = t.clientX - rect.left;
+const my = t.clientY - rect.top;
+const dx = mx - ball.x;
+const dy = my - ball.y;
+if (Math.sqrt(dx * dx + dy * dy) < 60) {
+dragStart = { x: mx, y: my };
+dragEnd = { x: mx, y: my };
+gameState = 'aiming';
+}
+});
+
+canvas.addEventListener('touchmove', (e) => {
+e.preventDefault();
+if (gameState !== 'aiming') return;
+const t = e.touches[0];
+const rect = canvas.getBoundingClientRect();
+dragEnd = { x: t.clientX - rect.left, y: t.clientY - rect.top };
+});
+
+canvas.addEventListener('touchend', (e) => {
+e.preventDefault();
+if (gameState !== 'aiming') return;
+const dx = dragStart.x - dragEnd.x;
+const dy = dragStart.y - dragEnd.y;
+const dist = Math.sqrt(dx * dx + dy * dy);
+if (dist > 10) {
+const power = Math.min(dist / 15, MAX_POWER);
+ball.vx = (dx / dist) * power;
+ball.vy = (dy / dist) * power;
+strokes++;
+gameState = 'ballMoving';
+playSound('launch');
+} else {
+gameState = 'playing';
+}
+dragStart = null;
+dragEnd = null;
+});
+
+// Keyboard restart
+window.addEventListener('keydown', (e) => {
+if (e.key === 'r' || e.key === 'R') {
+resetBall();
+}
+if (e.key === 'Escape' && gameState === 'gameComplete') {
+startGame();
+}
+});
+
+document.getElementById('restartBtn').addEventListener('click', () => {
+totalStrokes = 0;
+loadLevel(0);
+document.getElementById('restartBtn').style.display = 'none';
+});
+
+// Start game
+function startGame() {
+initAudio();
+document.getElementById('startScreen').style.display = 'none';
+document.getElementById('restartBtn').style.display = 'block';
+totalStrokes = 0;
+resize();
+loadLevel(0);
+}
+
+document.getElementById('startBtn').addEventListener('click', startGame);
+
+// Initial draw
+gameState = 'start';
+ball.x = W * 0.4; ball.y = H * 0.5;
+hole.x = W * 0.6; hole.y = H * 0.5;
+walls = [];
+gameLoop();
+</script>
+</body>
+</html>
