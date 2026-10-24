@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Snake Pong</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #0a0a1a; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const GRID = 20;
+const SNAKE_SPEED = 150; // ms per cell move
+const BALL_SPEED = 4;
+const WIN_SCORE = 5;
+const START_LENGTH = 5;
+
+let gameState = 'start'; // start, playing, score, gameover
+let scores = [0, 0];
+let winner = -1;
+let particles = [];
+let shakeTime = 0;
+let shakeMag = 0;
+let lastScoreTime = 0;
+
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+
+function playSound(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+
+function playBounce() { playSound(440, 0.1, 'square', 0.08); }
+function playWall() { playSound(330, 0.05, 'triangle', 0.06); }
+function playScore() { playSound(220, 0.4, 'sawtooth', 0.12); }
+function playWin() { playSound(880, 0.3, 'square', 0.1); setTimeout(()=>playSound(1100,0.3,'square',0.1),150); }
+
+class Snake {
+    constructor(startX, startY, dir, color) {
+        this.cells = [];
+        for (let i = 0; i < START_LENGTH; i++) {
+            this.cells.push({ x: startX - i * GRID, y: startY });
+        }
+        this.dir = dir;
+        this.color = color;
+        this.lastMove = 0;
+        this.trail = [];
+    }
+
+    reset(startX, startY, dir) {
+        this.cells = [];
+        for (let i = 0; i < START_LENGTH; i++) {
+            this.cells.push({ x: startX - i * GRID, y: startY });
+        }
+        this.dir = dir;
+        this.lastMove = 0;
+    }
+
+    update(time, inputDir) {
+        if (inputDir && inputDir.x !== 0 || inputDir.y !== 0) {
+            // Don't allow reversing directly into self
+            const dx = inputDir.x - this.dir.x;
+            const dy = inputDir.y - this.dir.y;
+            if (!(Math.abs(dx) + Math.abs(dy) === 2)) {
+                this.dir = { x: inputDir.x, y: inputDir.y };
+            }
+        }
+        if (time - this.lastMove >= SNAKE_SPEED) {
+            this.lastMove = time;
+            const head = this.cells[0];
+            const newHead = { x: head.x + this.dir.x * GRID, y: head.y + this.dir.y * GRID };
+            this.cells.unshift(newHead);
+            this.cells.pop();
+        }
+    }
+
+    draw(ctx) {
+        for (let i = this.cells.length - 1; i >= 0; i--) {
+            const c = this.cells[i];
+            const t = i / this.cells.length;
+            ctx.fillStyle = this.color;
+            ctx.globalAlpha = 1 - t * 0.5;
+            const r = Math.max(3, GRID - 4 - t * 6);
+            ctx.beginPath();
+            ctx.roundRect(c.x + 2, c.y + 2, GRID - 4, GRID - 4, r / 2);
+            ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+        // Head glow
+        const head = this.cells[0];
+        ctx.shadowColor = this.color;
+        ctx.shadowBlur = 8;
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(head.x + GRID/2, head.y + GRID/2, 4, 0, Math.PI*2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+    }
+
+    getHeadRect() {
+        return this.cells[0];
+    }
+
+    checkSelfCollision() {
+        const head = this.cells[0];
+        for (let i = 1; i < this.cells.length; i++) {
+            if (this.cells[i].x === head.x && this.cells[i].y === head.y) return true;
+        }
+        return false;
+    }
+
+    die() {
+        // Shrink by 2
+        if (this.cells.length > 3) {
+            this.cells.pop();
+            this.cells.pop();
+        }
+        spawnParticles(this.cells[0].x + GRID/2, this.cells[0].y + GRID/2, this.color, 15);
+    }
+}
+
+class Ball {
+    constructor() {
+        this.reset();
+    }
+
+    reset() {
+        this.x = W / 2;
+        this.y = H / 2;
+        const angle = (Math.random() * 0.8 - 0.4);
+        const dir = Math.random() < 0.5 ? 1 : -1;
+        this.vx = Math.cos(angle) * BALL_SPEED * dir;
+        this.vy = Math.sin(angle) * BALL_SPEED;
+    }
+
+    update() {
+        this.x += this.vx;
+        this.y += this.vy;
+
+        // Top/bottom bounce
+        const r = 8;
+        if (this.y - r < 0) { this.y = r; this.vy = Math.abs(this.vy); playWall(); }
+        if (this.y + r > H) { this.y = H - r; this.vy = -Math.abs(this.vy); playWall(); }
+
+        // Speed up slightly over time
+        const speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy);
+        if (speed < BALL_SPEED * 2.5) {
+            const scale = 1 + 0.0003;
+            this.vx *= scale;
+            this.vy *= scale;
+        }
+    }
+
+    draw(ctx) {
+        ctx.shadowColor = '#fff';
+        ctx.shadowBlur = 12;
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, 8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+    }
+
+    checkCollision(snake) {
+        const r = 8;
+        for (let i = 0; i < snake.cells.length; i++) {
+            const seg = snake.cells[i];
+            // Circle-rect collision
+            const cx = this.x, cy = this.y;
+            const rx = seg.x, ry = seg.y, rw = GRID, rh = GRID;
+
+            const closestX = Math.max(rx, Math.min(cx, rx + rw));
+            const closestY = Math.max(ry, Math.min(cy, ry + rh));
+
+            const dx = cx - closestX;
+            const dy = cy - closestY;
+
+            if (dx * dx + dy * dy < r * r) {
+                // Determine which face was hit
+                const overlapLeft = cx + r - rx;
+                const overlapRight = rx + rw - (cx - r);
+                const overlapTop = cy + r - ry;
+                const overlapBottom = ry + rh - (cy - r);
+
+                const minOverlap = Math.min(overlapLeft, overlapRight, overlapTop, overlapBottom);
+
+                if (minOverlap === overlapTop) { this.vy = -Math.abs(this.vy); }
+                else if (minOverlap === overlapBottom) { this.vy = Math.abs(this.vy); }
+                else if (minOverlap === overlapLeft) { this.vx = -Math.abs(this.vx); }
+                else if (minOverlap === overlapRight) { this.vx = Math.abs(this.vx); }
+
+                // Nudge ball out
+                this.x += this.vx * 2;
+                this.y += this.vy * 2;
+
+                playBounce();
+                spawnParticles(cx, cy, '#fff', 5);
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 1 + Math.random() * 3;
+        particles.push({
+            x, y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            life: 1,
+            color
+        });
+    }
+}
+
+let snake1, snake2, ball;
+let input1 = { x: 0, y: 0 };
+let input2 = { x: 0, y: 0 };
+
+function initGame() {
+    const padX = Math.floor(W * 0.25 / GRID) * GRID;
+    const padY = Math.floor(H / 2 / GRID) * GRID;
+    snake1 = new Snake(padX, padY, { x: 1, y: 0 }, '#00ff88');
+    snake2 = new Snake(W - padX - GRID * START_LENGTH, padY, { x: -1, y: 0 }, '#ff4466');
+    ball = new Ball();
+    scores = [0, 0];
+    winner = -1;
+    particles = [];
+    input1 = { x: 1, y: 0 };
+    input2 = { x: -1, y: 0 };
+}
+
+function resetRounds() {
+    const padX = Math.floor(W * 0.25 / GRID) * GRID;
+    const padY = Math.floor(H / 2 / GRID) * GRID;
+    snake1.reset(padX, padY, { x: 1, y: 0 });
+    snake2.reset(W - padX - GRID * START_LENGTH, padY, { x: -1, y: 0 });
+    ball.reset();
+}
+
+function handleScore() {
+    if (ball.x < -20) {
+        scores[1]++;
+        shakeTime = 10;
+        shakeMag = 5;
+        playScore();
+        spawnParticles(0, H/2, '#ff4466', 20);
+        checkWin();
+    } else if (ball.x > W + 20) {
+        scores[0]++;
+        shakeTime = 10;
+        shakeMag = 5;
+        playScore();
+        spawnParticles(W, H/2, '#00ff88', 20);
+        checkWin();
+    }
+}
+
+function checkWin() {
+    if (scores[0] >= WIN_SCORE) { winner = 0; gameState = 'gameover'; playWin(); }
+    else if (scores[1] >= WIN_SCORE) { winner = 1; gameState = 'gameover'; playWin(); }
+}
+
+function drawBackground() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    // Grid lines (subtle)
+    ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x < W; x += GRID) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+    }
+    for (let y = 0; y < H; y += GRID) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+
+    // Center line
+    ctx.setLineDash([10, 10]);
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(W/2, 0);
+    ctx.lineTo(W/2, H);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Center circle
+    ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+    ctx.beginPath();
+    ctx.arc(W/2, H/2, 60, 0, Math.PI*2);
+    ctx.stroke();
+}
+
+function drawScore() {
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#00ff88';
+    ctx.fillText(scores[0], W/2 - 80, 60);
+    ctx.fillStyle = '#ff4466';
+    ctx.fillText(scores[1], W/2 + 80, 60);
+
+    ctx.font = '14px monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.fillText('FIRST TO ' + WIN_SCORE, W/2, 85);
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 64px monospace';
+    ctx.fillStyle = '#00ff88';
+    ctx.shadowColor = '#00ff88';
+    ctx.shadowBlur = 20;
+    ctx.fillText('SNAKE PONG', W/2, H/3);
+    ctx.shadowBlur = 0;
+
+    ctx.font = '18px monospace';
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('Two snakes battle to bounce the ball!', W/2, H/3 + 50);
+
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#00ff88';
+    ctx.fillText('Player 1 (Left):', W/2 - 150, H/2 + 20);
+    ctx.fillStyle = '#fff';
+    ctx.fillText('W A S D', W/2 - 150, H/2 + 45);
+
+    ctx.fillStyle = '#ff4466';
+    ctx.fillText('Player 2 (Right):', W/2 + 150, H/2 + 20);
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Arrow Keys', W/2 + 150, H/2 + 45);
+
+    ctx.font = '16px monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fillText('First to ' + WIN_SCORE + ' points wins!', W/2, H/2 + 90);
+    ctx.fillText('Avoid hitting your own body!', W/2, H/2 + 115);
+
+    // Pulsing start prompt
+    const pulse = 0.5 + Math.sin(Date.now() * 0.003) * 0.5;
+    ctx.font = 'bold 24px monospace';
+    ctx.fillStyle = `rgba(255,255,255,${pulse})`;
+    ctx.fillText('Press SPACE to Start', W/2, H - 80);
+
+    // Draw demo snakes
+    const t = Date.now() * 0.001;
+    ctx.fillStyle = '#00ff88';
+    for (let i = 0; i < 5; i++) {
+        const x = W/2 - 200 + Math.sin(t + i * 0.5) * 10;
+        const y = H - 140 + i * 8;
+        ctx.globalAlpha = 1 - i * 0.15;
+        ctx.beginPath();
+        ctx.arc(x, y, 7 - i, 0, Math.PI*2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    ctx.fillStyle = '#ff4466';
+    for (let i = 0; i < 5; i++) {
+        const x = W/2 + 200 - Math.sin(t + i * 0.5) * 10;
+        const y = H - 140 + i * 8;
+        ctx.globalAlpha = 1 - i * 0.15;
+        ctx.beginPath();
+        ctx.arc(x, y, 7 - i, 0, Math.PI*2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(10,10,26,0.85)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 48px monospace';
+    if (winner === 0) {
+        ctx.fillStyle = '#00ff88';
+        ctx.shadowColor = '#00ff88';
+    } else {
+        ctx.fillStyle = '#ff4466';
+        ctx.shadowColor = '#ff4466';
+    }
+    ctx.shadowBlur = 20;
+    ctx.fillText('PLAYER ' + (winner + 1) + ' WINS!', W/2, H/3);
+    ctx.shadowBlur = 0;
+
+    ctx.font = '24px monospace';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(scores[0] + ' - ' + scores[1], W/2, H/3 + 60);
+
+    const pulse = 0.5 + Math.sin(Date.now() * 0.003) * 0.5;
+    ctx.font = 'bold 20px monospace';
+    ctx.fillStyle = `rgba(255,255,255,${pulse})`;
+    ctx.fillText('Press SPACE to Play Again', W/2, H - 80);
+}
+
+function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life -= 0.03;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function drawParticles() {
+    for (const p of particles) {
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 3 * p.life, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+}
+
+let lastTime = 0;
+
+function gameLoop(time) {
+    requestAnimationFrame(gameLoop);
+
+    if (gameState === 'start') {
+        drawStartScreen();
+        return;
+    }
+
+    if (gameState === 'gameover') {
+        drawBackground();
+        snake1.draw(ctx);
+        snake2.draw(ctx);
+        ball.draw(ctx);
+        drawScore();
+        drawGameOver();
+        updateParticles();
+        drawParticles();
+        return;
+    }
+
+    // Playing state
+    ctx.save();
+    if (shakeTime > 0) {
+        shakeTime--;
+        const sx = (Math.random() - 0.5) * shakeMag;
+        const sy = (Math.random() - 0.5) * shakeMag;
+        ctx.translate(sx, sy);
+    }
+
+    drawBackground();
+
+    // Update snakes
+    snake1.update(time, input1);
+    snake2.update(time, input2);
+
+    // Self-collision check
+    if (snake1.checkSelfCollision()) {
+        snake1.die();
+        playScore();
+        shakeTime = 8;
+        shakeMag = 4;
+    }
+    if (snake2.checkSelfCollision()) {
+        snake2.die();
+        playScore();
+        shakeTime = 8;
+        shakeMag = 4;
+    }
+
+    // Update ball
+    ball.update();
+
+    // Ball-snake collision
+    ball.checkCollision(snake1);
+    ball.checkCollision(snake2);
+
+    // Scoring
+    if (ball.x < -20 || ball.x > W + 20) {
+        handleScore();
+        if (gameState !== 'gameover') {
+            gameState = 'score';
+            lastScoreTime = time;
+        }
+    }
+
+    // Draw
+    snake1.draw(ctx);
+    snake2.draw(ctx);
+    ball.draw(ctx);
+    drawScore();
+    updateParticles();
+    drawParticles();
+
+    ctx.restore();
+
+    // Score pause
+    if (gameState === 'score') {
+        if (time - lastScoreTime > 1500) {
+            gameState = 'playing';
+            resetRounds();
+        }
+        // Flash effect
+        const t = (time - lastScoreTime) / 1500;
+        ctx.fillStyle = `rgba(255,255,255,${(1-t)*0.3})`;
+        ctx.fillRect(0, 0, W, H);
+    }
+}
+
+// Input handling
+window.addEventListener('keydown', (e) => {
+    initAudio();
+
+    if (gameState === 'start' && e.code === 'Space') {
+        gameState = 'playing';
+        initGame();
+        return;
+    }
+
+    if (gameState === 'gameover' && e.code === 'Space') {
+        gameState = 'playing';
+        initGame();
+        return;
+    }
+
+    // Player 1: WASD
+    switch(e.code) {
+        case 'KeyW': input1 = {x:0,y:-1}; break;
+        case 'KeyS': input1 = {x:0,y:1}; break;
+        case 'KeyA': input1 = {x:-1,y:0}; break;
+        case 'KeyD': input1 = {x:1,y:0}; break;
+    }
+
+    // Player 2: Arrows
+    switch(e.code) {
+        case 'ArrowUp': input2 = {x:0,y:-1}; break;
+        case 'ArrowDown': input2 = {x:0,y:1}; break;
+        case 'ArrowLeft': input2 = {x:-1,y:0}; break;
+        case 'ArrowRight': input2 = {x:1,y:0}; break;
+    }
+
+    e.preventDefault();
+});
+
+// Prevent scrolling with arrows
+window.addEventListener('keydown', (e) => {
+    if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) {
+        e.preventDefault();
+    }
+});
+
+// Save high score
+function saveHighScore() {
+    try {
+        const hs = JSON.parse(localStorage.getItem('snakePongHS') || 'null');
+        if (!hs) localStorage.setItem('snakePongHS', JSON.stringify({winner, scores}));
+    } catch(e) {}
+}
+
+window.addEventListener('beforeunload', () => {
+    if (gameState === 'gameover') saveHighScore();
+});
+
+initGame();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
