@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Tetris Pac-Man</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a1a; overflow: hidden; width: 100vw; height: 100vh; display: flex; justify-content: center; align-items: center; }
+canvas { display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, CELL, GRID_W = 10, GRID_H = 20;
+let audioCtx = null;
+
+function resize() {
+    const maxW = window.innerWidth;
+    const maxH = window.innerHeight;
+    const gridAspect = GRID_W / GRID_H;
+    let cw, ch;
+    if (maxW / maxH < gridAspect) {
+        cw = maxW * 0.85;
+        ch = cw / gridAspect;
+    } else {
+        ch = maxH * 0.9;
+        cw = ch * gridAspect;
+    }
+    W = Math.floor(cw);
+    H = Math.floor(ch);
+    canvas.width = W;
+    canvas.height = H;
+    CELL = Math.floor(W / (GRID_W + 4));
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playTone(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+function sfxMove() { playTone(200, 0.05, 'square', 0.05); }
+function sfxRotate() { playTone(300, 0.08, 'triangle', 0.08); }
+function sfxDrop() { playTone(150, 0.1, 'square', 0.1); }
+function sfxClear() { for (let i = 0; i < 4; i++) setTimeout(() => playTone(400 + i * 100, 0.15, 'triangle', 0.12), i * 60); }
+function sfxGameOver() { for (let i = 0; i < 6; i++) setTimeout(() => playTone(300 - i * 40, 0.2, 'sawtooth', 0.15), i * 120); }
+function sfxGhost() { playTone(80, 0.3, 'sawtooth', 0.1); }
+
+// Characters for each piece type
+const PIECES = [
+    { shape: [[1,1,1,1]], color: '#ff4444', char: 'ghost', name: 'Blinky' },
+    { shape: [[1,1],[1,1]], color: '#ff88ff', char: 'ghost', name: 'Pinky' },
+    { shape: [[1,1,1],[0,1,0]], color: '#44ddff', char: 'ghost', name: 'Inky' },
+    { shape: [[0,1,1],[1,1,0]], color: '#ffaa33', char: 'ghost', name: 'Clyde' },
+    { shape: [[1,0,0],[1,1,1]], color: '#ffee44', char: 'pacman', name: 'Pac-Man' },
+    { shape: [[1,1,0],[0,1,1]], color: '#66ff66', char: 'ghost', name: 'Sue' },
+    { shape: [[1,1,1],[1,0,0]], color: '#aa66ff', char: 'ghost', name: 'Pike' }
+];
+
+function rotate(shape) {
+    return shape[0].map((_, i) => shape.map(row => row[i])).reverse();
+}
+
+let state = 'start'; // start, playing, gameover
+let grid, current, nextPiece, score, lines, level, ghost, animTime, dots;
+let dropInterval, lastDrop, holdKey;
+
+function resetGame() {
+    grid = Array.from({length: GRID_H}, () => Array(GRID_W).fill(null));
+    score = 0; lines = 0; level = 1;
+    nextPiece = randomPiece();
+    spawnPiece();
+    ghost = { x: GRID_W / 2, y: -2, vx: 0.5, vy: 0.3, timer: 0 };
+    dropInterval = 800;
+    lastDrop = performance.now();
+    dots = [];
+    animTime = 0;
+}
+
+function randomPiece() {
+    const p = PIECES[Math.floor(Math.random() * PIECES.length)];
+    return { shape: p.shape, color: p.color, char: p.char, name: p.name, x: 3, y: 0 };
+}
+
+function spawnPiece() {
+    current = JSON.parse(JSON.stringify(nextPiece));
+    nextPiece = randomPiece();
+    current.x = Math.floor((GRID_W - current.shape[0].length) / 2);
+    current.y = 0;
+    if (collides(current.shape, current.x, current.y)) {
+        state = 'gameover';
+        sfxGameOver();
+    }
+}
+
+function collides(shape, px, py) {
+    for (let r = 0; r < shape.length; r++) {
+        for (let c = 0; c < shape[r].length; c++) {
+            if (shape[r][c]) {
+                const nx = px + c, ny = py + r;
+                if (nx < 0 || nx >= GRID_W || ny >= GRID_H) return true;
+                if (ny >= 0 && grid[ny][nx]) return true;
+            }
+        }
+    }
+    return false;
+}
+
+function lockPiece() {
+    const p = current;
+    for (let r = 0; r < p.shape.length; r++) {
+        for (let c = 0; c < p.shape[r].length; c++) {
+            if (p.shape[r][c]) {
+                const ny = p.y + r, nx = p.x + c;
+                if (ny >= 0) grid[ny][nx] = { color: p.color, char: p.char };
+            }
+        }
+    }
+    clearLines();
+    spawnPiece();
+}
+
+function clearLines() {
+    let cleared = 0;
+    for (let r = GRID_H - 1; r >= 0; r--) {
+        if (grid[r].every(cell => cell !== null)) {
+            grid.splice(r, 1);
+            grid.unshift(Array(GRID_W).fill(null));
+            cleared++;
+            // Spawn dots
+            for (let c = 0; c < GRID_W; c++) {
+                dots.push({ x: c * CELL + CELL/2, y: r * CELL + CELL/2, life: 30 });
+            }
+        }
+    }
+    if (cleared > 0) {
+        sfxClear();
+        const pts = [0, 40, 100, 300, 1200];
+        score += pts[cleared] * level;
+        lines += cleared;
+        level = Math.floor(lines / 10) + 1;
+        dropInterval = Math.max(200, 800 - (level - 1) * 70);
+    }
+}
+
+function tryRotate() {
+    const ns = rotate(current.shape);
+    // Wall kicks
+    const kicks = [[0,-1],[0,1],[-1,-1],[1,-1],[0,-2]];
+    for (const k of kicks) {
+        if (!collides(ns, current.x + k[1], current.y)) {
+            current.shape = ns;
+            current.x += k[1];
+            sfxRotate();
+            return;
+        }
+    }
+}
+
+function ghostUpdate(dt) {
+    if (state !== 'playing') return;
+    ghost.timer += dt;
+    // Wander toward falling piece
+    const tx = current.x + current.shape[0].length / 2;
+    const ty = current.y;
+    const dx = tx - ghost.x, dy = ty - ghost.y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    if (dist > 0.1) {
+        ghost.vx += (dx / dist) * 0.02;
+        ghost.vy += (dy / dist) * 0.02;
+    } else {
+        ghost.vx = Math.random() - 0.5;
+        ghost.vy = Math.random() - 0.5;
+    }
+    // Damp and bound
+    ghost.vx *= 0.98;
+    ghost.vy *= 0.98;
+    const speed = Math.sqrt(ghost.vx*ghost.vx + ghost.vy*ghost.vy);
+    if (speed > 0.4) { ghost.vx *= 0.4/speed; ghost.vy *= 0.4/speed; }
+    ghost.x += ghost.vx;
+    ghost.y += ghost.vy;
+    if (ghost.x < 0) { ghost.x = 0; ghost.vx *= -1; }
+    if (ghost.x > GRID_W) { ghost.x = GRID_W; ghost.vx *= -1; }
+    if (ghost.y < -3) { ghost.y = -3; ghost.vy *= -1; }
+    if (ghost.y > GRID_H) { ghost.y = GRID_H; ghost.vy *= -1; }
+
+    // Ghost touches piece?
+    for (let r = 0; r < current.shape.length; r++) {
+        for (let c = 0; c < current.shape[r].length; c++) {
+            if (current.shape[r][c]) {
+                const bx = current.x + c, by = current.y + r;
+                if (Math.abs(ghost.x - bx) < 1 && Math.abs(ghost.y - by) < 1) {
+                    // Push piece sideways
+                    current.x += ghost.vx > 0 ? 1 : -1;
+                    score = Math.max(0, score - 50);
+                    sfxGhost();
+                    ghost.timer = 0;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+function update(dt) {
+    if (state !== 'playing') return;
+    animTime += dt;
+    // Gravity
+    const now = performance.now();
+    if (now - lastDrop > dropInterval) {
+        if (!collides(current.shape, current.x, current.y + 1)) {
+            current.y++;
+        } else {
+            lockPiece();
+        }
+        lastDrop = now;
+    }
+    ghostUpdate(dt);
+    // Dots
+    for (let i = dots.length - 1; i >= 0; i--) {
+        dots[i].life--;
+        if (dots[i].life <= 0) dots.splice(i, 1);
+    }
+}
+
+function drawCharacter(x, y, size, char, color, frame) {
+    const s = size * 0.7;
+    const cx = x + size/2, cy = y + size/2;
+    ctx.save();
+    if (char === 'pacman') {
+        // Pac-Man chomping
+        const mouth = Math.abs(Math.sin(frame * 4)) * 0.6 + 0.1;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(cx, cy, s/2, mouth, Math.PI * 2 - mouth);
+        ctx.lineTo(cx, cy);
+        ctx.fill();
+        // Eye
+        ctx.fillStyle = '#000';
+        ctx.beginPath();
+        ctx.arc(cx + s*0.1, cy - s*0.15, s*0.08, 0, Math.PI*2);
+        ctx.fill();
+    } else {
+        // Ghost body
+        const bob = Math.sin(frame * 3) * size * 0.05;
+        ctx.fillStyle = color;
+        // Body
+        ctx.beginPath();
+        ctx.arc(cx, cy + bob - s*0.1, s/2, Math.PI, 0);
+        ctx.lineTo(cx + s/2, cy + bob + s*0.3);
+        // Feet (wavy)
+        const feet = 3;
+        for (let i = 0; i < feet; i++) {
+            const fx = cx + s/2 - (i+1)*(s/feet);
+            const fy = cy + bob + s*0.3 + Math.sin(frame*5 + i)*size*0.05;
+            ctx.lineTo(fx, fy);
+        }
+        ctx.closePath();
+        ctx.fill();
+        // Eyes
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(cx - s*0.15, cy + bob - s*0.15, s*0.12, 0, Math.PI*2);
+        ctx.arc(cx + s*0.15, cy + bob - s*0.15, s*0.12, 0, Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle = '#00f';
+        ctx.beginPath();
+        ctx.arc(cx - s*0.12, cy + bob - s*0.12, s*0.06, 0, Math.PI*2);
+        ctx.arc(cx + s*0.18, cy + bob - s*0.12, s*0.06, 0, Math.PI*2);
+        ctx.fill();
+    }
+    ctx.restore();
+}
+
+function draw() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    const offsetX = CELL * 2;
+    const offsetY = Math.floor((H - GRID_H * CELL) / 2);
+    const ox = offsetX, oy = offsetY;
+
+    // Grid background
+    ctx.strokeStyle = '#1a1a3a';
+    ctx.lineWidth = 1;
+    for (let r = 0; r <= GRID_H; r++) {
+        ctx.beginPath(); ctx.moveTo(ox, oy + r * CELL); ctx.lineTo(ox + GRID_W*CELL, oy + r*CELL); ctx.stroke();
+    }
+    for (let c = 0; c <= GRID_W; c++) {
+        ctx.beginPath(); ctx.moveTo(ox + c*CELL, oy); ctx.lineTo(ox + c*CELL, oy + GRID_H*CELL); ctx.stroke();
+    }
+
+    // Background dots
+    ctx.fillStyle = '#1a1a4a';
+    for (let r = 0; r < GRID_H; r++) {
+        for (let c = 0; c < GRID_W; c++) {
+            if ((r + c) % 2 === 0 && !grid[r][c]) {
+                ctx.beginPath();
+                ctx.arc(ox + c*CELL + CELL/2, oy + r*CELL + CELL/2, 2, 0, Math.PI*2);
+                ctx.fill();
+            }
+        }
+    }
+
+    if (state === 'start') {
+        drawStartScreen(ox, oy);
+        return;
+    }
+
+    // Placed blocks
+    for (let r = 0; r < GRID_H; r++) {
+        for (let c = 0; c < GRID_W; c++) {
+            if (grid[r][c]) {
+                ctx.fillStyle = grid[r][c].color + '44';
+                ctx.fillRect(ox + c*CELL+1, oy + r*CELL+1, CELL-2, CELL-2);
+                drawCharacter(ox + c*CELL, oy + r*CELL, CELL, grid[r][c].char, grid[r][c].color, animTime/1000 + r*0.3);
+            }
+        }
+    }
+
+    // Dots
+    for (const d of dots) {
+        const alpha = d.life / 30;
+        ctx.fillStyle = `rgba(255, 255, 100, ${alpha})`;
+        ctx.beginPath();
+        ctx.arc(d.x - ox + CELL*2, d.y - oy, 4 * alpha, 0, Math.PI*2);
+        ctx.fill();
+    }
+
+    // Current piece
+    if (current) {
+        for (let r = 0; r < current.shape.length; r++) {
+            for (let c = 0; c < current.shape[r].length; c++) {
+                if (current.shape[r][c]) {
+                    const px = ox + (current.x+c)*CELL, py = oy + (current.y+r)*CELL;
+                    ctx.fillStyle = current.color + '66';
+                    ctx.fillRect(px+1, py+1, CELL-2, CELL-2);
+                    drawCharacter(px, py, CELL, current.char, current.color, animTime/1000);
+                }
+            }
+        }
+    }
+
+    // Ghost
+    if (state === 'playing') {
+        const gx = ox + ghost.x * CELL, gy = oy + ghost.y * CELL;
+        drawCharacter(gx - CELL*0.4, gy - CELL*0.4, CELL*0.8, 'ghost', '#ff2266', animTime/1000);
+    }
+
+    // Side panel
+    const panelX = ox + GRID_W * CELL + 10;
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.floor(CELL*0.5)}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillText('SCORE', panelX, oy + 20);
+    ctx.font = `${Math.floor(CELL*0.45)}px monospace`;
+    ctx.fillText(score.toString(), panelX, oy + 45);
+
+    ctx.font = `bold ${Math.floor(CELL*0.5)}px monospace`;
+    ctx.fillText('LEVEL', panelX, oy + CELL*2.2);
+    ctx.font = `${Math.floor(CELL*0.45)}px monospace`;
+    ctx.fillText(level.toString(), panelX, oy + CELL*3);
+
+    // Next piece
+    ctx.font = `bold ${Math.floor(CELL*0.4)}px monospace`;
+    ctx.fillText('NEXT', panelX, oy + CELL*4);
+    if (nextPiece) {
+        const ns = nextPiece.shape;
+        for (let r = 0; r < ns.length; r++) {
+            for (let c = 0; c < ns[r].length; c++) {
+                if (ns[r][c]) {
+                    const px = panelX + c * CELL * 0.5, py = oy + CELL*4.5 + r * CELL * 0.5;
+                    ctx.fillStyle = nextPiece.color + '88';
+                    ctx.fillRect(px, py, CELL*0.5-1, CELL*0.5-1);
+                    drawCharacter(px, py, CELL*0.5, nextPiece.char, nextPiece.color, animTime/1000);
+                }
+            }
+        }
+    }
+
+    // Game over
+    if (state === 'gameover') {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#ff4444';
+        ctx.font = `bold ${Math.floor(CELL*1.2)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W/2, H/2 - 20);
+        ctx.fillStyle = '#fff';
+        ctx.font = `${Math.floor(CELL*0.6)}px monospace`;
+        ctx.fillText(`Score: ${score}`, W/2, H/2 + 30);
+        ctx.font = `${Math.floor(CELL*0.5)}px monospace`;
+        ctx.fillStyle = '#aaa';
+        ctx.fillText('Press ENTER to restart', W/2, H/2 + 70);
+    }
+}
+
+function drawStartScreen(ox, oy) {
+    // Draw a few decorative characters
+    for (let i = 0; i < 5; i++) {
+        const x = ox + (i - 2) * CELL * 1.5 + W/2 - ox;
+        const y = oy + GRID_H * CELL / 2 + Math.sin(animTime/500 + i) * 10;
+        drawCharacter(x, y, CELL, i % 2 === 0 ? 'pacman' : 'ghost', PIECES[i].color, animTime/1000);
+    }
+
+    ctx.fillStyle = '#ffee44';
+    ctx.font = `bold ${Math.floor(CELL*1.3)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('TETRIS', W/2, oy + CELL*2);
+    ctx.fillStyle = '#ff88ff';
+    ctx.fillText('PAC-MAN', W/2, oy + CELL*3.5);
+
+    ctx.fillStyle = '#aaa';
+    ctx.font = `${Math.floor(CELL*0.4)}px monospace`;
+    const controls = [
+        '← → Move',
+        '↑ Rotate',
+        '↓ Soft Drop',
+        'SPACE Hard Drop',
+        '',
+        'Beware the ghost!',
+        'Press ENTER to Start'
+    ];
+    controls.forEach((t, i) => {
+        ctx.fillText(t, W/2, oy + CELL*5 + i * CELL * 0.7);
+    });
+}
+
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = Math.min(time - lastTime, 100);
+    lastTime = time;
+    update(dt);
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+document.addEventListener('keydown', (e) => {
+    initAudio();
+    if (state === 'start' && e.key === 'Enter') {
+        resetGame();
+        state = 'playing';
+        return;
+    }
+    if (state === 'gameover' && e.key === 'Enter') {
+        resetGame();
+        state = 'playing';
+        return;
+    }
+    if (state !== 'playing' || !current) return;
+
+    switch(e.key) {
+        case 'ArrowLeft':
+            if (!collides(current.shape, current.x - 1, current.y)) { current.x--; sfxMove(); }
+            break;
+        case 'ArrowRight':
+            if (!collides(current.shape, current.x + 1, current.y)) { current.x++; sfxMove(); }
+            break;
+        case 'ArrowDown':
+            if (!collides(current.shape, current.x, current.y + 1)) { current.y++; lastDrop = performance.now(); sfxMove(); score += 1; }
+            break;
+        case 'ArrowUp':
+            tryRotate();
+            break;
+        case ' ':
+            e.preventDefault();
+            while (!collides(current.shape, current.x, current.y + 1)) current.y++;
+            lockPiece();
+            sfxDrop();
+            score += 2;
+            break;
+    }
+});
+
+// High score
+try {
+    let highScore = parseInt(localStorage.getItem('tetrisPacmanHigh') || '0');
+    window.addEventListener('beforeunload', () => { if (score > highScore) localStorage.setItem('tetrisPacmanHigh', score); });
+} catch(e) {}
+
+resetGame();
+state = 'start';
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
