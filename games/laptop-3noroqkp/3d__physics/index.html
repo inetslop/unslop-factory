@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neon Physics 3D</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0a0f; overflow: hidden; width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; font-family: 'Courier New', monospace; }
+        canvas { display: block; }
+        #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 10; pointer-events: none; }
+        #overlay.active { pointer-events: all; }
+        .title { font-size: clamp(2rem, 5vw, 4rem); color: #0ff; text-shadow: 0 0 20px #0ff, 0 0 40px #0ff; letter-spacing: 8px; margin-bottom: 30px; }
+        .subtitle { font-size: clamp(1rem, 2vw, 1.5rem); color: #f0f; text-shadow: 0 0 15px #f0f; margin-bottom: 40px; letter-spacing: 3px; }
+        .controls { color: #fff; font-size: clamp(0.8rem, 1.5vw, 1.1rem); line-height: 2; text-align: center; opacity: 0.8; }
+        .btn { margin-top: 40px; padding: 15px 50px; background: transparent; border: 2px solid #0ff; color: #0ff; font-size: 1.2rem; font-family: 'Courier New', monospace; cursor: pointer; letter-spacing: 3px; transition: all 0.3s; }
+        .btn:hover { background: #0ff; color: #0a0a0f; box-shadow: 0 0 30px #0ff; }
+        #hud { position: absolute; top: 15px; left: 20px; color: #0ff; font-size: 1rem; z-index: 5; text-shadow: 0 0 10px #0ff; pointer-events: none; }
+        #hud span { display: block; margin-bottom: 8px; }
+        #livesDisplay { position: absolute; top: 15px; right: 20px; color: #f44; font-size: 1.5rem; z-index: 5; text-shadow: 0 0 10px #f44; pointer-events: none; }
+    </style>
+</head>
+<body>
+    <canvas id="game"></canvas>
+    <div id="hud" style="display:none">
+        <span id="scoreDisplay">SCORE: 0</span>
+        <span id="comboDisplay">COMBO: x1</span>
+    </div>
+    <div id="livesDisplay" style="display:none">LIVES: ♥♥♥</div>
+    <div id="overlay" class="active">
+        <div class="title">NEON PHYSICS 3D</div>
+        <div class="subtitle">GRAVITY ARENA</div>
+        <div class="controls">
+            WASD / Arrow Keys — Move in X/Z plane<br>
+            SPACE — Jump (Y force)<br>
+            SHIFT — Dash boost<br><br>
+            Collect orbs. Avoid red spikes.<br>
+            Don't let gravity crush you!
+        </div>
+        <button class="btn" id="startBtn">START</button>
+    </div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const hud = document.getElementById('hud');
+const scoreDisplay = document.getElementById('scoreDisplay');
+const comboDisplay = document.getElementById('comboDisplay');
+const livesDisplay = document.getElementById('livesDisplay');
+const startBtn = document.getElementById('startBtn');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+
+// 3D Engine
+const camera = { x: 0, y: 12, z: 25, fov: 600 };
+let camAngle = 0;
+
+function project(x, y, z) {
+    const dx = x - camera.x;
+    const dy = y - camera.y;
+    const dz = z - camera.z;
+    const scale = camera.fov / (dz + 50);
+    return {
+        x: W / 2 + dx * scale,
+        y: H / 2 - dy * scale,
+        scale: scale,
+        depth: dz + 50
+    };
+}
+
+function draw3DLine(x1,y1,z1,x2,y2,z2,color,width) {
+    const p1 = project(x1,y1,z1);
+    const p2 = project(x2,y2,z2);
+    if (p1.depth < 0 || p2.depth < 0) return;
+    ctx.beginPath();
+    ctx.moveTo(p1.x, p1.y);
+    ctx.lineTo(p2.x, p2.y);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width || 1;
+    ctx.stroke();
+}
+
+function draw3DSphere(x, y, z, r, color, glow) {
+    const p = project(x, y, z);
+    if (p.depth < 0) return;
+    const sr = Math.max(r * p.scale * 2, 2);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, sr, 0, Math.PI * 2);
+    if (glow) {
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 15;
+    }
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+}
+
+// Game State
+let gameState = 'menu'; // menu, playing, gameover
+let score = 0;
+let lives = 3;
+let combo = 1;
+let comboTimer = 0;
+let time = 0;
+let particles = [];
+
+const ARENA = { x: 20, y: 20, z: 20 };
+
+// Player ball
+let player = {
+    x: 0, y: 5, z: 0,
+    vx: 0, vy: 0, vz: 0,
+    radius: 1.2
+};
+
+const GRAVITY = -15;
+const DAMPING = 0.98;
+const BOUNCE = 0.7;
+const MOVE_FORCE = 40;
+const JUMP_FORCE = 12;
+const DASH_MULT = 3;
+
+// Orbs
+let orbs = [];
+function spawnOrb() {
+    orbs.push({
+        x: (Math.random() - 0.5) * ARENA.x,
+        y: 2 + Math.random() * 8,
+        z: (Math.random() - 0.5) * ARENA.z,
+        r: 0.8,
+        phase: Math.random() * Math.PI * 2,
+        life: 15
+    });
+}
+
+// Spikes (obstacles)
+let spikes = [];
+function spawnSpike() {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1.5 + Math.random() * 2;
+    spikes.push({
+        x: (Math.random() - 0.5) * ARENA.x,
+        y: 1 + Math.random() * 6,
+        z: (Math.random() - 0.5) * ARENA.z,
+        vx: Math.cos(angle) * speed,
+        vy: 0,
+        vz: Math.sin(angle) * speed,
+        r: 1.0,
+        life: 20
+    });
+}
+
+let orbTimer = 0;
+let spikeTimer = 0;
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'menu' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+    if (gameState === 'gameover' && (e.code === 'Space' || e.code === 'Enter')) restart();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function startGame() {
+    initAudio();
+    gameState = 'playing';
+    overlay.classList.remove('active');
+    hud.style.display = '';
+    livesDisplay.style.display = '';
+    score = 0;
+    lives = 3;
+    combo = 1;
+    comboTimer = 0;
+    player.x = 0; player.y = 5; player.z = 0;
+    player.vx = 0; player.vy = 0; player.vz = 0;
+    orbs = [];
+    spikes = [];
+    particles = [];
+    orbTimer = 0;
+    spikeTimer = 2;
+    playSound(880, 0.3, 'sine', 0.2);
+}
+
+function restart() { startGame(); }
+
+startBtn.addEventListener('click', startGame);
+
+function addParticle(x, y, z, color) {
+    for (let i = 0; i < 8; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const b = Math.random() * Math.PI - Math.PI/2;
+        const sp = 3 + Math.random() * 5;
+        particles.push({
+            x, y, z,
+            vx: Math.cos(a) * Math.cos(b) * sp,
+            vy: Math.sin(b) * sp + 5,
+            vz: Math.sin(a) * Math.cos(b) * sp,
+            life: 1,
+            color
+        });
+    }
+}
+
+function hitWall() {
+    lives--;
+    combo = 1;
+    player.vx *= -0.5;
+    player.vy = 8;
+    player.vz *= -0.5;
+    addParticle(player.x, player.y, player.z, '#f44');
+    playSound(200, 0.3, 'sawtooth', 0.3);
+    if (lives <= 0) {
+        gameState = 'gameover';
+        overlay.classList.add('active');
+        document.querySelector('.title').textContent = 'GAME OVER';
+        document.querySelector('.subtitle').textContent = `FINAL SCORE: ${score}`;
+        document.querySelector('.controls').innerHTML = 'Press SPACE or ENTER to retry';
+        startBtn.textContent = 'RESTART';
+    }
+    updateLives();
+}
+
+function updateLives() {
+    livesDisplay.textContent = 'LIVES: ' + '♥'.repeat(Math.max(0, lives));
+}
+
+// Main loop
+let lastTime = 0;
+function gameLoop(timestamp) {
+    const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+    lastTime = timestamp;
+    time += dt;
+
+    if (gameState === 'playing') update(dt);
+    render();
+    requestAnimationFrame(gameLoop);
+}
+
+function update(dt) {
+    // Combo timer
+    comboTimer -= dt;
+    if (comboTimer <= 0) combo = Math.max(1, combo - 0.5);
+
+    // Input
+    let dash = keys['ShiftLeft'] || keys['ShiftRight'];
+    let force = MOVE_FORCE * (dash ? DASH_MULT : 1);
+
+    if (keys['KeyW'] || keys['ArrowUp']) player.vz -= force * dt;
+    if (keys['KeyS'] || keys['ArrowDown']) player.vz += force * dt;
+    if (keys['KeyA'] || keys['ArrowLeft']) player.vx -= force * dt;
+    if (keys['KeyD'] || keys['ArrowRight']) player.vx += force * dt;
+    if (keys['Space']) player.vy += JUMP_FORCE * dt;
+
+    // Physics
+    player.vy += GRAVITY * dt;
+    player.vx *= DAMPING;
+    player.vz *= DAMPING;
+    player.vy *= 0.995;
+
+    player.x += player.vx * dt;
+    player.y += player.vy * dt;
+    player.z += player.vz * dt;
+
+    // Wall collisions
+    const halfX = ARENA.x / 2 - player.radius;
+    const halfZ = ARENA.z / 2 - player.radius;
+    const floorY = player.radius;
+    const ceilY = ARENA.y - player.radius;
+
+    if (player.x < -halfX) { player.x = -halfX; hitWall(); }
+    if (player.x > halfX) { player.x = halfX; hitWall(); }
+    if (player.z < -halfZ) { player.z = -halfZ; hitWall(); }
+    if (player.z > halfZ) { player.z = halfZ; hitWall(); }
+    if (player.y < floorY) { player.y = floorY; player.vy *= -BOUNCE; }
+    if (player.y > ceilY) { player.y = ceilY; player.vy *= -BOUNCE; }
+
+    // Spawn orbs
+    orbTimer -= dt;
+    if (orbTimer <= 0 && orbs.length < 5) {
+        spawnOrb();
+        orbTimer = 2 + Math.random() * 2;
+    }
+
+    // Spawn spikes
+    spikeTimer -= dt;
+    if (spikeTimer <= 0 && spikes.length < 3 + Math.floor(score / 100)) {
+        spawnSpike();
+        spikeTimer = 3 - Math.min(2, score / 50);
+    }
+
+    // Update orbs
+    for (let i = orbs.length - 1; i >= 0; i--) {
+        const o = orbs[i];
+        o.phase += dt * 3;
+        o.y += Math.sin(o.phase) * 0.5 * dt;
+        o.life -= dt;
+        if (o.life <= 0) { orbs.splice(i, 1); continue; }
+
+        // Collect
+        const dx = player.x - o.x;
+        const dy = player.y - o.y;
+        const dz = player.z - o.z;
+        const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (dist < player.radius + o.r) {
+            score += 10 * combo;
+            comboTimer = 3;
+            combo = Math.min(5, combo + 0.5);
+            addParticle(o.x, o.y, o.z, '#0ff');
+            playSound(600 + combo * 100, 0.2, 'sine', 0.25);
+            orbs.splice(i, 1);
+        }
+    }
+
+    // Update spikes
+    for (let i = spikes.length - 1; i >= 0; i--) {
+        const s = spikes[i];
+        s.x += s.vx * dt;
+        s.z += s.vz * dt;
+        s.y += Math.sin(time * 3 + i) * dt;
+        s.life -= dt;
+
+        // Bounce off walls
+        if (s.x < -ARENA.x/2 || s.x > ARENA.x/2) s.vx *= -1;
+        if (s.z < -ARENA.z/2 || s.z > ARENA.z/2) s.vz *= -1;
+
+        if (s.life <= 0) { spikes.splice(i, 1); continue; }
+
+        // Hit player
+        const dx = player.x - s.x;
+        const dy = player.y - s.y;
+        const dz = player.z - s.z;
+        const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+        if (dist < player.radius + s.r) {
+            spikes.splice(i, 1);
+            hitWall();
+        }
+    }
+
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.z += p.vz * dt;
+        p.vy -= 10 * dt;
+        p.life -= dt * 2;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    // Camera follows player slightly
+    camAngle = Math.sin(time * 0.3) * 0.3;
+    const targetCamX = player.x * 0.3;
+    const targetCamZ = 25 + player.z * 0.4;
+    camera.x += (targetCamX - camera.x) * 2 * dt;
+    camera.z += (targetCamZ - camera.z) * 2 * dt;
+
+    // Update HUD
+    scoreDisplay.textContent = 'SCORE: ' + score;
+    comboDisplay.textContent = 'COMBO: x' + Math.floor(combo);
+}
+
+function render() {
+    ctx.fillStyle = '#0a0a0f';
+    ctx.fillRect(0, 0, W, H);
+
+    // Draw arena floor grid
+    const gridSize = ARENA.x / 2;
+    const gridStep = 5;
+    ctx.globalAlpha = 0.3;
+    for (let i = -gridSize; i <= gridSize; i += gridStep) {
+        draw3DLine(i, 0, -gridSize, i, 0, gridSize, 'rgba(0,255,255,0.3)', 1);
+        draw3DLine(-gridSize, 0, i, gridSize, 0, i, 'rgba(0,255,255,0.3)', 1);
+    }
+
+    // Arena walls (edges)
+    ctx.globalAlpha = 0.6;
+    const h = ARENA.y;
+    // Floor edges
+    draw3DLine(-gridSize, 0, -gridSize, gridSize, 0, -gridSize, '#0ff', 2);
+    draw3DLine(gridSize, 0, -gridSize, gridSize, 0, gridSize, '#0ff', 2);
+    draw3DLine(gridSize, 0, gridSize, -gridSize, 0, gridSize, '#0ff', 2);
+    draw3DLine(-gridSize, 0, gridSize, -gridSize, 0, -gridSize, '#0ff', 2);
+    // Vertical edges
+    draw3DLine(-gridSize, 0, -gridSize, -gridSize, h, -gridSize, 'rgba(0,255,255,0.4)', 1);
+    draw3DLine(gridSize, 0, -gridSize, gridSize, h, -gridSize, 'rgba(0,255,255,0.4)', 1);
+    draw3DLine(gridSize, 0, gridSize, gridSize, h, gridSize, 'rgba(0,255,255,0.4)', 1);
+    draw3DLine(-gridSize, 0, gridSize, -gridSize, h, gridSize, 'rgba(0,255,255,0.4)', 1);
+    // Top edges
+    draw3DLine(-gridSize, h, -gridSize, gridSize, h, -gridSize, 'rgba(255,0,255,0.4)', 1);
+    draw3DLine(gridSize, h, -gridSize, gridSize, h, gridSize, 'rgba(255,0,255,0.4)', 1);
+    draw3DLine(gridSize, h, gridSize, -gridSize, h, gridSize, 'rgba(255,0,255,0.4)', 1);
+    draw3DLine(-gridSize, h, gridSize, -gridSize, h, -gridSize, 'rgba(255,0,255,0.4)', 1);
+
+    ctx.globalAlpha = 1;
+
+    // Draw orbs
+    for (const o of orbs) {
+        const pulse = 1 + Math.sin(time * 5 + o.phase) * 0.2;
+        draw3DSphere(o.x, o.y, o.z, o.r * pulse, '#0ff', true);
+        // Inner glow
+        draw3DSphere(o.x, o.y, o.z, o.r * pulse * 0.5, '#fff', false);
+    }
+
+    // Draw spikes
+    for (const s of spikes) {
+        draw3DSphere(s.x, s.y, s.z, s.r, '#f44', true);
+        // Spike lines
+        for (let a = 0; a < 6; a++) {
+            const ang = (a / 6) * Math.PI * 2 + time * 3;
+            const ex = s.x + Math.cos(ang) * s.r * 1.5;
+            const ey = s.y + Math.sin(ang * 2) * s.r * 0.8;
+            const ez = s.z + Math.sin(ang) * s.r * 1.5;
+            draw3DLine(s.x, s.y, s.z, ex, ey, ez, '#f44', 2);
+        }
+    }
+
+    // Draw particles
+    for (const p of particles) {
+        ctx.globalAlpha = p.life;
+        draw3DSphere(p.x, p.y, p.z, 0.3 * p.life, p.color, true);
+    }
+    ctx.globalAlpha = 1;
+
+    // Draw player
+    const speed = Math.sqrt(player.vx*player.vx + player.vy*player.vy + player.vz*player.vz);
+    const playerColor = speed > 10 ? '#ff0' : '#0f0';
+    draw3DSphere(player.x, player.y, player.z, player.radius, playerColor, true);
+    // Player trail
+    const trailLen = Math.min(speed * 0.5, 8);
+    if (trailLen > 1) {
+        const tx = -player.vx / speed * trailLen;
+        const ty = -player.vy / speed * trailLen;
+        const tz = -player.vz / speed * trailLen;
+        draw3DLine(player.x, player.y, player.z, player.x + tx, player.y + ty, player.z + tz, 'rgba(0,255,0,0.5)', 3);
+    }
+
+    // Shadow on floor
+    const shadowP = project(player.x, 0, player.z);
+    if (shadowP.depth > 0) {
+        ctx.beginPath();
+        ctx.ellipse(shadowP.x, shadowP.y, player.radius * shadowP.scale * 3, player.radius * shadowP.scale * 1, 0, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(0,255,0,0.15)';
+        ctx.fill();
+    }
+
+    // Vignette
+    const grad = ctx.createRadialGradient(W/2, H/2, W*0.3, W/2, H/2, W*0.7);
+    grad.addColorStop(0, 'transparent');
+    grad.addColorStop(1, 'rgba(0,0,0,0.5)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    // Speed lines effect
+    if (speed > 8) {
+        ctx.globalAlpha = Math.min((speed - 8) / 20, 0.3);
+        for (let i = 0; i < 5; i++) {
+            const lx = Math.random() * W;
+            ctx.beginPath();
+            ctx.moveTo(lx, 0);
+            ctx.lineTo(lx, H);
+            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+    }
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
