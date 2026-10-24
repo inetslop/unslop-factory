@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Maze Stealth</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #0a0a1a; }
+canvas { display: block; width: 100vw; height: 100vh; cursor: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+function playTone(freq, dur, type='sine', vol=0.15) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + dur);
+}
+function playAlert() { playTone(880, 0.2, 'square', 0.1); setTimeout(() => playTone(660, 0.3, 'square', 0.1), 150); }
+function playCaught() { playTone(200, 0.5, 'sawtooth', 0.2); }
+function playWin() { playTone(523, 0.2, 'sine', 0.15); setTimeout(() => playTone(659, 0.2, 'sine', 0.15), 150); setTimeout(() => playTone(784, 0.3, 'sine', 0.15), 300); }
+function playFootstep() { playTone(100 + Math.random()*30, 0.05, 'triangle', 0.03); }
+
+// Game state
+const STATE = { START: 0, PLAYING: 1, CAUGHT: 2, WIN: 3 };
+let gameState = STATE.START;
+let level = 0;
+let maxLevel = 4;
+let maze = [];
+let cols = 0, rows = 0;
+let tileSize = 0;
+let player = { x: 0, y: 0, vx: 0, vy: 0, sneak: false };
+let guards = [];
+let exitPos = { x: 0, y: 0 };
+let alarm = false;
+let caughtTimer = 0;
+let winTimer = 0;
+let footstepTimer = 0;
+let particles = [];
+let time = 0;
+
+const keys = {};
+window.addEventListener('keydown', e => { keys[e.code] = true; if (gameState === STATE.START) startGame(); });
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function generateMaze(c, r) {
+  let grid = [];
+  for (let y = 0; y < r; y++) {
+    grid[y] = [];
+    for (let x = 0; x < c; x++) grid[y][x] = 1;
+  }
+  function carve(x, y) {
+    grid[y][x] = 0;
+    const dirs = [[0,-2],[0,2],[-2,0],[2,0]];
+    for (let i = dirs.length-1; i >= 0; i--) {
+      const idx = Math.floor(Math.random() * dirs.length);
+      [dirs[i], dirs[idx]] = [dirs[idx], dirs[i]];
+      const dx = dirs[i][0], dy = dirs[i][1];
+      const nx = x + dx, ny = y + dy;
+      if (nx > 0 && nx < c-1 && ny > 0 && ny < r-1 && grid[ny][nx] === 1) {
+        grid[y+dy/2][x+dx/2] = 0;
+        carve(nx, ny);
+      }
+    }
+  }
+  carve(1, 1);
+  // Add some extra openings for loops (stealth needs alternatives)
+  const extra = Math.floor(c * r * 0.03);
+  for (let i = 0; i < extra; i++) {
+    const x = 1 + Math.floor(Math.random() * (c-2));
+    const y = 1 + Math.floor(Math.random() * (r-2));
+    if (grid[y][x] === 1) {
+      // Only remove wall if it creates a connection
+      let openNeighbors = 0;
+      if (y > 0 && grid[y-1][x] === 0) openNeighbors++;
+      if (y < r-1 && grid[y+1][x] === 0) openNeighbors++;
+      if (x > 0 && grid[y][x-1] === 0) openNeighbors++;
+      if (x < c-1 && grid[y][x+1] === 0) openNeighbors++;
+      if (openNeighbors >= 2) grid[y][x] = 0;
+    }
+  }
+  return grid;
+}
+
+function isWall(gx, gy) {
+  if (gx < 0 || gx >= cols || gy < 0 || gy >= rows) return true;
+  return maze[gy][gx] === 1;
+}
+
+function hasLOS(fx1, fy1, fx2, fy2) {
+  // DDA raycast between two points in grid space
+  const x0 = Math.floor(fx1), y0 = Math.floor(fy1);
+  const x1 = Math.floor(fx2), y1 = Math.floor(fy2);
+  const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let dxt = (x1 - x0) * 2.5, dyt = (y1 - y0) * 2.5;
+  let err = dxt - dyt, x = x0, y = y0;
+  while (x !== x1 || y !== y1) {
+    if (isWall(x, y) && !(x === Math.floor(fx1) && y === Math.floor(fy1))) return false;
+    if (-2*dxt < err) { dyt -= dxt; x += sx; } else { dxt -= dyt; y += sy; }
+    err += dxt + dyt;
+  }
+  return true;
+}
+
+function canSee(gx, gy, px, py) {
+  const gx1 = gx + 0.5, gy1 = gy + 0.5;
+  const steps = 20;
+  for (let i = 1; i < steps; i++) {
+    const t = i / steps;
+    const cx = gx1 + (px - gx1) * t;
+    const cy = gy1 + (py - gy1) * t;
+    if (isWall(Math.floor(cx), Math.floor(cy))) return false;
+  }
+  return true;
+}
+
+function findPath(sx, sy, ex, ey) {
+  // BFS on grid
+  const visited = Array.from({length: rows}, () => Array(cols).fill(false));
+  const queue = [[sx, sy]];
+  const parent = {};
+  visited[sy][sx] = true;
+  while (queue.length > 0) {
+    const [cx, cy] = queue.shift();
+    if (cx === ex && cy === ey) {
+      // Reconstruct path
+      let path = [];
+      let cur = [ex, ey];
+      while (parent[cur[1]+','+cur[0]] !== undefined || (cur[0]===ex&&cur[1]===ey)) {
+        path.unshift([cur[0], cur[1]]);
+        const key = cur[1]+','+cur[0];
+        if (!parent[key]) break;
+        cur = parent[key];
+      }
+      return path;
+    }
+    for (const [dx, dy] of [[0,-1],[0,1],[-1,0],[1,0]]) {
+      const nx = cx+dx, ny = cy+dy;
+      if (!visited[ny][nx] && !isWall(nx, ny)) {
+        visited[ny][nx] = true;
+        queue.push([nx, ny]);
+        parent[ny+','+nx] = [cx, cy];
+      }
+    }
+  }
+  return null;
+}
+
+function loadLevel(lvl) {
+  const sizes = [[9,7],[13,9],[15,11],[19,13],[21,15]];
+  cols = sizes[lvl][0]; rows = sizes[lvl][1];
+  tileSize = Math.min(W / (cols + 2), H / (rows + 2));
+  maze = generateMaze(cols, rows);
+  
+  // Find open cells
+  const openCells = [];
+  for (let y = 0; y < rows; y++)
+    for (let x = 0; x < cols; x++)
+      if (!isWall(x,y)) openCells.push([x,y]);
+  
+  // Player start: top-left area
+  player.x = 1; player.y = 1;
+  while (isWall(Math.floor(player.x), Math.floor(player.y))) {
+    player.x = 1 + Math.floor(Math.random()*(cols-2));
+    player.y = 1 + Math.floor(Math.random()*(rows-2));
+  }
+  
+  // Exit: far corner
+  exitPos.x = cols - 2; exitPos.y = rows - 2;
+  while (isWall(exitPos.x, exitPos.y)) {
+    exitPos.x = 1 + Math.floor(Math.random()*(cols-2));
+    exitPos.y = 1 + Math.floor(Math.random()*(rows-2));
+  }
+  
+  // Guards
+  const guardCount = 1 + lvl;
+  guards = [];
+  for (let i = 0; i < guardCount; i++) {
+    let gx, gy;
+    do {
+      gx = 1 + Math.floor(Math.random()*(cols-2));
+      gy = 1 + Math.floor(Math.random()*(rows-2));
+    } while (isWall(gx,gy) || (Math.abs(gx-player.x)+Math.abs(gy-player.y) < 3));
+    
+    // Find patrol path
+    const path = findPath(gx, gy, exitPos.x, exitPos.y);
+    let patrolDir = 1;
+    let patrolTarget = {x: gx, y: gy};
+    if (path && path.length > 2) {
+      patrolTarget = { x: path[Math.floor(path.length/2)][0], y: path[Math.floor(path.length/2)][1] };
+    }
+    
+    guards.push({
+      x: gx + 0.5, y: gy + 0.5,
+      dirX: Math.random() < 0.5 ? 1 : -1,
+      dirY: 0,
+      state: 'patrol', // patrol, alert, chase
+      alertTimer: 0,
+      targetX: player.x, targetY: player.y,
+      patrolPath: path || [],
+      patrolIdx: 0,
+      speed: 1.2 + lvl * 0.3,
+      visionRange: 2.5 + lvl * 0.3,
+      visionAngle: Math.PI / 4,
+      angle: Math.random() * Math.PI * 2,
+      patrolTarget: patrolTarget
+    });
+  }
+  
+  alarm = false;
+  particles = [];
+}
+
+function startGame() {
+  initAudio();
+  level = 0;
+  gameState = STATE.PLAYING;
+  loadLevel(0);
+}
+
+function update(dt) {
+  time += dt;
+  if (gameState !== STATE.PLAYING) return;
+  
+  // Player movement
+  const speed = player.sneak ? 1.5 : 3.0;
+  let mx = 0, my = 0;
+  if (keys['KeyW'] || keys['ArrowUp']) my -= 1;
+  if (keys['KeyS'] || keys['ArrowDown']) my += 1;
+  if (keys['KeyA'] || keys['ArrowLeft']) mx -= 1;
+  if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+  
+  player.sneak = !!keys['ShiftLeft'] || !!keys['ShiftRight'];
+  
+  if (mx !== 0 && my !== 0) { mx *= 0.7071; my *= 0.7071; }
+  
+  const newX = player.x + mx * speed * dt;
+  const newY = player.y + my * speed * dt;
+  
+  // Collision check
+  const pr = 0.3;
+  if (!isWall(Math.floor(newX - pr), Math.floor(player.y)) && !isWall(Math.floor(newX + pr), Math.floor(player.y))) {
+    if (!isWall(Math.floor(newX), Math.floor(player.y - pr)) && !isWall(Math.floor(newX), Math.floor(player.y + pr))) {
+      player.x = newX;
+    }
+  }
+  if (!isWall(Math.floor(player.x), Math.floor(newY - pr)) && !isWall(Math.floor(player.x), Math.floor(newY + pr))) {
+    if (!isWall(Math.floor(player.x - pr), Math.floor(newY)) && !isWall(Math.floor(player.x + pr), Math.floor(newY))) {
+      player.y = newY;
+    }
+  }
+  
+  // Footsteps
+  if ((mx !== 0 || my !== 0) && (time * (player.sneak ? 2 : 4)) % 1 > 0.95) {
+    playFootstep();
+  }
+  
+  // Check exit
+  if (Math.floor(player.x) === exitPos.x && Math.floor(player.y) === exitPos.y) {
+    level++;
+    if (level > maxLevel) {
+      gameState = STATE.WIN;
+      winTimer = 0;
+      playWin();
+    } else {
+      loadLevel(level);
+      playTone(440, 0.15, 'sine', 0.1);
+    }
+    return;
+  }
+  
+  // Guards AI
+  const detectRange = player.sneak ? 0.6 : 1.0;
+  
+  for (let g of guards) {
+    const dx = player.x - g.x;
+    const dy = player.y - g.y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    const angleToPlayer = Math.atan2(dy, dx);
+    
+    let angDiff = Math.abs(angleToPlayer - g.angle);
+    if (angDiff > Math.PI) angDiff = 2*Math.PI - angDiff;
+    
+    const inCone = angDiff < g.visionAngle && dist < g.visionRange * detectRange;
+    const seesPlayer = inCone && canSee(Math.floor(g.x), Math.floor(g.y), player.x, player.y);
+    
+    if (seesPlayer) {
+      if (g.state !== 'chase') {
+        g.state = 'alert';
+        g.alertTimer = 0;
+        playAlert();
+      }
+      g.targetX = player.x;
+      g.targetY = player.y;
+    } else if (g.state === 'patrol') {
+      // Patrol
+      const spd = g.speed * 0.5;
+      if (Math.abs(g.x - g.patrolTarget.x) < 0.3 && Math.abs(g.y - g.patrolTarget.y) < 0.3) {
+        // Pick new target
+        let nx, ny;
+        do {
+          const dx2 = (Math.random()-0.5)*4|0;
+          const dy2 = (Math.random()-0.5)*4|0;
+          nx = Math.floor(g.x) + dx2;
+          ny = Math.floor(g.y) + dy2;
+        } while (isWall(nx,ny));
+        g.patrolTarget = {x: nx, y: ny};
+      }
+      const pdx = g.patrolTarget.x - g.x;
+      const pdy = g.patrolTarget.y - g.y;
+      const pd = Math.sqrt(pdx*pdx+pdy*pdy);
+      if (pd > 0.1) {
+        g.angle = Math.atan2(pdy, pdx);
+        g.x += (pdx/pd) * spd * dt;
+        g.y += (pdy/pd) * spd * dt;
+      } else {
+        g.angle += dt * 2;
+      }
+    } else if (g.state === 'alert') {
+      g.alertTimer += dt;
+      g.angle = angleToPlayer;
+      if (g.alertTimer > 0.5) g.state = 'chase';
+    } else if (g.state === 'chase') {
+      // Chase toward player
+      const cdx = player.x - g.x;
+      const cdy = player.y - g.y;
+      const cd = Math.sqrt(cdx*cdx+cdy*cdy);
+      if (cd > 0.1) {
+        g.angle = Math.atan2(cdy, cdx);
+        g.x += (cdx/cd) * g.speed * dt;
+        g.y += (cdy/cd) * g.speed * dt;
+      } else {
+        // Caught!
+        gameState = STATE.CAUGHT;
+        caughtTimer = 0;
+        playCaught();
+      }
+    }
+    
+    // Guard collision with walls
+    const gr = 0.3;
+    if (isWall(Math.floor(g.x - gr), Math.floor(g.y)) || isWall(Math.floor(g.x + gr), Math.floor(g.y))) {
+      g.x -= (g.x - Math.floor(g.x) + 0.5) * 0.1;
+    }
+    if (isWall(Math.floor(g.x), Math.floor(g.y - gr)) || isWall(Math.floor(g.x), Math.floor(g.y + gr))) {
+      g.y -= (g.y - Math.floor(g.y) + 0.5) * 0.1;
+    }
+    
+    // Alarm: if any guard chases, all become alert
+    if (g.state === 'chase' && !alarm) {
+      alarm = true;
+    }
+    if (alarm && g.state === 'patrol') {
+      g.state = 'alert';
+      g.alertTimer = 0.3;
+    }
+    
+    // Check catch distance
+    if (dist < 0.4) {
+      gameState = STATE.CAUGHT;
+      caughtTimer = 0;
+      playCaught();
+    }
+  }
+  
+  // Particles
+  for (let p of particles) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.life -= dt;
+  }
+  particles = particles.filter(p => p.life > 0);
+}
+
+function drawMaze() {
+  const ox = (W - cols * tileSize) / 2;
+  const oy = (H - rows * tileSize) / 2;
+  
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      if (maze[y][x] === 1) {
+        ctx.fillStyle = '#2a2a4a';
+        ctx.fillRect(ox + x*tileSize, oy + y*tileSize, tileSize, tileSize);
+        // Wall highlight
+        ctx.fillStyle = '#3a3a5a';
+        ctx.fillRect(ox + x*tileSize + 1, oy + y*tileSize + 1, tileSize - 2, 3);
+      } else {
+        ctx.fillStyle = '#141428';
+        ctx.fillRect(ox + x*tileSize, oy + y*tileSize, tileSize, tileSize);
+      }
+    }
+  }
+  
+  // Exit
+  const ex = ox + exitPos.x * tileSize;
+  const ey = oy + exitPos.y * tileSize;
+  ctx.fillStyle = `hsl(${120 + Math.sin(time*3)*20}, 70%, ${40 + Math.sin(time*5)*15}%)`;
+  ctx.fillRect(ex + 2, ey + 2, tileSize - 4, tileSize - 4);
+  ctx.strokeStyle = '#0f0';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(ex + 4, ey + 4, tileSize - 8, tileSize - 8);
+}
+
+function drawVision(g) {
+  const ox = (W - cols * tileSize) / 2;
+  const oy = (H - rows * tileSize) / 2;
+  
+  const gx = ox + g.x * tileSize;
+  const gy = oy + g.y * tileSize;
+  const range = g.visionRange * tileSize;
+  const startA = g.angle - g.visionAngle;
+  const endA = g.angle + g.visionAngle;
+  
+  let color;
+  if (g.state === 'chase') color = 'rgba(255, 50, 50, 0.15)';
+  else if (g.state === 'alert') color = 'rgba(255, 200, 50, 0.15)';
+  else color = 'rgba(255, 255, 150, 0.08)';
+  
+  ctx.beginPath();
+  ctx.moveTo(gx, gy);
+  
+  const rays = 30;
+  for (let i = 0; i <= rays; i++) {
+    const a = startA + (endA - startA) * (i / rays);
+    let maxDist = range;
+    // Check walls along ray
+    for (let d = 1; d < range; d += tileSize * 0.25) {
+      const wx = g.x + Math.cos(a) * d / tileSize;
+      const wy = g.y + Math.sin(a) * d / tileSize;
+      if (isWall(Math.floor(wx), Math.floor(wy))) {
+        maxDist = d;
+        break;
+      }
+    }
+    ctx.lineTo(gx + Math.cos(a) * maxDist, gy + Math.sin(a) * maxDist);
+  }
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+function drawGuard(g) {
+  const ox = (W - cols * tileSize) / 2;
+  const oy = (H - rows * tileSize) / 2;
+  const gx = ox + g.x * tileSize;
+  const gy = oy + g.y * tileSize;
+  
+  let color;
+  if (g.state === 'chase') color = '#ff3333';
+  else if (g.state === 'alert') color = '#ffaa00';
+  else color = '#ffcc44';
+  
+  ctx.beginPath();
+  ctx.arc(gx, gy, tileSize * 0.3, 0, Math.PI*2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  
+  // Direction indicator
+  ctx.beginPath();
+  ctx.moveTo(gx, gy);
+  ctx.lineTo(gx + Math.cos(g.angle) * tileSize*0.4, gy + Math.sin(g.angle) * tileSize*0.4);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  
+  // Alert exclamation
+  if (g.state === 'alert' || g.state === 'chase') {
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${tileSize*0.4}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('!', gx, gy - tileSize*0.4);
+  }
+}
+
+function drawPlayer() {
+  const ox = (W - cols * tileSize) / 2;
+  const oy = (H - rows * tileSize) / 2;
+  const px = ox + player.x * tileSize;
+  const py = oy + player.y * tileSize;
+  
+  ctx.beginPath();
+  ctx.arc(px, py, tileSize * 0.25, 0, Math.PI*2);
+  ctx.fillStyle = player.sneak ? '#44ff88' : '#66ccff';
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  
+  if (player.sneak) {
+    ctx.globalAlpha = 0.3 + Math.sin(time*4)*0.2;
+    ctx.beginPath();
+    ctx.arc(px, py, tileSize * 0.35, 0, Math.PI*2);
+    ctx.strokeStyle = '#44ff88';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawUI() {
+  // Level indicator
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(10, 10, 200, 50);
+  ctx.fillStyle = '#fff';
+  ctx.font = '14px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`LEVEL ${level + 1} / ${maxLevel + 1}`, 20, 30);
+  ctx.fillText(alarm ? '⚠ ALARM!' : 'Stealth Active', 20, 48);
+  if (alarm) {
+    ctx.fillStyle = `rgba(255,0,0,${0.3 + Math.sin(time*10)*0.2})`;
+    ctx.fillRect(10, 10, 200, 50);
+  }
+}
+
+function drawStartScreen() {
+  ctx.fillStyle = '#0a0a1a';
+  ctx.fillRect(0, 0, W, H);
+  
+  ctx.fillStyle = '#fff';
+  ctx.font = `bold ${Math.min(W*0.06, 48)}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText('MAZE STEALTH', W/2, H*0.3);
+  
+  ctx.font = `${Math.min(W*0.025, 18)}px monospace`;
+  ctx.fillStyle = '#aaa';
+  ctx.fillText('Navigate the maze to reach the exit.', W/2, H*0.42);
+  ctx.fillText('Avoid the guards\' vision cones!', W/2, H*0.47);
+  ctx.fillText('', W/2, H*0.52);
+  ctx.fillStyle = '#6cf';
+  ctx.fillText('WASD / Arrows - Move', W/2, H*0.58);
+  ctx.fillText('SHIFT - Sneak (slower, harder to spot)', W/2, H*0.63);
+  ctx.fillText('', W/2, H*0.68);
+  
+  ctx.fillStyle = `rgba(255,255,255,${0.5 + Math.sin(time*3)*0.4})`;
+  ctx.font = `${Math.min(W*0.03, 24)}px monospace`;
+  ctx.fillText('PRESS ANY KEY TO START', W/2, H*0.8);
+}
+
+function drawCaught() {
+  caughtTimer += 1/60;
+  ctx.fillStyle = `rgba(200, 0, 0, ${Math.min(caughtTimer * 0.5, 0.7)})`;
+  ctx.fillRect(0, 0, W, H);
+  
+  ctx.fillStyle = '#fff';
+  ctx.font = `bold ${Math.min(W*0.05, 40)}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText('CAUGHT!', W/2, H*0.4);
+  
+  if (caughtTimer > 1) {
+    ctx.font = `${Math.min(W*0.03, 22)}px monospace`;
+    ctx.fillStyle = `rgba(255,255,255,${0.5 + Math.sin(time*4)*0.4})`;
+    ctx.fillText('Press R to retry level', W/2, H*0.55);
+  }
+  
+  if (keys['KeyR'] && caughtTimer > 1) {
+    loadLevel(level);
+    gameState = STATE.PLAYING;
+  }
+}
+
+function drawWin() {
+  winTimer += 1/60;
+  ctx.fillStyle = `rgba(0, 50, 0, ${Math.min(winTimer * 0.5, 0.8)})`;
+  ctx.fillRect(0, 0, W, H);
+  
+  ctx.fillStyle = '#4f4';
+  ctx.font = `bold ${Math.min(W*0.06, 50)}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText('MASTERS OF STEALTH!', W/2, H*0.35);
+  
+  if (winTimer > 1) {
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.min(W*0.03, 24)}px monospace`;
+    ctx.fillText('You navigated all mazes undetected.', W/2, H*0.5);
+    ctx.fillStyle = `rgba(255,255,255,${0.5 + Math.sin(time*4)*0.4})`;
+    ctx.fillText('Press R to play again', W/2, H*0.65);
+    
+    if (keys['KeyR']) {
+      level = 0;
+      gameState = STATE.PLAYING;
+      loadLevel(0);
+    }
+  }
+}
+
+function render() {
+  ctx.clearRect(0, 0, W, H);
+  
+  if (gameState === STATE.START) {
+    drawStartScreen();
+    return;
+  }
+  
+  // Background
+  ctx.fillStyle = '#0a0a1a';
+  ctx.fillRect(0, 0, W, H);
+  
+  drawMaze();
+  
+  // Vision cones (under entities)
+  for (let g of guards) drawVision(g);
+  
+  // Guards
+  for (let g of guards) drawGuard(g);
+  
+  // Player
+  drawPlayer();
+  
+  // UI
+  drawUI();
+  
+  if (gameState === STATE.CAUGHT) drawCaught();
+  if (gameState === STATE.WIN) drawWin();
+}
+
+let lastTime = 0;
+function gameLoop(ts) {
+  const dt = Math.min((ts - lastTime) / 1000, 0.05);
+  lastTime = ts;
+  
+  update(dt);
+  render();
+  
+  requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
