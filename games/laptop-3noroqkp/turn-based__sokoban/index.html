@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sokoban</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#0f0f1a;font-family:'Segoe UI',system-ui,sans-serif}
+canvas{display:block;width:100%;height:100%}
+.overlay{position:absolute;top:0;left:0;width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(15,15,26,0.92);transition:opacity .4s;z-index:10}
+.overlay.hidden{opacity:0;pointer-events:none}
+.title{font-size:min(6vw,3rem);color:#ffd700;text-shadow:0 0 20px rgba(255,215,0,.5);margin-bottom:1rem;font-weight:700;letter-spacing:.1em}
+.subtitle{font-size:min(2.5vw,1.2rem);color:#b0bec5;margin-bottom:2rem;text-align:center;line-height:1.6}
+.btn{background:linear-gradient(135deg,#ffd700,#ff8f00);border:none;padding:14px 40px;font-size:min(2vw,1.1rem);font-weight:700;color:#1a1a2e;border-radius:8px;cursor:pointer;margin:8px;transition:transform .15s,box-shadow .15s;letter-spacing:.05em}
+.btn:hover{transform:scale(1.05);box-shadow:0 0 20px rgba(255,215,0,.4)}
+.btn.secondary{background:linear-gradient(135deg,#42a5f5,#1565c0);color:#fff}
+.stats{font-size:min(2vw,1rem);color:#90a4ae;margin-top:1.5rem;text-align:center}
+.badge{display:inline-block;background:rgba(66,165,245,.15);border:1px solid rgba(66,165,245,.3);padding:4px 12px;border-radius:20px;margin:4px;font-size:min(1.8vw,0.9rem);color:#90caf9}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="overlay" id="startScreen">
+<h1 class="title">SOKOBAN</h1>
+<p class="subtitle">Push all crates onto the glowing targets.<br>Use <span class="badge">↑↓←→</span><span class="badge">WASD</span> to move<br><span class="badge">U</span> Undo &nbsp; <span class="badge">R</span> Restart Level</p>
+<button class="btn" id="startBtn">START GAME</button>
+<p class="stats">5 levels · Turn-based puzzle</p>
+</div>
+<div class="overlay hidden" id="levelScreen">
+<h1 class="title" style="font-size:min(4vw,2rem)">LEVEL COMPLETE!</h1>
+<p class="subtitle" id="levelStats"></p>
+<button class="btn" id="nextBtn">NEXT LEVEL</button>
+</div>
+<div class="overlay hidden" id="winScreen">
+<h1 class="title">🎉 YOU WIN! 🎉</h1>
+<p class="subtitle" id="finalStats"></p>
+<button class="btn" id="restartBtn">PLAY AGAIN</button>
+</div>
+<script>
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+let W,H;
+
+function resize(){W=canvas.width=window.innerWidth;H=canvas.height=window.innerHeight;render();}
+window.addEventListener('resize',resize);
+
+const LEVELS=[
+["#######","#     #","# $ . #","#@    #","#######"],
+["########","#      #","#  ##  #","# $    #","# @ .  #","########"],
+["#########","#       #","# $ .   #","#   @   #","# $ .   #","#       #","#########"],
+["#########","#       #","#  $    #","#  @ .  #","#       #","#   ### #","#########"],
+["##########","#        #","# $ $ $  #","#   @    #","# . . .  #","#        #","#   ###  #","##########"]
+];
+
+let state='start';
+let curLevel=0;
+let moves=0;
+let totalMoves=0;
+let history=[];
+let player={r:0,c:0};
+let boxes=[];
+let targets=[];
+let walls=[];
+let floors=[];
+let gridW=0,gridH=0;
+let animProgress=0;
+let animFrom={r:0,c:0};
+let animTo={r:0,c:0};
+let animBoxFrom=null;
+let animBoxTo=null;
+let particles=[];
+let lastTime=0;
+
+// Audio
+let audioCtx=null;
+function initAudio(){if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();}
+function playSound(type){
+if(!audioCtx)return;
+const o=audioCtx.createOscillator();
+const g=audioCtx.createGain();
+o.connect(g);g.connect(audioCtx.destination);
+if(type==='move'){o.type='sine';o.frequency.value=220;g.gain.setValueAtTime(.1,audioCtx.currentTime);g.gain.exponentialRampToValueAtTime(.001,audioCtx.currentTime+.1);o.start();o.stop(audioCtx.currentTime+.1);}
+else if(type==='push'){o.type='triangle';o.frequency.value=180;g.gain.setValueAtTime(.12,audioCtx.currentTime);g.gain.exponentialRampToValueAtTime(.001,audioCtx.currentTime+.15);o.start();o.stop(audioCtx.currentTime+.15);}
+else if(type==='win'){const notes=[262,330,392,523];notes.forEach((f,i)=>{const o2=audioCtx.createOscillator();const g2=audioCtx.createGain();o2.connect(g2);g2.connect(audioCtx.destination);o2.type='sine';o2.frequency.value=f;g2.gain.setValueAtTime(.1,audioCtx.currentTime+i*.12);g2.gain.exponentialRampToValueAtTime(.001,audioCtx.currentTime+i*.12+.3);o2.start(audioCtx.currentTime+i*.12);o2.stop(audioCtx.currentTime+i*.12+.3);});return;}
+else if(type==='error'){o.type='sawtooth';o.frequency.value=100;g.gain.setValueAtTime(.08,audioCtx.currentTime);g.gain.exponentialRampToValueAtTime(.001,audioCtx.currentTime+.15);o.start();o.stop(audioCtx.currentTime+.15);}
+}
+
+function loadLevel(n){
+const lv=LEVELS[n];
+gridH=lv.length;gridW=lv[0].length;
+player={r:0,c:0};boxes=[];targets=[];walls=[];floors=[];
+history=[];moves=0;animProgress=1;
+for(let r=0;r<gridH;r++){
+for(let c=0;c<gridW;c++){
+const ch=lv[r][c];
+if(ch==='#')walls.push({r,c});
+if(ch===' '||ch==='@'||ch==='$'||ch==='.'||ch==='*'||ch==='+')floors.push({r,c});
+if(ch==='@')player={r,c};
+if(ch==='$'||ch==='*')boxes.push({r,c});
+if(ch==='.'||ch==='*'||ch==='+')targets.push({r,c});
+}
+}
+}
+
+function isWall(r,c){return r<0||c<0||r>=gridH||c>=gridW||walls.some(w=>w.r===r&&w.c===c);}
+function boxAt(r,c){return boxes.findIndex(b=>b.r===r&&b.c===c);}
+function targetAt(r,c){return targets.some(t=>t.r===r&&t.c===c);}
+
+function move(dr,dc){
+if(state!=='playing'||animProgress<1)return;
+const nr=player.r+dr,nc=player.c+dc;
+if(isWall(nr,nc)){playSound('error');return;}
+let boxIdx=boxAt(nr,nc);
+let pushing=false;
+if(boxIdx>=0){
+const br=boxes[boxIdx].r,bc=boxes[boxIdx].c;
+const tr=br+dr,tc=bc+dc;
+if(isWall(tr,tc)||boxAt(tr,tc)>=0){playSound('error');return;}
+pushing=true;
+}
+// Save history
+history.push({player:{...player},boxes:boxes.map(b=>({...b}))});
+// Animate
+animFrom={...player};
+animTo={r:nr,c:nc};
+if(pushing){
+animBoxFrom={...boxes[boxIdx]};
+animBoxTo={r:boxes[boxIdx].r+dr,c:boxes[boxIdx].c+dc};
+}
+player={r:nr,c:nc};
+moves++;totalMoves++;
+if(pushing){
+boxes[boxIdx]={r:boxes[boxIdx].r+dr,c:boxes[boxIdx].c+dc};
+playSound('push');
+}else{
+playSound('move');
+}
+animProgress=0;
+// Check win
+const allOnTarget=boxes.every(b=>targetAt(b.r,b.c));
+if(allOnTarget){
+setTimeout(()=>{
+state='levelComplete';
+document.getElementById('levelStats').textContent=`Level ${curLevel+1} solved in ${moves} moves!`;
+document.getElementById('levelScreen').classList.remove('hidden');
+playSound('win');
+addParticles();
+},300);
+}
+}
+
+function undo(){
+if(state!=='playing'||history.length===0||animProgress<1)return;
+const prev=history.pop();
+animFrom={...player};
+animTo={...prev.player};
+player={...prev.player};
+boxes=prev.boxes.map(b=>({...b}));
+moves++;totalMoves++;
+animProgress=0;
+playSound('move');
+}
+
+function addParticles(){
+for(let i=0;i<30;i++){
+particles.push({x:W/2,y:H/2,vx:(Math.random()-.5)*8,vy:(Math.random()-.5)*8-2,life:1,color:`hsl(${Math.random()*60+40},100%,60%)`});
+}
+}
+
+function render(){
+ctx.fillStyle='#0f0f1a';
+ctx.fillRect(0,0,W,H);
+if(state==='start')return;
+// Calculate tile size
+const pad=20;
+const availW=W-pad*2,availH=H-pad*2-50;
+const tile=Math.min(Math.floor(availW/gridW),Math.floor(availH/gridH));
+const offX=(W-gridW*tile)/2;
+const offY=(H-gridH*tile)/2+25;
+
+// Draw floors
+floors.forEach(f=>{
+ctx.fillStyle='#1e1e30';
+ctx.fillRect(offX+f.c*tile,offY+f.r*tile,tile,tile);
+ctx.strokeStyle='rgba(255,255,255,.04)';
+ctx.strokeRect(offX+f.c*tile+.5,offY+f.r*tile+.5,tile-1,tile-1);
+});
+
+// Draw targets
+const pulse=Math.sin(Date.now()/500)*0.3+0.7;
+targets.forEach(t=>{
+const cx=offX+t.c*tile+tile/2,cy=offY+t.r*tile+tile/2;
+ctx.beginPath();
+ctx.arc(cx,cy,tile*.2*pulse,0,Math.PI*2);
+ctx.fillStyle=`rgba(0,229,255,${.3+pulse*.3})`;
+ctx.fill();
+ctx.beginPath();
+ctx.arc(cx,cy,tile*.12,0,Math.PI*2);
+ctx.fillStyle=`rgba(0,229,255,${.5+pulse*.3})`;
+ctx.fill();
+});
+
+// Draw walls
+walls.forEach(w=>{
+const x=offX+w.c*tile,y=offY+w.r*tile;
+ctx.fillStyle='#2d2d44';
+ctx.fillRect(x,y,tile,tile);
+ctx.fillStyle='#3a3a5c';
+ctx.fillRect(x+2,y+2,tile-4,tile-4);
+ctx.fillStyle='rgba(255,255,255,.05)';
+ctx.fillRect(x+2,y+2,tile-4,3);
+});
+
+// Draw boxes with animation
+let boxAnimPos=null;
+if(animProgress<1&&animBoxFrom){
+boxAnimPos={
+fromR:animBoxFrom.r,fromC:animBoxFrom.c,
+toR:animBoxTo.r,toC:animBoxTo.c
+};
+}
+boxes.forEach((b,i)=>{
+let br=b.r,bc=b.c;
+if(animProgress<1&&boxAnimPos&&(b.r===animBoxTo.r&&b.c===animBoxTo.c)){
+br=boxAnimPos.fromR+(boxAnimPos.toR-boxAnimPos.fromR)*animProgress;
+bc=boxAnimPos.fromC+(boxAnimPos.toC-boxAnimPos.fromC)*animProgress;
+}
+const x=offX+bc*tile,y=offY+br*tile;
+const onTarget=targetAt(b.r,b.c);
+ctx.fillStyle=onTarget?'#2e7d32':'#b8860b';
+ctx.fillRect(x+3,y+3,tile-6,tile-6);
+ctx.fillStyle=onTarget?'#4caf50':'#ffd700';
+ctx.fillRect(x+5,y+5,tile-10,tile-10);
+ctx.strokeStyle=onTarget?'#81c784':'#fff8e1';
+ctx.lineWidth=2;
+ctx.strokeRect(x+6,y+6,tile-12,tile-12);
+if(onTarget){
+ctx.fillStyle='rgba(76,175,80,.3)';
+ctx.fillRect(x+2,y+2,tile-4,tile-4);
+}
+});
+
+// Draw player with animation
+let pr=player.r,pc=player.c;
+if(animProgress<1){
+pr=animFrom.r+(animTo.r-animFrom.r)*animProgress;
+pc=animFrom.c+(animTo.c-animFrom.c)*animProgress;
+}
+const px=offX+pc*tile+tile/2,py=offY+pr*tile+tile/2;
+ctx.beginPath();
+ctx.arc(px,py,tile*.35,0,Math.PI*2);
+ctx.fillStyle='#42a5f5';
+ctx.fill();
+ctx.beginPath();
+ctx.arc(px,py,tile*.28,0,Math.PI*2);
+ctx.fillStyle='#64b5f6';
+ctx.fill();
+// Eyes
+const eyeOff=tile*.1;
+ctx.fillStyle='#fff';
+ctx.beginPath();ctx.arc(px-eyeOff*.5,py-tile*.08,tile*.07,0,Math.PI*2);ctx.fill();
+ctx.beginPath();ctx.arc(px+eyeOff*.5,py-tile*.08,tile*.07,0,Math.PI*2);ctx.fill();
+ctx.fillStyle='#1a237e';
+ctx.beginPath();ctx.arc(px-eyeOff*.4,py-tile*.06,tile*.04,0,Math.PI*2);ctx.fill();
+ctx.beginPath();ctx.arc(px+eyeOff*.4,py-tile*.06,tile*.04,0,Math.PI*2);ctx.fill();
+
+// Particles
+particles.forEach(p=>{
+ctx.globalAlpha=p.life;
+ctx.fillStyle=p.color;
+ctx.fillRect(p.x-3,p.y-3,6,6);
+});
+ctx.globalAlpha=1;
+
+// HUD
+ctx.fillStyle='rgba(255,255,255,.7)';
+ctx.font=`${Math.min(18,W*.02)}px 'Segoe UI',sans-serif`;
+ctx.textAlign='left';
+ctx.fillText(`Level ${curLevel+1}/5`,15,H-15);
+ctx.textAlign='right';
+const boxCount=boxes.filter(b=>targetAt(b.r,b.c)).length;
+ctx.fillText(`Crate: ${boxCount}/${boxes.length}  |  Moves: ${moves}`,W-15,H-15);
+ctx.textAlign='center';
+ctx.fillStyle='rgba(255,255,255,.3)';
+ctx.fillText('U=Undo  R=Restart',W/2,H-15);
+}
+
+function gameLoop(t){
+const dt=(t-lastTime)/1000;lastTime=t;
+if(animProgress<1)animProgress=Math.min(1,animProgress+dt*8);
+particles.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.vy+=.2;p.life-=dt*1.5;});
+particles=particles.filter(p=>p.life>0);
+render();
+requestAnimationFrame(gameLoop);
+}
+
+// Input
+window.addEventListener('keydown',e=>{
+if(state==='start')return;
+initAudio();
+const k=e.key.toLowerCase();
+if(k==='u'){undo();e.preventDefault();}
+else if(k==='r'){loadLevel(curLevel);e.preventDefault();}
+else if(state==='playing'){
+if(k==='arrowup'||k==='w')move(-1,0);
+else if(k==='arrowdown'||k==='s')move(1,0);
+else if(k==='arrowleft'||k==='a')move(0,-1);
+else if(k==='arrowright'||k==='d')move(0,1);
+e.preventDefault();
+}
+});
+
+// Buttons
+document.getElementById('startBtn').addEventListener('click',()=>{
+initAudio();
+state='playing';
+curLevel=0;totalMoves=0;
+loadLevel(0);
+document.getElementById('startScreen').classList.add('hidden');
+playSound('move');
+});
+document.getElementById('nextBtn').addEventListener('click',()=>{
+curLevel++;
+if(curLevel>=LEVELS.length){
+state='gameComplete';
+document.getElementById('finalStats').textContent=`All 5 levels completed in ${totalMoves} total moves!`;
+document.getElementById('levelScreen').classList.add('hidden');
+document.getElementById('winScreen').classList.remove('hidden');
+}else{
+loadLevel(curLevel);
+state='playing';
+document.getElementById('levelScreen').classList.add('hidden');
+}
+});
+document.getElementById('restartBtn').addEventListener('click',()=>{
+curLevel=0;totalMoves=0;
+loadLevel(0);
+state='playing';
+document.getElementById('winScreen').classList.add('hidden');
+document.getElementById('startScreen').classList.remove('hidden');
+});
+
+// Init
+resize();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
