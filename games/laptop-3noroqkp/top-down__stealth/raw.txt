@@ -1,0 +1,484 @@
+<think>
+The user wants a top-down stealth game as a single HTML file. Let me think about what makes a good stealth game:
+
+1. Player character that moves around (WASD or arrow keys)
+2. Guards/enemies with vision cones that patrol
+3. Walls/obstacles for cover
+4. Objective (reach a goal, steal an item, etc.)
+5. Detection mechanics - if guards see you, game over
+6. Maybe a "noise" mechanic or crouch mechanic
+
+Let me design this:
+
+- Top-down 2D canvas game
+- Player moves with WASD/arrow keys
+- Guards patrol on paths, have vision cones (yellow arc)
+- If player is in a vision cone and line of sight is clear, detection happens
+- Detection meter fills up - if full, caught
+- Goal: reach the vault/extraction point
+- Walls block movement AND block line of sight
+- Crouch (Shift) makes you harder to detect (smaller radius)
+
+Game mechanics:
+- Canvas-based rendering
+- Grid or free-form level with walls as rectangles
+- Guards follow waypoint paths, turn around at ends
+- Vision cone is an arc in front of guard's facing direction
+- Line of sight check: raycast from guard to player, blocked by walls
+- Detection: if in cone + line of sight clear, detection meter fills. If out of all cones, it drains.
+- When detection is full: caught (game over)
+- Reach the exit: win!
+
+Let me make this polished with:
+- Dark atmosphere (dark background, spotlights from guards)
+- Player character as a small circle/figure
+- Guards with visible vision cones
+- Walls as rectangles
+- A level design that's interesting
+- Start screen with instructions
+- Game over / win screens
+- Restart button
+
+Let me code this up properly. I'll use a canvas-based approach with:
+- Fixed tile size for walls (easier collision and line of sight)
+- Guards with waypoint navigation
+- Proper raycasting for line of sight through walls
+
+Actually, let me use a simpler approach: walls as axis-aligned rectangles, and for line of sight I'll do segment-vs-rectangle intersection tests.
+
+Let me design the level:
+- A room with several corridors and rooms
+- 3-4 guards patrolling different routes
+- Player starts top-left, exit is bottom-right
+- Walls create cover opportunities
+
+I'll make it visually appealing with:
+- Dark floor with subtle grid
+- Glowing vision cones (semi-transparent yellow/orange)
+- Red glow when detection is happening
+- Smooth animations
+
+Let me write this out now.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Shadow Protocol - Top-Down Stealth Game</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a0f; font-family: 'Courier New', monospace; }
+canvas { display: block; width: 100vw; height: 100vh; }
+#ui-overlay {
+position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+display: flex; align-items: center; justify-content: center;
+pointer-events: none; z-index: 10;
+}
+#screen {
+text-align: center; color: #e0e0e0; pointer-events: auto;
+}
+#screen h1 { font-size: clamp(2rem, 5vw, 4rem); color: #f0c040; text-shadow: 0 0 20px #f0c04080; margin-bottom: 20px; letter-spacing: 4px; }
+#screen p { font-size: clamp(0.9rem, 2vw, 1.2rem); color: #aaa; line-height: 1.8; }
+#screen .key { background: #222; padding: 2px 8px; border-radius: 3px; border: 1px solid #555; color: #fff; }
+#screen button {
+margin-top: 25px; padding: 12px 40px; font-size: 1.2rem; font-family: inherit;
+background: #f0c040; color: #1a1a1a; border: none; cursor: pointer;
+letter-spacing: 2px; transition: all 0.2s;
+}
+#screen button:hover { background: #fff; }
+.hidden { display: none !important; }
+#hud {
+position: fixed; top: 15px; left: 50%; transform: translateX(-50%);
+z-index: 5; pointer-events: none;
+}
+#detection-bar {
+width: 200px; height: 8px; background: #222; border: 1px solid #444; border-radius: 4px; overflow: hidden;
+}
+#detection-fill {
+height: 100%; width: 0%; transition: width 0.1s;
+background: linear-gradient(90deg, #f0c040, #ff4444); border-radius: 3px;
+}
+#detection-label { font-size: 0.75rem; color: #888; text-align: center; margin-top: 4px; letter-spacing: 1px; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<div id="hud" class="hidden">
+<div id="detection-bar"><div id="detection-fill"></div></div>
+<div id="detection-label">DETECTION</div>
+</div>
+<div id="ui-overlay">
+<div id="screen">
+<h1>SHADOW PROTOCOL</h1>
+<p>Infiltrate the facility and reach the <span style="color:#4f8;font-size:1.1em;">EXTRACTION POINT</span>.</p>
+<p style="margin-top:15px;">
+<span class="key">W</span> <span class="key">A</span> <span class="key">S</span> <span class="key">D</span> — Move<br>
+<span class="key">SHIFT</span> — Sneak (slower, harder to spot)<br>
+Guards have vision cones. Avoid them at all costs.<br>
+Walls block their line of sight. Use cover wisely.
+</p>
+<button id="startBtn" onclick="startGame()">BEGIN INFILTRATION</button>
+</div>
+</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let W, H, scale;
+
+function resize() {
+W = window.innerWidth; H = window.innerHeight;
+canvas.width = W; canvas.height = H;
+scale = Math.min(W, H) / 700;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Game state
+let gameState = 'menu'; // menu, playing, caught, won
+let player, guards, walls, exitPoint;
+let detection = 0;
+let lastTime = 0;
+let audioCtx = null;
+
+const TILE = 40;
+const LEVEL_W = 17 * TILE;
+const LEVEL_H = 12 * TILE;
+
+function generateLevel() {
+walls = [
+// Outer walls (top)
+{x:0,y:0,w:LEVEL_W,h:TILE},
+// Left
+{x:0,y:0,w:TILE,h:LEVEL_H},
+// Right
+{x:LEVEL_W-TILE,y:0,w:TILE,h:LEVEL_H},
+// Bottom
+{x:0,y:LEVEL_H-TILE,w:LEVEL_W,h:TILE},
+// Internal walls - Room A (top-left area)
+{x:3*TILE,y:TILE,w:TILE,h:5*TILE},
+{x:3*TILE,y:4*TILE,w:2*TILE,h:TILE},
+// Wall creating corridor
+{x:6*TILE,y:2*TILE,w:TILE,h:3*TILE},
+// Middle section
+{x:9*TILE,y:TILE,w:TILE,h:4*TILE},
+{x:8*TILE,y:5*TILE,w:3*TILE,h:TILE},
+// Right section
+{x:13*TILE,y:2*TILE,w:TILE,h:3*TILE},
+// Bottom-left room
+{x:2*TILE,y:7*TILE,w:4*TILE,h:TILE},
+{x:5*TILE,y:8*TILE,w:TILE,h:3*TILE},
+// Center bottom
+{x:8*TILE,y:9*TILE,w:2*TILE,h:TILE},
+{x:10*TILE,y:7*TILE,w:TILE,h:4*TILE},
+// Right bottom
+{x:14*TILE,y:9*TILE,w:TILE,h:3*TILE},
+// Extra cover
+{x:6*TILE,y:5*TILE,w:TILE,h:2*TILE},
+{x:11*TILE,y:3*TILE,w:2*TILE,h:TILE},
+{x:4*TILE,y:9*TILE,w:2*TILE,h:TILE},
+];
+
+exitPoint = {x: 15.5*TILE, y: 10.5*TILE, r: 18};
+
+guards = [
+{ x:4*TILE, y:6*TILE, dir:{x:1,y:0}, waypoints:[{x:4*TILE,y:6*TILE},{x:4*TILE,y:9*TILE},{x:7*TILE,y:9*TILE},{x:7*TILE,y:6*TILE}], wpIndex:0, visionRange:180, visionAngle:Math.PI/3, speed:80, facing:0 },
+{ x:11*TILE, y:4*TILE, dir:{x:0,y:1}, waypoints:[{x:11*TILE,y:4*TILE},{x:11*TILE,y:6*TILE},{x:13*TILE,y:6*TILE}], wpIndex:0, visionRange:200, visionAngle:Math.PI/3.5, speed:70, facing:Math.PI/2 },
+{ x:8*TILE, y:2*TILE, dir:{x:1,y:0}, waypoints:[{x:6*TILE,y:2*TILE},{x:12*TILE,y:2*TILE}], wpIndex:0, visionRange:170, visionAngle:Math.PI/3.2, speed:90, facing:0 },
+];
+
+player = { x: 2*TILE, y: 6*TILE, r: 12, speed: 180, sneakSpeed: 100 };
+detection = 0;
+}
+
+function startGame() {
+if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+generateLevel();
+gameState = 'playing';
+document.getElementById('screen').classList.add('hidden');
+document.getElementById('hud').classList.remove('hidden');
+}
+
+function endGame(won) {
+gameState = won ? 'won' : 'caught';
+document.getElementById('hud').classList.add('hidden');
+const screen = document.getElementById('screen');
+if (won) {
+screen.innerHTML = '<h1 style="color:#4f8;">MISSION COMPLETE</h1><p>You slipped through the shadows undetected.</p><button onclick="startGame()">INFILTRATE AGAIN</button>';
+} else {
+screen.innerHTML = '<h1 style="color:#f44;">DETECTED</h1><p>Your cover has been compromised. Guards have you in their sights.</p><button onclick="startGame()">RETRY MISSION</button>';
+}
+screen.classList.remove('hidden');
+playSound(won ? 'win' : 'caught');
+}
+
+function playSound(type) {
+if (!audioCtx) return;
+const osc = audioCtx.createOscillator();
+const gain = audioCtx.createGain();
+osc.connect(gain); gain.connect(audioCtx.destination);
+if (type === 'caught') {
+osc.type = 'sawtooth'; osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+osc.frequency.linearRampToValueAtTime(80, audioCtx.currentTime + 0.5);
+gain.gain.setValueAtTime(0.3, audioCtx.currentTime); gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.5);
+osc.start(); osc.stop(audioCtx.currentTime + 0.5);
+} else if (type === 'win') {
+osc.type = 'sine'; osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+osc.frequency.linearRampToValueAtTime(800, audioCtx.currentTime + 0.3);
+gain.gain.setValueAtTime(0.2, audioCtx.currentTime); gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.4);
+osc.start(); osc.stop(audioCtx.currentTime + 0.4);
+} else if (type === 'detect') {
+osc.type = 'square'; osc.frequency.setValueAtTime(1200, audioCtx.currentTime);
+gain.gain.setValueAtTime(0.15, audioCtx.currentTime); gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.1);
+osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+}
+}
+
+let keys = {};
+window.addEventListener('keydown', e => { keys[e.code] = true; if (gameState === 'menu') startGame(); });
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+function circleRectCollision(cx, cy, r, rx, ry, rw, rh) {
+const dx = cx - rx, dy = cy - ry;
+const closestX = clamp(cx, rx, rx + rw);
+const closestY = clamp(cy, ry, ry + rh);
+const distX = cx - closestX, distY = cy - closestY;
+return (distX * distX + distY * distY) < r * r;
+}
+
+function moveEntity(e, dx, dy) {
+let nx = e.x + dx;
+let ny = e.y + dy;
+// Check walls
+for (let w of walls) {
+if (circleRectCollision(nx, ny, e.r, w.x, w.y, w.w, w.h)) return false;
+}
+e.x = clamp(e.x + dx, TILE + e.r, LEVEL_W - TILE - e.r);
+e.y = clamp(e.y + dy, TILE + e.r, LEVEL_H - TILE - e.r);
+return true;
+}
+
+function segmentIntersectsRect(x1,y1,x2,y2, rx,ry,rw,rh) {
+// Check if line segment from (x1,y1) to (x2,y2) intersects rectangle
+let points = [
+[rx, ry], [rx+rw, ry], [rx, ry+rh], [rx+rw, ry+rh]
+];
+for (let p of points) {
+if (segIntersectsSeg(x1,y1,x2,y2, rx,ry, rx+rw,ry) ||
+segIntersectsSeg(x1,y1,x2,y2, rx+rw,ry, rx+rw,ry+rh) ||
+segIntersectsSeg(x1,y1,x2,y2, rx,ry+rh, rx+rw,ry+rh) ||
+segIntersectsSeg(x1,y1,x2,y2, rx,ry, rx,ry+rh)) return true;
+}
+// Check if segment passes through interior
+let midX = (x1+x2)/2, midY = (y1+y2)/2;
+if (midX > rx && midX < rx+rw && midY > ry && midY < ry+rh) return true;
+return false;
+}
+
+function segIntersectsSeg(x1,y1,x2,y2,x3,y3,x4,y4) {
+let d1 = (x4-x3)*(y1-y3) - (y4-y3)*(x1-x3);
+let d2 = (x4-x3)*(y2-y3) - (y4-y3)*(x2-x3);
+let d3 = (x2-x1)*(y3-y1) - (y2-y1)*(x3-x1);
+let d4 = (x2-x1)*(y4-y1) - (y2-y1)*(x4-x1);
+return ((d1>0&&d2<0)||(d1<0&&d2>0)) && ((d3>0&&d4<0)||(d3<0&&d4>0));
+}
+
+function lineOfSight(gx, gy, px, py) {
+for (let w of walls) {
+if (segmentIntersectsRect(gx,gy,px,py,w.x,w.y,w.w,w.h)) return false;
+}
+return true;
+}
+
+function inVisionCone(guard, px, py) {
+const dx = px - guard.x, dy = py - guard.y;
+const dist = Math.sqrt(dx*dx + dy*dy);
+if (dist > guard.visionRange) return false;
+let angleToPlayer = Math.atan2(dy, dx);
+let facingAngle = guard.facing;
+let diff = Math.abs(angleDiff(facingAngle, angleToPlayer));
+return diff < guard.visionAngle / 2;
+}
+
+function angleDiff(a, b) {
+let d = a - b;
+while (d > Math.PI) d -= 2*Math.PI;
+while (d < -Math.PI) d += 2*Math.PI;
+return d;
+}
+
+function update(dt) {
+if (gameState !== 'playing') return;
+
+// Player movement
+let sx = keys['ShiftLeft'] || keys['ShiftRight'];
+let spd = sx ? player.sneakSpeed : player.speed;
+let dx = 0, dy = 0;
+if (keys['KeyW'] || keys['ArrowUp']) dy -= spd * dt;
+if (keys['KeyS'] || keys['ArrowDown']) dy += spd * dt;
+if (keys['KeyA'] || keys['ArrowLeft']) dx -= spd * dt;
+if (keys['KeyD'] || keys['ArrowRight']) dx += spd * dt;
+if (dx !== 0 || dy !== 0) {
+let len = Math.sqrt(dx*dx+dy*dy);
+dx /= len; dy /= len;
+moveEntity(player, dx, dy);
+}
+
+// Guard movement
+for (let g of guards) {
+let wp = g.waypoints[g.wpIndex];
+let dx = wp.x - g.x, dy = wp.y - g.y;
+let dist = Math.sqrt(dx*dx + dy*dy);
+if (dist < 5) {
+g.wpIndex = (g.wpIndex + 1) % g.waypoints.length;
+} else {
+let moveX = (dx/dist) * g.speed * dt;
+let moveY = (dy/dist) * g.speed * dt;
+g.x += moveX; g.y += moveY;
+// Smooth facing
+let targetAngle = Math.atan2(dy, dx);
+let diff = angleDiff(targetAngle, g.facing);
+g.facing += diff * 5 * dt;
+}
+}
+
+// Detection
+let detected = false;
+for (let g of guards) {
+if (inVisionCone(g, player.x, player.y) && lineOfSight(g.x, g.y, player.x, player.y)) {
+detected = true;
+break;
+}
+}
+
+if (detected) {
+detection += dt * 1.2;
+if (detection >= 1) { endGame(false); return; }
+} else {
+detection -= dt * 0.5;
+detection = Math.max(0, detection);
+}
+
+document.getElementById('detection-fill').style.width = (detection * 100) + '%';
+
+// Win check
+let edx = player.x - exitPoint.x, edy = player.y - exitPoint.y;
+if (Math.sqrt(edx*edx+edy*edy) < exitPoint.r + player.r) {
+endGame(true);
+}
+}
+
+function render() {
+ctx.fillStyle = '#0a0a0f';
+ctx.fillRect(0, 0, W, H);
+
+let ox = W/2 - LEVEL_W*scale/2;
+let oy = H/2 - LEVEL_H*scale/2;
+
+ctx.save();
+ctx.translate(ox, oy);
+ctx.scale(scale, scale);
+
+// Floor
+ctx.fillStyle = '#14141a';
+ctx.fillRect(TILE, TILE, LEVEL_W-2*TILE, LEVEL_H-2*TILE);
+
+// Floor grid
+ctx.strokeStyle = '#1a1a22';
+ctx.lineWidth = 1;
+for (let x = TILE; x < LEVEL_W-TILE; x += TILE) {
+ctx.beginPath(); ctx.moveTo(x, TILE); ctx.lineTo(x, LEVEL_H-TILE); ctx.stroke();
+}
+for (let y = TILE; y < LEVEL_H-TILE; y += TILE) {
+ctx.beginPath(); ctx.moveTo(TILE, y); ctx.lineTo(LEVEL_W-TILE, y); ctx.stroke();
+}
+
+// Vision cones
+for (let g of guards) {
+ctx.save();
+ctx.translate(g.x, g.y);
+ctx.rotate(g.facing);
+let grad = ctx.createRadialGradient(0,0,10, 0,0,g.visionRange);
+grad.addColorStop(0, 'rgba(255,200,60,0.15)');
+grad.addColorStop(1, 'rgba(255,200,60,0.02)');
+ctx.fillStyle = grad;
+ctx.beginPath();
+ctx.moveTo(0,0);
+ctx.arc(0, 0, g.visionRange, -g.visionAngle/2, g.visionAngle/2);
+ctx.closePath();
+ctx.fill();
+ctx.restore();
+}
+
+// Walls
+for (let w of walls) {
+ctx.fillStyle = '#2a2a35';
+ctx.fillRect(w.x, w.y, w.w, w.h);
+ctx.strokeStyle = '#3a3a48';
+ctx.lineWidth = 2;
+ctx.strokeRect(w.x, w.y, w.w, w.h);
+}
+
+// Exit point
+let pulse = Math.sin(Date.now()*0.005)*0.3+0.7;
+ctx.fillStyle = `rgba(60,255,140,${pulse*0.3})`;
+ctx.beginPath(); ctx.arc(exitPoint.x, exitPoint.y, exitPoint.r, 0, Math.PI*2); ctx.fill();
+ctx.strokeStyle = `rgba(60,255,140,${pulse})`;
+ctx.lineWidth = 2;
+ctx.beginPath(); ctx.arc(exitPoint.x, exitPoint.y, exitPoint.r, 0, Math.PI*2); ctx.stroke();
+ctx.fillStyle = '#4f8';
+ctx.font = 'bold 14px monospace';
+ctx.textAlign = 'center';
+ctx.fillText('EXIT', exitPoint.x, exitPoint.y + 5);
+
+// Guards
+for (let g of guards) {
+ctx.save();
+ctx.translate(g.x, g.y);
+ctx.rotate(g.facing);
+// Body
+ctx.fillStyle = '#cc3333';
+ctx.beginPath(); ctx.arc(0, 0, 12, 0, Math.PI*2); ctx.fill();
+// Facing indicator
+ctx.strokeStyle = '#ff6666';
+ctx.lineWidth = 3;
+ctx.beginPath(); ctx.moveTo(8,0); ctx.lineTo(18,0); ctx.stroke();
+ctx.restore();
+}
+
+// Player
+let pGlow = detection > 0 ? `rgba(255,50,50,${detection*0.4})` : 'rgba(100,200,255,0.2)';
+ctx.fillStyle = pGlow;
+ctx.beginPath(); ctx.arc(player.x, player.y, 20, 0, Math.PI*2); ctx.fill();
+ctx.fillStyle = '#6cf';
+ctx.beginPath(); ctx.arc(player.x, player.y, player.r, 0, Math.PI*2); ctx.fill();
+ctx.strokeStyle = '#aef';
+ctx.lineWidth = 2;
+ctx.beginPath(); ctx.arc(player.x, player.y, player.r, 0, Math.PI*2); ctx.stroke();
+
+// Detection warning overlay
+if (detection > 0.1 && gameState === 'playing') {
+let alpha = detection * 0.15;
+ctx.fillStyle = `rgba(255,0,0,${alpha})`;
+ctx.fillRect(0, 0, LEVEL_W, LEVEL_H);
+}
+
+ctx.restore();
+}
+
+function gameLoop(time) {
+let dt = Math.min((time - lastTime) / 1000, 0.05);
+lastTime = time;
+update(dt);
+render();
+requestAnimationFrame(gameLoop);
+}
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
+```
