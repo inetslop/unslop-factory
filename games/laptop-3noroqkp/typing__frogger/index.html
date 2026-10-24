@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Typing Frogger</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; overflow: hidden; width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; font-family: monospace; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, cellSize;
+let gameState = 'start'; // start, playing, gameover
+let frog = { x: 0, y: 0 };
+let score = 0;
+let lives = 3;
+let cars = [];
+let logs = [];
+let typingWord = '';
+let typedSoFar = '';
+let timerMax = 3000;
+let timerStart = 0;
+let lastFrameTime = 0;
+let invincible = false;
+let invincibleTimer = 0;
+let particles = [];
+let safetyPads = [];
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playBeep(freq, dur, type='square', vol=0.15) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+function playSuccess() { playBeep(523, 0.1); setTimeout(() => playBeep(659, 0.1), 80); setTimeout(() => playBeep(784, 0.15), 160); }
+function playFail() { playBeep(200, 0.3, 'sawtooth', 0.1); }
+function playDeath() { playBeep(150, 0.4, 'sawtooth', 0.2); setTimeout(() => playBeep(100, 0.5, 'sawtooth', 0.15), 100); }
+function playWin() { for(let i=0;i<5;i++) setTimeout(()=>playBeep(400+i*100,0.15,'square',0.12),i*100); }
+
+const ROWS = 13;
+const COLS = 13;
+const RIVER_START = 1; // rows 1-5 are river
+const RIVER_END = 5;
+const ROAD_START = 6; // rows 6-12 are road
+const ROAD_END = 12;
+
+function resize() {
+    const maxW = window.innerWidth;
+    const maxH = window.innerHeight;
+    cellSize = Math.floor(Math.min(maxW / COLS, maxH / (ROWS + 3)));
+    W = cellSize * COLS;
+    H = cellSize * (ROWS + 2);
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function initGame() {
+    score = 0;
+    lives = 3;
+    resetFrog();
+    initLanes();
+    nextWord();
+}
+
+function resetFrog() {
+    frog.x = Math.floor(COLS / 2);
+    frog.y = ROAD_END + 1; // bottom row (row 12 is last road, we use a starting area)
+    // Actually let's put frog at y=12 (bottom of road area, row index 12)
+    frog.y = ROAD_END;
+    invincible = true;
+    invincibleTimer = 2000;
+}
+
+function initLanes() {
+    cars = [];
+    logs = [];
+    safetyPads = [3, 6, 9]; // safety pad columns at top
+
+    // Road lanes (rows 6-12) - 7 lanes of cars
+    for (let row = ROAD_START; row <= ROAD_END; row++) {
+        const speed = (row >= ROAD_START && row <= ROAD_START + 2) ? 1 : 0.8;
+        const dir = (row % 2 === 0) ? 1 : -1;
+        const count = 3 + Math.floor(Math.random() * 2);
+        for (let i = 0; i < count; i++) {
+            cars.push({
+                x: (i * COLS / count + Math.random() * 2) % COLS,
+                y: row,
+                speed: speed * dir * (0.5 + Math.random() * 0.3),
+                len: Math.random() > 0.5 ? 1 : 2
+            });
+        }
+    }
+
+    // River lanes (rows 1-5) - logs/fish
+    for (let row = RIVER_START; row <= RIVER_END; row++) {
+        const speed = 0.4 + Math.random() * 0.3;
+        const dir = (row % 2 === 0) ? 1 : -1;
+        const count = 3;
+        for (let i = 0; i < count; i++) {
+            logs.push({
+                x: (i * COLS / count + Math.random()) % COLS,
+                y: row,
+                speed: speed * dir * 0.5,
+                len: 2 + Math.floor(Math.random() * 2),
+                type: 'log' // or fish
+            });
+        }
+    }
+}
+
+const WORDS = ['LEFT', 'RIGHT', 'UP', 'DOWN'];
+function nextWord() {
+    typingWord = WORDS[Math.floor(Math.random() * WORDS.length)];
+    typedSoFar = '';
+    timerStart = performance.now();
+}
+
+function moveFrog(dir) {
+    if (invincible) return;
+    let nx = frog.x, ny = frog.y;
+    switch (dir) {
+        case 'LEFT': nx--; break;
+        case 'RIGHT': nx++; break;
+        case 'UP': ny--; break;
+        case 'DOWN': ny++; break;
+    }
+    if (nx < 0 || nx >= COLS || ny < 0 || ny > ROAD_END) return;
+    frog.x = nx;
+    frog.y = ny;
+    playBeep(330, 0.05, 'square', 0.1);
+
+    // Check safety - reached row 0
+    if (ny === 0) {
+        if (safetyPads.includes(nx)) {
+            score += 10 + lives * 2;
+            playWin();
+            spawnParticles(frog.x, frog.y);
+            resetFrog();
+            nextWord();
+            return;
+        } else {
+            killFrog();
+            return;
+        }
+    }
+
+    // Check if in water without log
+    if (ny >= RIVER_START && ny <= RIVER_END) {
+        let onLog = false;
+        for (let log of logs) {
+            if (log.y === ny) {
+                const logStart = Math.floor(log.x);
+                const logEnd = logStart + log.len - 1;
+                if (frog.x >= logStart && frog.x <= logEnd) onLog = true;
+            }
+        }
+        if (!onLog) { killFrog(); return; }
+    }
+
+    // Check car collision
+    for (let car of cars) {
+        if (car.y === ny) {
+            const carStart = Math.floor(car.x);
+            const carEnd = carStart + car.len - 1;
+            if (frog.x >= carStart && frog.x <= carEnd) { killFrog(); return; }
+        }
+    }
+}
+
+function killFrog() {
+    playDeath();
+    lives--;
+    spawnParticles(frog.x, frog.y);
+    if (lives <= 0) {
+        gameState = 'gameover';
+    } else {
+        resetFrog();
+    }
+}
+
+function spawnParticles(cx, cy) {
+    for (let i = 0; i < 12; i++) {
+        const angle = (Math.PI * 2 / 12) * i;
+        particles.push({ x: cx, y: cy, vx: Math.cos(angle) * 2, vy: Math.sin(angle) * 2, life: 30 });
+    }
+}
+
+function update(dt) {
+    if (gameState !== 'playing') return;
+
+    // Move cars
+    for (let car of cars) {
+        car.x += car.speed * dt * 0.001;
+        if (car.x > COLS) car.x = -car.len;
+        if (car.x < -car.len) car.x = COLS;
+    }
+
+    // Move logs
+    for (let log of logs) {
+        log.x += log.speed * dt * 0.001;
+        if (log.x > COLS) log.x = -log.len;
+        if (log.x < -log.len) log.x = COLS;
+    }
+
+    // Check collisions continuously
+    if (!invincible) {
+        // Car collision
+        for (let car of cars) {
+            if (car.y === frog.y) {
+                const cs = Math.floor(car.x);
+                const ce = cs + car.len - 1;
+                if (frog.x >= cs && frog.x <= ce) { killFrog(); break; }
+            }
+        }
+        // Water check
+        if (gameState === 'playing' && frog.y >= RIVER_START && frog.y <= RIVER_END) {
+            let onLog = false;
+            for (let log of logs) {
+                if (log.y === frog.y) {
+                    const ls = Math.floor(log.x);
+                    const le = ls + log.len - 1;
+                    if (frog.x >= ls && frog.x <= le) onLog = true;
+                }
+            }
+            if (!onLog) killFrog();
+        }
+    }
+
+    // Invincibility timer
+    if (invincible) {
+        invincibleTimer -= dt;
+        if (invincibleTimer <= 0) invincible = false;
+    }
+
+    // Typing timer - if expired, penalty
+    const elapsed = performance.now() - timerStart;
+    if (elapsed > timerMax && gameState === 'playing') {
+        typedSoFar = '';
+        nextWord();
+    }
+
+    // Update particles
+    for (let p of particles) {
+        p.x += p.vx * dt * 0.01;
+        p.y += p.vy * dt * 0.01;
+        p.life -= dt * 0.03;
+    }
+    particles = particles.filter(p => p.life > 0);
+}
+
+function draw() {
+    ctx.clearRect(0, 0, W, H);
+
+    // Draw lanes
+    for (let row = 0; row <= ROAD_END; row++) {
+        const y = (row + 1) * cellSize;
+        if (row === 0) {
+            // Safety zone
+            ctx.fillStyle = '#2d5a27';
+            ctx.fillRect(0, y, W, cellSize);
+            for (let col of safetyPads) {
+                ctx.fillStyle = '#4a9e3f';
+                ctx.beginPath();
+                ctx.arc((col + 0.5) * cellSize, y + cellSize / 2, cellSize * 0.35, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        } else if (row >= RIVER_START && row <= RIVER_END) {
+            ctx.fillStyle = '#1a4a6e';
+            ctx.fillRect(0, y, W, cellSize);
+        } else {
+            ctx.fillStyle = row % 2 === 0 ? '#3a3a3a' : '#333333';
+            ctx.fillRect(0, y, W, cellSize);
+            // Road markings
+            ctx.strokeStyle = '#ffcc00';
+            ctx.lineWidth = 1;
+            ctx.setLineDash([cellSize * 0.3, cellSize * 0.3]);
+            ctx.beginPath();
+            ctx.moveTo(0, y + cellSize / 2);
+            ctx.lineTo(W, y + cellSize / 2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+    }
+
+    // Draw logs
+    for (let log of logs) {
+        const x = log.x * cellSize;
+        const y = (log.y + 1) * cellSize;
+        ctx.fillStyle = '#8B5E3C';
+        ctx.fillRect(x, y + cellSize * 0.2, log.len * cellSize, cellSize * 0.6);
+        ctx.strokeStyle = '#6B4226';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x, y + cellSize * 0.2, log.len * cellSize, cellSize * 0.6);
+    }
+
+    // Draw cars
+    for (let car of cars) {
+        const x = car.x * cellSize;
+        const y = (car.y + 1) * cellSize;
+        const colors = ['#e74c3c', '#3498db', '#f39c12', '#9b59b6', '#1abc9c'];
+        ctx.fillStyle = colors[car.y % colors.length];
+        roundRect(x, y + cellSize * 0.15, car.len * cellSize, cellSize * 0.7, cellSize * 0.1);
+    }
+
+    // Draw particles
+    for (let p of particles) {
+        ctx.fillStyle = `rgba(100, 255, 100, ${p.life / 30})`;
+        ctx.beginPath();
+        ctx.arc((p.x + 0.5) * cellSize, (p.y + 1) * cellSize, cellSize * 0.1, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Draw frog
+    if (gameState === 'playing' || gameState === 'start') {
+        const fx = (frog.x + 0.5) * cellSize;
+        const fy = (frog.y + 1.5) * cellSize;
+        if (!invincible || Math.floor(performance.now() / 200) % 2 === 0) {
+            // Frog body
+            ctx.fillStyle = '#4CAF50';
+            ctx.beginPath();
+            ctx.arc(fx, fy, cellSize * 0.35, 0, Math.PI * 2);
+            ctx.fill();
+            // Eyes
+            ctx.fillStyle = 'white';
+            ctx.beginPath();
+            ctx.arc(fx - cellSize * 0.15, fy - cellSize * 0.15, cellSize * 0.1, 0, Math.PI * 2);
+            ctx.arc(fx + cellSize * 0.15, fy - cellSize * 0.15, cellSize * 0.1, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = 'black';
+            ctx.beginPath();
+            ctx.arc(fx - cellSize * 0.15, fy - cellSize * 0.15, cellSize * 0.05, 0, Math.PI * 2);
+            ctx.arc(fx + cellSize * 0.15, fy - cellSize * 0.15, cellSize * 0.05, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+
+    // Draw typing UI
+    if (gameState === 'playing') {
+        const uiY = cellSize * 0.5;
+        // Word display
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold ${cellSize * 0.6}px monospace`;
+        ctx.textAlign = 'center';
+
+        const wordLen = typingWord.length;
+        const totalW = cellSize * 0.7 * wordLen;
+        const startX = W / 2 - totalW / 2;
+
+        for (let i = 0; i < wordLen; i++) {
+            const charX = startX + i * cellSize * 0.7 + cellSize * 0.35;
+            if (i < typedSoFar.length) {
+                ctx.fillStyle = '#4CAF50';
+            } else if (i === typedSoFar.length) {
+                ctx.fillStyle = '#FFD700';
+            } else {
+                ctx.fillStyle = 'rgba(255,255,255,0.4)';
+            }
+            ctx.fillText(typingWord[i], charX, uiY + cellSize * 0.1);
+        }
+
+        // Timer bar
+        const elapsed = performance.now() - timerStart;
+        const remaining = Math.max(0, 1 - elapsed / timerMax);
+        const barW = W * 0.6;
+        const barX = (W - barW) / 2;
+        ctx.fillStyle = '#333';
+        ctx.fillRect(barX, uiY + cellSize * 0.5, barW, cellSize * 0.2);
+        ctx.fillStyle = remaining > 0.3 ? '#4CAF50' : '#e74c3c';
+        ctx.fillRect(barX, uiY + cellSize * 0.5, barW * remaining, cellSize * 0.2);
+
+        // Score and lives
+        ctx.fillStyle = '#fff';
+        ctx.font = `${cellSize * 0.4}px monospace`;
+        ctx.textAlign = 'left';
+        ctx.fillText(`Score: ${score}`, cellSize * 0.5, uiY + cellSize * 0.1);
+        ctx.textAlign = 'right';
+        for (let i = 0; i < lives; i++) {
+            ctx.fillStyle = '#4CAF50';
+            ctx.fillText('🐸', W - cellSize * 0.5 - i * cellSize * 0.5, uiY + cellSize * 0.1);
+        }
+    }
+
+    // Start screen
+    if (gameState === 'start') {
+        ctx.fillStyle = 'rgba(0,0,0,0.85)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#4CAF50';
+        ctx.font = `bold ${cellSize * 1.2}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('TYPING FROGGER', W / 2, H * 0.2);
+
+        ctx.fillStyle = '#fff';
+        ctx.font = `${cellSize * 0.45}px monospace`;
+        const instructions = [
+            'Cross the road and river to reach safety!',
+            '',
+            'Type words to move your frog:',
+            'LEFT / RIGHT / UP / DOWN',
+            '',
+            'Complete the word before the timer runs out!',
+            'Avoid cars on the road.',
+            'Stay on logs in the water.',
+            'Reach a green pad at the top to score!',
+            '',
+            'Press ANY KEY to start!'
+        ];
+        instructions.forEach((line, i) => {
+            ctx.fillText(line, W / 2, H * 0.35 + i * cellSize * 0.55);
+        });
+    }
+
+    // Game over screen
+    if (gameState === 'gameover') {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#e74c3c';
+        ctx.font = `bold ${cellSize * 1}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W / 2, H * 0.35);
+        ctx.fillStyle = '#fff';
+        ctx.font = `${cellSize * 0.5}px monospace`;
+        ctx.fillText(`Final Score: ${score}`, W / 2, H * 0.5);
+        ctx.fillStyle = '#4CAF50';
+        ctx.font = `${cellSize * 0.45}px monospace`;
+        ctx.fillText('Press R to Restart', W / 2, H * 0.65);
+    }
+}
+
+function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+    ctx.fill();
+}
+
+function gameLoop(timestamp) {
+    const dt = timestamp - lastFrameTime;
+    lastFrameTime = timestamp;
+    update(dt);
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+window.addEventListener('keydown', (e) => {
+    initAudio();
+    const key = e.key.toUpperCase();
+
+    if (gameState === 'start') {
+        gameState = 'playing';
+        initGame();
+        return;
+    }
+
+    if (gameState === 'gameover') {
+        if (key === 'R') {
+            gameState = 'playing';
+            initGame();
+        }
+        return;
+    }
+
+    if (gameState !== 'playing') return;
+
+    if (key >= 'A' && key <= 'Z') {
+        const nextChar = typingWord[typedSoFar.length] || '';
+        if (key === nextChar) {
+            typedSoFar += key;
+            playBeep(440 + typedSoFar.length * 50, 0.05, 'square', 0.08);
+            if (typedSoFar.length === typingWord.length) {
+                // Word complete!
+                playSuccess();
+                moveFrog(typingWord);
+                nextWord();
+            }
+        } else {
+            // Wrong key - reset progress
+            typedSoFar = '';
+            playFail();
+        }
+    }
+
+    if (key === 'R' && gameState === 'gameover') {
+        gameState = 'playing';
+        initGame();
+    }
+});
+
+// Prevent scrolling with keys
+window.addEventListener('keydown', (e) => {
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+});
+
+// Initialize
+initGame();
+gameState = 'start';
+lastFrameTime = performance.now();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
