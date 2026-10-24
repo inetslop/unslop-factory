@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Zombie Tetris</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; overflow: hidden; width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; font-family: 'Courier New', monospace; }
+canvas { display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function() {
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale, cellSize;
+let audioCtx = null;
+
+function resize() {
+    const aspect = 14/20;
+    let h = window.innerHeight;
+    let w = h * aspect;
+    if (w > window.innerWidth) { w = window.innerWidth; h = w / aspect; }
+    canvas.width = Math.floor(w);
+    canvas.height = Math.floor(h);
+    W = canvas.width; H = canvas.height;
+    scale = Math.min(W, H);
+    cellSize = Math.floor(scale * 0.045);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Audio
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function playSound(freq, duration, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+
+function playPlace() { playSound(200, 0.1, 'square', 0.08); }
+function playClear() { playSound(523, 0.15, 'square', 0.12); setTimeout(() => playSound(659, 0.15, 'square', 0.12), 80); setTimeout(() => playSound(784, 0.2, 'square', 0.12), 160); }
+function playGameOver() { playSound(150, 0.5, 'sawtooth', 0.15); setTimeout(() => playSound(100, 0.8, 'sawtooth', 0.15), 200); }
+function playZombieGrowl() { playSound(80, 0.3, 'sawtooth', 0.06); }
+
+// Game constants
+const COLS = 10, ROWS = 20;
+const ZOMBIE_MAX_ROWS = 5;
+
+const SHAPES = [
+    [[1,1,1,1]], // I
+    [[1,1],[1,1]], // O
+    [[0,1,0],[1,1,1]], // T
+    [[1,0,0],[1,1,1]], // L
+    [[0,0,1],[1,1,1]], // J
+    [[0,1,1],[1,1,0]], // S
+    [[1,1,0],[0,1,1]], // Z
+    [[0,1,0],[0,1,0],[0,1,0]] // ?
+];
+
+const COLORS = ['#00e5ff','#ffee00','#b400ff','#ff6d00','#0032fa','#ff0057','#ff0000','#ffffff'];
+
+function getShape(type) {
+    if (type === 6) return [[1,0],[1,0],[1,0]];
+    return SHAPES[type];
+}
+
+function rotateCW(shape) {
+    const rows = shape.length, cols = shape[0].length;
+    const result = [];
+    for (let c = 0; c < cols; c++) {
+        const row = [];
+        for (let r = rows - 1; r >= 0; r--) row.push(shape[r][c]);
+        result.push(row);
+    }
+    return result;
+}
+
+function rotateCCW(shape) {
+    const rows = shape.length, cols = shape[0].length;
+    const result = [];
+    for (let c = 0; c < cols; c++) {
+        const row = [];
+        for (let r = 0; r < rows; r++) row.push(shape[r][c]);
+        result.push(row);
+    }
+    return result;
+}
+
+function cloneShape(s) { return s.map(r => r.slice()); }
+
+// Game state
+let board, currentPiece, nextPiece, score, lines, level, zombieLevel, zombieTimer, gameOver, started, particles, screenShake, shakeTime, comboCount;
+
+const PIECE_TYPES = 7;
+
+function newPiece() {
+    const type = Math.floor(Math.random() * PIECE_TYPES);
+    const shape = cloneShape(getShape(type));
+    return {
+        type: type,
+        shape: shape,
+        x: Math.floor((COLS - shape[0].length) / 2),
+        y: 0,
+        color: COLORS[type]
+    };
+}
+
+function initGame() {
+    board = Array.from({length: ROWS}, () => Array(COLS).fill(-1));
+    score = 0; lines = 0; level = 1;
+    zombieLevel = 0; zombieTimer = 0;
+    gameOver = false; started = true;
+    particles = []; screenShake = 0; shakeTime = 0; comboCount = 0;
+    currentPiece = newPiece();
+    nextPiece = newPiece();
+}
+
+function collides(shape, px, py) {
+    for (let r = 0; r < shape.length; r++) {
+        for (let c = 0; c < shape[r].length; c++) {
+            if (shape[r][c]) {
+                const nx = px + c, ny = py + r;
+                if (nx < 0 || nx >= COLS || ny >= ROWS) return true;
+                if (ny >= 0 && board[ny][nx] !== -1) return true;
+            }
+        }
+    }
+    return false;
+}
+
+function merge() {
+    const s = currentPiece.shape;
+    for (let r = 0; r < s.length; r++) {
+        for (let c = 0; c < s[r].length; c++) {
+            if (s[r][c]) {
+                const ny = currentPiece.y + r, nx = currentPiece.x + c;
+                if (ny >= 0 && ny < ROWS && nx >= 0 && nx < COLS) board[ny][nx] = currentPiece.type;
+            }
+        }
+    }
+}
+
+function clearLines() {
+    let cleared = 0;
+    for (let r = ROWS - 1; r >= 0; r--) {
+        if (board[r].every(v => v !== -1)) {
+            board.splice(r, 1);
+            board.unshift(Array(COLS).fill(-1));
+            cleared++;
+            // Particles
+            for (let c = 0; c < COLS; c++) {
+                for (let i = 0; i < 3; i++) {
+                    particles.push({
+                        x: (c + Math.random() * 0.5) * cellSize,
+                        y: r * cellSize,
+                        vx: (Math.random() - 0.5) * 3,
+                        vy: (Math.random() - 0.5) * 3 - 2,
+                        life: 1,
+                        color: COLORS[Math.floor(Math.random() * 7)]
+                    });
+                }
+            }
+        }
+    }
+    if (cleared > 0) {
+        comboCount++;
+        const pts = [0, 100, 300, 500, 800];
+        score += pts[cleared] * level;
+        lines += cleared;
+        level = Math.floor(lines / 10) + 1;
+        zombieLevel = Math.max(0, zombieLevel - cleared);
+        playClear();
+        screenShake = 5; shakeTime = 200;
+    } else {
+        comboCount = 0;
+    }
+}
+
+function drop() {
+    if (!collides(currentPiece.shape, currentPiece.x, currentPiece.y + 1)) {
+        currentPiece.y++;
+    } else {
+        merge();
+        clearLines();
+        playPlace();
+        spawnNext();
+    }
+}
+
+function hardDrop() {
+    while (!collides(currentPiece.shape, currentPiece.x, currentPiece.y + 1)) {
+        currentPiece.y++;
+        score += 2;
+    }
+    merge();
+    clearLines();
+    playPlace();
+    spawnNext();
+}
+
+function spawnNext() {
+    currentPiece = nextPiece;
+    nextPiece = newPiece();
+    if (collides(currentPiece.shape, currentPiece.x, currentPiece.y)) {
+        gameOver = true;
+        playGameOver();
+    }
+}
+
+function move(dx) {
+    if (!collides(currentPiece.shape, currentPiece.x + dx, currentPiece.y)) {
+        currentPiece.x += dx;
+    }
+}
+
+function rotate(dir) {
+    const newShape = dir === 1 ? rotateCW(currentPiece.shape) : rotateCCW(currentPiece.shape);
+    // Wall kicks
+    const kicks = [0, -1, 1, -2, 2];
+    for (const k of kicks) {
+        if (!collides(newShape, currentPiece.x + k, currentPiece.y)) {
+            currentPiece.shape = newShape;
+            currentPiece.x += k;
+            return;
+        }
+    }
+}
+
+function getDropPos() {
+    let y = currentPiece.y;
+    while (!collides(currentPiece.shape, currentPiece.x, y + 1)) y++;
+    return y;
+}
+
+// Zombie logic
+let zombieGrowlTimer = 0;
+
+function updateZombies(dt) {
+    if (gameOver) return;
+    const growRate = 0.3 + level * 0.08; // rows per second
+    zombieTimer += dt / 1000 * growRate;
+    if (zombieTimer >= 1) {
+        zombieTimer -= 1;
+        zombieLevel++;
+        playZombieGrowl();
+        screenShake = 3; shakeTime = 300;
+        if (zombieLevel >= ZOMBIE_MAX_ROWS + 2) {
+            gameOver = true;
+            playGameOver();
+        }
+    }
+}
+
+function resetZombieTimer() { zombieTimer = 0; }
+
+// Particles
+function updateParticles(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.2;
+        p.life -= dt / 500;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+// Drawing
+function drawBoard() {
+    const ox = W * 0.05, oy = H * 0.02;
+    const bx = ox + cellSize * 2, by = oy;
+    
+    // Board background
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(bx - 2, by - 2, COLS * cellSize + 4, ROWS * cellSize + 4);
+    
+    // Grid
+    ctx.strokeStyle = '#1a1a3e';
+    ctx.lineWidth = 1;
+    for (let r = 0; r <= ROWS; r++) {
+        ctx.beginPath(); ctx.moveTo(bx, by + r * cellSize); ctx.lineTo(bx + COLS * cellSize, by + r * cellSize); ctx.stroke();
+    }
+    for (let c = 0; c <= COLS; c++) {
+        ctx.beginPath(); ctx.moveTo(bx + c * cellSize, by); ctx.lineTo(bx + c * cellSize, by + ROWS * cellSize); ctx.stroke();
+    }
+    
+    // Zombie rows
+    if (zombieLevel > 0) {
+        for (let r = 0; r < zombieLevel; r++) {
+            const zy = by + (ROWS - 1 - r) * cellSize;
+            ctx.fillStyle = '#2d5a1b';
+            ctx.fillRect(bx, zy, COLS * cellSize, cellSize);
+            
+            // Draw zombie faces
+            for (let c = 0; c < COLS; c += 2) {
+                const zx = bx + c * cellSize + cellSize * 0.3;
+                const zyy = zy + cellSize * 0.2;
+                // Head
+                ctx.fillStyle = '#4a7a2f';
+                ctx.beginPath(); ctx.arc(zx + cellSize*0.2, zyy + cellSize*0.25, cellSize*0.18, 0, Math.PI*2); ctx.fill();
+                // Eyes
+                ctx.fillStyle = '#ff3333';
+                ctx.fillRect(zx + cellSize*0.1, zyy + cellSize*0.15, cellSize*0.06, cellSize*0.06);
+                ctx.fillRect(zx + cellSize*0.3, zyy + cellSize*0.15, cellSize*0.06, cellSize*0.06);
+                // Mouth
+                ctx.fillStyle = '#1a1a1a';
+                ctx.fillRect(zx + cellSize*0.12, zyy + cellSize*0.35, cellSize*0.2, cellSize*0.04);
+            }
+            
+            // Green glow
+            ctx.fillStyle = 'rgba(76, 175, 80, 0.1)';
+            ctx.fillRect(bx, zy, COLS * cellSize, cellSize);
+        }
+    }
+    
+    // Placed blocks
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            if (board[r][c] !== -1) {
+                const x = bx + c * cellSize, y = by + r * cellSize;
+                ctx.fillStyle = COLORS[board[r][c]];
+                ctx.fillRect(x + 1, y + 1, cellSize - 2, cellSize - 2);
+                ctx.fillStyle = 'rgba(255,255,255,0.3)';
+                ctx.fillRect(x + 1, y + 1, cellSize - 2, 3);
+                ctx.fillStyle = 'rgba(0,0,0,0.3)';
+                ctx.fillRect(x + 1, y + cellSize - 4, cellSize - 2, 3);
+            }
+        }
+    }
+    
+    // Ghost piece
+    if (!gameOver && currentPiece) {
+        const gy = getDropPos();
+        ctx.globalAlpha = 0.3;
+        for (let r = 0; r < currentPiece.shape.length; r++) {
+            for (let c = 0; c < currentPiece.shape[r].length; c++) {
+                if (currentPiece.shape[r][c]) {
+                    const x = bx + (currentPiece.x + c) * cellSize;
+                    const y = by + (gy + r) * cellSize;
+                    ctx.fillStyle = currentPiece.color;
+                    ctx.fillRect(x + 1, y + 1, cellSize - 2, cellSize - 2);
+                }
+            }
+        }
+        ctx.globalAlpha = 1;
+    }
+    
+    // Current piece
+    if (!gameOver && currentPiece) {
+        for (let r = 0; r < currentPiece.shape.length; r++) {
+            for (let c = 0; c < currentPiece.shape[r].length; c++) {
+                if (currentPiece.shape[r][c]) {
+                    const x = bx + (currentPiece.x + c) * cellSize;
+                    const y = by + (currentPiece.y + r) * cellSize;
+                    ctx.fillStyle = currentPiece.color;
+                    ctx.fillRect(x + 1, y + 1, cellSize - 2, cellSize - 2);
+                    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+                    ctx.fillRect(x + 1, y + 1, cellSize - 2, 3);
+                }
+            }
+        }
+    }
+    
+    // Particles
+    for (const p of particles) {
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(bx + p.x, by + p.y, 4, 4);
+    }
+    ctx.globalAlpha = 1;
+    
+    // Side panels
+    const panelX = bx + COLS * cellSize + cellSize * 0.8;
+    
+    // Next piece
+    ctx.fillStyle = '#aaa';
+    ctx.font = `bold ${cellSize * 0.6}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillText('NEXT', panelX, by + cellSize * 0.5);
+    
+    if (nextPiece) {
+        const ns = nextPiece.shape;
+        const ncx = panelX + cellSize * 1.2;
+        const ncy = by + cellSize * 1.5;
+        for (let r = 0; r < ns.length; r++) {
+            for (let c = 0; c < ns[r].length; c++) {
+                if (ns[r][c]) {
+                    ctx.fillStyle = nextPiece.color;
+                    ctx.fillRect(ncx + c * cellSize * 0.7, ncy + r * cellSize * 0.7, cellSize * 0.65, cellSize * 0.65);
+                }
+            }
+        }
+    }
+    
+    // Score
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${cellSize * 0.5}px monospace`;
+    const scoreY = by + cellSize * 3.5;
+    ctx.fillText('SCORE', panelX, scoreY);
+    ctx.fillStyle = '#0ff';
+    ctx.fillText(score.toString(), panelX, scoreY + cellSize * 0.7);
+    
+    // Lines
+    ctx.fillStyle = '#fff';
+    ctx.fillText('LINES', panelX, scoreY + cellSize * 1.5);
+    ctx.fillStyle = '#ff0';
+    ctx.fillText(lines.toString(), panelX, scoreY + cellSize * 2.2);
+    
+    // Level
+    ctx.fillStyle = '#fff';
+    ctx.fillText('LEVEL', panelX, scoreY + cellSize * 3);
+    ctx.fillStyle = '#f0f';
+    ctx.fillText(level.toString(), panelX, scoreY + cellSize * 3.7);
+    
+    // Zombie danger meter
+    const meterY = by + cellSize * 8;
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${cellSize * 0.45}px monospace`;
+    ctx.fillText('ZOMBIES', panelX, meterY);
+    
+    const meterH = cellSize * 4;
+    const meterW = cellSize * 0.5;
+    const mx = panelX + meterW / 2;
+    const my = meterY + cellSize * 0.6;
+    
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(mx, my, meterW, meterH);
+    
+    const dangerRatio = zombieLevel / (ZOMBIE_MAX_ROWS + 2);
+    const fillH = meterH * dangerRatio;
+    const dangerColor = dangerRatio > 0.7 ? '#f00' : dangerRatio > 0.4 ? '#ff8800' : '#4caf50';
+    ctx.fillStyle = dangerColor;
+    ctx.fillRect(mx, my + meterH - fillH, meterW, fillH);
+    
+    ctx.strokeStyle = '#333';
+    ctx.strokeRect(mx, my, meterW, meterH);
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+    
+    const cx = W / 2;
+    const cy = H / 2;
+    
+    // Title
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${cellSize * 1.5}px monospace`;
+    ctx.fillStyle = '#4caf50';
+    ctx.fillText('ZOMBIE', cx, cy - cellSize * 3);
+    ctx.fillStyle = '#ff3333';
+    ctx.fillText('TETRIS', cx, cy - cellSize * 1.5);
+    
+    // Zombie face
+    ctx.font = `${cellSize * 2}px monospace`;
+    ctx.fillText('\u{1F922}', cx, cy + cellSize);
+    
+    ctx.font = `${cellSize * 0.6}px monospace`;
+    ctx.fillStyle = '#ccc';
+    ctx.fillText('Clear lines to keep the zombies down!', cx, cy + cellSize * 2.5);
+    
+    ctx.fillStyle = '#888';
+    ctx.font = `${cellSize * 0.5}px monospace`;
+    ctx.fillText('\u2190 \u2191 \u2192 : Move & Rotate', cx, cy + cellSize * 3.8);
+    ctx.fillText('\u2193 : Soft Drop', cx, cy + cellSize * 4.4);
+    ctx.fillText('SPACE : Hard Drop', cx, cy + cellSize * 5);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${cellSize * 0.7}px monospace`;
+    const blink = Math.sin(Date.now() / 500) > 0;
+    if (blink) ctx.fillText('PRESS ENTER TO START', cx, cy + cellSize * 6.5);
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    
+    const cx = W / 2, cy = H / 2;
+    ctx.textAlign = 'center';
+    
+    ctx.font = `bold ${cellSize * 1.2}px monospace`;
+    ctx.fillStyle = '#f44';
+    ctx.fillText('THE ZOMBIES', cx, cy - cellSize * 1.5);
+    ctx.fillText('ATE YOU!', cx, cy - cellSize * 0.3);
+    
+    ctx.font = `${cellSize * 0.7}px monospace`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`Score: ${score}`, cx, cy + cellSize * 1.2);
+    ctx.fillText(`Lines: ${lines}  Level: ${level}`, cx, cy + cellSize * 2);
+    
+    const blink = Math.sin(Date.now() / 500) > 0;
+    if (blink) {
+        ctx.fillStyle = '#4caf50';
+        ctx.font = `bold ${cellSize * 0.6}px monospace`;
+        ctx.fillText('PRESS ENTER TO RESTART', cx, cy + cellSize * 3.5);
+    }
+}
+
+// Main loop
+let lastTime = 0;
+let dropInterval = 800;
+let lastDrop = 0;
+
+function gameLoop(time) {
+    const dt = time - lastTime;
+    lastTime = time;
+    
+    if (!started) {
+        drawStartScreen();
+        requestAnimationFrame(gameLoop);
+        return;
+    }
+    
+    if (gameOver) {
+        drawBoard();
+        drawGameOver();
+        updateParticles(dt);
+        requestAnimationFrame(gameLoop);
+        return;
+    }
+    
+    // Update
+    updateZombies(dt);
+    updateParticles(dt);
+    
+    if (screenShake > 0) {
+        screenShake -= dt * 0.01;
+        if (screenShake < 0) screenShake = 0;
+    }
+    
+    // Gravity
+    dropInterval = Math.max(100, 800 - level * 50);
+    if (time - lastDrop > dropInterval) {
+        lastDrop = time;
+        drop();
+    }
+    
+    // Draw
+    ctx.save();
+    if (screenShake > 0) {
+        const sx = (Math.random() - 0.5) * screenShake;
+        const sy = (Math.random() - 0.5) * screenShake;
+        ctx.translate(sx, sy);
+    }
+    
+    drawBoard();
+    ctx.restore();
+    
+    requestAnimationFrame(gameLoop);
+}
+
+// Input
+let keyDown = {};
+window.addEventListener('keydown', (e) => {
+    if (!started || gameOver) {
+        if (e.key === 'Enter' || e.key === ' ') {
+            initAudio();
+            initGame();
+        }
+        return;
+    }
+    
+    if (keyDown[e.key]) return;
+    keyDown[e.key] = true;
+    
+    switch (e.key) {
+        case 'ArrowLeft': move(-1); break;
+        case 'ArrowRight': move(1); break;
+        case 'ArrowUp': rotate(1); break;
+        case 'z': rotate(-1); break;
+        case 'ArrowDown': drop(); lastDrop = lastTime; break;
+        case ' ': e.preventDefault(); hardDrop(); lastDrop = lastTime; break;
+        case 'x': rotate(1); break;
+    }
+});
+
+window.addEventListener('keyup', (e) => {
+    keyDown[e.key] = false;
+});
+
+// Start
+started = false;
+gameOver = false;
+board = Array.from({length: ROWS}, () => Array(COLS).fill(-1));
+score = 0; lines = 0; level = 1;
+zombieLevel = 0; zombieTimer = 0;
+particles = []; screenShake = 0; shakeTime = 0; comboCount = 0;
+currentPiece = null; nextPiece = null;
+
+requestAnimationFrame(gameLoop);
+})();
+</script>
+</body>
+</html>
