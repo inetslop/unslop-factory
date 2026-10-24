@@ -1,0 +1,613 @@
+<think>
+The user wants a stealth endless game. Let me think about what would make a good stealth endless game:
+
+Concept: A top-down (or side-view) stealth game where you're a shadow/agent moving through an endless series of rooms/corridors with guards patrolling. You need to avoid detection (stay in shadows, crouch behind cover) while progressing forward endlessly. Guards have vision cones. If spotted, you get caught and it's game over (or you lose health).
+
+Let me design this:
+- Top-down view, the player is a small shadow figure
+- The world scrolls/extends endlessly to the right (or upward)
+- Obstacles: walls, furniture (cover spots that block vision)
+- Guards patrol in patterns with visible vision cones (yellow/white sectors)
+- Player can crouch (slower movement but harder to spot), sprint, and hide behind objects
+- Detection meter - if a guard sees you, a meter fills up. If it fills, game over.
+- Score based on distance traveled
+- Endless = procedurally generated rooms/corridors
+
+Let me refine:
+- Canvas-based top-down game
+- Player moves with WASD/arrow keys
+- Space to crouch (stealth mode - slower but guards can't see you as far)
+- Shift to sprint (faster but louder/more detectable)
+- Guards have vision cones rendered in yellow/translucent
+- Cover objects (crates, walls) block line of sight
+- Procedural generation: as you move right, new sections generate
+- Detection: if guard's cone hits player AND line of sight is clear → detection fills
+- If detection maxes out → caught → game over
+- Score = distance in pixels/meters
+
+Let me code this up as a complete HTML file:
+
+- Start screen with title "SHADOW PROTOCOL" or "GHOST RUN"
+- Controls: WASD move, Space crouch, Shift sprint
+- Canvas fills window
+- No external resources
+- Web Audio for subtle sounds (footsteps, alert)
+- Restart button on game over
+
+Let me think about the mechanics more carefully:
+
+Player:
+- Position x,y
+- Velocity
+- State: normal, crouched, sprinting
+- Speed: normal 3, crouch 1.5, sprint 4.5
+- Detection radius affected by state: normal 100, crouch 60, sprint 150
+
+Guards:
+- Patrol between two points (or in a circle)
+- Vision cone: angle ~60 degrees, range based on player state
+- If player is in cone AND no wall blocks line of sight → detection increases
+- Detection decreases when not seen
+- If detection hits max → game over
+
+World generation:
+- Sections to the right, each section has:
+  - Some walls/obstacles (rectangles)
+  - 1-3 guards patrolling
+  - Maybe some "shadow zones" where you're harder to spot
+- Generate ahead of player, remove behind
+
+Visual style:
+- Dark theme (fits stealth)
+- Player is a small dark figure with subtle glow
+- Guards are slightly larger, with red/yellow vision cones
+- Walls are gray rectangles
+- Background is very dark
+- Grid lines or floor pattern for sense of movement
+
+Let me code this now. I'll make it polished and fun.
+
+Actually let me think about the game name: "GHOSTLINE" - stealth endless runner. Or "SHADOW DRIFT". Let me go with "GHOSTLINE".
+
+Controls:
+- WASD / Arrow keys: Move
+- SPACE: Crouch (stealth)
+- SHIFT: Sprint (risky)
+- Mouse or click to start/restart
+
+Let me write the full HTML now.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GHOSTLINE - Stealth Endless</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a0f; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function(){
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+function playTone(freq, dur, vol, type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+function playStep() { playTone(80 + Math.random()*40, 0.05, 0.03, 'triangle'); }
+function playAlert() { playTone(220, 0.15, 0.15, 'square'); }
+function playCaught() { playTone(110, 0.4, 0.2, 'sawtooth'); }
+function playSprintStep() { playTone(60 + Math.random()*30, 0.04, 0.05, 'triangle'); }
+
+// Game state
+let gameState = 'menu'; // menu, playing, gameover
+let score = 0;
+let highScore = 0;
+try { highScore = parseInt(localStorage.getItem('ghostline_high') || '0'); } catch(e) {}
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'menu' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+    if (gameState === 'gameover' && (e.code === 'Space' || e.code === 'Enter' || e.code === 'KeyR')) startGame();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Player
+let player = {};
+function resetPlayer() {
+    player = {
+        x: 100, y: 0, vx: 0, vy: 0,
+        crouched: false, sprinting: false,
+        detection: 0, // 0-1, fills when seen
+        stepTimer: 0,
+        radius: 8
+    };
+}
+
+// World generation
+let sections = [];
+let nextSectionX = 0;
+const SECTION_W = 600;
+
+function generateSection(x) {
+    const sec = { x: x, walls: [], guards: [], shadows: [] };
+    const margin = 80;
+    const usableW = SECTION_W - margin * 2;
+    const usableH = H - margin * 2;
+
+    // Generate 2-5 walls/obstacles
+    const numWalls = 2 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < numWalls; i++) {
+        const ww = 30 + Math.random() * 80;
+        const wh = 30 + Math.random() * 80;
+        const wx = x + margin + Math.random() * usableW;
+        const wy = margin + Math.random() * (usableH - wh);
+        sec.walls.push({ x: wx, y: wy, w: ww, h: wh });
+    }
+
+    // Generate shadow zones (circular safe spots)
+    if (Math.random() > 0.4) {
+        const sx = x + margin + Math.random() * usableW;
+        const sy = margin + Math.random() * usableH;
+        sec.shadows.push({ x: sx, y: sy, r: 50 + Math.random() * 30 });
+    }
+
+    // Generate guards (1-2)
+    const numGuards = 1 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < numGuards; i++) {
+        const gx = x + margin + Math.random() * usableW;
+        const gy = margin + Math.random() * usableH;
+        const patrolRange = 60 + Math.random() * 100;
+        const angle = Math.random() * Math.PI * 2;
+        sec.guards.push({
+            x: gx, y: gy,
+            homeX: gx, homeY: gy,
+            angle: angle,
+            patrolAngle: angle,
+            patrolRange: patrolRange,
+            speed: 0.5 + Math.random() * 0.8,
+            visionRange: 120 + Math.random() * 60,
+            visionArc: 0.7 + Math.random() * 0.3, // radians half-angle
+            timer: Math.random() * 200,
+            alertLevel: 0
+        });
+    }
+
+    sections.push(sec);
+}
+
+function startGame() {
+    initAudio();
+    gameState = 'playing';
+    score = 0;
+    resetPlayer();
+    player.y = H / 2;
+    sections = [];
+    nextSectionX = 0;
+    for (let i = 0; i < 5; i++) generateSection(nextSectionX);
+    nextSectionX = SECTION_W * 4;
+}
+
+// Collision
+function rectCircle(rx, ry, rw, rh, cx, cy, cr) {
+    const dx = Math.abs(cx - (rx + rw/2));
+    const dy = Math.abs(cy - (ry + rh/2));
+    if (dx > rw/2 + cr || dy > rh/2 + cr) return false;
+    if (dx <= rw/2 || dy <= rh/2) return true;
+    const dx2 = dx - rw/2, dy2 = dy - rh/2;
+    return dx2*dx2 + dy2*dy2 <= cr*cr;
+}
+
+function lineOfSightBlocked(x1, y1, x2, y2) {
+    // Check if any wall blocks the line
+    for (let s of sections) {
+        for (let w of s.walls) {
+            if (lineIntersectsRect(x1, y1, x2, y2, w.x, w.y, w.w, w.h)) return true;
+        }
+    }
+    return false;
+}
+
+function lineIntersectsRect(x1, y1, x2, y2, rx, ry, rw, rh) {
+    // Liang-Barsky clipping
+    const dx = x2 - x1, dy = y2 - y1;
+    let t1 = 0, t2 = 1;
+    const p = [-dx, dx, -dy, dy];
+    const q = [x1 - rx, rx + rw - x1, y1 - ry, ry + rh - y1];
+    for (let i = 0; i < 4; i++) {
+        if (p[i] === 0) { if (q[i] < 0) return false; }
+        else {
+            const t = q[i] / p[i];
+            if (p[i] < 0) { if (t > t2) return false; if (t > t1) t1 = t; }
+            else { if (t < t1) return false; if (t < t2) t2 = t; }
+        }
+    }
+    return t1 <= t2;
+}
+
+function inShadowZone(px, py) {
+    for (let s of sections) {
+        for (let sh of s.shadows) {
+            const dx = px - sh.x, dy = py - sh.y;
+            if (dx*dx + dy*dy < sh.r * sh.r) return true;
+        }
+    }
+    return false;
+}
+
+// Update
+function update(dt) {
+    if (gameState !== 'playing') return;
+
+    const speed = player.crouched ? 1.5 : (player.sprinting ? 4.5 : 3);
+    let mx = 0, my = 0;
+    if (keys['KeyW'] || keys['ArrowUp']) my -= 1;
+    if (keys['KeyS'] || keys['ArrowDown']) my += 1;
+    if (keys['KeyA'] || keys['ArrowLeft']) mx -= 1;
+    if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+
+    player.crouched = !!keys['Space'];
+    player.sprinting = !player.crouched && (keys['ShiftLeft'] || keys['ShiftRight']);
+
+    const len = Math.sqrt(mx*mx + my*my) || 1;
+    player.vx = (mx/len) * speed;
+    player.vy = (my/len) * speed;
+
+    // Move with wall collision
+    let nx = player.x + player.vx * dt * 60;
+    let ny = player.y + player.vy * dt * 60;
+
+    for (let s of sections) {
+        for (let w of s.walls) {
+            if (rectCircle(w.x, w.y, w.w, w.h, nx, ny, player.radius)) {
+                // Push out
+                const cx = w.x + w.w/2, cy = w.y + w.h/2;
+                const dx = nx - cx, dy = ny - cy;
+                if (Math.abs(dx) > Math.abs(dy)) nx = dx > 0 ? w.x + w.w + player.radius : w.x - player.radius;
+                else ny = dy > 0 ? w.y + w.h + player.radius : w.y - player.radius;
+            }
+        }
+    }
+
+    // Keep in bounds vertically
+    ny = Math.max(player.radius, Math.min(H - player.radius, ny));
+    player.x = nx;
+    player.y = ny;
+
+    // Step sounds
+    if ((mx !== 0 || my !== 0)) {
+        player.stepTimer += dt * (player.sprinting ? 12 : 6);
+        if (player.stepTimer > 1) {
+            player.stepTimer = 0;
+            if (player.crouched) playStep();
+            else if (player.sprinting) playSprintStep();
+            else playStep();
+        }
+    }
+
+    // Update guards
+    let seenByAny = false;
+    for (let s of sections) {
+        for (let g of s.guards) {
+            g.timer += dt * 60;
+            const t = g.timer * 0.02;
+            g.patrolAngle += dt * g.speed * 0.3;
+            g.x = g.homeX + Math.cos(g.patrolAngle) * g.patrolRange;
+            g.y = g.homeY + Math.sin(g.patrolAngle) * g.patrolRange * 0.6;
+            g.angle = Math.sin(g.timer * 0.015) * 0.8;
+
+            // Check if player is in vision cone
+            const dx = player.x - g.x, dy = player.y - g.y;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            let visRange = g.visionRange;
+            if (player.crouched) visRange *= 0.5;
+            if (player.sprinting) visRange *= 1.4;
+            if (inShadowZone(player.x, player.y)) visRange *= 0.6;
+
+            if (dist < visRange) {
+                const angleToPlayer = Math.atan2(dy, dx);
+                let diff = angleToPlayer - g.angle;
+                while (diff > Math.PI) diff -= Math.PI * 2;
+                while (diff < -Math.PI) diff += Math.PI * 2;
+                if (Math.abs(diff) < g.visionArc) {
+                    if (!lineOfSightBlocked(g.x, g.y, player.x, player.y)) {
+                        seenByAny = true;
+                        g.alertLevel = Math.min(1, g.alertLevel + dt * 2);
+                    }
+                }
+            }
+            if (g.alertLevel > 0 && !seenByAny) g.alertLevel = Math.max(0, g.alertLevel - dt * 0.5);
+        }
+    }
+
+    // Detection
+    if (seenByAny) {
+        player.detection += dt * 1.2;
+        if (player.detection > 0.3 && Math.random() < 0.05) playAlert();
+    } else {
+        player.detection = Math.max(0, player.detection - dt * 0.8);
+    }
+
+    if (player.detection >= 1) {
+        gameState = 'gameover';
+        playCaught();
+        try { localStorage.setItem('ghostline_high', String(highScore)); } catch(e) {}
+        if (score > highScore) { highScore = score; }
+    }
+
+    // Score
+    score = Math.floor(player.x / 10);
+
+    // Generate ahead, remove behind
+    while (nextSectionX < player.x + W * 2) {
+        generateSection(nextSectionX);
+        nextSectionX += SECTION_W;
+    }
+    sections = sections.filter(s => s.x + SECTION_W > player.x - 200);
+}
+
+// Render
+function render() {
+    ctx.fillStyle = '#0a0a0f';
+    ctx.fillRect(0, 0, W, H);
+
+    if (gameState === 'menu') {
+        renderMenu();
+        return;
+    }
+
+    const camX = player.x - W * 0.3;
+
+    // Floor grid
+    ctx.strokeStyle = 'rgba(40, 50, 70, 0.3)';
+    ctx.lineWidth = 1;
+    const gridSize = 60;
+    const startX = Math.floor(camX / gridSize) * gridSize;
+    for (let x = startX; x < camX + W + gridSize; x += gridSize) {
+        ctx.beginPath(); ctx.moveTo(x - camX, 0); ctx.lineTo(x - camX, H); ctx.stroke();
+    }
+    for (let y = 0; y < H + gridSize; y += gridSize) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+
+    // Shadow zones
+    for (let s of sections) {
+        for (let sh of s.shadows) {
+            const sx = sh.x - camX;
+            const grad = ctx.createRadialGradient(sx, sh.y, 0, sx, sh.y, sh.r);
+            grad.addColorStop(0, 'rgba(20, 40, 80, 0.3)');
+            grad.addColorStop(1, 'rgba(20, 40, 80, 0)');
+            ctx.fillStyle = grad;
+            ctx.beginPath(); ctx.arc(sx, sh.y, sh.r, 0, Math.PI*2); ctx.fill();
+        }
+    }
+
+    // Walls
+    for (let s of sections) {
+        for (let w of s.walls) {
+            const wx = w.x - camX;
+            ctx.fillStyle = '#2a2a35';
+            ctx.fillRect(wx, w.y, w.w, w.h);
+            ctx.strokeStyle = '#4a4a5a';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(wx, w.y, w.w, w.h);
+        }
+    }
+
+    // Guards & vision cones
+    for (let s of sections) {
+        for (let g of s.guards) {
+            const gx = g.x - camX;
+            let visRange = g.visionRange;
+            if (player.crouched) visRange *= 0.5;
+            if (player.sprinting) visRange *= 1.4;
+            if (inShadowZone(player.x, player.y)) visRange *= 0.6;
+
+            // Vision cone
+            ctx.beginPath();
+            ctx.moveTo(gx, g.y);
+            ctx.arc(gx, g.y, visRange, g.angle - g.visionArc, g.angle + g.visionArc);
+            ctx.closePath();
+            const alertColor = g.alertLevel > 0.5 ? 'rgba(255, 50, 50,' : 'rgba(255, 200, 50,';
+            ctx.fillStyle = alertColor + (0.1 + g.alertLevel * 0.1) + ')';
+            ctx.fill();
+            ctx.strokeStyle = alertColor + '0.3)';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            // Guard body
+            ctx.fillStyle = '#cc3333';
+            ctx.beginPath(); ctx.arc(gx, g.y, 10, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle = '#ff6666';
+            ctx.beginPath(); ctx.arc(gx, g.y, 5, 0, Math.PI*2); ctx.fill();
+
+            // Alert indicator
+            if (g.alertLevel > 0.1) {
+                ctx.fillStyle = 'rgba(255,50,50,' + g.alertLevel + ')';
+                ctx.font = 'bold 16px monospace';
+                ctx.fillText('!', gx - 3, g.y - 18);
+            }
+        }
+    }
+
+    // Player
+    const px = player.x - camX;
+    const py = player.y;
+    const pR = player.crouched ? 5 : 8;
+
+    // Glow
+    const glowGrad = ctx.createRadialGradient(px, py, 0, px, py, pR * 3);
+    glowGrad.addColorStop(0, 'rgba(100, 150, 255, 0.3)');
+    glowGrad.addColorStop(1, 'rgba(100, 150, 255, 0)');
+    ctx.fillStyle = glowGrad;
+    ctx.beginPath(); ctx.arc(px, py, pR * 3, 0, Math.PI*2); ctx.fill();
+
+    // Body
+    ctx.fillStyle = player.crouched ? '#4488cc' : '#66aaff';
+    ctx.beginPath(); ctx.arc(px, py, pR, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#aaccee';
+    ctx.beginPath(); ctx.arc(px, py, pR * 0.5, 0, Math.PI*2); ctx.fill();
+
+    // Detection bar
+    const barW = 120;
+    const barH = 8;
+    const barX = px - barW/2;
+    const barY = py - 25;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(barX, barY, barW, barH);
+    const detColor = player.detection > 0.7 ? '#ff3333' : (player.detection > 0.4 ? '#ffaa00' : '#44cc44');
+    ctx.fillStyle = detColor;
+    ctx.fillRect(barX, barY, barW * player.detection, barH);
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.strokeRect(barX, barY, barW, barH);
+
+    // HUD
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 18px monospace';
+    ctx.fillText('SCORE: ' + score, 20, 35);
+    ctx.font = '14px monospace';
+    ctx.fillStyle = '#888';
+    ctx.fillText('HI: ' + highScore, 20, 55);
+
+    // State indicator
+    if (player.crouched) { ctx.fillStyle = '#66aaff'; ctx.fillText('[CROUCHED]', 20, 80); }
+    if (player.sprinting) { ctx.fillStyle = '#ffaa44'; ctx.fillText('[SPRINTING]', 20, 80); }
+
+    // Vignette when detected
+    if (player.detection > 0.3) {
+        const vigAlpha = player.detection * 0.4;
+        const vGrad = ctx.createRadialGradient(W/2, H/2, W*0.3, W/2, H/2, W*0.6);
+        vGrad.addColorStop(0, 'rgba(0,0,0,0)');
+        vGrad.addColorStop(1, 'rgba(255,0,0,' + vigAlpha + ')');
+        ctx.fillStyle = vGrad;
+        ctx.fillRect(0, 0, W, H);
+    }
+
+    if (gameState === 'gameover') renderGameOver();
+}
+
+function renderMenu() {
+    ctx.fillStyle = '#0a0a0f';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title glow
+    const tGrad = ctx.createRadialGradient(W/2, H*0.3, 0, W/2, H*0.3, 200);
+    tGrad.addColorStop(0, 'rgba(100,150,255,0.1)');
+    tGrad.addColorStop(1, 'rgba(100,150,255,0)');
+    ctx.fillStyle = tGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 48px monospace';
+    ctx.fillStyle = '#66aaff';
+    ctx.fillText('G H O S T L I N E', W/2, H * 0.3);
+
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('A stealth endless runner', W/2, H * 0.3 + 35);
+
+    ctx.font = '14px monospace';
+    ctx.fillStyle = '#888';
+    const lines = [
+        'WASD / Arrows — Move',
+        'SPACE — Crouch (harder to spot, slower)',
+        'SHIFT — Sprint (faster, easier to spot)',
+        '',
+        'Avoid guard vision cones. Stay in shadow zones.',
+        'If the detection bar fills up, you\'re caught.'
+    ];
+    lines.forEach((l, i) => ctx.fillText(l, W/2, H * 0.45 + i * 24));
+
+    ctx.font = 'bold 18px monospace';
+    ctx.fillStyle = '#fff';
+    const pulse = 0.5 + Math.sin(Date.now() * 0.003) * 0.5;
+    ctx.globalAlpha = pulse;
+    ctx.fillText('PRESS SPACE TO BEGIN', W/2, H * 0.8);
+    ctx.globalAlpha = 1;
+
+    if (highScore > 0) {
+        ctx.font = '14px monospace';
+        ctx.fillStyle = '#666';
+        ctx.fillText('HIGH SCORE: ' + highScore, W/2, H * 0.87);
+    }
+    ctx.textAlign = 'left';
+}
+
+function renderGameOver() {
+    ctx.fillStyle = 'rgba(10,10,15,0.8)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 36px monospace';
+    ctx.fillStyle = '#ff4444';
+    ctx.fillText('DETECTED', W/2, H * 0.35);
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Score: ' + score, W/2, H * 0.45);
+    if (score >= highScore && score > 0) {
+        ctx.fillStyle = '#ffcc00';
+        ctx.fillText('NEW HIGH SCORE!', W/2, H * 0.52);
+    }
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#aaa';
+    const pulse = 0.5 + Math.sin(Date.now() * 0.003) * 0.5;
+    ctx.globalAlpha = pulse;
+    ctx.fillText('PRESS SPACE TO RETRY', W/2, H * 0.65);
+    ctx.globalAlpha = 1;
+    ctx.textAlign = 'left';
+}
+
+// Game loop
+let lastTime = 0;
+function loop(time) {
+    const dt = Math.min((time - lastTime) / 1000, 0.05);
+    lastTime = time;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// Click to start (for audio context)
+canvas.addEventListener('click', () => {
+    initAudio();
+    if (gameState === 'menu') startGame();
+    else if (gameState === 'gameover') startGame();
+});
+})();
+</script>
+</body>
+</html>
+```
