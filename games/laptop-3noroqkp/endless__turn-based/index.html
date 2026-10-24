@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Depth - Endless Dungeon</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a0f; overflow: hidden; display: flex; align-items: center; justify-content: center; height: 100vh; width: 100vw; font-family: monospace; }
+canvas { display: block; image-rendering: pixelated; }
+#ui-overlay {
+position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+display: flex; align-items: center; justify-content: center;
+pointer-events: none; z-index: 10;
+}
+#start-screen, #game-over {
+background: rgba(10,10,15,0.95); border: 2px solid #4a3b6b; border-radius: 8px;
+padding: 40px; text-align: center; color: #e0d8f0; max-width: 500px; pointer-events: all;
+}
+#start-screen h1, #game-over h1 { font-size: 2.5em; color: #b8a0e8; margin-bottom: 10px; text-shadow: 0 0 20px #6b4c9a; }
+#start-screen p, #game-over p { font-size: 1em; line-height: 1.6; color: #a89cc8; margin: 10px 0; }
+.btn {
+background: #4a3b6b; color: #e0d8f0; border: 2px solid #7b5fb0; padding: 12px 30px;
+font-size: 1.1em; font-family: monospace; cursor: pointer; border-radius: 4px; margin-top: 15px;
+transition: all 0.2s;
+}
+.btn:hover { background: #6b4c9a; transform: scale(1.05); }
+.controls { font-size: 0.85em; color: #7a6e9a; margin-top: 15px; line-height: 1.8; }
+#game-over .stats { color: #b8a0e8; font-size: 1.2em; margin: 15px 0; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="ui-overlay">
+<div id="start-screen">
+<h1>⚔ DEPTH ⚔</h1>
+<p>Descend into the endless dungeon. Fight monsters, collect loot, and survive as long as you can.</p>
+<p class="controls">
+<strong>WASD / Arrow Keys</strong> — Move & Attack<br>
+<strong>Space</strong> — Wait a turn<br>
+<strong>G</strong> — Pick up item (auto)<br>
+Find the <span style="color:#7fff7f">stairs ▼</span> to descend deeper.<br>
+Each level is harder. How deep can you go?
+</p>
+<button class="btn" id="start-btn">DESCEND</button>
+</div>
+<div id="game-over" style="display:none">
+<h1>☠ SLAIN ☠</h1>
+<div class="stats" id="final-stats"></div>
+<button class="btn" id="restart-btn">TRY AGAIN</button>
+</div>
+</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W, H, TILE;
+let gameState = 'start'; // start, playing, over
+let audioCtx = null;
+
+function resize() {
+W = window.innerWidth; H = window.innerHeight;
+canvas.width = W; canvas.height = H;
+TILE = Math.floor(Math.min(W, H) / 22);
+}
+window.addEventListener('resize', resize);
+resize();
+
+function initAudio() {
+if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function playSound(freq, dur, type='square', vol=0.15) {
+if (!audioCtx) return;
+const osc = audioCtx.createOscillator();
+const gain = audioCtx.createGain();
+osc.type = type;
+osc.frequency.value = freq;
+gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+osc.connect(gain);
+gain.connect(audioCtx.destination);
+osc.start();
+osc.stop(audioCtx.currentTime + dur);
+}
+
+function sfxMove() { playSound(200, 0.05, 'sine', 0.08); }
+function sfxAttack() { playSound(300, 0.1, 'square', 0.12); }
+function sfxHit() { playSound(150, 0.15, 'sawtooth', 0.15); }
+function sfxStairs() { playSound(400, 0.3, 'sine', 0.1); setTimeout(()=>playSound(600,0.2,'sine',0.08),100); }
+function sfxPickup() { playSound(800, 0.1, 'sine', 0.1); }
+function sfxDeath() { playSound(100, 0.5, 'sawtooth', 0.2); }
+
+// Game state
+let player, enemies, items, stairs, level, score, kills, turnCount;
+const GRID_W = 19, GRID_H = 15;
+
+function initGame() {
+player = { x: Math.floor(GRID_W/2), y: Math.floor(GRID_H/2), hp: 30, maxHp: 30, atk: 4, def: 2 };
+level = 1; score = 0; kills = 0; turnCount = 0;
+enemies = []; items = []; stairs = null;
+generateLevel();
+}
+
+function generateLevel() {
+enemies = []; items = [];
+const numEnemies = Math.min(3 + level, 12);
+for (let i = 0; i < numEnemies; i++) {
+let ex, ey;
+do { ex = Math.floor(Math.random()*GRID_W); ey = Math.floor(Math.random()*GRID_H); }
+while (Math.abs(ex - player.x) + Math.abs(ey - player.y) < 4 || enemies.some(e => e.x===ex && e.y===ey));
+const type = getEnemyType();
+enemies.push({ x: ex, y: ey, hp: type.hp, maxHp: type.hp, atk: type.atk, def: type.def, name: type.name, color: type.color, aggro: 2 + Math.floor(level/3) });
+}
+// Items
+const numItems = 1 + Math.floor(Math.random()*3);
+for (let i = 0; i < numItems; i++) {
+let ix, iy;
+do { ix = Math.floor(Math.random()*GRID_W); iy = Math.floor(Math.random()*GRID_H); }
+while ((ix===player.x && iy===player.y) || enemies.some(e=>e.x===ix&&e.y===iy) || items.some(it=>it.x===ix&&it.y===iy));
+const type = Math.random() < 0.5 ? 'heal' : 'atk';
+items.push({ x: ix, y: iy, type });
+}
+// Stairs
+let sx, sy;
+do { sx = Math.floor(Math.random()*GRID_W); sy = Math.floor(Math.random()*GRID_H); }
+while ((sx===player.x && sy===player.y) || enemies.some(e=>e.x===sx&&e.y===sy) || items.some(it=>it.x===sx&&it.y===sy));
+stairs = { x: sx, y: sy };
+}
+
+function getEnemyType() {
+const types = [
+{ name:'Slime', hp: 4 + level, atk: 2 + Math.floor(level/2), def: 0, color:'#5a3' },
+{ name:'Ghoul', hp: 6 + level, atk: 3 + Math.floor(level/2), def: 1, color:'#755' },
+{ name:'Wraith', hp: 5 + level, atk: 4 + level, def: 0, color:'#87b' },
+{ name:'Ogre', hp: 10 + level*2, atk: 2 + Math.floor(level/3), def: 2, color:'#a64' },
+];
+const idx = Math.floor(Math.random() * Math.min(types.length, 1 + Math.floor(level/2)));
+return types[idx % types.length];
+}
+
+function playerMove(dx, dy) {
+if (gameState !== 'playing') return;
+const nx = player.x + dx, ny = player.y + dy;
+if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) return;
+
+// Check item pickup
+const itemIdx = items.findIndex(it => it.x === nx && it.y === ny);
+if (itemIdx >= 0) {
+const it = items[itemIdx];
+if (it.type === 'heal') { player.hp = Math.min(player.hp + 5, player.maxHp); }
+else { player.atk += 1; }
+sfxPickup();
+items.splice(itemIdx, 1);
+}
+
+// Check stairs
+if (nx === stairs.x && ny === stairs.y) {
+level++;
+score += level * 10;
+sfxStairs();
+player.x = nx; player.y = ny;
+generateLevel();
+endTurn();
+return;
+}
+
+// Check enemy collision (attack)
+const eIdx = enemies.findIndex(e => e.x === nx && e.y === ny);
+if (eIdx >= 0) {
+const e = enemies[eIdx];
+const dmg = Math.max(1, player.atk - e.def);
+e.hp -= dmg;
+sfxAttack();
+if (e.hp <= 0) {
+score += e.maxHp * 2 + level;
+kills++;
+enemies.splice(eIdx, 1);
+sfxHit();
+}
+endTurn();
+return;
+}
+
+player.x = nx; player.y = ny;
+sfxMove();
+endTurn();
+}
+
+function endTurn() {
+turnCount++;
+// Enemy turns
+for (let i = enemies.length - 1; i >= 0; i--) {
+const e = enemies[i];
+const dist = Math.abs(e.x - player.x) + Math.abs(e.y - player.y);
+if (dist <= e.aggro) {
+// Move toward player
+let dx = Math.sign(player.x - e.x), dy = Math.sign(player.y - e.y);
+// Try to attack
+if (dist === 1) {
+const dmg = Math.max(1, e.atk - player.def);
+player.hp -= dmg;
+sfxHit();
+if (player.hp <= 0) { gameOver(); return; }
+} else {
+let moved = false;
+// Try primary direction
+if (!blocked(e.x+dx, e.y) && !enemies.some(en=>en.x===e.x+dx&&en.y===e.y)) { e.x+=dx; moved=true; }
+else if (!blocked(e.x, e.y+dy) && !enemies.some(en=>en.x===e.x&&en.y===e.y+dy)) { e.y+=dy; moved=true; }
+else if (!blocked(e.x-dx, e.y) && !enemies.some(en=>en.x===e.x-dx&&en.y===e.y)) { e.x-=dx; moved=true; }
+else if (!blocked(e.x, e.y-dy) && !enemies.some(en=>en.x===e.x&&en.y===e.y-dy)) { e.y-=dy; moved=true; }
+}
+} else {
+// Random wander
+if (Math.random() < 0.4) {
+const dirs = [[-1,0],[1,0],[0,-1],[0,1]];
+const d = dirs[Math.floor(Math.random()*4)];
+const nx2 = e.x+d[0], ny2 = e.y+d[1];
+if (!blocked(nx2,ny2) && !enemies.some(en=>en.x===nx2&&en.y===ny2) && !(nx2===player.x&&ny2===player.y)) {
+e.x=nx2; e.y=ny2;
+}
+}
+}
+}
+}
+
+function blocked(x,y) { return x<0||x>=GRID_W||y<0||y>=GRID_H; }
+
+function gameOver() {
+gameState = 'over';
+sfxDeath();
+document.getElementById('final-stats').innerHTML =
+`Depth reached: <strong>${level}</strong><br>Score: <strong>${score}</strong><br>Kills: <strong>${kills}</strong><br>Turns: <strong>${turnCount}</strong>`;
+document.getElementById('game-over').style.display = 'block';
+}
+
+function startGame() {
+initAudio();
+initGame();
+gameState = 'playing';
+document.getElementById('start-screen').style.display = 'none';
+document.getElementById('game-over').style.display = 'none';
+}
+
+document.getElementById('start-btn').addEventListener('click', startGame);
+document.getElementById('restart-btn').addEventListener('click', startGame);
+
+window.addEventListener('keydown', (e) => {
+if (gameState !== 'playing') return;
+initAudio();
+let dx=0, dy=0;
+switch(e.key) {
+case 'ArrowUp': case 'w': case 'W': dy=-1; break;
+case 'ArrowDown': case 's': case 'S': dy=1; break;
+case 'ArrowLeft': case 'a': case 'A': dx=-1; break;
+case 'ArrowRight': case 'd': case 'D': dx=1; break;
+case ' ': e.preventDefault(); endTurn(); return;
+default: return;
+}
+e.preventDefault();
+playerMove(dx, dy);
+});
+
+// Rendering
+function draw() {
+ctx.fillStyle = '#0a0a0f';
+ctx.fillRect(0, 0, W, H);
+
+if (gameState === 'start') { requestAnimationFrame(draw); return; }
+
+const ox = (W - GRID_W * TILE) / 2;
+const oy = (H - GRID_H * TILE) / 2;
+
+// Draw grid
+for (let x = 0; x < GRID_W; x++) {
+for (let y = 0; y < GRID_H; y++) {
+const px = ox + x * TILE, py = oy + y * TILE;
+const c1 = ((x+y)%2===0) ? '#1a1a24' : '#15151f';
+ctx.fillStyle = c1;
+ctx.fillRect(px, py, TILE, TILE);
+}
+}
+
+// Grid border
+ctx.strokeStyle = '#2a2a3a';
+ctx.lineWidth = 2;
+ctx.strokeRect(ox, oy, GRID_W*TILE, GRID_H*TILE);
+
+// Stairs
+if (stairs) {
+const sx = ox + stairs.x*TILE, sy = oy + stairs.y*TILE;
+ctx.fillStyle = '#1a3a1a';
+ctx.fillRect(sx+2, sy+2, TILE-4, TILE-4);
+ctx.fillStyle = '#7fff7f';
+ctx.font = `bold ${TILE*0.6}px monospace`;
+ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+ctx.fillText('▼', sx+TILE/2, sy+TILE/2);
+}
+
+// Items
+for (const it of items) {
+const ix = ox + it.x*TILE, iy = oy + it.y*TILE;
+ctx.fillStyle = it.type==='heal' ? '#2a5a2a' : '#5a3a1a';
+ctx.fillRect(ix+3, iy+3, TILE-6, TILE-6);
+ctx.fillStyle = it.type==='heal' ? '#7fff7f' : '#ffbf40';
+ctx.font = `bold ${TILE*0.5}px monospace`;
+ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+ctx.fillText(it.type==='heal' ? '+' : '⚔', ix+TILE/2, iy+TILE/2);
+}
+
+// Enemies
+for (const e of enemies) {
+const ex = ox + e.x*TILE, ey = oy + e.y*TILE;
+ctx.fillStyle = e.color;
+ctx.fillRect(ex+3, ey+3, TILE-6, TILE-6);
+// HP bar
+const hpPct = e.hp / e.maxHp;
+ctx.fillStyle = '#300';
+ctx.fillRect(ex+3, ey+TILE-4, TILE-6, 3);
+ctx.fillStyle = hpPct > 0.5 ? '#5f5' : hpPct > 0.25 ? '#ff5' : '#f55';
+ctx.fillRect(ex+3, ey+TILE-4, (TILE-6)*hpPct, 3);
+// Face
+ctx.fillStyle = '#fff';
+ctx.font = `${TILE*0.4}px monospace`;
+ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+ctx.fillText('☠', ex+TILE/2, ey+TILE/2-2);
+}
+
+// Player
+const px = ox + player.x*TILE, py = oy + player.y*TILE;
+ctx.fillStyle = '#3a6aff';
+ctx.fillRect(px+2, py+2, TILE-4, TILE-4);
+ctx.fillStyle = '#fff';
+ctx.font = `bold ${TILE*0.5}px monospace`;
+ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+ctx.fillText('♞', px+TILE/2, py+TILE/2);
+
+// HUD
+const hudY = oy + GRID_H*TILE + 10;
+ctx.fillStyle = '#e0d8f0';
+ctx.font = '14px monospace';
+ctx.textAlign = 'left';
+ctx.fillText(`Depth: ${level}   Score: ${score}   Kills: ${kills}   Turn: ${turnCount}`, ox, hudY);
+
+// HP Bar
+const hpW = 200, hpH = 14;
+ctx.fillStyle = '#300';
+ctx.fillRect(ox, hudY + 10, hpW, hpH);
+const hpPct = Math.max(0, player.hp / player.maxHp);
+ctx.fillStyle = hpPct > 0.5 ? '#5f5' : hpPct > 0.25 ? '#ff5' : '#f55';
+ctx.fillRect(ox, hudY + 10, hpW * hpPct, hpH);
+ctx.strokeStyle = '#666';
+ctx.strokeRect(ox, hudY + 10, hpW, hpH);
+ctx.fillStyle = '#fff';
+ctx.font = '11px monospace';
+ctx.textAlign = 'center';
+ctx.fillText(`${Math.max(0,player.hp)}/${player.maxHp}`, ox + hpW/2, hudY + 17);
+
+// ATK display
+ctx.textAlign = 'left';
+ctx.fillStyle = '#ffbf40';
+ctx.font = '13px monospace';
+ctx.fillText(`ATK: ${player.atk}  DEF: ${player.def}`, ox + hpW + 20, hudY + 22);
+
+requestAnimationFrame(draw);
+}
+
+// Touch controls for mobile
+let touchStartX = 0, touchStartY = 0;
+canvas.addEventListener('touchstart', (e) => {
+initAudio();
+if (gameState !== 'playing') return;
+touchStartX = e.touches[0].clientX;
+touchStartY = e.touches[0].clientY;
+});
+canvas.addEventListener('touchend', (e) => {
+if (gameState !== 'playing') return;
+const dx = e.changedTouches[0].clientX - touchStartX;
+const dy = e.changedTouches[0].clientY - touchStartY;
+if (Math.abs(dx) > Math.abs(dy)) {
+if (Math.abs(dx) > 20) playerMove(Math.sign(dx), 0);
+} else {
+if (Math.abs(dy) > 20) playerMove(0, Math.sign(dy));
+}
+});
+
+initGame();
+draw();
+</script>
+</body>
+</html>
