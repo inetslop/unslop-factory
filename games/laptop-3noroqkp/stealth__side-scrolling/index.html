@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shadow Step</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a0f; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+function playTone(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.15, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+function sfxAlert() { playTone(440, 0.3, 'sawtooth', 0.1); }
+function sfxCaught() { playTone(200, 0.8, 'square', 0.2); }
+function sfxWin() { playTone(660, 0.3, 'sine', 0.15); setTimeout(() => playTone(880, 0.4, 'sine', 0.15), 200); }
+function sfxStep() { playTone(80, 0.05, 'triangle', 0.03); }
+
+// Game state
+let gameState = 'start'; // start, playing, caught, won
+let keys = {};
+let lastTime = 0;
+let stepTimer = 0;
+
+const LEVEL_W = 3200;
+const GROUND_Y_RATIO = 0.78;
+
+// Player
+let player = { x: 100, y: 0, w: 28, h: 52, vy: 0, speed: 200, crouching: false, facing: 1, visible: true };
+const CROUCH_H = 32;
+
+// Guards
+let guards = [];
+function initGuards() {
+    guards = [
+        { x: 600, y: 0, w: 30, h: 52, patrolMin: 450, patrolMax: 850, dir: 1, speed: 60, facing: 1, alert: 0, range: 220, fov: Math.PI * 0.3 },
+        { x: 1400, y: 0, w: 30, h: 52, patrolMin: 1250, patrolMax: 1700, dir: -1, speed: 80, facing: -1, alert: 0, range: 250, fov: Math.PI * 0.25 },
+        { x: 2400, y: 0, w: 30, h: 52, patrolMin: 2200, patrolMax: 2700, dir: 1, speed: 70, facing: 1, alert: 0, range: 280, fov: Math.PI * 0.3 },
+        { x: 2850, y: 0, w: 30, h: 52, patrolMin: 2750, patrolMax: 3050, dir: -1, speed: 90, facing: -1, alert: 0, range: 200, fov: Math.PI * 0.35 }
+    ];
+}
+
+// Obstacles (pillars/walls)
+let obstacles = [];
+function initObstacles() {
+    const gy = GROUND_Y_RATIO;
+    obstacles = [
+        { x: 400, y: gy - 1.0, w: 30, h: 80 },
+        { x: 900, y: gy - 1.2, w: 35, h: 100 },
+        { x: 1100, y: gy - 0.8, w: 25, h: 60 },
+        { x: 1550, y: gy - 1.1, w: 30, h: 90 },
+        { x: 1900, y: gy - 0.9, w: 40, h: 70 },
+        { x: 2250, y: gy - 1.3, w: 30, h: 110 },
+        { x: 2600, y: gy - 0.8, w: 25, h: 65 },
+        { x: 2950, y: gy - 1.0, w: 35, h: 85 }
+    ];
+}
+
+// Goal
+const goalX = LEVEL_W - 80;
+
+// Camera
+let camX = 0;
+
+function groundY() { return H * GROUND_Y_RATIO; }
+
+function resetGame() {
+    player.x = 100;
+    player.crouching = false;
+    player.facing = 1;
+    player.visible = true;
+    player.vy = 0;
+    initGuards();
+    initObstacles();
+    camX = 0;
+}
+
+// Input
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'start' && (e.code === 'Space' || e.code === 'Enter')) {
+        initAudio();
+        resetGame();
+        gameState = 'playing';
+    }
+    if ((gameState === 'caught' || gameState === 'won') && e.code === 'KeyR') {
+        resetGame();
+        gameState = 'playing';
+    }
+    if (e.code === 'Space' || e.code === 'Enter') e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Vision check
+function canSee(guard, px, py) {
+    const gx = guard.x + guard.w / 2;
+    const gy = groundY() - guard.h / 2;
+    const dx = px - gx;
+    const dy = py - gy;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > guard.range) return false;
+
+    // Check facing direction
+    const angle = Math.atan2(dy, dx);
+    let diff = Math.abs(angle - (guard.facing === 1 ? 0 : Math.PI));
+    if (diff > Math.PI) diff = 2 * Math.PI - diff;
+    if (diff > guard.fov) return false;
+
+    // Check obstacle blocking (simple: check if any obstacle is between them roughly on the line)
+    for (let obs of obstacles) {
+        const ox = obs.x + obs.w / 2;
+        const oy = groundY() - obs.h / 2;
+        // Point-to-segment distance approximation
+        const t = Math.max(0, Math.min(1, ((ox - gx) * (px - gx) + (oy - gy) * (py - gy)) / (dist * dist)));
+        const cx = gx + t * (px - gx);
+        const cy = gy + t * (py - gy);
+        const cdx = ox - cx;
+        const cdy = oy - cy;
+        if (Math.sqrt(cdx * cdx + cdy * cdy) < Math.max(obs.w, obs.h) * 0.6 && t > 0.1 && t < 0.9) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function update(dt) {
+    if (gameState !== 'playing') return;
+
+    const gy = groundY();
+    // Player movement
+    let speed = player.crouching ? 80 : player.speed;
+    if (keys['KeyA'] || keys['ArrowLeft']) { player.x -= speed * dt; player.facing = -1; }
+    if (keys['KeyD'] || keys['ArrowRight']) { player.x += speed * dt; player.facing = 1; }
+    if (keys['KeyC']) player.crouching = true; else player.crouching = false;
+
+    player.h = player.crouching ? CROUCH_H : 52;
+    player.y = gy - player.h;
+
+    // Step sound
+    if ((keys['KeyA'] || keys['ArrowLeft'] || keys['KeyD'] || keys['ArrowRight']) && !player.crouching) {
+        stepTimer += dt;
+        if (stepTimer > 0.35) { stepTimer = 0; sfxStep(); }
+    } else { stepTimer = 0; }
+
+    player.x = Math.max(0, Math.min(LEVEL_W - player.w, player.x));
+
+    // Guards
+    let anyAlert = false;
+    for (let g of guards) {
+        g.x += g.dir * g.speed * dt;
+        if (g.x < g.patrolMin) { g.x = g.patrolMin; g.dir = 1; }
+        if (g.x > g.patrolMax) { g.x = g.patrolMax; g.dir = -1; }
+        g.facing = g.dir;
+
+        const px = player.x + player.w / 2;
+        const py = player.y + player.h / 2;
+        if (canSee(g, px, py)) {
+            g.alert = Math.min(1, g.alert + dt * 1.5);
+            anyAlert = true;
+            if (g.alert >= 1 && gameState === 'playing') {
+                gameState = 'caught';
+                sfxCaught();
+                return;
+            }
+        } else {
+            g.alert = Math.max(0, g.alert - dt * 0.5);
+        }
+    }
+
+    // Goal check
+    if (player.x + player.w > goalX) {
+        gameState = 'won';
+        sfxWin();
+    }
+
+    // Camera
+    const targetCam = player.x - W * 0.4;
+    camX += (targetCam - camX) * dt * 5;
+    camX = Math.max(0, Math.min(LEVEL_W - W, camX));
+}
+
+function draw() {
+    ctx.clearRect(0, 0, W, H);
+
+    // Background gradient
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+    bgGrad.addColorStop(0, '#0d1117');
+    bgGrad.addColorStop(1, '#1a1f2e');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    const gy = groundY();
+
+    if (gameState === 'start') {
+        drawStartScreen();
+        return;
+    }
+
+    // Parallax background elements
+    ctx.save();
+    ctx.translate(-camX * 0.3, 0);
+    for (let i = 0; i < 20; i++) {
+        const bx = (i * 200 + 50) % (LEVEL_W * 0.5);
+        ctx.fillStyle = '#1e293b';
+        ctx.fillRect(bx, gy - 180 - Math.sin(i * 1.7) * 40, 40, 180 + Math.sin(i * 1.7) * 40);
+    }
+    ctx.restore();
+
+    // Ground
+    ctx.fillStyle = '#2a2a3a';
+    ctx.fillRect(0, gy, W, H - gy);
+    ctx.strokeStyle = '#4a4a6a';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, gy);
+    ctx.lineTo(W, gy);
+    ctx.stroke();
+
+    // Ground details
+    ctx.fillStyle = '#353548';
+    for (let i = 0; i < LEVEL_W / 40; i++) {
+        const lx = i * 40 - camX % 40;
+        ctx.fillRect(lx, gy + 5, 20, 3);
+    }
+
+    // Obstacles
+    for (let obs of obstacles) {
+        const sx = obs.x - camX;
+        if (sx < -100 || sx > W + 100) continue;
+        ctx.fillStyle = '#3d3d5c';
+        ctx.fillRect(sx, gy - obs.h, obs.w, obs.h);
+        ctx.strokeStyle = '#5a5a8a';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(sx, gy - obs.h, obs.w, obs.h);
+        // Highlight top
+        ctx.fillStyle = '#5a5a8a';
+        ctx.fillRect(sx, gy - obs.h, obs.w, 4);
+    }
+
+    // Goal flag
+    const goalSX = goalX - camX;
+    if (goalSX > -100 && goalSX < W + 100) {
+        ctx.fillStyle = '#22c55e';
+        ctx.fillRect(goalSX, gy - 80, 4, 80);
+        ctx.beginPath();
+        ctx.moveTo(goalSX + 4, gy - 80);
+        ctx.lineTo(goalSX + 40, gy - 65);
+        ctx.lineTo(goalSX + 4, gy - 50);
+        ctx.closePath();
+        ctx.fillStyle = '#22c55e';
+        ctx.fill();
+    }
+
+    // Guards and vision cones
+    for (let g of guards) {
+        const sx = g.x - camX;
+        if (sx < -300 || sx > W + 300) continue;
+
+        // Vision cone
+        const gx = sx + g.w / 2;
+        const gyCenter = gy - g.h / 2;
+        const fovStart = (g.facing === 1 ? -g.fov : Math.PI - g.fov);
+        const fovEnd = (g.facing === 1 ? g.fov : Math.PI + g.fov);
+
+        ctx.beginPath();
+        ctx.moveTo(gx, gyCenter);
+        ctx.arc(gx, gyCenter, g.range, g.facing === 1 ? -g.fov : Math.PI - g.fov, g.facing === 1 ? g.fov : Math.PI + g.fov);
+        ctx.closePath();
+
+        const coneColor = g.alert > 0.5 ? 'rgba(239, 68, 68, 0.2)' : g.alert > 0 ? 'rgba(249, 115, 22, 0.15)' : 'rgba(56, 189, 248, 0.1)';
+        ctx.fillStyle = coneColor;
+        ctx.fill();
+
+        // Guard body
+        ctx.fillStyle = g.alert > 0.5 ? '#ef4444' : g.alert > 0 ? '#f97316' : '#64748b';
+        ctx.fillRect(sx, gy - g.h, g.w, g.h);
+        // Head
+        ctx.fillStyle = '#94a3b8';
+        ctx.beginPath();
+        ctx.arc(sx + g.w / 2, gy - g.h - 8, 10, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Eyes (facing direction)
+        ctx.fillStyle = '#fff';
+        const eyeX = sx + g.w / 2 + (g.facing === 1 ? 4 : -4);
+        ctx.beginPath();
+        ctx.arc(eyeX, gy - g.h - 8, 3, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Alert indicator
+        if (g.alert > 0) {
+            ctx.fillStyle = '#1e293b';
+            ctx.fillRect(sx - 5, gy - g.h - 28, 40, 6);
+            ctx.fillStyle = g.alert > 0.5 ? '#ef4444' : '#f97316';
+            ctx.fillRect(sx - 5, gy - g.h - 28, 40 * g.alert, 6);
+        }
+
+        // "!" when alerting
+        if (g.alert > 0.3) {
+            ctx.fillStyle = '#fbbf24';
+            ctx.font = 'bold 18px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('!', sx + g.w / 2, gy - g.h - 35);
+        }
+    }
+
+    // Player
+    const px = player.x - camX;
+    const py = player.y;
+    if (player.visible) {
+        ctx.fillStyle = '#06b6d4';
+        ctx.fillRect(px, py, player.w, player.h);
+        // Head
+        ctx.fillStyle = '#a5f3fc';
+        ctx.beginPath();
+        ctx.arc(px + player.w / 2, py - (player.crouching ? 4 : 8), player.crouching ? 7 : 9, 0, Math.PI * 2);
+        ctx.fill();
+    } else {
+        // Ghosted when in shadow (not lit by any guard)
+        ctx.globalAlpha = 0.4;
+        ctx.fillStyle = '#06b6d4';
+        ctx.fillRect(px, py, player.w, player.h);
+        ctx.fillStyle = '#a5f3fc';
+        ctx.beginPath();
+        ctx.arc(px + player.w / 2, py - (player.crouching ? 4 : 8), player.crouching ? 7 : 9, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+    }
+
+    // Check if player is in any cone for visual effect
+    let lit = false;
+    const pxCenter = player.x + player.w / 2;
+    const pyCenter = player.y + player.h / 2;
+    for (let g of guards) {
+        if (canSee(g, pxCenter, pyCenter)) { lit = true; break; }
+    }
+    player.visible = lit;
+
+    // HUD
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(10, 10, 220, 60);
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '13px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('SHADOW STEP', 20, 30);
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText(`Progress: ${Math.floor((player.x / goalX) * 100)}%`, 20, 50);
+
+    // Progress bar
+    ctx.fillStyle = '#1e293b';
+    ctx.fillRect(10, 75, 200, 8);
+    ctx.fillStyle = '#22c55e';
+    ctx.fillRect(10, 75, 200 * (player.x / goalX), 8);
+
+    // Crouch indicator
+    if (player.crouching) {
+        ctx.fillStyle = 'rgba(6, 182, 212, 0.3)';
+        ctx.fillRect(px - 4, py - 4, player.w + 8, player.h + 8);
+    }
+
+    // Caught / Won overlay
+    if (gameState === 'caught') {
+        ctx.fillStyle = 'rgba(127, 29, 29, 0.7)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('CAUGHT!', W / 2, H / 2 - 20);
+        ctx.font = '20px monospace';
+        ctx.fillStyle = '#fca5a5';
+        ctx.fillText('Press R to try again', W / 2, H / 2 + 30);
+    }
+
+    if (gameState === 'won') {
+        ctx.fillStyle = 'rgba(6, 78, 59, 0.7)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('ESCAPED!', W / 2, H / 2 - 20);
+        ctx.font = '20px monospace';
+        ctx.fillStyle = '#a7f3d0';
+        ctx.fillText('You made it to the other side.', W / 2, H / 2 + 20);
+        ctx.fillText('Press R to play again', W / 2, H / 2 + 50);
+    }
+}
+
+function drawStartScreen() {
+    const gy = groundY();
+    // Decorative background
+    for (let i = 0; i < 15; i++) {
+        ctx.fillStyle = '#1e293b';
+        const bx = (i * 180) % W;
+        ctx.fillRect(bx, gy - 150 - Math.sin(i * 2.1) * 50, 50, 150 + Math.sin(i * 2.1) * 50);
+    }
+
+    ctx.fillStyle = '#2a2a3a';
+    ctx.fillRect(0, gy, W, H - gy);
+
+    // Title
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#06b6d4';
+    ctx.font = 'bold 56px monospace';
+    ctx.fillText('SHADOW STEP', W / 2, H * 0.3);
+
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = '18px monospace';
+    ctx.fillText('A side-scrolling stealth game', W / 2, H * 0.3 + 40);
+
+    // Controls box
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+    const boxW = Math.min(420, W - 40);
+    const boxX = (W - boxW) / 2;
+    const boxY = H * 0.42;
+    ctx.fillRect(boxX, boxY, boxW, 180);
+    ctx.strokeStyle = '#334155';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(boxX, boxY, boxW, 180);
+
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = '15px monospace';
+    const lines = [
+        'A / D or ← →   Move',
+        'C              Crouch (slower, stealthier)',
+        '               ',
+        'Avoid the guards\' vision cones.',
+        'Reach the green flag to escape!',
+        'Pillars block their line of sight.'
+    ];
+    lines.forEach((l, i) => {
+        ctx.fillText(l, W / 2, boxY + 30 + i * 26);
+    });
+
+    // Blinking prompt
+    const blink = Math.sin(Date.now() * 0.005) > 0;
+    if (blink) {
+        ctx.fillStyle = '#22c55e';
+        ctx.font = '20px monospace';
+        ctx.fillText('Press SPACE or ENTER to start', W / 2, H * 0.85);
+    }
+}
+
+function gameLoop(timestamp) {
+    const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+    lastTime = timestamp;
+    update(dt);
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+resetGame();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
