@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Frogger Minesweeper</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; font-family: 'Courier New', monospace; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+let audioCtx = null;
+
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const COLS = 10;
+const ROWS = 8;
+const MINE_DENSITY = 0.25;
+
+let gameState = 'start'; // start, playing, dead, won
+let grid = [];
+let frogX, frogY;
+let revealed = [];
+let mines = [];
+let score = 0;
+let stepCount = 0;
+let animFrame = 0;
+let deathAnim = 0;
+let winAnim = 0;
+let particles = [];
+
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+
+function playTone(freq, duration, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+
+function playStep() { playTone(400, 0.08, 'square', 0.08); }
+function playDeath() { playTone(150, 0.3, 'sawtooth', 0.15); setTimeout(() => playTone(100, 0.4, 'sawtooth', 0.12), 100); }
+function playWin() { [523,659,784,1047].forEach((f,i) => setTimeout(() => playTone(f, 0.2, 'square', 0.1), i*120)); }
+function playStart() { playTone(330, 0.1, 'square', 0.08); setTimeout(() => playTone(440, 0.15, 'square', 0.08), 100); }
+
+function getCellSize() {
+    const maxW = W * 0.8;
+    const maxH = H * 0.75;
+    return Math.min(maxW / COLS, maxH / ROWS);
+}
+
+function getGridOffset() {
+    const cs = getCellSize();
+    return { x: (W - cs * COLS) / 2, y: (H - cs * ROWS) / 2 + 10 };
+}
+
+function initGame() {
+    grid = [];
+    revealed = [];
+    mines = [];
+    for (let r = 0; r < ROWS; r++) {
+        grid[r] = [];
+        revealed[r] = [];
+        mines[r] = [];
+        for (let c = 0; c < COLS; c++) {
+            grid[r][c] = -1;
+            revealed[r][c] = false;
+            mines[r][c] = Math.random() < MINE_DENSITY ? 1 : 0;
+        }
+    }
+    // Ensure start cell is safe and first few columns have a path
+    for (let r = 0; r < ROWS; r++) {
+        if (mines[r][0]) mines[r][0] = 0;
+    }
+    // Guarantee at least one path exists (simple: clear a random walk)
+    let cr = Math.floor(ROWS / 2);
+    for (let c = 0; c < COLS; c++) {
+        if (mines[cr][c]) mines[cr][c] = 0;
+        if (c < COLS - 1 && Math.random() < 0.3) {
+            cr += Math.floor(Math.random() * 3) - 1;
+            cr = Math.max(0, Math.min(ROWS - 1, cr));
+        }
+    }
+
+    frogX = 0;
+    frogY = Math.floor(ROWS / 2);
+    revealed[frogY][frogX] = true;
+    score = 0;
+    stepCount = 0;
+    deathAnim = 0;
+    winAnim = 0;
+    particles = [];
+}
+
+function getAdjacentMineCount(r, c) {
+    let count = 0;
+    for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+            if (dr === 0 && dc === 0) continue;
+            const nr = r + dr, nc = c + dc;
+            if (nr >= 0 && nr < ROWS && nc >= 0 && nc < COLS) {
+                count += mines[nr][nc];
+            }
+        }
+    }
+    return count;
+}
+
+function moveFrog(dr, dc) {
+    if (gameState !== 'playing') return;
+    initAudio();
+    const nr = frogY + dr;
+    const nc = frogX + dc;
+    if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) return;
+
+    frogX = nc;
+    frogY = nr;
+    stepCount++;
+    revealed[frogY][frogX] = true;
+    score += 10;
+
+    if (mines[frogY][frogX]) {
+        gameState = 'dead';
+        deathAnim = 0;
+        playDeath();
+        for (let i = 0; i < 20; i++) {
+            const cs = getCellSize();
+            const ox = getGridOffset().x + frogX * cs + cs/2;
+            const oy = getGridOffset().y + frogY * cs + cs/2;
+            particles.push({ x: ox, y: oy, vx: (Math.random()-0.5)*4, vy: (Math.random()-0.5)*4 - 2, life: 60, color: '#ff4444' });
+        }
+    } else {
+        playStep();
+        if (frogX === COLS - 1) {
+            gameState = 'won';
+            winAnim = 0;
+            score += 100;
+            playWin();
+            for (let i = 0; i < 30; i++) {
+                const cs = getCellSize();
+                const ox = getGridOffset().x + frogX * cs + cs/2;
+                const oy = getGridOffset().y + frogY * cs + cs/2;
+                particles.push({ x: ox, y: oy, vx: (Math.random()-0.5)*6, vy: (Math.random()-0.5)*6 - 3, life: 80, color: Math.random() < 0.5 ? '#44ff44' : '#ffff44' });
+            }
+        }
+    }
+}
+
+window.addEventListener('keydown', (e) => {
+    if (gameState === 'start') {
+        initAudio();
+        playStart();
+        initGame();
+        gameState = 'playing';
+        return;
+    }
+    if (gameState === 'dead' || gameState === 'won') {
+        if (e.key === 'r' || e.key === 'R' || e.key === ' ') {
+            initAudio();
+            playStart();
+            initGame();
+            gameState = 'playing';
+        }
+        return;
+    }
+    if (gameState === 'playing') {
+        switch(e.key) {
+            case 'ArrowUp': e.preventDefault(); moveFrog(-1, 0); break;
+            case 'ArrowDown': e.preventDefault(); moveFrog(1, 0); break;
+            case 'ArrowLeft': e.preventDefault(); moveFrog(0, -1); break;
+            case 'ArrowRight': e.preventDefault(); moveFrog(0, 1); break;
+        }
+    }
+});
+
+function drawFrog(x, y, size, dead) {
+    const s = size * 0.6;
+    ctx.save();
+    ctx.translate(x + size/2, y + size/2);
+
+    if (dead) {
+        ctx.rotate(Math.PI / 2);
+    }
+
+    // Body
+    ctx.fillStyle = dead ? '#884444' : '#33cc33';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, s*0.45, s*0.4, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Head
+    ctx.fillStyle = dead ? '#995555' : '#44dd44';
+    ctx.beginPath();
+    ctx.ellipse(0, -s*0.25, s*0.35, s*0.3, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Eyes
+    if (!dead) {
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(-s*0.18, -s*0.35, s*0.12, 0, Math.PI*2);
+        ctx.arc(s*0.18, -s*0.35, s*0.12, 0, Math.PI*2);
+        ctx.fill();
+        ctx.fillStyle = '#000';
+        ctx.beginPath();
+        ctx.arc(-s*0.18, -s*0.37, s*0.06, 0, Math.PI*2);
+        ctx.arc(s*0.18, -s*0.37, s*0.06, 0, Math.PI*2);
+        ctx.fill();
+    } else {
+        // X eyes
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        for (let ex of [-s*0.18, s*0.18]) {
+            ctx.beginPath();
+            ctx.moveTo(ex - 4, -s*0.35 - 4);
+            ctx.lineTo(ex + 4, -s*0.35 + 4);
+            ctx.moveTo(ex + 4, -s*0.35 - 4);
+            ctx.lineTo(ex - 4, -s*0.35 + 4);
+            ctx.stroke();
+        }
+    }
+
+    // Legs
+    ctx.fillStyle = dead ? '#773333' : '#22aa22';
+    ctx.beginPath();
+    ctx.ellipse(-s*0.4, s*0.25, s*0.15, s*0.1, -0.5, 0, Math.PI*2);
+    ctx.ellipse(s*0.4, s*0.25, s*0.15, s*0.1, 0.5, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.restore();
+}
+
+function drawMine(x, y, size) {
+    const s = size * 0.3;
+    ctx.save();
+    ctx.translate(x + size/2, y + size/2);
+
+    // Body
+    ctx.fillStyle = '#333';
+    ctx.beginPath();
+    ctx.arc(0, 0, s*0.7, 0, Math.PI*2);
+    ctx.fill();
+
+    // Spikes
+    ctx.strokeStyle = '#555';
+    ctx.lineWidth = 2;
+    for (let a = 0; a < Math.PI*2; a += Math.PI/4) {
+        ctx.beginPath();
+        ctx.moveTo(Math.cos(a)*s*0.7, Math.sin(a)*s*0.7);
+        ctx.lineTo(Math.cos(a)*s, Math.sin(a)*s);
+        ctx.stroke();
+    }
+
+    // Highlight
+    ctx.fillStyle = '#666';
+    ctx.beginPath();
+    ctx.arc(-s*0.2, -s*0.2, s*0.2, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.restore();
+}
+
+function drawNumber(x, y, size, num) {
+    const colors = ['#fff', '#44ccff', '#44ff44', '#ffff44', '#ffaa44', '#ff4444', '#ff44ff', '#ffffff'];
+    ctx.fillStyle = colors[num] || '#fff';
+    ctx.font = `bold ${size * 0.5}px 'Courier New'`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(num, x + size/2, y + size/2);
+}
+
+function drawGrid() {
+    const cs = getCellSize();
+    const ox = getGridOffset().x;
+    const oy = getGridOffset().y;
+
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            const x = ox + c * cs;
+            const y = oy + r * cs;
+
+            // Cell background
+            if (revealed[r][c]) {
+                ctx.fillStyle = mines[r][c] ? '#4a1a1a' : '#2a3a2a';
+            } else {
+                ctx.fillStyle = (r+c) % 2 === 0 ? '#2a2a3e' : '#252538';
+            }
+            ctx.fillRect(x, y, cs - 1, cs - 1);
+
+            // Border
+            ctx.strokeStyle = '#444';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x, y, cs - 1, cs - 1);
+
+            if (revealed[r][c]) {
+                if (mines[r][c]) {
+                    drawMine(x, y, cs);
+                } else {
+                    const adj = getAdjacentMineCount(r, c);
+                    if (adj > 0) drawNumber(x, y, cs, adj);
+                }
+            }
+
+            // Show mines on death
+            if (gameState === 'dead' && !revealed[r][c] && mines[r][c]) {
+                ctx.globalAlpha = 0.5;
+                drawMine(x, y, cs);
+                ctx.globalAlpha = 1;
+            }
+        }
+    }
+
+    // Draw goal line
+    const goalX = ox + (COLS - 1) * cs;
+    ctx.strokeStyle = '#44ff44';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([5, 5]);
+    ctx.beginPath();
+    ctx.moveTo(goalX + cs, oy);
+    ctx.lineTo(goalX + cs, oy + ROWS * cs);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Goal label
+    ctx.fillStyle = '#44ff44';
+    ctx.font = `bold ${cs * 0.3}px 'Courier New'`;
+    ctx.textAlign = 'center';
+    ctx.fillText('EXIT', goalX + cs/2, oy - 10);
+
+    // Draw frog
+    drawFrog(ox + frogX * cs, oy + frogY * cs, cs, gameState === 'dead');
+}
+
+function drawParticles() {
+    for (let p of particles) {
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.life / 60;
+        ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+    }
+    ctx.globalAlpha = 1;
+}
+
+function updateParticles() {
+    for (let p of particles) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.15;
+        p.life--;
+    }
+    particles = particles.filter(p => p.life > 0);
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+
+    const cx = W / 2;
+    const cy = H / 2;
+
+    // Title
+    ctx.fillStyle = '#33cc33';
+    ctx.font = `bold ${Math.min(W*0.06, 48)}px 'Courier New'`;
+    ctx.textAlign = 'center';
+    ctx.fillText('FROGGER', cx, cy - 120);
+    ctx.fillStyle = '#ffcc33';
+    ctx.font = `bold ${Math.min(W*0.05, 40)}px 'Courier New'`;
+    ctx.fillText('MINESWEEPER', cx, cy - 75);
+
+    // Frog on start screen
+    drawFrog(cx - 25, cy - 160, 50, false);
+
+    // Instructions
+    ctx.fillStyle = '#aaccff';
+    ctx.font = `${Math.min(W*0.03, 18)}px 'Courier New'`;
+    const lines = [
+        'Guide the frog from left to right!',
+        '',
+        'Arrow Keys: Move Up / Down / Left / Right',
+        '',
+        'Numbers show adjacent mines.',
+        'Avoid stepping on mines (spiky balls)!',
+        'Reach the green EXIT line to win.',
+        '',
+        'Score: 10 pts per cell + 100 for reaching exit'
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, cx, cy - 20 + i * 28);
+    });
+
+    // Blinking prompt
+    if (Math.floor(Date.now() / 500) % 2 === 0) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `bold ${Math.min(W*0.035, 24)}px 'Courier New'`;
+        ctx.fillText('PRESS ANY KEY TO START', cx, cy + 260);
+    }
+}
+
+function drawEndScreen() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+
+    const cx = W / 2;
+    const cy = H / 2;
+
+    if (gameState === 'dead') {
+        ctx.fillStyle = '#ff4444';
+        ctx.font = `bold ${Math.min(W*0.06, 48)}px 'Courier New'`;
+        ctx.textAlign = 'center';
+        ctx.fillText('SPLAT!', cx, cy - 60);
+
+        ctx.fillStyle = '#ffaaaa';
+        ctx.font = `${Math.min(W*0.035, 24)}px 'Courier New'`;
+        ctx.fillText(`The frog hit a mine!`, cx, cy - 10);
+        ctx.fillText(`Cells revealed: ${stepCount}`, cx, cy + 30);
+        ctx.fillText(`Score: ${score}`, cx, cy + 65);
+    } else {
+        ctx.fillStyle = '#44ff44';
+        ctx.font = `bold ${Math.min(W*0.06, 48)}px 'Courier New'`;
+        ctx.textAlign = 'center';
+        ctx.fillText('CROSSED THE RIVER!', cx, cy - 60);
+
+        ctx.fillStyle = '#aaffaa';
+        ctx.font = `${Math.min(W*0.035, 24)}px 'Courier New'`;
+        ctx.fillText(`Steps taken: ${stepCount}`, cx, cy - 10);
+        ctx.fillText(`Final Score: ${score}`, cx, cy + 30);
+
+        // Confetti particles
+        if (Math.random() < 0.3) {
+            particles.push({ x: Math.random()*W, y: H+10, vx: (Math.random()-0.5)*3, vy: -Math.random()*5-2, life: 60, color: ['#ff4444','#44ff44','#ffff44','#4444ff','#ff44ff'][Math.floor(Math.random()*5)] });
+        }
+    }
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `${Math.min(W*0.03, 20)}px 'Courier New'`;
+    if (Math.floor(Date.now() / 500) % 2 === 0) {
+        ctx.fillText('Press R or SPACE to play again', cx, cy + 120);
+    }
+}
+
+function drawHUD() {
+    const cs = getCellSize();
+    const ox = getGridOffset().x;
+    const oy = getGridOffset().y;
+
+    ctx.fillStyle = '#aaccff';
+    ctx.font = `bold ${Math.min(W*0.025, 18)}px 'Courier New'`;
+    ctx.textAlign = 'left';
+    ctx.fillText(`Score: ${score}`, ox, oy - 30);
+    ctx.textAlign = 'right';
+    ctx.fillText(`Steps: ${stepCount}`, ox + COLS * cs, oy - 30);
+
+    // Title at top
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#33cc33';
+    ctx.font = `bold ${Math.min(W*0.03, 24)}px 'Courier New'`;
+    ctx.fillText('FROGGER MINESWEEPER', W/2, oy - 55);
+}
+
+function drawWater() {
+    const cs = getCellSize();
+    const ox = getGridOffset().x;
+    const oy = getGridOffset().y;
+    const t = Date.now() * 0.003;
+
+    // Water background around grid
+    ctx.fillStyle = '#0a1a2e';
+    ctx.fillRect(0, 0, W, H);
+
+    // Animated water lines
+    ctx.strokeStyle = 'rgba(50,100,180,0.3)';
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 8; i++) {
+        const wy = oy + i * (ROWS * cs / 8);
+        ctx.beginPath();
+        for (let x = ox - 20; x < ox + COLS*cs + 20; x += 10) {
+            const yOff = Math.sin((x + t * 50) * 0.05 + i) * 3;
+            if (x === ox - 20) ctx.moveTo(x, wy + yOff);
+            else ctx.lineTo(x, wy + yOff);
+        }
+        ctx.stroke();
+    }
+}
+
+function render() {
+    animFrame++;
+
+    if (gameState === 'start') {
+        drawStartScreen();
+    } else {
+        drawWater();
+        drawGrid();
+        drawParticles();
+        updateParticles();
+        drawHUD();
+
+        if (gameState === 'dead') {
+            deathAnim++;
+            if (deathAnim > 30) drawEndScreen();
+        }
+        if (gameState === 'won') {
+            winAnim++;
+            if (winAnim > 30) drawEndScreen();
+        }
+    }
+
+    requestAnimationFrame(render);
+}
+
+initGame();
+render();
+</script>
+</body>
+</html>
