@@ -1,0 +1,2128 @@
+<think>
+The user wants a racing physics game as a single HTML file. Let me think about what makes a great racing physics game:
+
+1. **Core mechanics**: Top-down 2D car physics — acceleration, braking, reverse, steering with speed-dependent turn rate, drift/handling (lateral friction), grip model. Classic arcade-y but physics-based approach:
+   - Car has position and velocity vector
+   - Velocity decomposes into forward component (along heading) and lateral component
+   - Lateral friction is high (grip), forward friction is lower
+   - Handbrake reduces lateral grip → drift
+
+2. **Track**: Circuit on canvas. Can draw a track with walls, or free-drift with boundary check against track polygon. Good approach: define track as closed loop of centerline points with width; if car goes off track (distance from nearest centerline segment > half-width), apply grass friction/slowdown and push back / clamp to prevent crossing wall? Better: draw soft boundary — off-track is grass that slows you, plus walls at outer edge.
+
+   Simpler and more robust approach: track = closed spline of points; render thick stroked path as asphalt with edges. Collision: compute distance from car to nearest point on centerline polyline; if dist > halfWidth - carRadius, collide with wall: push back, reflect velocity component, damage/slowdown. Grass: between halfWidth and grassBand... hmm actually just have walls at track edge and off-track is inaccessible? That's boring. Alternative: wide grass area around track, no walls — going off track you slow down significantly (grass drag) but can still drive; that's the classic Mario Kart approach. But then player can shortcut. To prevent shortcuts, place invisible walls outside a margin beyond the track edge... or just let them drive on grass slowly — if grass is 60% slower, shortcuts are naturally discouraged.
+
+   Let me do this: asphalt (fast), dirt/grass shoulder (slower, more drag), and outer boundary wall to keep car in bounds (reflect). Plus checkpoint system for lap counting.
+
+3. **Laps & timing**: Checkpoints along centerline (e.g., 8 of them), then finish line = lap complete. Show lap time, best lap (try/catch localStorage), total laps (3). Ghost? Maybe too much. Add race AI opponents? Could be fun — a few AI cars with simple follow-centerline logic and speed control. That makes it feel like a real racing game: position tracking (1st/2nd/3rd/4th), finish times.
+
+   Ambitious but doable. Let me design:
+   - 4 cars: player + 3 AI.
+   - AI: follow waypoints, target speed based on curvature ahead, same physics for visual consistency (reuse Car class). Rubber-banding a bit.
+   - Progress metric: lap count * N + checkpoint index + interpolation along segment → overall progress for ranking.
+
+4. **Camera**: Follow player with rotation? Rotating camera is cool but can be disorienting; smooth-follow non-rotated top-down, slight zoom based on speed. Add subtle lead in velocity direction. Screen shake on wall hit. Particles: tire smoke when drifting, dust on grass, sparks on wall hit.
+
+5. **Visuals**: Canvas 2D. Make it look nice:
+   - Background: layered — grass with mowed stripes (alternating bands), scattered trees/rocks? Keep cheap: pre-render static world to offscreen canvas once (big but track is a fixed size ~3000x2000). Pre-rendering static terrain to an offscreen canvas is best for perf.
+   - Track: dark asphalt with subtle noise, white/red curbs on high-curvature corners (or full edge lines), dashed centerline? Start/finish checkered line.
+   - Car: rounded-rect body, cabin, wheels, draw shadow; player's car distinct color; drift marks (fading skid trail) — save recent positions when drifting and draw semi-transparent black strokes on a persistent "marks" canvas (offscreen same size as world? memory 3000x2000 canvas = ~24MB RGBA… fine in modern browsers; but let's do smaller: marks layer at half resolution, or just keep an array of recent skid segments with alpha fade — array cap e.g. 600 segments. Array is simpler and bounded.)
+   - HUD: speed (km/h), lap X/3, position, timer (current lap, best lap), minimap! Minimap in corner with track outline and car dots. Yes, minimap.
+   - Speed lines/vignette at high speed? Subtle vignette is cheap: radial gradient overlay drawn each frame or CSS. Use CSS overlay for vignette + slight chromatic aberration? Keep it simple: CSS vignette.
+
+6. **Sound**: Web Audio after first input (start button click). Engine sound: oscillator (sawtooth) with frequency mapped to throttle/RPM, plus low-pass; skid noise: filtered noise buffer when drifting; collision thud: short noise burst + sine drop. Keep master gain modest. Mute toggle (M key).
+
+7. **Controls**: WASD/arrow keys, Space = handbrake, R = restart, M = mute, P/Esc = pause. Show on start screen.
+
+8. **Screens**: Start screen overlay (title, controls, best lap), countdown 3-2-1-GO with beeps, race, finish screen (results table, total time, best lap, "Restart" button + R key). Restart resets state without reload.
+
+9. **Physics details** (arcade drift model):
+   ```
+   forward = (cos h, sin h)
+   vF = dot(v, forward); vL = dot(v, right)
+   // engine
+   if throttle: vF += accel*dt (scaled by (1 - vF/maxSpeed))
+   if brake: if vF>0 decel, else reverse accel up to maxReverse
+   drag: vF *= (1 - dragCoef*dt); also quadratic term
+   grip: vL *= (1 - gripLat*dt) where gripLat high on asphalt (~8-12/s), low when handbrake (~2.5/s), grass lower grip + more drag? Actually grass: higher forward drag, slightly lower lateral grip → slidey.
+   heading: h += steer * steerRate * dt * f(vF) — turn scales with speed, capped, and inverted when reversing.
+   v = forward*vF + right*vL
+   ```
+   Drift detection: |vL| > threshold → smoke particles + skid marks + reduced grip (hysteresis). Handbrake also boosts steer rate slightly for drift initiation.
+
+   Wall collision: find nearest point on centerline polyline; d = distance; limit = halfWidth - carRadius? Actually if we have grass shoulder before wall, then wall is at halfWidth + shoulder. Let's define: asphaltHalf = W (e.g., 55 world units), shoulder out to W+40 where it's dirt, wall at W+40. If d > W+40 - carR: clamp position to that radius, reflect velocity along normal with restitution ~0.35, kill some forward speed, spawn sparks, screen shake, thud sound (rate-limited).
+
+   Find nearest point on polyline: iterate segments (~200 segs) per car per frame × 4 cars = 800 distance calcs — trivial.
+
+10. **Track shape**: Design a fun circuit. Let me craft control points for a closed loop and smooth with Catmull-Rom sampling to ~300+ centerline points. Something interesting: start/finish straight, hairpin, chicane, long sweeper, backstraight with slight S. World size ~3200x2200.
+
+Let me sketch points (x,y) for a loop in world 3400x2300:
+   - Start straight along bottom heading right? Let's put start/finish on the left side going up, or bottom straight going right. Classic: bottom straight → turn 1 right (clockwise loop).
+
+Clockwise circuit points (going clockwise when y is down... let me think in screen coords, y down; "clockwise" visually):
+   P = [
+   (500, 1900), (1400, 1900), (2000, 1900),        // bottom straight going right
+   (2600, 1850), (3000, 1550),                        // turn up-right
+   (2950, 1050),                                     // up right side
+   (2550, 750),                                      // hairpin-ish top right? 
+   (2150, 850),                                      // dip down (chicane)
+   (1750, 650),                                      // up-left
+   (1350, 400), (800, 450),                          // top straight going left
+   (400, 700),                                       // turn down-left
+   (450, 1200),                                      // 
+   (250, 1600)? hmm need to close back to (500,1900)
+   ]
+   Let me make it smoother and more deliberate. Actually let's define ~14 control points and Catmull-Rom sample 24 per segment → 336 centerline points. Ensure no self-intersection: keep the loop simple, like a distorted ellipse with features.
+
+Let me place (world 3400 x 2300):
+   A (620, 1950) bottom-left corner area
+   B (1700, 1980) bottom straight mid — slight variation for organic feel? Keep nearly straight: (1700,1960)
+   C (2550, 1930) bottom-right before turn
+   D (3050, 1500) right side going up (turn 1, big right)
+   E (2850, 950) 
+   F (2300, 800) — then dip down: G (2100, 1150) hairpin "duck's bill"
+   H (1600, 900) — up-left: I (1500, 450)?? getting close to top. Let me simplify: after E go left along upper-mid with a chicane:
+   E (2850, 950), F (2350, 700), G (1900, 950) [dip down — S], H (1400, 700), I (900, 420) top-left turn, J (400, 800) left side going down, K (620, 1350)? then back to A. Hmm K (500,1400) then A (620,1950).
+
+Let me verify rough convexity/flow: bottom straight A→C going right; D up-right turn; E up-left; F upper-mid; G dip down (S chicane); H back up; I top-left corner; J left side going down; K lower-left; close to A. Plausible, no crossings since x decreases monotonically along top and y increases on left side. Good enough; Catmull-Rom will smooth.
+
+Start/finish: place at a point on the bottom straight, say between A and B — index where centerline x ≈ 1000, y≈1965. Car starts there heading +x (along track direction). Grid: player P1 at back of grid (position 4) or front? Player is P4 (last) to make racing exciting; AI ahead.
+
+Start line orientation: normal to track direction. Draw checkered band across the track there.
+
+Checkpoints: every N centerline points, e.g., 8 checkpoints including start. Car must pass in order; passing = crossing segment from prev CP area... simpler: for each car, track progress by nearest centerline index (with hysteresis within a window around last known index to avoid jumps), and checkpoint i is reached when index passes cpIndex[i] (mod N). Lap completes when all cps passed and then crosses start again. Simplest robust way: compute s = nearest index; maintain car.dist (scalar that accumulates forward progress): each frame, delta = wrap(s - lastS) into [-N/2, N/2]; if delta > 0 small → dist += delta (allow only when |delta| < N/4 to prevent teleport cheating). Checkpoints: cpCount advances when dist >= nextCpDist. Lap++ when dist >= lapLen*lap+... actually just treat track as a circular tape of length N points: totalProgress = lap*N + s. Use checkpoint gating: must have passed at least half? Standard approach: divide into K=8 gates; gate g is passed when floor(totalProgress / (N/K)) > lastGate, monotonic. If totalProgress increments only by small forward deltas (capped per frame), you can't skip gates without driving through them... well, a big jump in s could skip but delta is capped at say 40 points/frame — gate size is N/8 ≈ 42 → hmm, cap delta to like 15/frame and require gates sequential: gate = floor(totalProgress/(N/K)); if gate > lastGate+? we set gate=lastGate+1 only when reaching. Simplest: nextGate index; when totalProgress >= (nextGate)*gateLen + something → advance. Since totalProgress accumulates continuously with cap, to reach gate 3's distance you must have driven through gates 0..2 region... not strictly (could cut a corner and skip some arc length) but if delta capped at 15/frame and gate spacing 42 points, skipping would require a jump of 42+ in one frame — impossible. If they drive backwards then forwards, totalProgress could decrease? Only accumulate forward (delta>0). Backwards driving doesn't reduce (or does slightly? no—keep it monotonic forward only; prevents exploit and simpler). Actually if you go around the track in reverse... s decreases, delta<0, ignore. Fine.
+
+   So: car.progress (float, in "points" units, monotonic), lap = floor(progress / N) with lap counting gated by full laps: when progress crosses multiple of N → complete lap (record time if all gates passed — implicitly true). Track gate for minimap/progress display: currentGate.
+
+   AI target: look ahead centerline index = s + lookahead; steer toward point; throttle based on angle difference and curvature ahead; brake if sharp. Use same Car physics with input {throttle, brake, steer, handbrake}. Add small per-AI skill variance and rubber-band (if far behind player, boost accel 10%).
+
+11. **Minimap**: Pre-render track outline to a small offscreen; each frame draw dots. Scale world→map ~ mapW/worldW.
+
+12. **HUD design**: This is a game — let's make it bold and arcade-y. Font: no external fonts, so use system stack creatively. Pair a display feel with a readable body. For racing, an italic condensed vibe works well: font-family: "Arial Black", "Avenir Next Condensed"... hmm cross-platform condensed availability is spotty. Use transform: skewX(-8deg) on headings for that speed feel, and letter-spacing. Body: system-ui / "Segoe UI". HUD numbers: monospace (ui-monospace, Consolas) for timers — tabular figures matter. That gives a display+body pairing without external fonts: heavy italic sans for titles + mono for timing + regular sans for body. Good.
+
+    Palette: racing → asphalt charcoal, signal yellow (#ffd23f), red accents, white; grass green background. HUD panels: dark translucent with cut corners (clip-path polygon) — angled shapes fit racing. Yellow + red + white on dark = motorsport livery. Good.
+
+13. **Layout/responsive**: Canvas fills window (100vw/vh), devicePixelRatio scaling, resize handler. World camera zoom base fits... pick zoom so track width looks good: world units ~ pixels; default zoom maybe 0.9-1.0 scaled by min(canvasW/1200,...)? Let me compute: I want view to show ~1400 world units wide → zoom = canvasW/1400 with clamps, plus speed-based zoom-out (zoom *= 1 - speedFactor*0.15). Also handle small screens: scale HUD via CSS clamp / vmin.
+
+    No scrollbars: body overflow hidden.
+
+14. **Performance**: Pre-render world to offscreen canvas at 1x world resolution (3400x2300 ≈ 7.8M px — OK; ~31MB RAM, acceptable). Draw each frame: drawImage the region. Skid marks array capped. Particles capped ~300. requestAnimationFrame with dt clamp (max 1/30), fixed-ish step? Variable dt with clamp is fine for this physics given damping stability at these rates — use semi-implicit Euler; damping factor via Math.exp(-k*dt) for frame-rate independence: vL *= exp(-gripLat*dt).
+
+15. **Countdown and states**: state = 'menu' | 'countdown' | 'racing' | 'finished' (+ paused flag). Enter countdown on start button/Enter/Space; 3,2,1 (beeps 440Hz short) GO (880 longer), cars can move only after GO (inputs ignored before but engine idle rev?). During countdown camera locked to player's grid slot.
+
+    Finish: when player completes 3 laps → 'finished' state, show results overlay listing each car with total time (AI that haven't finished get "+Xs" estimate or DNF-ish "—" — better: keep simulating AI in background? Simpler: freeze and compute projected times: if AI has progress, estimated = elapsed + (remainingProgress/avgSpeed). Or just show finish order and player's lap times; give AI a time if they finished before player, else "DNF". Cleaner: continue race simulation behind the results screen until all finished or 20s, then estimate. Even simpler & acceptable: show final position based on progress at moment of player finishing + player's total/best lap; AI rows show their finish time if already finished, else "+gap" estimated from progress delta / player pace. Let me do estimation — one line.)
+
+    Also track "best lap" in localStorage try/catch, key 'apexrush_best'.
+
+16. **Title**: something punchy: "APEX RUSH". <title>Apex Rush — Racing Physics</title>.
+
+Now let me code carefully. Structure:
+
+- HTML: canvas#game, HUD divs (top bar: position, lap, timer; bottom-left speedo; bottom-right minimap canvas), overlay screens (start, pause, finish) as absolutely positioned divs, vignette div.
+- CSS: reset, full-bleed, HUD styling with angled panels, keyframes for countdown pop, subtle animated stripe on start screen background? Start screen: layered — dark gradient + animated diagonal hazard stripes moving via CSS animation, big skewed title with layering (text-shadow offset red/white), controls grid, best lap display. That's a distinctive opener — racing livery not a generic centered hero... it is a menu so some centering is fine, but make it feel like a race poster: big italic title top-left? Centered menu is standard for games; let me make it a "race number board" style card with checkered flag strip.
+
+Let me write out the physics constants:
+- accel = 620 u/s², brakeDecel = 900, reverseAccel = 300 (maxReverse ~ -180)
+- maxSpeed ≈ 780 u/s (~280 km/h display: speedKmh = vF * 0.42?) Let's map: display kmh = |v| * 0.45 → 780→351 too fast; use 0.36 → ~280. OK, tune later: kmh = v*0.36.
+- drag linear k=0.6/s + quadratic: vF -= vF*|vF|*kq*dt, kq tuned so terminal ≈ maxSpeed: with accel A and quad k: vterm=sqrt(A/k) → 780 = sqrt(620/k) → k = 620/780² ≈ 0.001019.
+- gripLat asphalt = 9.5 (drifts when handbrake or high lateral input), handbrake: 2.2 and also apply extra forward decel 4/s? Handbrake adds brakeDecel*0.5.
+- grass: gripLat 6, drag k*3 + linear 1.2 → strong slowdown; plus slight random jitter for rumble.
+- steer: baseRate 2.6 rad/s * speedFactor; speedFactor = clamp(|vF|/140, 0, 1) * (1 - 0.35*clamp(|vF|/maxSpeed,0,1)); steering inverted when vF<0. Handbrake boosts rate ×1.25.
+- Car radius for collision ~ 16 (car drawn ~ 46x24).
+
+Drift detection: |vL| > 90 → drifting; hysteresis exit at < 50. When drifting: spawn smoke from rear wheels, skid marks (save segments per wheel), skid sound gain up.
+
+Surface check: distance d to centerline: d < asphaltHalf → asphalt; d < wallDist-? else grass. Also curbs: |d| between asphaltHalf and asphaltHalf+10 on high-curvature corners? Simpler: curbs are visual-only along whole edge (red-white dashes at track edge) — draw on pre-render as alternating colored segments along both edges. Curb effect: slight bump jitter + grip 7 when in curb band. Keep curbs only visual to reduce complexity, plus small rumble sound? Skip sound; add tiny random accel noise for feel. Well, keep it visual.
+
+Wall at d > wallDist = asphaltHalf + shoulder (shoulder=46). On collision: normal n = (car - nearestPoint)/d (sign of side handled since we use signed distance? need signed: side = sign(cross(dir, car-nearest)) — but the nearest-point approach gives unsigned; compute signed via segment orientation. Simpler: treat as circle around polyline: if d > wallDist - r: pos = nearest + dir*(wallDist - r); vn = dot(v, n); if vn>0 v -= (1+rest)*vn*n; also tangential damp 0.985. Works regardless of side sign since n points outward from centerline to car.
+
+But careful: nearest point on polyline for a closed loop — fine.
+
+AI logic:
+- lookAhead = 40 + speed*0.06 (in index units? per-point spacing ≈ totalLen/N; compute arc length per point ~ avg dist between samples). Let me compute sample points with roughly uniform spacing (Catmull-Rom resample by arc length to N=360 uniform → spacing s = L/360). lookahead px = 120 + speed*0.25 → indices = round(px/spacing).
+- target point T = center[(s+la) mod N]; desired heading = atan2(T - pos); angDiff wrap; steer = clamp(angDiff*2.2, -1, 1).
+- curvature ahead: angle between (center[s+la] - center[s]) and (center[s+2la] - center[s+la]) → sharpness; targetSpeed = maxCornerSpeed(sharpness) e.g., speed = lerp(700, 300, sharpNorm). If vF > targetSpeed → brake, throttle=0 else throttle=1.
+- Add per-car noise: skill multiplier on maxSpeed (0.94–1.02), slight lateral offset target (racing line: bias toward inside of upcoming curve — skip, center is fine).
+- Rubber-band: if player is ahead by > 300 points in progress? Use world distance: if AI behind player by >600px → accel*1.12; if ahead by >600 → *0.95. Subtle.
+
+Ranking: sort by (progress) descending → position. Display "P{pos}/4".
+
+Lap count = 3. Player lap times array; best lap highlighted; final total.
+
+Sound engine (WebAudio):
+- Create ctx on first user gesture (start click / keydown). master gain 0.5, mute toggle.
+- Engine: two oscillators (sawtooth + square sub) → lowpass(600–2400 by rpm) → gain (0.05 idle → 0.16 throttle). rpm = |vF|/maxSpeed mapped with throttle bumps; freq = 70 + rpm*320.
+- Skid: looping noise bufferSource → bandpass(900) → gain 0→0.2 by drift amount (smoothed).
+- Collision: one-shot: noise burst lowpass 300, gain envelope 0.4→0 in 0.18s + sine 120→50 pitch drop.
+- Beeps: osc square 660/990, short.
+- Grass rumble: reuse skid noise at lower gain & lowerpass? Optional — tie to onGrass with lowpass 300 and gain 0.08. Let's have one noise node with filter freq modulated (grass=250 lowpass-ish via bandpass center, drift=1200) — two separate small nodes is simpler. Keep: skidNode (bandpass 1000, Q1), rumbleNode (lowpass 240).
+
+Pause: P/Esc toggles during racing; overlay "PAUSED". Restart R works in race/pause/finished → resetRace() → countdown. From menu, Enter starts.
+
+Camera: cam.x += (target - cam.x) * (1 - exp(-6*dt)); target = player.pos + vel*0.25. zoom = baseZoom * (1 - 0.18*speedFrac), smooth. Screen shake: shakeAmp decays; offset random * amp.
+
+Rendering order: world pre-render image → skid marks (world-space, drawn before cars) → start line? (part of prerender) → particles under? smoke above track below car? Smoke is above car OK → cars (shadow, body, wheels, AI labels?) → sparks/smoke particles → HUD canvas stuff (minimap separate canvas).
+
+Skid marks: array of {x1,y1,x2,y2,alpha,w} — each frame while drifting push 2 segments (per rear wheel); alpha starts 0.35 and fades over life 6s; remove when alpha<=0; cap 900 (shift oldest). Draw with strokeStyle rgba(20,20,25,alpha). Batch: beginPath per mark? 900 individual strokes each frame is heavy-ish but OK on modern; better: draw all in one pass grouped by rounded alpha? Simpler: single path with globalAlpha average won't vary... acceptable: iterate and stroke individually but only those within view (bounds check) — usually <200 visible. Fine.
+
+Particles: {x,y,vx,vy,life,maxLife,size,type(smoke|spark|dust)}; smoke grows & fades (gray), spark short bright yellow/white line-ish (draw as small rect with velocity direction), dust tan. Update + draw in world space. Cap 350.
+
+Pre-render world:
+- Grass base: fill #3f7a2e? Let's do mowed stripes: vertical bands alternating two greens (#4c8b35 / #457f2f) width 130; plus subtle noise: draw ~1500 random small darker/lighter dots (deterministic with seeded RNG so consistent — use a mulberry32 seed).
+- Trees/rocks decoration outside track? Place blobs at random positions that are more than wallDist+60 from centerline — dark green circles with highlight. ~60 trees + a few grandstands near start? Grandstands: striped rect with dots (crowd) near start line — nice touch! Plus tire stacks at corners? Keep: trees, grandstand, some banners? Let's do grandstand + trees + a couple of "billboard" rectangles with text ("APEX", "RUSH"). Text on prerender is fine.
+- Shoulder/dirt ring: stroke centerline path with lineWidth = (wallDist*2) color dirt #8a6a3f... wait, order: draw dirt band (width 2*(wallDist)) → then curb dashes (width 2*(asphaltHalf+10), dashed pattern red/white? Canvas dashing on a thick stroke gives alternating segments along path — lineWidth curbOuter=asphaltHalf*2+24, setLineDash([28,28]) strokeStyle white; second pass lineDashOffset 28 strokeStyle #d33 → produces red/white curbs. Then asphalt stroke width 2*asphaltHalf color #3b3f46 with subtle noise overlay (clip to path? just draw semi-transparent dark speckle rects along... simpler: after asphalt, draw a few hundred small random alpha dots sampled near centerline points).
+- Edge lines: white solid thin line at ±(asphaltHalf-4): stroke offset path — can't easily offset a stroked path; instead draw two polylines computed from normals: build array of leftEdge/rightEdge points and stroke them 3px white (alpha .8).
+- Center dashed yellow? Faint. Optional, skip or faint.
+- Start/finish: checker band across track at startIdx: compute normal, rows of squares (2 rows × ~14 cols) alternating black/white; plus "START" arch? Draw a simple overhead gantry: two posts + banner rect with checkers and text "APEX RUSH". Cute.
+- Grid slots marks: small white lines/arrows at 4 grid positions behind start line.
+
+Minimap prerender: scale world to e.g. 180x122 (world 3400x2300 → ratio .0529). Draw centerline path as 6px gray stroke with white edge; start tick.
+
+World size: let me finalize track points and compute N=360 samples, L computed at runtime.
+
+Let me recheck the control points list (14 pts) for no self-intersection:
+```
+const CP = [
+ [620, 1950],   // A bottom-left
+ [1700, 1985],  // B bottom straight
+ [2560, 1930],  // C bottom-right
+ [3060, 1480],  // D right turn up
+ [2870, 940],   // E 
+ [2360, 700],   // F top-mid
+ [1900, 950],   // G dip (S chicane down)
+ [1400, 690],   // H up again
+ [880, 430],    // I top-left corner
+ [380, 820],    // J left side going down
+ [520, 1380],   // K lower-left kink? 
+];
+```
+Hmm K (520,1380) → back to A (620,1950): fine. But G dip: from F(2360,700) down to G(1900,950) then up to H(1400,690) — forms S/chicane; Catmull-Rom will make it smooth. Verify E→F: (2870,940)→(2360,700) OK. I(880,430)→J(380,820): left turn going down. J→K: (380,820)→(520,1380) slight rightward; K→A: (520,1380)→(620,1950). A→B bottom straight y ~1950-1985 nearly flat. Loop is simple (no crossing): yes, roughly a clockwise blob with an S on top-mid-right... wait direction: A(bottom-left) → B(bottom-mid) → C(bottom-right) → D(right, going up) → E(up) → F(left) → G(down) → H(up-left) → I(top-left) → J(down) → K(down) → A. Direction of travel is counterclockwise? On screen (y down): moving right along bottom then up on right side then left along top = counterclockwise visually? Screen coords y-down: rightward at bottom, then up on right side (decreasing y), then leftward at top — that's CCW in standard math but CW... let me not worry; it's a valid circuit.
+
+Start line: pick index where path is on the bottom straight heading +x: find sample point with x≈1000 & y>1900 → startIdx. Cars face along tangent there. Grid: slot i at center[startIdx - (i+1)*14] offset laterally alternating ±26, i=0..3 (P1 AI front ... P4 player back). Actually put player in slot 1 (pole) for fairness? Racing games often put you last for excitement; with rubber-band AI it's fun to chase. Let me put player at P3 (second from back) — balanced. Hmm, simpler: player pole position (grid[0]) — feels good and can demonstrate physics immediately. But then "position" starts 1st and may feel static if AI is weak. With decent AI + rubber band, starting last = more engagement. Let's do player at slot index 3 (last) of 4.
+
+AI count: 3 → total 4. Names/colors:
+- Player: "YOU" — yellow #ffd23f? Or red #ff3b30 with white stripe; AI: teal #2ec4b6, orange #ff7b29, purple? Let me pick a livery palette: player = signal yellow w/ black stripes; AI1 = cyan #35c6e8 "VOLT"; AI2 = red-orange #ff6a3d "BLAZE"; AI3 = lime #a3e048 "THORN"? or magenta. Fine.
+
+HUD layout:
+- Top-left: position panel (big "P1" + "/4"), angled yellow.
+- Top-center: lap "LAP 1/3".
+- Top-right: timing block: current lap time big mono, best lap small, last lap small.
+- Bottom-left: speedo: big number + "KM/H", plus a small bar? Speed arc might be overkill; big italic number with skew panel + drift indicator lamp ("DRIFT" glows when drifting) — nice feedback.
+- Bottom-right: minimap canvas in angled frame, player dot yellow pulsing.
+- Center: countdown digits (big pop animation), "GO!" flash.
+- Lap banner: on lap complete, show "LAP 2 — 0:34.21" slide-in top-center; on final: "FINISH!" then results.
+
+Results overlay: "RACE COMPLETE" + position badge ("YOU FINISHED 2ND"), table rows: pos, driver, time (or est), best lap? Just total + status. Buttons: [RESTART RACE] and [MENU]. Show session best lap from storage.
+
+Start screen content: title APEX RUSH, tagline "3 laps · drift physics · beat the field", controls list (WASD/arrows to drive, SPACE handbrake, R restart, P pause, M mute), "CLICK or PRESS ENTER TO START", best lap display if any. Styled as race poster with checkered strip and hazard stripes animated.
+
+Pause overlay: "PAUSED" + resume/restart/menu buttons + controls reminder.
+
+Now let me code. I'll be careful about these gotchas:
+- Resize: canvas.width = innerWidth*dpr etc; recompute baseZoom.
+- rAF loop always running; update only when racing & !paused; render always (so menu shows the world behind? Menu can show world with slow orbiting camera — nice! Camera slowly pans around track center / follows an AI in "demo" mode? Simplest: menu camera drifts along centerline slowly. Let's do that: demoT += dt*speed, cam follows center[demoIdx]. Cheap and lively.)
+- Audio init on first gesture; resume() if suspended.
+- Keyboard: preventDefault on arrows/space to avoid scroll (no scrollbars anyway but space might click focused button — blur buttons after click).
+- Enter on menu starts; R anywhere (except typing? no inputs) restarts → countdown.
+
+Timing: race clock elapsed (seconds) during racing state (after GO). Lap time = elapsed - lapStartT. Format m:ss.mmm.
+
+Estimate for unfinished AI at results: remaining = (3*N - progress); avgSpeedPtsPerSec ~ estimated from player's own average? Use constant: track length L px, points per sec ≈ (L/N) / (L/avgVpx)... simpler: estimate seconds = remainingPoints * spacing / 420 (assumed 420 px/s). Display "+~12.3s" — mark with "~". OK.
+
+Let me define progress more concretely:
+- N=360 samples uniform spacing sp = L/N.
+- car.sIdx (nearest index), car.progress (float in point units, monotonic increasing by forward delta only).
+- Each frame: find nearest idx in window [sIdx-45, sIdx+45] (mod N) → newIdx; d = wrapped(newIdx - sIdx); if |d| <= 30: car.sIdx=newIdx; if d>0: car.progress += d.
+  Window search: 91 candidates × 4 cars = 364 distance calcs/frame — fine.
+- Gates: G=8, gateLen=N/G=45. nextGate starts at 0 (car is at start line... grid slightly before? place grid behind start line so progress starts ~ -k and first gate crossing happens right after GO; then lap count = floor(progress / N)? Let me define: lapsDone = floor((progress + gridOffset) / N), where gridOffset accounts for starting behind the line. Simpler: initialize car.progress = 0 at the moment they cross start? Alternative: progress measured from grid: init progress=0; totalToLap = distance in points from grid slot to startIdx ≈ (startIdx - slotIdx mod N). Then lap completes when progress >= lapTarget*lap, lapTarget = pointsPerLap = N. Since uniform spacing, one lap from any point back to same point = N. Grid is behind line: first crossing of line happens at progress = gap (~15-40 pts) — but lap should count at line crossing not grid. Hmm — for timing, laps are timed from GO (first lap includes the gap; standard racing does that too — first lap time is slightly longer, that's authentic). And "LAP 2" banner appears when car crosses line = progress >= N. So: onLapCross(prevProg<N*k<=newProg) → completed lap k, record time for player. Good: lap number = floor(progress/N)+1 clamped to ≤3; when progress >= 3N → finished (line crossing at 3rd).
+- Position ranking by progress (monotonic, comparable).
+
+AI also uses same progression; AI finish when progress>=3N → record time, keep driving (cruise) or stop? Let them drive laps, harmless.
+
+Player finish → state finished, freeze race clock, show results after short delay (0.8s) with "FINISH!" banner first.
+
+Edge: player may finish before/after AI; ranking at finish = order of completion + unfinished by progress. Results list sorted: finished cars by time asc, then non-finished by progress desc with est.
+
+Now let me write the Car class:
+```
+class Car {
+  constructor(opts){ pos, heading, color, name, isPlayer, ai params }
+  reset(pos,heading)
+  update(dt, input, world)
+}
+```
+World functions: surfaceAt(x,y) → {d, type}, nearestOnTrack(x,y) → {px,py,d}.
+
+Let me precompute center[] (x,y), normals? For edges at prerender we need tangent/normal per sample: compute from neighbors.
+
+Physics update (player & AI same):
+```
+const f = {x:cos(h), y:sin(h)}, r={x:-sin(h)? } right = (-f.y, f.x)?? For heading h, forward=(cos,sin); right (screen, y down) = (cos(h+90°)...) = (-sin? ) let me define right = {x: -Math.sin(h), y: Math.cos(h)} — rotate forward +90° CW in screen coords (y down): rotation by +90° in screen: (x,y)->(-y,x). So right = (-f.y, f.x) = (-sin h, cos h). Yes.
+vF = v·f; vL = v·r.
+// engine/brake
+if(inp.throttle>0) vF += inp.throttle*ACC*dt*(1 - Math.max(vF,0)/maxV); // taper near top speed... actually use (1 - vF/maxV) so reverse unaffected: if vF<maxV then factor positive; at vF=maxV → 0. At vF negative (reversing) factor >1 slightly — cap factor to ≤1? (1 - vF/maxV) when vF=-200 → 1.26 boost — fine, natural.
+if(inp.brake>0){ if(vF>30) vF -= BRK*dt; else vF -= REVACCEL*dt; clamp vF >= -maxRev }
+Handbrake: vF -= HB*sign? just vF *= exp(-1.2dt) and grip→low.
+// drag
+vF -= vF*Math.abs(vF)*kq*dt*(surface.dragMul);
+vF -= vF*klin*dt;
+// lateral
+grip = surface.grip * (inp.handbrake? 0.24 : 1) * (drifting? extra 0.6? no—drift is result not cause). Actually to make drift persist: when |vL|>threshold, reduce grip further (tire saturation): grip *= 1 - 0.55*clamp((|vL|-90)/260,0,1).
+vL *= Math.exp(-grip*dt);
+// steering
+steerPow = clamp(|vF|/150,0,1) * (1 - 0.38*clamp(vF/maxV,0,1)); if vF<0 invert sign.
+h += inp.steer * STEER * steerPow * dt * (inp.handbrake?1.28:1);
+// recombine
+v = f*vF + r*vL; pos += v*dt;
+```
+Wall collide after integration (check both axes via nearest point). Also keep car within world bounds as safety.
+
+Drift & sfx flags set each frame for player: drifting, onGrass, speed.
+
+AI input generation per frame as described. Add slight steer smoothing and noise to avoid jitter: ai.steer = clamp(angDiff*2.4 - vL*0.0015, -1, 1) (vL term stabilizes). Speed target from curvature: sample angles at sIdx+la1 and +la2: sharpness = |wrapAngle(dir2-dir1)|; also immediate angle to lookahead point. targetV = clamp(760*skill - sharpness*900, 240, 760*skill)? Tune: sharpness in radians over ~500px arc; hairpin maybe 1.9 rad → 760-1.7=... let me use targetV = max( minV, base - kTurn*max(0,sharp-0.15) ). Tune kTurn≈520, base≈ skill*740, minV≈230. If vF > targetV+20 → brake=1, throttle=0; else if vF < targetV-10 → throttle=1 else throttle=0.6 (coast). Handbrake: none for AI (or occasionally in hairpins? skip).
+
+Rubber-band applied to ACC and BRK multipliers each frame based on distance to player.
+
+Skid marks: rear wheel world positions: pos - f*carLen*0.32 ± r*carWid*0.42. Store previous; if drifting && surface allows (asphalt/curb) push segment with alpha 0.5. Grass: dust particles instead, no marks (or faint brown).
+
+Sparks on wall hit: 8-14 particles at contact point, velocity = reflection random, life 0.25s, color #ffe28a→white; shake amp += 6+vn/60.
+
+Smoke: while drifting spawn 1-2 per frame at rear wheels: vel = -v*0.1 + random, life 0.7, size grows 6→22, gray rgba(230,230,235,a).
+Dust on grass at speed>100: tan puffs.
+
+Engine rpm for sound: rpm = clamp(|vF|/maxV,0,1); if throttle && vF< maxV*0.95 add 0.15 rev. freq=64+rpm*260 + throttle*30. Skid gain target = drifting? min(0.28, |vL|/700):0; lerp 10/s. Rumble: onGrass&&speed>80 → 0.1 else 0.
+
+Countdown state timing: cdT from 3.999; digits = ceil(cdT-1)? Let me do: total 3.6s: t=0..0.7 "3", .."2","1", then GO at t≥2.1? Classic: 3 (1s) 2 (1s) 1 (1s) GO. state countdown with cdT counting up; phase = floor(cdT); on phase change play beep (3→660, 2→660, 1→660, go→990 long). At cdT>=3 → state racing, raceT=0, show "GO!" for 0.8s. Cars locked until racing.
+
+Menu demo camera: demoIdx += dt*22 (points/s) wraps; cam pos = center[demoIdx], zoom base*0.55 (wide). Lerp smoothly.
+
+Zoom: baseZoom = clamp(min(W,H)/900, 0.55, 1.4)? Let me think: want ~1300 world units visible across min dimension? At canvas 1280x720: zoom=720/1000=0.72 → view 1778x1000 world units. Track width 2*asphaltHalf(58)=116 + shoulder ~ 208 → visible ~4 track widths — good. baseZoom = clamp(minDim/1000, .5, 1.3). Speed zoom: z *= (1 - 0.16*speedFrac) smoothed.
+
+Draw world: ctx.save; translate(W/2,H/2); scale(z); rotate(0); translate(-cam + shakeOffset); drawImage(worldCanvas, ...), then marks/particles/cars in world coords; restore. DPR: set ctx.setTransform(dpr,0,0,dpr,0,0) at frame start and use CSS pixel coords throughout.
+
+Minimap: canvas 200x140 css (dpr scaled). Prerender track path once to that canvas with scale = min(mw/WORLD_W, mh/WORLD_H) centering; each frame clear? draw prerender image then dots.
+
+Now HUD DOM update per frame: speed text (rounded), lap, position, timer — cheap textContent updates; only when value changes to avoid layout thrash (guard with cached strings).
+
+Best lap localStorage: key 'apexrush_bestlap'. Save on new best (player). Display on menu + results. try/catch.
+
+Pause: toggle; also auto-pause on blur? Optional — add visibilitychange → if racing, pause. Nice touch.
+
+Restart: reset all cars to grid, clear marks/particles, raceT=0, state=countdown, cdT=0, banners hidden, lapTimes=[].
+
+Menu button → state menu (demo cam), show start overlay.
+
+Overlay management: .screen divs with .active class; pointer-events only when active.
+
+Buttons: Start (menu), Resume/Restart/Menu (pause), Restart/Menu (results). Also key handling: Enter/Space on menu = start; P/Esc toggles pause during racing/countdown? Pause during countdown OK too (freeze cdT); R restarts from race/pause/results; M mute anywhere.
+
+Prevent arrow/space scrolling: e.preventDefault() for keys in the control set when target is body.
+
+Blur active element after button click so space doesn't retrigger: btn.blur().
+
+Now visual polish details:
+- Car draw: shadow (offset ellipse), body: rounded rect 46x24 with gradient? Use two-tone: base color, darker side shade, black windshield trapezoid toward front, spoiler bar on rear for AI? Player has white racing stripe. Wheels: 4 dark rects at corners; slight rotation of wheels? Keep static (top-down), but rotate front wheels by steer*0.5 — nice detail, cheap.
+- Car heading: draw with ctx.rotate(h). Front = +x direction in local space.
+- Label above AI cars: small name text? Draw a small triangle marker for player (white arrow bobbing). Player indicator helps on minimap too (dot color yellow vs others).
+- Speed effect: at high speed, faint motion streaks? Skip — smoke/shake enough. Add slight zoom pulse on GO? Fine without.
+
+Banner element: #banner with class show; set text and animate via CSS (translateY + fade); JS removes after 1.6s or retrigger via reflow.
+
+Countdown element: big digit centered, animate scale/opacity per phase — retrigger animation on each change by resetting class (void el.offsetWidth).
+
+CSS specifics:
+- :root palette: --ink #0e1116; --panel rgba(12,15,20,.78); --yellow #ffd23f; --red #ff4b3a; --white #f4f6f8; green bg.
+- Font stack: display: 'Arial Black','Segoe UI Black',system-ui heavy weight 900 italic; body: system-ui,'Segoe UI',Roboto... hmm Roboto in the stack is fine as fallback (not an external load). Mono: ui-monospace, 'Cascadia Mono', Consolas.
+- Panels: clip-path polygon angled corners (e.g., polygon(0 0,100% 0,calc(100% - 14px) 100%,0 100%)) + border-left accent.
+- Start screen: full overlay bg: layered — dark radial gradient + animated hazard stripes band top and bottom (repeating-linear-gradient 45°, animate background-position), checkered strip (repeating-conic? use conic-gradient checker via background-size). Title huge italic with layered shadow (red offset + white) and a skewed underline bar. "PRESS ENTER" pulsing. Controls in two-column kbd chips (kbd style: dark key cap with bottom border). Best lap chip.
+- Results: panel card, position stamp ("2ND") big rotated -6deg red/yellow, table rows with colored car swatches, buttons styled as angled yellow/red.
+
+Accessibility-wise: focusable buttons; but keyboard shortcuts cover everything.
+
+Edge cases:
+- dt clamp 0.033; if tab hidden long, skip.
+- Nearest search window when car teleports? none.
+- AI stuck against wall: add recovery — if speed <20 for >1.5s and on grass → steer toward centerline (target = nearest center point). Implement: ai.stuckT accumulates; target override to nearest center. Also strong wall reflection with restitution prevents deep sticking. Add gentle "tractor" too: if d > wallDist-40 (near wall) AI steers toward center (bias target point to center). Let me include a simple stuck recovery.
+
+- Player going backward across line: progress only increases forward; fine.
+
+Now let me finalize numbers:
+WORLD_W=3400, WORLD_H=2300. asphaltHalf=58 → track width 116. Car length 44 — track ~2.6 car widths. Shoulder to wall: +46 → wallDist=104.
+
+N samples: resample Catmull-Rom uniformly: first generate dense (per segment 60 steps * 11 seg = 660 pts), compute cumulative length, then sample N=360 uniformly. L ≈ perimeter estimate: rough ellipse 2400x1500 → ~6300 + S wiggles → ~6800 px. sp≈19px/point. Max speed 780 px/s → lap time at avg ~550 → ~12.4s/lap?? too fast for a 3-lap race (37s). Real arcade: fine but let me slow down: maxV 640, accel 480. Avg maybe 420 → 16s/lap → 48s race. Good. kq = A/vterm²: with taper model (accel*(1-vF/maxV)) terminal is exactly maxV=640. kmh display = v*0.42 → 640→269 km/h.
+
+Steer STEER base 2.5 rad/s * speedFactor; at 640: factor=(1-0.38)=0.62→ 1.55 rad/s — full lock circle radius = v/ω = 640/1.55 ≈ 413 px > track width, good (need to ease off). At 300 px/s: factor≈(300/150=clamp1)*(1-0.38*0.47)=0.82 → 2.05 rad/s → radius 146 — hairpin OK with drift.
+
+Grip asphalt 9.0; when handbrake ×0.22 → lateral decay slow → slidey. Drift threshold |vL|>80.
+
+AI base speed skill: [0.97, 0.94, 0.915]*maxV? With rubber-band they stay close. targetV = clamp(base - kTurn*max(0,sharp-0.12), minV=230, base). kTurn: sharp is over lookAhead arc; let me compute sharp as total turn angle between 2 lookahead segments (each ~ 14+speed*0.05 indices?). Let me define laIdx = round((140 + vF*0.28)/sp). dirA = center[s+la]-center[s]; dirB = center[s+2la]-center[s+la]; sharp=|wrapAng(angB-angA)|. Hairpin: turn ~1.6 rad → targetV= base(≈620)-520*1.48≈ -148→ clamp 230. Gentle 0.3 → 620-94=526. OK.
+
+Also AI throttle off slightly before sharp corners: look further: sharpFar at 2la already included. Fine.
+
+AI lateral offset per car (-18,0,+18) to spread them and avoid overlap (no car-car collision! Should cars collide with each other? That's the "physics" expectation... Car-car collision adds a lot of fun & difficulty. Simple elastic: treat as circles r=20; on overlap push apart along normal + swap some velocity (impulse). Cheap O(n²) for 4 cars. Let me add it — makes overtakes feel real. Impulse: relative velocity along normal, if approaching: apply restitution 0.35 equal mass, separate positions half each. Add small spark? Just sound tick rate-limited + tiny shake for player.)
+
+Careful AI vs wall + car jostle could cause jitter; use damping. Fine.
+
+Now, HUD "position" uses progress ranking — with car-car collision, progress still monotonic per car (only increases when moving forward) so OK.
+
+Let me code the results estimation: est = raceT + (3N - prog)*sp/420 → format "+X.Xs after you"? Show their estimate total as "~1:23.4". Fine: display `${fmt(est)}*`.
+
+Also record player last lap for banner: "LAP 2 · 0:16.84" and on finish lap "FINAL LAP DONE!".
+
+Sound design check — engine osc continuous: create on audio init, start; each frame set freq/gain with setTargetAtTime for smoothing (timeConstant 0.05). Skid: looping noise buffer (1s random) → bandpass → gain 0. Rumble separate lowpass. Collision one-shot function. Beep function. Mute: master.gain=0/0.55; also suspend? just gain.
+
+First input requirement: audio ctx created on first click/keydown (start). All good — menu has no sound until start pressed (Enter key is a gesture too → can init there).
+
+Now let me write the whole file. Let me draft JS structure in order:
+
+1. Constants & helpers (clamp, lerp, wrapAng, fmtTime, mulberry32).
+2. Track build (CP → dense catmull → resample N=360; compute L, sp, tangents/normals, startIdx, grid slots, gates).
+3. Prerender world canvas (grass stripes, noise dots, trees, grandstand, billboards, dirt band, curbs, asphalt + speckle, edge lines, centerline faint, checker start + gantry, grid marks).
+4. Minimap prerender.
+5. Audio module.
+6. Car class + inputs.
+7. Game state object; resetRace(); startCountdown(); finishRace().
+8. AI controller.
+9. Physics step (surface check, integrate, wall collide, car-car collide, drift marks, particles spawn).
+10. Progress/lap logic.
+11. Particles & skid marks arrays + update/draw.
+12. Camera & render loop (world, marks, cars, particles, minimap).
+13. HUD DOM refs + per-frame update.
+14. Banners / countdown DOM.
+15. Input handling (keydown/up map; buttons; blur pause).
+16. Resize handler.
+17. Boot: build, reset to menu, rAF.
+
+Let me write catmull-rom:
+```
+function catmull(p0,p1,p2,p3,t){ const t2=t*t,t3=t2*t; return [
+ 0.5*((2*p1[0])+(-p0[0]+p2[0])*t+(2*p0[0]-5*p1[0]+4*p2[0]-p3[0])*t2+(-p0[0]+3*p1[0]-3*p2[0]+p3[0])*t3),
+ same for y];}
+```
+Closed loop: index wrap.
+
+Dense sampling: for each i in CP: p0=CP[(i-1+n)%n], p1=CP[i], p2=CP[(i+1)%n], p3=CP[(i+2)%n]; t=0..steps-1/steps → push.
+Then resample to N uniform by arc length.
+
+startIdx: find dense/resampled point with y > 1900 and x in [850,1150] → closest. Grid slots: for k=0..3: idx = (startIdx - (8 + k*16) + N)%N; lateral offset alternating: off = (k%2? 24 : -24); slot pos = center[idx] + normal[idx]*off. heading = tangent angle at idx. Player is last (k=3).
+
+AI order: slots 0,1,2 → AI A, B, C; player at slot 3.
+
+normal[i] = perpendicular to tangent: t=(dx,dy) normalized → n=(-ty? ) pick either consistent side: n = {x:-t.y? } let me use left normal = (-t.y? ...) in screen coords: rotate tangent -90° (CW?): nL = (t.y, -t.x), nR = (-t.y, t.x). Either is fine for offset.
+
+Gates: not needed anymore with progress-based laps! Laps: lapCross when floor(prog/N) increases → but first crossing happens at prog≈gap? no wait — prog starts at 0 at grid (behind line); after driving forward from grid to line, prog = gap (~32 pts), then continues; crossing line again = prog = N + ... hmm NO. Let me re-derive: progress measured by accumulated forward travel in point units. Starting behind line by g points. Crossing start line first time at prog=g. One full lap later at prog = g+N. So laps complete when prog >= g + k*N for k=1..3. So store car.lineGap = g (points from grid to line). Lap k completes at threshold lineGap + k*N.
+
+Compute g: ((startIdx - slotIdx) mod N) → forward distance in points from slot to line.
+
+Ranking by prog — all cars have different gaps (slot spacing 16 pts) — fair enough since it reflects actual position on track... actually ranking should be by "current arc position + laps completed": rankKey = floor(prog/N)*N + ((prog - lineGap?) ... hmm. Simpler: rankKey = prog - lineGap (distance past the line, cumulative). At start, player at -g4, AI at -g1..-g3 → correct order (AI ahead).
+
+So car.raceDist = prog - gap; lapsDone = floor(raceDist / N) (when ≥0); finish when raceDist >= 3N. Lap timing: on k crossing of lap K: time.
+
+Gate sanity not needed.
+
+Minimap dots: pos scaled.
+
+Now car-car collision details:
+```
+for pairs (i<j): dx,dy,d; minD=34; if d<minD && d>0.01: nx,ny; overlap=(minD-d); separate each by overlap/2 along n (from i to j? define n from A to B): a.pos -= n*half; b.pos += n*half; rel = (b.v - a.v)·n; if rel<0: imp = -(1+e)*rel/2; a.v -= n*imp; b.v += n*imp; e=0.3; also small lateral scrub. If player involved && |rel|>60 → thud sfx + shake 3, spark at midpoint.
+```
+
+Wall collision detail: nearest point on centerline — use windowed search (car.sIdx) to get px,py,d (unsigned). If d > wallDist - 12 (car radius ~14): n = (pos-np)/d; pos = np + n*(wallDist-14); vn = v·n; if vn>0: v -= n*vn*(1+0.35); v *= 0.985 tangent... just apply both: after reflection, also multiply tangential by 0.96. Spawn sparks at contact point pos - n*10, count ~ min(12, vn/40). shake += clamp(vn/70,2,9). Thud sound if vn>90 rate-limited 100ms.
+
+Surface: d<asphaltHalf-? curb band [asphaltHalf, asphaltHalf+12] → type 'curb' (grip 6.5, dragMul 1.4, rumble jitter), [.., wallDist-?] dirt shoulder: grip 7, dragMul 2.2, dust; beyond visual grass (rare) same as dirt but more drag. Actually let me set: asphalt d<asphaltHalf (grip 9, kq base); curb d≤asphaltHalf+13 (grip 6.2, kq*1.5, rumble shake 0.4); off d> that (grip 7.5? hmm grass should be slower: grip 6.5, kq*2.6, klin 1.0) → top speed on grass ~ sqrt(480/ (kq*2.6)) ≈ 400 — still fast; add klin 1.6 → terminal lower ~300. OK.
+
+kq base: A=480 taper model gives exact maxV... but with taper, drag isn't needed for terminal; still keep small kq for feel? Taper alone is stable: vF += A*(1-vF/maxV)*dt → asymptote maxV. Add klin 0.35 for braking-off coast decay (natural slow-down when no throttle). Good — drop kq entirely (simpler, stable at any dt). On grass/curb: multiply effective maxV: treat as accel toward lower cap: use surfaceMax = maxV * surf.capMul (asphalt 1, curb .82, off .5); engine term A*(1 - vF/surfaceMax) → on grass top ≈320. Also add extra drag when coasting on grass: vF *= exp(-1.4*dt).
+
+Reverse: brake with vF<30 → vF -= 320*dt down to -230. Reverse steer inverted (handled by sign(vF)).
+
+Handbrake: grip*0.22, plus vF toward 0: vF *= exp(-1.1dt).
+
+Drift saturation as above.
+
+Now steering feel: also add slight auto-centering? No—arcade is fine without.
+
+Camera lead: target = pos + vel*0.32 (clamp lead to 260px).
+
+Zoom smoothing & shake: cam.shake decays exp(-7dt); offset = (rand-.5)*shake each axis.
+
+Render car with slight body roll? Skip — wheels rotate, that's enough. Add brake lights: when braking, red glow rect at rear; headlight cone on... no night. Keep brake lights — nice feedback.
+
+Player marker: small white chevron above car bobbing (sin(t*6)), only for player.
+
+HUD position display: "P1" big + "OF 4" small. Lap: "LAP 2/3". During countdown show "LAP 1/3 READY".
+
+Timer panel: CURRENT lap live; LAST; BEST (session best including storage). Colors: best yellow.
+
+Speedo: number + unit; drift lamp text "DRIFT" glows red when drifting; handbrake indicator? Drift is enough.
+
+Minimap: player dot pulsing radius via sin; AI dots 3px.
+
+Now the results table rows: swatch color, name (YOU bold yellow), finish time or estimate, and a "Δ" vs winner? Keep: pos | driver | total | best lap (for player show best). AI best lap unknown — skip column, just total + status chip ("FINISHED"/"EST").
+
+Position stamp text: 1ST/2ND/3RD/4TH with color (1st yellow, others white/red?). Add flavor line: 1st "FLAWLESS DRIVE." 2nd "SO CLOSE TO THE WHEELS." 3rd "BACKMARKERS BEHIND YOU — FOR NOW." 4th "THE FIELD GOT AWAY. RE-RACE IT."
+
+Buttons: [RESTART RACE (R)] primary yellow; [MAIN MENU] ghost.
+
+Pause screen similar minimal.
+
+Now let me write CSS carefully for angled racing aesthetic. Use clip-path polygons on panels; kbd chips; hazard stripes animation; checker strip via repeating-conic-gradient(45deg? ) — checker: background: repeating-conic-gradient(#fff 0 25%, #111 0 50%) 0 0/24px 24px. Good.
+
+Countdown digits: font display 900 italic, size clamp(80px, 20vmin), color yellow with red shadow; animation pop (scale 1.6→1, fade). GO! green? Use #7CFC9A? Racing "lights out" — use white/green. Let me do green (#5dff8f) for GO.
+
+Banner: top-center below lap panel; slide down + hold + fade via CSS animation 1.8s; JS sets text and restarts animation.
+
+Vignette: fixed div, radial-gradient(transparent 55%, rgba(0,0,0,.45)), pointer-events none. Plus subtle top gradient. And a "speed lines" overlay? Skip.
+
+Grass color check vs HUD dark — fine.
+
+Performance concern: drawImage of world canvas each frame with transform — GPU handles it. Skid marks strokes: batch into 2 paths by alpha bucket (rounded to .05) → ≤8 path strokes total. Let me do that: group map keyed by alpha bucket; but alpha decays per mark... bucket = Math.round(alpha*20)/20. Marks fade over life; store birth & drawAlpha computed each frame. Grouping fine.
+
+Particles drawn individually (≤350) — ok.
+
+Text on canvas (AI name): small, maybe skip to reduce clutter; use colored dots + minimap. Actually little name tags above AI cars help identify rivals: 10px font, alpha .8, draw each frame ×3 — fine, include.
+
+Now let me write the final code with attention to length but completeness matters more. Let me draft JS in order, watching for bugs:
+
+- wrapAng(a): while(a>PI)a-=2PI; while(a<-PI)a+=2PI.
+- fmt(t): m=floor(t/60); s=t-m*60 → `${m}:${s.toFixed(3).padStart(6,'0')}`.
+- mulberry32(seed).
+
+Track build code:
+```
+const CP=[[620,1950],[1700,1985],[2560,1930],[3060,1480],[2870,940],[2360,700],[1900,950],[1400,690],[880,430],[380,820],[520,1380]];
+```
+Wait — let me check G dip vs E/F/H spacing: F(2360,700) → G(1900,950): down-left; H(1400,690): up-left. S shape OK. But I(880,430) is close to H(1400,690)? dist ~ sqrt(520²+260²)=581 fine. J(380,820)→K(520,1380): down; K→A(620,1950). Left side: I(880,430)→J(380,820)→K(520,1380): slight S but OK. Top between H and I: (1400,690)→(880,430) fine.
+
+Hmm one concern: segment D(3060,1480)→E(2870,940)→F(2360,700): the turn radius there is large (good, fast sweeper). C(2560,1930)→D: turn 1.
+
+Track max x = ~3060 + width/2+shoulder 104 → 3060+? centerline could bulge to ~3100; world W=3400 OK (margin 300). Min y: I(880,430) & H area maybe ~400 with curve → margin to 0 is 400-104=296 OK. Max y: B 1985 + bulge ~2020; H world 2300 → 280 margin. Min x: J 380 - maybe 340 → 340-104=236 OK. Good, keep WORLD 3400x2300.
+
+Grandstand placement: near start line (around x≈1000,y≈1965, track direction +x). Place grandstand on the upper side of straight: rect centered at (1000, 1780) size 340x90? distance from centerline ~185 > wallDist(104)+margin — but must not overlap dirt band: dirt extends to 104; grandstand at 1785 → 180 away: OK. Add crowd dots.
+
+Billboards: two rects along outside of turn D (right side) and near top straight. Just simple colored rect + text "APEX" / "RUSH". Positions: (3230, 1180) rotated? Keep axis-aligned for simplicity, ensure clearance > 170 from centerline. Let me place: BB1 (3260,1150) w140 h46; check distance to E(2870,940)/(D 3060,1480): nearest centerline maybe ~ (3000,1200)? distance from (3260,1150) ≈ 265 OK. BB2 near top: (620,240)? I(880,430) dist ~ sqrt(260²+190²)=322 OK. w150 h46.
+
+Trees: random via seeded rng; reject if distance to any centerline sample < 190 → sample a coarse subset (every 4th) for check. Also avoid grandstand/billboard rects (just check distance to their centers > r+80). ~70 trees, radius 16-34, dark green with lighter blob offset.
+
+Grass stripes: vertical bands width 150 alternating #4b8a33/#447f2d... plus vignette? Fine. Add subtle overall gradient? Skip.
+
+Dirt band color: #9c7a4a? With noise dots darker. Curb white/red #e8e8e8 / #d63b2f. Asphalt #3a3e45, speckle rgba(255,255,255,.03) & (0,0,0,.15) dots along track: for i in samples step 2: at center[i]+rand*asphaltHalf offset draw 2-3 px dot.
+
+Edge lines: white 4px at ±(asphaltHalf-6), alpha .85; also thin yellow? No.
+
+Centerline dashes: stroke path dashed [18,26] width 3 rgba(255,255,255,.25). Subtle.
+
+Start checker: at startIdx: tangent t, normal n. Band across track: rows r=0..1, cols c=0..13: square size = (asphaltHalf*2)/14 ≈ 16.6; center pos = center[startIdx] + n*(c-6.5)*sq - t*r*sq... plus small white "grid" slots: for each slot k: line perpendicular at slot idx, width 30px, alpha .5, offset to car side? Just draw short dashed vertical ticks.
+
+Gantry: two posts (rects) at ±(wallDist+18) from center along n, height 60? Top-down gantry = just a bar across with "APEX RUSH" text on it + small checker ends. Draw a rect bar width 2*(wallDist+24), height 14, dark, with yellow text 12px centered — top-down overhead banner. Cute.
+
+Minimap: canvas 210x150; scale = min(190/3400, 130/2300)=min(.0559,.0565)=.0559 → w=190,h=128. Draw path lineWidth 7 #2b2f36 + 3 #6d7480? plus start tick white. Frame via CSS.
+
+Now the AI controller function computeAI(car, dt):
+```
+const sp = track.sp;
+const la = Math.round((150 + car.vF*0.30)/sp); // indices
+let ti = (car.sIdx + la) % N;
+// curvature
+const a1i=car.sIdx, a2i=(car.sIdx+la)%N, a3i=(car.sIdx+2*la)%N;
+angA = atan2(c[a2]-c[a1]); angB = atan2(c[a3]-c[a2]); sharp=|wrapAng(angB-angA)|;
+const base = car.skill * 640; // maxV base same as player 640
+let targetV = clamp(base - (sharp-0.12)*560, 240, base);
+// near-wall bias: if d>wallDist-30 steer to center: use nearest center point as target instead
+if(car.d > wallDist-26 || car.stuckT>1.2){ ti = car.sIdx; } // aim at centerline directly
+const tp = C[ti];
+let dh = wrapAng(atan2(tp.y-car.y, tp.x-car.x) - car.h);
+car.inp.steer = clamp(dh*2.6 - car.vL*0.004, -1, 1);
+if(car.vF > targetV+25){car.inp.throttle=0;car.inp.brake=1;}
+else if(car.vF < targetV-15){car.inp.throttle=1;car.inp.brake=0;}
+else {car.inp.throttle=0.55;car.inp.brake=0;}
+car.inp.handbrake=false;
+// stuck timer
+if(Math.hypot(car.vx,car.vy)<40) car.stuckT+=dt; else car.stuckT=Math.max(0,car.stuckT-dt*2);
+if(car.stuckT>1.6){ // recovery: face center and throttle
+  ... same as above (ti=sIdx covers), force brake 0? if vF<-50 brake to stop then go.
+}
+```
+Also AI rubber-band: mult = clamp(1 + (playerDist - aiDist world?)... use raceDist diff: diff = player.raceDist - car.raceDist (points); if diff>40 → accelerate boost 1.10; if diff<-60 → 0.93. Apply to base & ACC. Store car.rb.
+
+Player input from keys: steer = (left?-1:0)+(right?1:0), etc.
+
+Car.update(dt): uses this.inp; compute surface via nearest search — combine: windowed nearest returns idx & px,py & d. Save to car.sIdx, car.d.
+
+Then integrate as designed. Then wall collide. Then progress update (using new sIdx). Then drift check → marks/particles/sfx flags.
+
+Wait ordering: for progress we use sIdx from before or after move? After move is fine; window ±45 covers high speed: max 640px/s*0.033=21px ≈ 1.1 pts/frame — tiny. Window ±45 generous (also helps when car on grass far away, d large but idx still close).
+
+But careful: windowed nearest can lock onto wrong branch near track self-proximity... our track min separation between non-adjacent branches: G dip (1900,950) vs F/H line (2360,700)/(1400,690): vertical gap ~ 950-700=250 < window 45pts*19px=855?? Window is along track index, not spatial — it searches indices within ±45 of current sIdx, i.e., only nearby arc length. Car can't be far from its own local arc unless it teleports across a branch — impossible since wall contains car. Safe.
+
+Edge: at start, sIdx initialized to slot idx. Good.
+
+Lap logic per car (player uses for timing; AI for finish):
+```
+const rd = car.prog - car.gap; // raceDist
+const newLap = Math.floor(rd / N); // 0-based lap completed? When rd in [0,N) → floor 0... 
+```
+Hmm: at start rd ≈ 0 (just after crossing line, rd=gap+prog... wait prog starts 0 at grid; rd = -gap). Crossing line → rd=0. Lap 1 completes when rd ≥ N. So lapsDone = floor(rd/N) for rd≥0 else 0. On increase of lapsDone: if lapsDone>=1 → completed lap number lapsDone (1..3); record time = raceT - car.lapStart; car.lapStart=raceT; if lapsDone==3 → finished (car.finishTime=raceT).
+Player banner on lap completion: if k<3 → "LAP k+1 · time" else → finish sequence.
+
+But careful with negative rd: floor(-0.5) = -1 — guard: lapsDone = rd>0 ? Math.floor(rd/N)+? no: rd in [0,N): 0 laps done (in lap 1). floor(0.x*N /N)=0 ✓. rd in [N,2N): 1 ✓. Good; when rd<0 → lapsDone=0 (guard max(0,...)).
+
+car.lapStart init at GO: raceT=0.
+
+Player HUD "LAP" display = min(3, lapsDone+1).
+
+Position ranking each frame: sort by raceDist descending → pos map. Player's position for HUD; results order from same.
+
+Finish (player): state='finished'; finishDelay timer 1.2s → show results overlay (build rows); stop race clock at player's finishTime. AI continues? Freeze everything on finished (simplest) — but then estimate uses frozen progress: fine, compute est = player.finishTime + (3N - ai.raceDist)*sp/400.
+
+Hmm actually let me keep simulating AI behind overlay for a few seconds so we get real times if they finish close... complexity not worth it; estimate is honest with "~".
+
+Countdown → racing transition: state='racing'; raceT=0; cars lapStart=0.
+
+Menu state: demo camera; HUD hidden? Show HUD but dimmed? Hide HUD in menu (class on body per state). Body dataset.state drives CSS visibility of HUD.
+
+Pause implementation: paused bool only meaningful during countdown/racing; freeze updates; overlay shown; resume button/P/Esc.
+
+Restart key R: if state in [racing,countdown,finished] → resetRace() + startCountdown(). From menu, Enter/Space/click to start.
+
+Now audio engine node graph:
+```
+AC = new (AudioContext||webkit)(); master=AC.createGain()→destination; 
+engineOsc1 sawtooth, osc2 square detune -12? freq base*0.5; engFilter lowpass 900 Q .8; engGain 0 → master.
+noiseBuf: 1s white; skidSrc loop → skidBP bandpass 950 Q 0.9 → skidGain 0 → master; rumbleSrc loop → rumbleLP 220 → rumbleGain 0 → master.
+```
+Per-frame update (if audioOn && state racing/countdown): rpm = clamp(|vF|/maxV*1 + inp.throttle*0.18, 0, 1.05); f=62+rpm*300; osc1.freq setTargetAtTime(f, t, .06); osc2 f*0.5+3; engFilter.freq = 500+rpm*1900; engGain.gain target = (state racing? (0.05+0.11*rpm + throttle*0.04) : idle 0.03). Skid gain: target drifting? clamp(|vL|/650,0,.3):0 tc .08. Rumble: onGrass&&spd>90 → .12 else 0 tc .1.
+Beep(freq,dur,type='square',vol=.25): osc+gain envelope.
+Thud(): noise burst + sine drop (as above), vol by impact.
+
+Mute toggle: muted flag; master.gain.value = muted?0:0.6.
+
+Init audio on first gesture: function ensureAudio() { if(!AC){create...} if(AC.state==='suspended') AC.resume(); } called in keydown & pointerdown (once) — but must not create before user gesture to comply; both are gestures. Guard with try/catch.
+
+Now let me write the render:
+
+```
+function frame(t){ requestAnimationFrame(frame); const dt=clamp((t-lastT)/1000,0,0.033); lastT=t; 
+ if(!paused){ if(state==='countdown'){cdUpdate(dt);} else if(state==='racing'){raceUpdate(dt);} else if(state==='menu'){demoUpdate(dt);} else if(state==='finished'){ /* keep updating particles & AI? Freeze cars; update particles for smoke to settle */ particleUpdate(dt);} }
+ render(); hudUpdate(); 
+}
+```
+raceUpdate: raceT+=dt; for each car: if AI computeAI; car.update(dt); progress/lap; collisions (car-car after all updates); camera update; particles; marks fade.
+
+Render: as planned. Also draw "GO!" etc via DOM not canvas.
+
+Minimap drawn in render (cheap).
+
+HUD text update with cached values.
+
+Now sizing: car body 46×24, radius for collision wall 13, pair minD 30.
+
+Let me define input keys mapping:
+```
+keys = {}; window keydown: k=e.key.toLowerCase(); map: 'arrowup','w'→up; 'arrowdown','s'; 'a','arrowleft'; 'd','arrowright'; ' ' handbrake (preventDefault); 'r'; 'p','escape'; 'm'; 'enter'.
+```
+Player inp computed each frame from keys.
+
+Space in menu = start? Enter primary; Space also starts (but space is handbrake — during race it's handbrake; on menu it starts). OK: if state==='menu' && (Enter||Space) → startRace().
+
+Buttons wired with click handlers + blur.
+
+visibilitychange: if document.hidden && (racing|countdown) → pause(true).
+
+Resize: set canvas size & dpr, recompute baseZoom, minimap unaffected. Also world prerender done once at build time (independent of screen).
+
+One more juice: on GO, brief rev sound + camera punch; on new best lap, banner "NEW BEST!" gold; speed-based FOV already there; tire screech pitch varies with |vL| (set skidBP freq 700+|vL|*2).
+
+Also idle in menu: cars not present? Show parked grid cars behind menu overlay for depth — yes! Reset race to grid at boot (state menu), render scene (frozen) + demo camera orbit. Good.
+
+Let me finalize banner text and results flavor.
+
+Time to write the code fully. Let me be careful with syntax as I go. Also ensure no external resources. Title: "Apex Rush — Racing Physics".
+
+Let me write CSS variables & styles:
+
+```
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;background:#12151a}
+body{font-family:'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif;color:#f4f6f8;-webkit-user-select:none;user-select:none}
+#game{position:fixed;inset:0;display:block}
+.display{font-family:'Arial Black','Segoe UI',system-ui,sans-serif;font-style:italic;font-weight:900;letter-spacing:.5px}
+.mono{font-family:ui-monospace,'Cascadia Mono',Consolas,Menlo,monospace}
+```
+
+HUD:
+```
+#hud{position:fixed;inset:0;pointer-events:none;z-index:5;opacity:0;transition:opacity .3s}
+body[data-state="racing"] #hud, body[data-state="countdown"] #hud, body[data-state="finished"] #hud{opacity:1}
+.panel{position:absolute;background:linear-gradient(180deg,rgba(16,20,27,.85),rgba(10,13,18,.78));clip-path:polygon(0 0,100% 0,calc(100% - 16px) 100%,0 100%);padding:...;border-top:2px solid var(--yellow)? clip-path clips border... use inset box-shadow? Simpler: add separate accent bar div or use border with clip — border gets clipped at angled corner but fine.
+```
+Use ::before for accent stripe.
+
+Position panel top-left: big "P1" 44px display yellow, small "/ 4".
+Lap top-center: "LAP" small + "2/3" big white.
+Timing top-right: rows: [CURRENT 0:16.482] big mono; [LAST --:--.---]; [BEST --:--.---] yellow.
+Speedo bottom-left: number 56px display skew, "km/h", drift lamp.
+Minimap bottom-right: canvas with border and clip angled, label "TRACK".
+
+Countdown #cd centered huge.
+#banner top 18% centered.
+
+Screens: .screen{position:fixed;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;visibility:hidden;opacity:0;transition:.25s} .screen.active{visible}. Menu screen bg: layered gradient + hazard bars top/bottom (abs div with repeating-linear-gradient animated) + checker strip.
+
+Title block: "APEX" white with red hard shadow, "RUSH" yellow; big clamp(64px,14vmin,150px); slight rotate(-2deg). Below: tagline chip row: "3 LAPS", "DRIFT PHYSICS", "BEAT 3 RIVALS". Controls grid: kbd chips. Start button big yellow angled, hover shift + shadow; "or press ENTER". Best lap line.
+
+Results screen: card panel with stamp, table, buttons.
+Pause: simple.
+
+Media query for small screens: scale HUD down via font-size clamp using vmin units mostly; minimap smaller (canvas width 150). Use CSS width on canvas element (200px desktop / 140 mobile) but keep internal resolution fixed — set style width in media query, drawing uses internal.
+
+Now let me write the full JS. Let me draft carefully:
+
+```js
+'use strict';
+// ---------- helpers
+const $=id=>document.getElementById(id);
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+const TAU=Math.PI*2;
+function wrapAng(a){while(a>Math.PI)a-=TAU;while(a<-Math.PI)a+=TAU;return a;}
+function fmt(t){if(t==null||!isFinite(t))return '--:--.---';const m=Math.floor(t/60);const s=t-m*60;return m+':'+(s<10?'0':'')+s.toFixed(3);}
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
+```
+
+Track:
+```js
+const WORLD={w:3400,h:2300};
+const TRACK_N=360, ASPHALT_HALF=58, CURB_W=13, WALL_D=ASPHALT_HALF+CURB_W+46; // 58+13+46=117
+```
+Hmm earlier said shoulder 46 total; now curb 13 + dirt 46 → wall at 117. OK.
+
+```js
+const CP=[[620,1950],[1700,1985],[2560,1930],[3060,1480],[2870,940],[2360,700],[1900,950],[1400,690],[880,430],[380,820],[520,1380]];
+function buildTrack(){
+ // dense catmull
+ const pts=[];const n=CP.length;const steps=70;
+ for(let i=0;i<n;i++){const p0=CP[(i-1+n)%n],p1=CP[i],p2=CP[(i+1)%n],p3=CP[(i+2)%n];
+  for(let s=0;s<steps;s++){const t=s/steps,t2=t*t,t3=t2*t;
+   pts.push([
+    .5*(2*p1[0]+(-p0[0]+p2[0])*t+(2*p0[0]-5*p0? ...
+```
+Let me write catmull correctly:
+x = 0.5*((2*p1x) + (-p0x+p2x)*t + (2p0x-5p1x+4p2x-p3x)*t² + (-p0x+3p1x-3p2x+p3x)*t³). Yes.
+
+Then resample uniformly:
+```js
+ // cumulative
+ const cum=[0];let L=0;for(let i=1;i<=pts.length;i++){const a=pts[i-1],b=pts[i%pts.length];L+=Math.hypot(b[0]-a[0],b[1]-a[1]);cum.push(L);}
+ const N=TRACK_N, C=new Array(N), Tg=new Array(N), Nm=new Array(N);
+ let j=0;
+ for(let i=0;i<N;i++){const target=L*i/N;while(cum[j+1]<target)j++;
+  const a=pts[j%pts.length],b=pts[(j+1)%pts.length];const seg=cum[j+1]-cum[j]||1;const f=(target-cum[j])/seg;
+  C[i]=[lerp(a[0],b[0],f),lerp(a[1],b[1],f)];}
+ for(let i=0;i<N;i++){const a=C[(i-1+N)%N],b=C[(i+1)%N];let dx=b[0]-a[0],dy=b[1]-a[1];const l=Math.hypot(dx,dy)||1;dx/=l;dy/=l;Tg[i]=[dx,dy];Nm[i]=[-dy? , dx];}
+```
+Normal: left of tangent = rotate -90° (screen): (-dy,dx)? Rotate (dx,dy) by +90° in screen (y down) → (x,y)->(-y,x) so N=[-dy,dx]. Either side consistent; use that.
+
+startIdx: find i where C[i][1]>1850 && C[i][0] between 800 and 1200, pick middle-ish: iterate and pick min |x-1000|.
+```js
+let startIdx=0,best=1e9;for(let i=0;i<N;i++){const[x,y]=C[i];if(y>1850&&x>750&&x<1250){const d=Math.abs(x-1000);if(d<best){best=d;startIdx=i;}}}
+```
+Grid slots: for k 0..3 idx=(startIdx-(10+k*15)+N)%N; off=(k%2? -26:26); pos=C[idx]+Nm[idx]*off; heading=atan2(Tg).
+
+Wait Nm = [-dy,dx] is left normal (for a +x tangent → (0,-1) which is up on screen (negative y) — that's the left side of travel? For direction +x (rightward), left hand side is up (-y)? Facing +x on screen, left is -y (up). Yes Nm points to left. Fine.
+
+gap for slot k: ((startIdx - idx)+N)%N → forward point distance from slot to line = (startIdx - idx mod N) since we move in direction of increasing index. slot idx = startIdx-(10+15k) → gap = 10+15k.
+
+trackSp = L/N.
+
+Store track={C,Tg,Nm,startIdx,L,sp}.
+
+Nearest search function:
+```js
+function nearestTrack(x,y,hint){let bi=hint,bd=1e18;for(let o=-48;o<=48;o++){const i=(hint+o+N)%N;const dx=x-C[i][0],dy=y-C[i][1];const d=dx*dx+dy*dy;if(d<bd){bd=d;bi=i;}}return{idx:bi,px:C[bi][0],py:C[bi][1],d:Math.sqrt(bd)};}
+```
+
+Surface from d: d<=ASPHALT_HALF→'road'; <=+CURB_W→'curb'; else 'off'.
+
+World prerender function drawWorld():
+Create canvas WORLD.w×WORLD.h (3400×2300). Steps as planned. Path helper:
+```js
+function trackPath(ctx){ctx.beginPath();for(let i=0;i<=N;i++){const p=C[i%N];i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]);}ctx.closePath();}
+```
+Stroke widths in world units.
+
+Grass: fill base #45812e; stripes: x bands width 160 alternating rgba(255,255,255,.03)/rgba(0,0,0,.05)? Use two greens explicitly: alternate fillRect #47832f / #427a2b. Then noise dots via rng 1600: small rects alpha .05 dark/light.
+
+Trees: rng positions; if min distance to centerline (check every 3rd sample) >200 and not near grandstand → draw: shadow ellipse, canopy circle #2f5d24, inner lighter #3a7030 offset, darker rim? Keep 2 circles + highlight.
+
+Grandstand at (1000,1785): rect w=360 h=95 fill #2a2e35 border; roof stripe yellow/black thin; crowd: rows of colored dots (rng colors from palette) 5 rows × 24.
+Plus small "start" grass sign? Skip.
+
+Billboards: drawBoard(x,y,w,txt,col): dark bg, colored border, text display font 26px white/colored. BB1 (3270,1120) w=150 "APEX" red; BB2 (640,235) w=150 "RUSH" yellow? Check distance to centerline: near I(880,430) & J(380,820): point (715,258)... nearest sample probably ~(820,470)? dist≈ sqrt(105²+212²)=237 > 117+board half (~90 diagonal?) board is 150x46 at y235: bottom edge y=258; centerline top near x~700? H→I segment passes through (1140,560)? and I(880,430): nearest to (715,258) maybe (900,440): dist 254. Board's corner closest point (790,258)→(900,440)= sqrt(110²+182²)=213 > 117+w/2? Wall is at 117; need board entirely outside dirt: distance from board center to centerline should exceed 117 + half-diag(~80) → 197. 254 ✓. BB1 (3270,1120): nearest centerline ~ D-E arc maybe (3010,1230)? dist ≈ sqrt(260²+110²)=282 ✓.
+
+Dirt band: trackPath stroke lineWidth=WALL_D*2 color #9a7a4c; then speckle? Skip speckle on dirt or few dots. Actually let me make it two-tone: outer dirt #93744a, then inner strip (shoulder gravel) slightly lighter? Keep single + edge shadow: stroke lineWidth=WALL_D*2+10 rgba(0,0,0,.18) first (soft shadow under track).
+
+Curbs: stroke lineWidth=(ASPHALT_HALF+CURB_W)*2: pass 1 white solid; pass 2 red dashed [34,34] offset 0 → alternating. Wait order: draw curb band full width white first, then red dashes on top with same width → red segments over white base ✓.
+
+Asphalt: lineWidth=ASPHALT_HALF*2 color #383d45; then inner subtle: lineWidth ASPHALT_HALF*2-14 rgba(0,0,0,.12)? No that darkens center — actually racing groove: two darker tire lines at ±20: stroke polyline offset ±20 width 10 rgba(0,0,0,.18). Compute offset arrays once. Plus speckle dots along (rng 900): p=C[i]+Nm*rand(-half+6,half-6) size 1-2 alpha .05 white or black.
+
+Edge lines: ±(ASPHALT_HALF-7) width 4 #e8ecef alpha .8.
+Centerline dashed: trackPath setLineDash([16,30]) width 3 rgba(255,255,255,.18).
+
+Start checker + gantry + grid ticks as planned (using Tg/Nm at startIdx).
+
+Grid tick: for each slot idx: line across? Draw a small white chevron pointing along tangent at slot position, alpha .6.
+
+Minimap prerender similar path scaled.
+
+Now Car class:
+
+```js
+class Car{
+ constructor(o){Object.assign(this,o);this.vx=0;this.vy=0;this.vF=0;this.vL=0;this.prog=0;this.lapsDone=0;this.drift=false;this.surface='road';this.stuckT=0;this.inp={throttle:0,brake:0,steer:0,hb:false};}
+ reset(x,y,h){this.x=x;this.y=y;this.h=h;this.vx=this.vy=0;this.prog=0;this.lapsDone=0;this.lapStart=null;this.finishTime=null;this.drift=false;this.stuckT=0;}
+ update(dt,surfMul){ // surfMul for rubber band accel
+  const inp=this.inp;
+  let fx=Math.cos(this.h),fy=Math.sin(this.h);const rx=-fy,ry=fx;
+  let vF=this.vx*fx+this.vy*fy, vL=this.vx*rx+this.vy*ry;
+  // surface from this.d (set by caller before? need d: compute nearest first)
+```
+Order in update: at start of update, nearestTrack with hint sIdx → set sIdx,d,surface. Then physics. Then wall collide (reusing np). Then progress with new sIdx after move — recompute? Movement shifts position; idx change is minor; use same idx (from before move) for progress delta vs lastIdx... but sIdx was updated to nearest-before-move; after move, delta should compare to previous frame's idx. Let me store prevS = this.sIdx (before update); at start of update compute newNearest → this.sIdx; d=wrapped(new-prev) in [-N/2,N/2]; if |d|<=30 && d>0: prog+=d.
+
+But wall collide might move pos — after that sIdx slightly stale, fine.
+
+Continuing physics:
+```js
+ const maxV=this.maxV*surf.cap; // per surface capMul
+ if(inp.throttle) vF+=this.accel*surfMul*(1-vF/maxV)*dt;  // careful when vF>maxV → negative term = aero drag ✓ (handles over-speed after boost)
+ if(inp.brake){ if(vF>20) vF-=980*dt; else vF-=340*dt; }
+ if(inp.hb) vF*=Math.exp(-1.15*dt);
+ // coasting drag
+ const cd = (this.surface==='road'?0.4: this.surface==='curb'?1.1:2.2);
+ vF*=Math.exp(-cd*dt);
+ if(vF<-230)vF=-230;
+ // lateral grip
+ let grip=surf.grip*(inp.hb?0.22:1);
+ const sat=clamp((Math.abs(vL)-85)/260,0,1); grip*= (1-0.5*sat);
+ vL*=Math.exp(-grip*dt);
+ // steering
+ const sf=clamp(Math.abs(vF)/150,0,1)*(1-0.38*clamp(vF/this.maxV,0,1));
+ this.h+=inp.steer*this.steerRate*sf*(vF<0?-1:1)*dt*(inp.hb?1.25:1);
+ // recombine (recompute f,r after h change)
+ fx=Math.cos(this.h);fy=Math.sin(this.h);rx=-fy;ry=fx;
+ this.vx=fx*vF+rx*vL;this.vy=fy*vF+ry*vL;
+ this.x+=this.vx*dt;this.y+=this.vy*dt;
+ this.vF=vF;this.vL=vL;
+ // world bounds safety
+ this.x=clamp(this.x,20,WORLD.w-20);this.y=clamp(this.y,20,WORLD.h-20);
+```
+Wait: recomputing f after h change but vF/vL were in old frame — standard arcade approximation, fine (slight energy drift negligible).
+
+Wall collide:
+```js
+ const lim=WALL_D-13;
+ if(this.d>lim){const nx=(this.x-np.px)/this.d, ny=(this.y-np.py)/this.d;
+  this.x=np.px+nx*lim;this.y=np.py+ny*lim;
+  const vn=this.vx*nx+this.vy*ny;
+  if(vn>0){this.vx-=nx*vn*1.35;this.vy-=ny*vn*1.35; this.hitV=vn;} else this.hitV=0;
+ }
+```
+1.35 = (1+e) e=.35. hitV used for sparks/shake/sound (player only, rate-limited).
+
+Progress:
+```js
+ const dIdx=wrapIdx(this.sIdx-this.prevS); if(dIdx>0&&dIdx<N/2)this.prog+=dIdx;
+```
+where wrapIdx maps to [-N/2,N/2].
+
+Drift flag: 
+```js
+const driftNow=Math.abs(vL)>80 && Math.hypot(this.vx,this.vy)>120;
+this.drifting = this.drift? (Math.abs(vL)>45) : driftNow; this.drift=this.drift? ... 
+```
+Simpler with hysteresis: if(!this.drifting && |vL|>85) drifting=true; if(this.drifting && |vL|<45) drifting=false.
+
+Car-car collide function over array.
+
+AI update as planned; also AI shouldn't handbrake; add tiny throttle noise.
+
+Player particles & marks in raceUpdate after car.update:
+```js
+if(player.drifting){spawn smoke at rear wheels (2), push skid segments if surface road/curb}
+if(player.surface!=='road' && speed>140){dust}
+if(player.hitV>60){sparks+shake+thud(rate-limited)}
+```
+Rear wheel positions: rx = x - cos(h)*15 ± (-sin? ) let me compute: back center = pos - f*15; wheels = back ± r*9.
+
+Skid segment: store per-wheel previous position on car (pw1,pw2). If drifting && surface!=='off': for each wheel: if prev exists push {x1..y2, b:now}. Reset prev when not drifting (avoid long lines across gaps): track car.markOn flag.
+
+Marks array items {x1,y1,x2,y2,t0}; life 7s; alpha=0.38*(1-age/7). Group by bucket for draw. Cap: if len>900 splice(0,len-900).
+
+Particles update: pos+=v*dt; v*=exp(-2dt) for smoke (drift), sparks gravity? top-down no gravity — sparks just decelerate fast & fade, drawn as short line along velocity direction. Smoke size grows: s=s0+(1-lifeRatio)*14.
+
+Draw particles: smoke: circle rgba(225,228,235,alpha*0.5); dust: rgba(196,166,110,...); spark: line stroke #ffd76a width 2 alpha.
+
+Camera:
+```js
+cam={x,y,z,shake:0};
+target = player pos + vel*0.3 (clamp magnitude 240)
+k=1-Math.exp(-5*dt); cam.x+=(tx-cam.x)*k; ...
+zTarget=baseZoom*(1-0.15*clamp(speed/maxV,0,1)); cam.z+=(zt-cam.z)*(1-exp(-3dt));
+cam.shake*=Math.exp(-6.5*dt);
+```
+Menu demo: idx+=dt*24; target=C[idx]; z=baseZoom*0.5? Maybe 0.62 for nice wide; lerp same.
+
+Render:
+```js
+function render(){
+ const W=view.w,H=view.h; // css px
+ ctx.setTransform(dpr,0,0,dpr,0,0);
+ ctx.clearRect? just fill bg (world covers view anyway but edges may show if track small — world is 3400x2300 and camera clamps? if cam near edge, view could extend beyond world canvas → drawImage leaves transparent → fill base dark green first: ctx.fillStyle='#3f7a2c';fillRect(0,0,W,H).
+ const shx=(Math.random()-.5)*cam.shake*2, shy=...;
+ ctx.save();ctx.translate(W/2,H/2);ctx.scale(cam.z,cam.z);ctx.translate(-cam.x+shx,-cam.y+shy);
+ ctx.drawImage(worldCv,0,0);
+ drawMarks(); drawParticlesBelow? (smoke above track but below cars? smoke looks better above car... let's do: marks → dust/smoke particles → cars → sparks & player marker)
+ drawCars(); 
+ ctx.restore();
+ drawMinimap();
+}
+```
+Cull marks to view rect: compute view bounds in world coords: x0=cam.x-W/2/z etc.
+
+drawCar(c):
+```js
+ctx.save();ctx.translate(c.x,c.y);ctx.rotate(c.h);
+// shadow
+ctx.fillStyle='rgba(0,0,0,.35)';roundRect(-23,-12+3? ,46,24,7) offset (2,3)... draw before rotate? Shadow should stay axis-aligned in world ideally; simpler: draw shadow ellipse without rotation first: at (c.x+2,c.y+4) fillEllipse 26x15 rgba(0,0,0,.3). Then rotated body.
+// wheels (dark) 4 rects: front x=13±? positions (±13, ±9): wheel w8 h5; front wheels rotate by steer*0.45: save/translate/rotate each.
+// body: gradient? use flat + shading: fill #color rounded rect (-22,-11,44,22,r6); darker rear half overlay rgba(0,0,0,.18) rect(-22,-11,16,22)? Windshield: dark trapezoid at x 2..12; roof stripe for player: white rect (-20,-3,40,6)? Player yellow body + black stripe. Spoiler: rear rect (-24,-10,5,20) darker.
+// brake light: if inp.brake>0 && vF>... draw red glow at rear: fillRect(-24,-8,3,5)&(−24,3,3,5) #ff5b4d + shadowBlur? Keep simple bright rect alpha .9.
+ctx.restore();
+// name tag for AI (screen-aligned): font 10px; fillText at (c.x, c.y-20/z?) — in world space with scale z text scales too; acceptable: draw in world coords font size 13 → appears ~9-13px. ok alpha .85 color c.color with dark outline? use strokeText dark then fillText.
+```
+Player marker: chevron at (x, y-26 + sin(t*7)*3): triangle white.
+
+Car colors: player #ffd23f (yellow) name 'YOU'; AI: ['#41c7e8' 'VOLT', '#ff6a3d' 'BLAZE', '#9be15d' 'THORN'] — 3rd maybe magenta #e05fd0? Lime vs grass green contrast OK if body has dark outline. Add black outline stroke around body for readability: strokeRect round with rgba(0,0,0,.5) lw2.
+
+roundRect helper (modern ctx.roundRect exists but implement manually for safety).
+
+Minimap draw:
+```js
+mctx.setTransform(dpr,0,0,dpr,0,0); mctx.clearRect(0,0,mw,mh); mctx.drawImage(mapCv,0,0,mw,mh); dots: for each car: x=c.x*mscale+mo... player: pulsing ring.
+```
+Minimap internal size fixed 220x150*dpr? Set canvas attribute width=220*dpr etc once; CSS width via media query (style="width:200px" → mobile 150px). Draw in 220x150 logical.
+
+mapCv prerender at 220x150 too (no dpr needed since it's drawn scaled? drawImage scales fine, slight blur acceptable; better render mapCv at 220x150 *2 for crispness → 440x300 and drawImage to 220. Fine.)
+
+HUD update:
+```js
+speed = Math.round(Math.hypot(v)*0.42); textContent if changed.
+pos: 'P'+pos; lap: min(3,lapsDone+1)+'/3'; cur time: state racing? raceT-lapStart : 0? during countdown show 0:00.000. last & best.
+drift lamp class toggle.
+```
+Best session: bestSession initialized from storage (parse float). On player lap completion: t=...; if(t<bestSession){bestSession=t;save;newBestFlag for banner}.
+
+Banner queue: simple showBanner(text, cls) sets #banner textContent, restarts animation via classList remove/add + reflow.
+
+Countdown DOM: #cd element; function setCd(txt,colorClass): set text & restart pop anim. Phases: at cdT floor change: 0:'3',1:'2',2:'1' beeps 660; when cdT≥3 → state racing, show 'GO!' green (hide after .9s via timeout or in update), beep 990 longer.
+
+cdUpdate(dt): cdT+=dt; phase=floor(cdT); if(phase!==lastPhase){...} if(cdT>=3){state='racing';raceT=0;setCd('GO!','go'); goFlash until raceT>1 then hide (in raceUpdate: if(goShown && raceT>1) hide).}
+
+Lap completion handling in raceUpdate after each car update:
+```js
+const rd=c.prog-c.gap; const ld=rd>0?Math.floor(rd/trackN):0; wait N is global 360.
+if(ld>c.lapsDone){c.lapsDone=ld;const t=raceT-c.lapStart;c.lastLap=t;c.lapStart=raceT;
+ if(c===player){ if(ld<3){banner(`LAP ${ld+1} · ${fmt(t)}` + (newBest?' ★ NEW BEST':'')); if new best save. } else { player.finishTime=raceT; finishRace(); } }
+ else { c.finishTime=t; /* AI finished, keep driving */ }
+}
+```
+Hmm AI finish: set finishTime when lapsDone==3; continue driving (inp throttle .5 cruise). Fine.
+
+finishRace(): state='finished'; build results after delay: setTimeout? use raceT-independent timer: store finishedAt=now perf; in frame if(state==='finished' && !resultsShown && performance.now()-finishedAt>1400) showResults(). During that window, banner "FINISH!". Also stop engine sound → fade.
+
+ShowResults: compute order: cars sorted: finished first by finishTime, then rest by raceDist desc. Build rows HTML. Estimate for unfinished: est=player.finishTime + (3N - rd)*track.sp/420. Row: pos medal color, swatch, name, time (fmt or '~'+fmt(est)), status text 'FIN' / 'EST'. Stamp: ordinal of player; flavor line. Update best lap chip. Buttons.
+
+Ordinal: ['1ST','2ND','3RD','4TH'].
+
+Also results show your best lap & total: "TOTAL 0:52.318 · BEST LAP 0:16.402".
+
+resetRace():
+```js
+cars.forEach((c,i)=>{slot=grid[i];c.reset(slot.x,slot.y,slot.h);});
+player reference = cars[3] (or build order: [aiA,aiB,aiC,player]).
+marks.length=0;particles.length=0;raceT=0;cdT=0;newBest=false;resultsShown=false;goHidden...
+cam snap to player (cam.x=player.x...) shake 0.
+state='countdown'; lastPhase=-1; hide overlays; body dataset.state.
+```
+startRace from menu: ensureAudio(); resetRace().
+
+toMenu(): state='menu'; show menu screen; update best chip; body dataset.
+
+Pause: only during countdown/racing: paused=!paused; overlay toggle; engine gain 0 when paused (in audio tick if paused → target 0).
+
+Keydown handler:
+```js
+window.addEventListener('keydown',e=>{
+ const k=e.key.toLowerCase();
+ if(['arrowup','arrowdown','arrowleft','arrowright',' '].includes(k))e.preventDefault();
+ ensureAudio(); // gesture ok
+ if(k==='m'){toggleMute();return;}
+ if(state==='menu'&&(k==='enter'||k===' ')){startRace();return;}
+ if(state==='finished'&&k==='r'){resetRace();return;}
+ if((state==='racing'||state==='countdown')&&k==='r'){resetRace();return;}
+ if((state==='racing'||state==='countdown')&&(k==='p'||k==='escape')){togglePause();return;}
+ if(state==='paused'... 
+```
+Wait paused is separate bool; state remains 'racing' with paused true. Keys: p/esc toggles during racing/countdown. While paused, p/esc/resume works (state still racing). Enter while paused → resume? Fine to add.
+
+Also track keys set for movement: keys[k]=true on down, false on up; player inp computed in raceUpdate:
+```js
+const up=keys['w']||keys['arrowup'], dn=..., lf=..., rt=...;
+player.inp.throttle=up?1:0;brake=dn?1:0;steer=(rt?1:0)-(lf?1:0);hb= keys[' '];
+```
+
+Mute button + M: flip muted; master.gain.setTargetAtTime(muted?0:.6, t,.02); update mute chip text.
+
+ensureAudio(): try{ if(!AC){ build graph } if(AC.state==='suspended')AC.resume(); }catch(e){}
+
+Per-frame audio tick (call in frame even when menu? Engine idle only during race states; menu silent):
+```js
+if(AC && !mutedRef) { ... set params based on player & state & paused }
+```
+When state==='menu' → engGain target 0.
+
+Thud/beep guard if(!AC||muted) skip (master gain handles mute anyway; just check AC).
+
+Now sizes: baseZoom compute: minDim=Math.min(W,H); baseZoom=clamp(minDim/1050, .42, 1.35). At 720 → .686. View width world = W/z: 1280/.686=1866 — track is 3400 wide so view shows ~half the map; good sense of speed.
+
+Mobile portrait: minDim ~ 380 → z=.36 clamp .42 → view 375/.42=893 wide world — track width 234 fits with context ✓.
+
+HUD CSS sizes via clamp/vmin to adapt.
+
+Edge: dpr change on resize (browser zoom) — recompute.
+
+I think the design is solid. Let me now write out the whole file. Length will be substantial (~1000+ lines). Ensure correctness of all referenced ids. IDs: game, hud, posVal, lapVal, timeCur, timeLast, timeBest, speedVal, driftLamp, minimap, cdEl(cd), banner, screen-menu, screen-pause, screen-results, btnStart, btnResume, btnRestartP, btnMenuP, btnRestartR, btnMenuR, resultsBody, resStamp, resFlavor, resTotals, bestChip, muteChip.
+
+Also "body[data-state]" states: menu/countdown/racing/finished. Pause overlay separate visibility via class.
+
+Let me write the results table markup builder in JS with template strings — careful with backticks inside; fine.
+
+One more check — AI computeAI uses car.d which is set in update; first frame d undefined → init to 0 and surface 'road'; set default in constructor.
+
+AI also needs sIdx initialized from slot idx (reset sets this.sIdx=slotIdx, prevS=slotIdx).
+
+Player maxV=640 accel=480 steerRate=2.5. AI: skill {0.97,0.94,0.91} → maxV*skill? Let me give AI same physics maxV 640 but lower targetV via skill in controller (base=640*skill) & accel*skill slightly. Rubber band multiplies base.
+
+Car-car minD: cars are 46 long — use 30 circle distance; overlap push. OK.
+
+Sparks on car hit for player only if relative vel >80: small thud (vol .15) + shake 2.5.
+
+Rate limit: lastHitSfx time.
+
+Let me also add subtle camera zoom punch on GO: cam.shake=4.
+
+Countdown lock: during 'countdown' state, cars don't update physics (locked at grid) but engine rev sound allowed? Just keep silent except beeps; show idle. Fine — but allow player steering input to pre-rotate? No, locked (grid). OK.
+
+GO transition: set cdT≥3 → racing; also set lapStart=0 for all cars & raceT=0 at that instant.
+
+Also on resetRace, hide 'GO' element & banner.
+
+Potential bug: floor of cdT when cdT exactly 3.0 → phase 3 handled by ≥3 branch first. Ensure ordering: if(cdT>=3) go else phase logic.
+
+fmt for null lastLap → '--:--.---'.
+
+Storage: 
+```js
+function loadBest(){try{const v=parseFloat(localStorage.getItem('apexrush_best'));return isFinite(v)&&v>0?v:null}catch(e){return null}}
+function saveBest(v){try{localStorage.setItem('apexrush_best',String(v))}catch(e){}}
+```
+
+Menu best chip: "SESSION BEST 0:16.402" or "NO LAPS SET — BEAT THE CLOCK".
+
+Also show a control hint bottom-center during race first few seconds? Small fade hint "SPACE = HANDBRAKE · DRIFT THROUGH CORNERS" for first 6s of race. Nice onboarding. Implement with #hint div, visible while raceT<7 && state racing.
+
+Now — let me write it all out. I'll be careful about:
+- ctx.roundRect fallback helper rr(ctx,x,y,w,h,r).
+- All template strings balanced.
+- No stray references.
+
+Also remember the requirement: "listen for keys on window" ✓; start screen with name & controls ✓; restart without reload ✓ (R + buttons); no alert/confirm/prompt ✓; localStorage try/catch ✓; sound after first input ✓ (ensureAudio on keydown/click — engine loop starts but gains 0 until racing; that's fine as it's post-gesture).
+
+Title in <title> ✓.
+
+Let me write the CSS for animated hazard stripes:
+```css
+.hazard{position:absolute;left:0;right:0;height:26px;background:repeating-linear-gradient(-45deg,var(--yellow) 0 26px,#15181d 26px 52px);animation:hz 1.2s linear infinite;opacity:.9}
+@keyframes hz{to{background-position:73.5px 0}} 
+```
+Hmm background-position shift for repeating gradient at -45° needs period = 52/sin? Visually any continuous loop works if shift equals pattern period along x: period_x = (52)/cos(45)=73.5 ✓ good.
+
+Checker strip:
+```css
+.checker{height:18px;background:repeating-conic-gradient(#f4f6f8 0% 25%,#15181d 0% 50%);background-size:24px 24px}
+```
+Wait repeating-conic with background-size gives checker ✓.
+
+Menu layout: full overlay; inner .menu-card? Let me do a poster: absolute-positioned elements — title big top-left-ish center, controls panel bottom-right? For robustness across sizes, use flex column center with left-aligned content block (not centered text) — distinctive. Add car graphic? Draw a small CSS car? Skip; the live game behind (menu shows demo camera over actual track with parked cars) is the background — overlay semi-transparent dark so world visible = layered bg ✓.
+
+Menu overlay bg: rgba(8,10,14,.72) + blur? backdrop-filter might be heavy; use gradient only.
+
+Title styling:
+```css
+.title{font-size:clamp(56px,13vmin,140px);line-height:.9;transform:skewX(-6deg)}
+.t1{color:#f4f6f8;text-shadow:6px 6px 0 #d63b2f}
+.t2{color:var(--yellow);text-shadow:6px 6px 0 rgba(0,0,0,.55)}
+```
+With a small "RACING PHYSICS" overline chip and tagline.
+
+Buttons:
+```css
+.btn{pointer-events:auto;cursor:pointer;font-family display;font-style italic;font-weight 900;letter-spacing:1px;border:0;padding:14px 34px;font-size:clamp(15px,2vmin,20px);background:var(--yellow);color:#101318;clip-path:polygon(12px 0,100% 0,calc(100% - 12px) 100%,0 100%);transition:transform .12s, box-shadow... hover: translateX(4px); active push. Ghost variant transparent border? clip-path kills visible border on angled sides — use background #1b2027 text white for ghost.
+```
+
+kbd chip:
+```css
+kbd{font-family mono;background:#1b2129;border-bottom:3px solid #0d1015;padding:4px 9px;font-size:12px;min-width:34px;text-align:center;display:inline-block}
+```
+
+Controls grid: rows label + keys.
+
+Results card: width min(560px, 92vw); stamp absolute top-right rotated.
+
+Pause: simple centered minimal panel (not a generic hero — it's a pause screen; fine).
+
+Also add mute chip top-right corner? Below timing panel small "M · SOUND ON/OFF" indicator at bottom-center-left? Let me put a small sound state in the hint row & on pause/menu screens. Keep an always-visible tiny chip at bottom-center during race: "M SOUND:ON". OK, minor.
+
+Actually let me keep HUD clean: only show mute state on pause & menu screens; M key works anytime.
+
+Now finalize AI stuck recovery: if car.stuckT>1.4: inp.brake=0; target ti = sIdx (centerline ahead 0) — aim straight at center point → steer toward it; also allow reverse escape? If facing wall (vn<0 moving into wall), reversing helps: if stuckT>2.5 && vF>-5: brake to stop, then... keep simple: aim at center + throttle 1 usually resolves since wall bounce redirects. Add small random jitter to steer when stuck to break symmetry.
+
+Also AI shouldn't overlap grid start exactly: give them same slots as player setup (they're in slots 0-2).
+
+One subtlety: cars start "locked" during countdown — but car.update not called → sIdx/d stays initial; ensure constructor sets d=0 surface road so first frame fine.
+
+Let me write drawMarks with view culling & alpha bucketing:
+```js
+function drawMarks(){const z=cam.z,W=view.w,H=view.h;const x0=cam.x-W/2/z-40,x1=cam.x+W/2/z+40,y0=...,y1=...;
+ const buckets=new Map();
+ for(const m of marks){const a=(1-(nowS-m.t0)/MARK_LIFE); if(a<=0)continue; if(m.x1<x0&&m.x2<x0||...) continue cull;
+  const b=Math.round(a*24)/24; let arr=buckets.get(b);if(!arr){arr=[];buckets.set(b,arr);}arr.push(m);}
+ ctx.lineWidth=4.5;ctx.lineCap='round';
+ for(const[b,arr]of buckets){ctx.strokeStyle=`rgba(18,20,26,${b*0.38})`;ctx.beginPath();for(const m of arr){ctx.moveTo(m.x1,m.y1);ctx.lineTo(m.x2,m.y2);}ctx.stroke();}
+ // prune expired
+ if(marks.length>900)marks.splice(0,marks.length-900);
+}
+```
+Prune by age occasionally (every frame filter is O(n), fine for 900).
+
+nowS = performance.now()/1000 global time.
+
+Particles:
+```js
+function spawnP(x,y,vx,vy,type,life,size){if(particles.length>340)particles.shift();particles.push({x,y,vx,vy,type,life,t0:nowS,size});}
+update: for each p: age=nowS-t0; if>life remove; else move (dt), smoke vx*=exp(-1.6dt)...
+draw: alpha=(1-age/life);
+ smoke: r=p.size+age*26; fill rgba(226,229,236, .45*alpha)
+ dust: r=p.size+age*18; rgba(199,170,116,.4*alpha)
+ spark: line from (x,y) to (x-vx*.03,y-vy*.03) stroke #ffd76a lw2 alpha
+```
+
+Camera target for finished state: keep following player (who may still be moving? freeze cars on finished — but let's keep updating physics for all cars even in 'finished' so they can finish naturally, and just ignore timing! That gives real AI times if close. But then "est" not needed... results shown 1.4s later while sim continues — rows would become stale. Compromise: freeze sim on finished (simplest, consistent with est display). Let me go with freeze; smoke particles continue fading via particleUpdate in finished branch ✓.
+
+Hmm but freezing cars mid-track behind the results overlay is fine visually.
+
+Also during 'finished', HUD stays visible (opacity rule includes finished) — good, shows final speed 0? Speed frozen at last value; acceptable, or set to 0? Keep as is.
+
+Edge: player finishes → finishRace sets state finished; cars freeze mid-frame; results after 1.4s via check in frame loop with finishedAt timestamp ✓.
+
+Also on finished, engine sound fades (state!=='racing'&&'countdown' → target gain 0) ✓.
+
+Let me write everything now. Also add `touch-action:none` and maybe basic touch? Not required; keyboard game. But mobile users can't play... requirement says listen for keys on window — keyboard is the contract. Skip touch controls to keep scope (maybe add simple note "keyboard required"). Actually let me add minimal touch: virtual buttons? That's a lot of extra work; skip — desktop-first, display hint. Fine.
+
+Font pairing recap: display = 'Arial Black'/system 900 italic; body = 'Segoe UI' system stack; mono for timers = ui-monospace/Consolas. ✓
+
+Color palette: charcoal #14181f, signal yellow #ffd23f, red #e8402f, white #f4f6f8, grass greens, cyan/orange/lime cars. ✓
+
+Let me double-check steering direction sign: heading h, forward (cos h, sin h). Positive steer should turn right (clockwise on screen) when pressing D: h increases → since y is down, increasing angle rotates from +x toward +y (down) = visually clockwise = turning right ✓. AI's dh = wrapAng(desired - h); steer=clamp(dh*2.6): if target is to the left (dh negative) steer negative → counterclockwise ✓.
+
+Reverse steering inversion: when vF<0, real car turns opposite; we invert so controls feel natural (D still moves nose right while reversing? Actually in a real car reversing, pressing D swings front right and rear goes left — with our inverted sign the nose goes left while backing... standard arcade keeps same mapping for sanity. Let me not invert: h += steer*sf*dt where sf already uses |vF| → when reversing, D turns nose right and the car moves backward-left... hmm that's confusing. Many arcade games invert so "steering feels like steering the front of the car". Keep inversion (nose follows key direction regardless of travel) — wait I wrote `(vF<0?-1:1)` above which inverts. Let me think: nose-follow: pressing D should always rotate h + (nose right). So no inversion needed at all! h += steer*rate*sf*dt, sf from |vF|. That makes nose follow key direction even while reversing = intuitive. Remove the -1 factor. ✓
+
+AI reverse escape: not implemented; ok.
+
+Grid slots behind line: heading tangent forward; player slot 3 is 10+45=55 pts ≈ 1050px behind line?? sp≈L/360; L estimate ~7000 → sp≈19.4 → 55pts≈1070px back along the straight — bottom straight from x=1000 going back to A(620,1950) and curving... slot idx = startIdx-55 → that's ~1000px behind → around x≈? The straight is only ~ (620→2560) 1900px; 1070 back from x1000 → x≈-70?? Off track into corner — no wait, the track curves at A so idx-55 lands on the left turn area. Grid would be spread across the corner — bad. Reduce spacing: slot k: idx = startIdx - (6 + k*9) → player 6+27=33pts≈640px back → x≈1000-640=360... still past A(620)? Straight from A(620) to B: at x 360 we're on the curve before A. Hmm. The straight between corners is ~1900px but start line at x≈1000 leaves only 380px of straight behind. Let me move start line further right: x target 1500 → 880px of straight behind (from A 620). Player 640 back → x≈860 ✓ on straight. Set startIdx pick |x-1500|. Then grid: gaps 6,15,24,33 pts ≈ 117/291/465/639 px behind → player at x≈1500-639=861 ✓; AI at 1383, 1209, 1035 ✓ all on straight (x>620+corner radius ~750?). Corner A region: curve from K→A→B has x<620 area; slot at x 861 is safe.
+
+But wait — does the bottom straight actually stay near y≈1965 for x 620..1500? CP A(620,1950) B(1700,1985): yes, nearly flat ✓.
+
+Lateral offsets ±26 → y ≈ 1965±26 within asphalt (half 58) ✓ wall no issue.
+
+Also make sure startIdx detection: samples with y>1850 && x in [1300,1700], pick closest to 1500.
+
+AI target when ti=sIdx (aim at centerline directly under car) → dh≈small; better aim slightly ahead: ti = (sIdx+6)%N for wall bias. Use +8.
+
+Now estimate lap length & race time sanity: L? rough perimeter of our loop: width ~2700, height ~1550 ellipse-ish → π*sqrt((a²+b²)/2)... approx 2π*sqrt(((1350)²+(775)²)/2)=2π*1107≈6954 + S wiggle ≈ 7200. sp=20. Avg speed maybe 430 → lap ~16.7s, race ~50s ✓ good for demo.
+
+kmh factor: 640*0.42=269 max ✓.
+
+Now let me write the final HTML. Also include meta viewport. Keep code organized with section comments. Let me be careful writing it all in one pass, mentally checking each function.
+
+Potential pitfalls to double-check while writing:
+1. trackPath stroke widths & lineJoin round (set ctx.lineJoin='round', lineCap='round' for smooth corners).
+2. Curb dash alignment — fine.
+3. drawImage(worldCv) with cam translate — worldCv is 3400x2300 at world coords ✓ drawn at (0,0) in world space ✓.
+4. Minimap scale: ms=Math.min(220/WORLD.w? ) compute mx=190/3400≈0.05588; offset to center: ox=(220-3400*mx)/2, oy=(150-2300*my)/2 with my same as mx → 3400*.0559=190 ✓ w fits, h=2300*.0559=128.6, oy=(150-128.6)/2≈10.7.
+   mapCv prerender at 2x: 440x300, scale factor mx*2.
+5. AI name font in world space scales with zoom — set font '900 italic 13px Arial Black' fine.
+6. Player marker triangle.
+7. Ensure no `const` redeclaration collisions (e.g., N used widely — name it TN? Use TRACK.N via global const N=TRACK_N after build... let me define consts: N, C, TG, NM, SP, START_I from buildTrack return and destructure into module-level lets. Fine.)
+
+Let me write the code. I'll aim for clarity + compactness. Estimated ~950 lines total file. Let's go.
+
+Extra small features to include (cheap & lively):
+- Curb rumble shake: if player on curb && speed>200 → cam.shake=max(shake,1.2) + tiny pitch wobble? Just shake.
+- Speed streak particles at vF>560: spawn 2 per frame near edges of view? Skip — smoke & zoom enough. Actually cheap: draw 6 radial speed lines at screen edges when speedFrac>0.8 (screen-space, alpha ramp). Nice juice, 10 lines. Add in render after world restore: if sf>0.78: alpha=(sf-0.78)/0.22*0.5; draw lines from edges toward center at random angles (seeded by frame? random per frame flickers — use time-based angle step). Let me do 14 fixed directions, length scaled. Subtle white lines. OK include — small function.
+
+- GO flash: quick white overlay fade (div #flash) opacity animation on go. Simple: in render if raceT<0.35 && racing: fillRect white alpha (0.35-raceT)*1.2 screen space. Easy ✓.
+
+Results flavor lines & stamp colors done.
+
+Also handle "R" during menu → also start? R on menu = restart→startRace, fine to allow.
+
+Let me write the pause overlay with a small stats row (current lap time) — optional skip.
+
+Time to output. Let me write the code carefully and completely.
+
+One more: ensureAudio creates nodes; engine osc starts immediately at 0 gain ✓. Beep function:
+```js
+function beep(f,d=0.12,type='square',v=0.22){if(!AC)return;const t=AC.currentTime;const o=AC.createOscillator(),g=AC.createGain();o.type=type;o.frequency.value=f;g.gain.setValueAtTime(v,t);g.gain.exponentialRampToValueAtTime(0.001,t+d);o.connect(g).connect(master);o.start(t);o.stop(t+d+.02);}
+```
+thud:
+```js
+function thud(v){if(!AC)return;const t=AC.currentTime;const o=AC.createOscillator(),g=AC.createGain();o.type='sine';o.frequency.setValueAtTime(150,t);o.frequency.exponentialRampToValueAtTime(40,t+.22);g.gain.setValueAtTime(clamp(v,0.08,0.5),t);g.gain.exponentialRampToValueAtTime(.001,t+.25);o.connect(g).connect(master);o.start(t);o.stop(t+.3);
+ // noise burst
+ const n=AC.createBufferSource();n.buffer=noiseBuf;const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=420;const g2=AC.createGain();g2.gain.setValueAtTime(clamp(v*.7,.05,.35),t);g2.gain.exponentialRampToValueAtTime(.001,t+.15);n.connect(f).connect(g2).connect(master);n.start(t);n.stop(t+.16);}
+```
+
+Engine tick:
+```js
+function audioTick(dt){if(!AC)return;const t=AC.currentTime;const p=cars[3];
+ let rpm=0,th=0,skid=0,rum=0;
+ const active=(state==='racing'||state==='countdown')&&!paused;
+ if(active){rpm=clamp(Math.abs(p.vF)/p.maxV + (p.inp.throttle?0.14:0),0,1);th=p.inp.throttle;skid=p.drifting?clamp(Math.abs(p.vL)/620,0,.3):0;rum=(p.surface!=='road'&&Math.hypot(p.vx,p.vy)>90)?.13:0;}
+ engOsc.frequency.setTargetAtTime(58+rpm*300,t,.07);
+ engOsc2.frequency.setTargetAtTime((58+rpm*300)*.5+4,t,.07);
+ engFilt.frequency.setTargetAtTime(420+rpm*2100,t,.09);
+ engGain.gain.setTargetAtTime(active?(.04+.11*rpm+.03*th):0,t,.1);
+ skidGain.gain.setTargetAtTime(skid,t,.08);
+ skidBP.frequency.setTargetAtTime(650+Math.abs(p.vL)*2.2,t,.1);
+ rumGain.gain.setTargetAtTime(rum,t,.12);
+}
+```
+
+Mute: master.gain setTargetAtTime(muted?0:0.6).
+
+OK writing the final now. Also `view={w,h}` updated on resize; dpr.
+
+Let me write drawCars with wheel rotation for front wheels by inp.steer*0.5.
+
+Brake light condition: inp.brake>0 && vF>-10 (not reversing) → red rear lights; reverse: white? skip.
+
+Also add subtle body tilt: rotate additional vL*0.0004? Skip.
+
+Player marker & AI tags drawn after restore? They need world coords — draw inside world transform ✓ (text scales with zoom, fine).
+
+Minimap dots: player: yellow dot r4 + ring pulsing; AI r3 their color; plus start tick already in mapCv.
+
+Let me also make sure the state transitions set body.dataset.state so CSS shows/hides HUD & screens. Screens visibility via .active class on each overlay independently (menu/pause/results) — simpler than data-state for overlays; HUD uses data-state.
+
+Pause: paused=true + #screen-pause.active; resume reverse. If user presses R during pause → resetRace() which sets paused=false and hides pause screen ✓ ensure resetRace clears paused & all overlays.
+
+showResults builds rows:
+```js
+const order=[...cars].sort((a,b)=> (a.finishTime??Infinity)-(b.finishTime??Infinity) || b.raceDist-a.raceDist);
+rows: order.map((c,i)=>{ const t=c.finishTime; const est=!t? p.finishTime+(3*N-c.raceDist)*SP/420 : null; ...})
+```
+raceDist getter: c.prog - c.gap.
+
+Player pos = index of player in order +1.
+
+Stamp ordinal & flavor by pos.
+
+resTotals text: `TOTAL ${fmt(p.finishTime)} · BEST LAP ${fmt(playerBestLap)}` where playerBestLap = min of lapTimes collected (store array). Collect player.lapTimes push t on each completion.
+
+Session best chip updated too.
+
+OK — also a small "hint" element: #hint shows during first 7s: text "SPACE — HANDBRAKE · DRIFT THROUGH THE CORNERS". CSS animation fade in/out, JS toggles class when raceT crosses.
+
+I'm confident in the design; let me write it out now. Careful with syntax as I go. Also double check that all getElementById ids exist in HTML.
+
+HTML skeleton:
+```html
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Apex Rush — Racing Physics</title><style>...</style></head>
+<body data-state="menu">
+<canvas id="game"></canvas>
+<div id="vignette"></div>
+<div id="hud">
+  <div class="panel pos"><span id="posVal" class="display">P4</span><span class="sub">/ 4</span></div>
+  <div class="panel lap"><span class="lbl">LAP</span><span id="lapVal" class="display">1/3</span></div>
+  <div class="panel timing mono"><div class="row cur"><span>CURRENT</span><b id="timeCur">0:00.000</b></div><div class="row"><span>LAST</span><b id="timeLast">--:--.---</b></div><div class="row best"><span>BEST</span><b id="timeBest">--:--.---</b></div></div>
+  <div class="panel speedo"><span id="speedVal" class="display">0</span><span class="unit">km/h</span><span id="driftLamp" class="lamp">DRIFT</span></div>
+  <div class="mapwrap"><canvas id="minimap"></canvas><span class="lbl">TRACK</span></div>
+  <div id="hint"></div>
+</div>
+<div id="cd" class="display"></div>
+<div id="banner" class="display"></div>
+<div id="screen-menu" class="screen active"> ... </div>
+<div id="screen-pause" class="screen"> ... </div>
+<div id="screen-results" class="screen"> ... </div>
+<script>...</script></body></html>
+```
+
+Countdown #cd styling: fixed center, pointer-events none, hidden by default (opacity 0), .show triggers pop anim.
+
+Banner: top ~16%, similar show class with slide anim; JS timeout to hide? Use animation fill forwards with end opacity 0 → no need to hide (element invisible until retriggered) ✓ animation 'bannerIn 2s ease forwards'.
+
+#cd: after GO, we want it gone — give it 'show go' and then remove class after 900ms via setTimeout in code (fine).
+
+Menu screen content:
+```html
+<div class="hazard top"></div><div class="checker topc"></div>
+<div class="menu-inner">
+ <div class="overline">RACING PHYSICS · DRIFT ARC</div>
+ <h1 class="title display"><span class="t1">APEX</span> <span class="t2">RUSH</span></h1>
+ <div class="tags"><span>3 LAPS</span><span>4 CARS</span><span>DRIFT PHYSICS</span></div>
+ <div class="menu-cols">
+   <div class="controls"> rows: [W A S D / ← ↑ ↓ →] DRIVE · BRAKE ; [SPACE] HANDBRAKE — DRIFT ; [R] RESTART ; [P] PAUSE ; [M] SOUND </div>
+   <div class="menu-side"> best chip + big start button + "or press ENTER" + note keyboard</div>
+ </div>
+</div>
+<div class="checker bot"></div><div class="hazard bot"></div>
+```
+Layout: menu-inner width min(980px, 94vw), left-aligned text; columns flex wrap.
+
+Pause screen: panel with "PAUSED" + button row (RESUME / RESTART / MENU) + small keys reminder.
+
+Results: 
+```html
+<div class="res-card">
+ <div id="resStamp" class="stamp display">2ND</div>
+ <div class="overline">RACE COMPLETE</div>
+ <h2 class="res-title display">FINISH LINE</h2>
+ <p id="resFlavor"></p>
+ <table id="resTable">... built ...</table>
+ <div id="resTotals" class="mono totals"></div>
+ <div class="btn-row"><button id="btnRestartR" class="btn display">RESTART · R</button><button id="btnMenuR" class="btn ghost display">MENU</button></div>
+</div>
+```
+
+Good. Now finalize CSS values and write it out. Also focus outline styling for buttons (accessibility): :focus-visible outline yellow offset.
+
+Ensure pointer-events: .screen{pointer-events:none} .screen.active{pointer-events:auto}. Buttons obviously clickable.
+
+Canvas resize:
+```js
+function resize(){dpr=Math.min(window.devicePixelRatio||1,2);view.w=innerWidth;view.h=innerHeight;cv.width=view.w*dpr;cv.height=view.h*dpr;baseZoom=clamp(Math.min(view.w,view.h)/1050,.4,1.3);}
+```
+Minimap canvas: fixed logical 220x150; set width=220*dpr,height=150*dpr once (dpr at load) — CSS width via class (200px / media 148px). Drawing uses mctx.setTransform(dpr...).
+
+mapCv prerender 440x300.
+
+Let me write everything now, final. Also don't forget: no external font loading — all system stacks ✓.
+
+Let me also double-check the wrapIdx helper:
+```js
+function wrapIdx(d){d=((d%N)+N)%N; if(d>N/2)d-=N; return d;}
+```
+
+AI lookahead indices use SP (px per point): laIdx=Math.round((150+car.vF*0.3)/SP). At vF 640: (150+192)/20≈17pts≈340px ahead ✓.
+
+Curvature sample: a1=car.sIdx, a2=(sIdx+la), a3=(sIdx+2la): angA from C[a1]→C[a2], angB C[a2]→C[a3]; sharp=|wrapAng(angB-angA)|. Hairpin ~ 1.5-2 rad ✓; straight ~0.
+
+targetV = clamp(base - Math.max(0,sharp-0.1)*540, 235, base). base=640*skill*rb. At sharp .4 → 640*.97*(1)-162≈457 hmm a moderate corner at 457 is OK.
+
+AI vF uses this.vF (signed) ✓.
+
+Also AI small random: add per-car phase noise to base: base *= 1+0.03*Math.sin(nowS*1.7+car.seed). Subtle variation so they don't lock in formation. Plus lateral offset target: aim point = C[ti] + NM[ti]*car.lineOff (lineOff ∈ {-20,0,20}) → different racing lines, less stacking ✓ nice.
+
+Player lineOff 0 n/a.
+
+Car-car collision: also prevent grid overlap at start? They're spaced 9pts≈180px apart laterally alternating — fine.
+
+Let me write it all out. Also add `window.addEventListener('blur')` → pause if racing? visibilitychange covers tab switch; simple blur might annoy on devtools click — use only visibilitychange ✓.
+
+Final check for "restart without reload" ✓ R key + buttons call resetRace/toMenu.
+
+Now output. Let me keep comments concise. Here we go.
+
+Actually one more consideration about drawImage of the 3400×2300 world canvas every frame with scale — browsers handle it fine.
+
+Trees near track could visually overlap dirt band if distance check is only against centerline samples (every 3rd = 60px apart) — margin 200 vs wall 117: tree at exactly 199 from sample but 150 from midpoint between samples (bulge)? Sample spacing 60px → max sag error ~ 60²/8/chordR... negligible (<10px). Safe with margin 200.
+
+Grandstand distance check: place manually, verified above.
+
+Also world edges: fill entire canvas with grass so view never sees void ✓ (camera can wander to edge; add cam clamp: cam.x=clamp(cam.x, view.w/2/z*?, ...) — simpler clamp cam to [400, W-400]×[350,H-350]? That prevents seeing beyond world at low zoom... At z=.4 with 1920 wide: half-view=2400 > world half 1700 → edges visible regardless. So also draw a border? Grass fills to edge; outside grass = nothing (canvas ends). If view extends past world canvas, we see the base fill color we painted (dark green) — matches grass ✓ seamless enough. Good: paint bg #427a2b before drawing image.
+
+OK writing final answer now. Ensure single html code block only.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Apex Rush — Racing Physics</title>
+<style>
+:root{
+  --ink:#10141a; --panel:rgba(13,16,22,.82); --yellow:#ffd23f; --red:#e8402f;
+  --white:#f4f6f8; --dim:#9aa3ad; --grass:#427a2b;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;background:var(--ink)}
+body{font-family:'Segoe UI',system-ui,-apple-system,Helvetica,Arial,sans-serif;color:var(--white);
+  -webkit-user-select:none;user-select:none;touch-action:none}
+.display{font-family:'Arial Black','Segoe UI Black',system-ui,sans-serif;font-style:italic;font-weight:900;letter-spacing:.5px}
+.mono{font-family:ui-monospace,'Cascadia Mono',Consolas,Menlo,monospace}
+#game{position:fixed;inset:0;display:block}
+#vignette{position:fixed;inset:0;pointer-events:none;z-index:4;
+  background:radial-gradient(ellipse at center,transparent 52%,rgba(5,8,12,.5) 100%)}
+
+/* ---------- HUD ---------- */
+#hud{position:fixed;inset:0;pointer-events:none;z-index:6;opacity:0;transition:opacity .35s}
+body[data-state="countdown"] #hud,body[data-state="racing"] #hud,body[data-state="finished"] #hud{opacity:1}
+.panel{position:absolute;background:var(--panel);clip-path:polygon(0 0,100% 0,calc(100% - 16px) 100%,0 100%);
+  padding:8px 20px 9px 14px;box-shadow:inset 0 2px 0 rgba(255,210,63,.9)}
+.panel .lbl{display:block;font-size:10px;letter-spacing:2.5px;color:var(--dim);font-weight:700}
+.pos{top:14px;left:14px;display:flex;align-items:baseline;gap:6px}
+#posVal{font-size:clamp(30px,5vmin,46px);color:var(--yellow);line-height:1}
+.pos .sub{font-size:13px;color:var(--dim);font-weight:700}
+.lap{top:14px;left:50%;transform:translateX(-50%);text-align:center;min-width:120px}
+#lapVal{font-size:clamp(22px,3.6vmin,34px);line-height:1.05}
+.timing{top:14px;right:14px;display:flex;flex-direction:column;gap:2px;min-width:190px;font-size:12px}
+.timing .row{display:flex;justify-content:space-between;gap:16px}
+.timing .row span{color:var(--dim);letter-spacing:1.5px;font-weight:700}
+.timing b{font-weight:700;color:var(--white)}
+.timing .cur b{font-size:clamp(17px,2.8vmin,24px)}
+.timing .best b{color:var(--yellow)}
+.speedo{bottom:16px;left:14px;display:flex;align-items:baseline;gap:8px;padding-bottom:12px}
+#speedVal{font-size:clamp(38px,7vmin,60px);line-height:1;color:var(--white)}
+.speedo .unit{font-size:12px;letter-spacing:2px;color:var(--dim);font-weight:700}
+.lamp{margin-left:14px;font-size:11px;font-weight:900;letter-spacing:2px;color:#5a636e;padding:4px 8px;
+  border:1px solid #3a424c;transform:skewX(-10deg);transition:all .1s}
+.lamp.on{color:#fff;background:var(--red);border-color:var(--red);box-shadow:0 0 14px rgba(232,64,47,.8)}
+.mapwrap{position:absolute;bottom:16px;right:14px;background:var(--panel);clip-path:polygon(0 0,100% 0,100% calc(100% - 14px),calc(100% - 14px) 100%,0 100%);
+  padding:8px 10px 6px;box-shadow:inset 0 2px 0 rgba(255,210,63,.9)}
+.mapwrap .lbl{display:block;text-align:center;font-size:9px;letter-spacing:3px;color:var(--dim);font-weight:700;margin-top:4px}
+#minimap{display:block;width:200px;height:auto;background:#0d1116}
+#hint{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);font-size:clamp(11px,1.7vmin,14px);
+  letter-spacing:2px;font-weight:700;color:#ffe9a8;background:rgba(10,13,18,.7);padding:8px 18px;
+  clip-path:polygon(10px 0,100% 0,calc(100% - 10px) 100%,0 100%);opacity:0}
+#hint.show{animation:hintA 7s ease forwards}
+@keyframes hintA{0%{opacity:0;transform:translate(-50%,8px)}8%{opacity:1;transform:translate(-50%,0)}82%{opacity:1}100%{opacity:0}}
+
+/* ---------- countdown / banner ---------- */
+#cd{position:fixed;top:34%;left:0;right:0;text-align:center;z-index:7;pointer-events:none;
+  font-size:clamp(90px,26vmin,230px);color:var(--yellow);text-shadow:8px 8px 0 rgba(15,18,24,.85),0 0 40px rgba(255,210,63,.35);
+  opacity:0;transform:skewX(-6deg)}
+#cd.go{color:#6dffa0;text-shadow:8px 8px 0 rgba(15,18,24,.85),0 0 50px rgba(109,255,160,.4)}
+#cd.show{animation:cdPop .92s cubic-bezier(.2,1.4,.4,1) forwards}
+@keyframes cdPop{0%{opacity:0;transform:skewX(-6deg) scale(2.1)}18%{opacity:1;transform:skewX(-6deg) scale(1)}80%{opacity:1}100%{opacity:0}}
+#banner{position:fixed;top:15%;left:0;right:0;text-align:center;z-index:7;pointer-events:none;
+  font-size:clamp(24px,5vmin,44px);color:#fff;text-shadow:5px 5px 0 rgba(15,18,24,.9);transform:skewX(-6deg);opacity:0}
+#banner.gold{color:var(--yellow)}
+#banner.show{animation:banA 2s ease forwards}
+@keyframes banA{0%{opacity:0;transform:translateY(-18px) skewX(-6deg)}12%{opacity:1;transform:translateY(0) skewX(-6deg)}78%{opacity:1}100%{opacity:0}}
+
+/* ---------- screens ---------- */
+.screen{position:fixed;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;
+  visibility:hidden;opacity:0;transition:opacity .25s,visibility .25s;pointer-events:none}
+.screen.active{visibility:visible;opacity:1;pointer-events:auto}
+#screen-menu{background:linear-gradient(180deg,rgba(6,9,13,.82),rgba(6,9,13,.6) 40%,rgba(6,9,13,.85))}
+.hazard{position:absolute;left:0;right:0;height:26px;z-index:1;opacity:.95;
+  background:repeating-linear-gradient(-45deg,var(--yellow) 0 26px,#14181f 26px 52px);animation:hz 1.1s linear infinite}
+.hazard.top{top:0}.hazard.bot{bottom:0;animation-direction:reverse}
+@keyframes hz{to{background-position:73.5px 0}}
+.checker{position:absolute;left:0;right:0;height:16px;z-index:1;opacity:.9;
+  background:repeating-conic-gradient(#e8ebef 0% 25%,#14181f 0% 50%);background-size:24px 24px}
+.checker.top{top:26px}.checker.bot{bottom:26px}
+.menu-inner{position:relative;z-index:2;width:min(960px,94vw);padding:48px 0}
+.overline{display:inline-block;font-size:clamp(10px,1.5vmin,13px);letter-spacing:4px;font-weight:800;color:#10141a;
+  background:var(--yellow);padding:5px 12px;transform:skewX(-10deg)}
+.title{font-size:clamp(58px,13.5vmin,148px);line-height:.92;margin:14px 0 6px;transform:skewX(-6deg)}
+.title .t1{color:#fff;text-shadow:7px 7px 0 var(--red)}
+.title .t2{color:var(--yellow);text-shadow:7px 7px 0 rgba(0,0,0,.55)}
+.tags{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:26px}
+.tags span{font-size:clamp(10px,1.5vmin,13px);letter-spacing:2.5px;font-weight:800;color:var(--dim);
+  border:1px solid #3a424c;padding:5px 11px;transform:skewX(-10deg)}
+.menu-cols{display:flex;gap:34px;flex-wrap:wrap;align-items:flex-end}
+.controls{flex:1 1 320px;background:rgba(10,13,18,.66);padding:18px 20px;border-left:4px solid var(--yellow);
+  clip-path:polygon(0 0,100% 0,calc(100% - 14px) 100%,0 100%)}
+.controls h3{font-size:11px;letter-spacing:3px;color:var(--dim);margin-bottom:12px;font-weight:800}
+.crow{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:6px 0;font-size:clamp(11px,1.7vmin,14px);font-weight:600;color:#cdd4db}
+kbd{font-family:ui-monospace,Consolas,monospace;font-size:11px;background:#1c232c;border-bottom:3px solid #0b0e12;
+  padding:4px 9px;min-width:30px;text-align:center;display:inline-block;margin-left:4px;color:#fff}
+.menu-side{flex:1 1 260px;display:flex;flex-direction:column;gap:14px}
+.best-chip{font-size:clamp(11px,1.7vmin,14px);letter-spacing:1px;color:var(--dim);font-weight:700}
+.best-chip b{color:var(--yellow)}
+.btn{pointer-events:auto;cursor:pointer;border:0;font-family:'Arial Black',system-ui,sans-serif;font-style:italic;font-weight:900;
+  letter-spacing:1.5px;padding:15px 34px;font-size:clamp(15px,2.2vmin,21px);color:#10141a;background:var(--yellow);
+  clip-path:polygon(14px 0,100% 0,calc(100% - 14px) 100%,0 100%);transition:transform .12s,filter .12s}
+.btn:hover{transform:translateX(5px);filter:brightness(1.1)}
+.btn:active{transform:translateX(5px) scale(.97)}
+.btn:focus-visible{outline:3px solid #fff;outline-offset:3px}
+.btn.ghost{background:#20262f;color:var(--white)}
+.press{font-size:11px;letter-spacing:3px;color:var(--dim);font-weight:800;animation:blink 1.4s ease infinite}
+@keyframes blink{50%{opacity:.35}}
+.note{font-size:11px;color:#6a7380}
+
+/* pause */
+#screen-pause{background:rgba(6,9,13,.72)}
+.pause-card{background:var(--panel);border-top:4px solid var(--red);padding:34px 46px;text-align:center;
+  clip-path:polygon(0 0,100% 0,calc(100% - 22px) 100%,0 100%)}
+.pause-card h2{font-size:clamp(40px,8vmin,64px);transform:skewX(-6deg);margin-bottom:18px;color:var(--white);text-shadow:5px 5px 0 rgba(232,64,47,.55)}
+.btn-row{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:8px}
+.pause-keys{margin-top:18px;font-size:11px;color:var(--dim);letter-spacing:1px}
+
+/* results */
+#screen-results{background:rgba(6,9,13,.78)}
+.res-card{position:relative;width:min(580px,94vw);max-height:92vh;overflow:auto;background:var(--panel);
+  border-top:4px solid var(--yellow);padding:30px 34px 26px;clip-path:polygon(0 0,100% 0,calc(100% - 24px) 100%,0 100%)}
+.res-card .overline{margin-bottom:8px}
+.res-title{font-size:clamp(34px,6.5vmin,52px);transform:skewX(-6deg);text-shadow:5px 5px 0 rgba(232,64,47,.5)}
+.stamp{position:absolute;top:18px;right:20px;font-size:clamp(30px,6vmin,50px);color:var(--yellow);
+  border:3px solid var(--yellow);padding:4px 16px;transform:rotate(-7deg) skewX(-6deg);letter-spacing:1px}
+.stamp.late{color:#ff8d7e;border-color:#ff8d7e}
+#resFlavor{color:#cdd4db;font-size:clamp(12px,1.9vmin,15px);margin:6px 0 16px;font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:clamp(12px,1.9vmin,15px)}
+th{font-size:10px;letter-spacing:2px;color:var(--dim);text-align:left;padding:4px 6px;border-bottom:1px solid #333b45}
+td{padding:8px 6px;border-bottom:1px solid rgba(255,255,255,.07)}
+tr.you td{background:rgba(255,210,63,.1);color:#ffe9a8;font-weight:800}
+.swatch{display:inline-block;width:13px;height:13px;margin-right:8px;transform:skewX(-12deg)}
+.posn{font-family:'Arial Black',system-ui,sans-serif;font-style:italic;color:var(--dim);width:44px}
+.totals{margin:14px 0 4px;font-size:clamp(11px,1.8vmin,14px);color:var(--dim);letter-spacing:.5px}
+.totals b{color:var(--white)}
+.fin{color:#6dffa0;font-weight:700}.est{color:var(--dim)}
+
+@media (max-width:640px){
+  #minimap{width:148px}
+  .timing{min-width:150px}
+  .menu-inner{padding:34px 0}
+}
+</style>
+</head>
+<body data-state="menu">
+<canvas id="game"></canvas>
+<div id="vignette"></div>
+
+<div id="hud">
+  <div class="panel pos"><span id="posVal" class="display">P4</span><span class="sub">/ 4</span></div>
+  <div class="panel lap"><span class="lbl">LAP</span><span id="lapVal" class="display">1 / 3</span></div>
+  <div class="panel timing mono">
+    <div class="row cur"><span>CURRENT</span><b id="timeCur">0:00.000</b></div>
+    <div class="row"><span>LAST</span><b id="timeLast">--:--.---</b></div>
+    <div class="row best"><span>BEST</span><b id="timeBest">--:--.---</b></div>
+  </div>
+  <div class="panel speedo"><span id="speedVal" class="display">0</span><span class="unit">KM/H</span><span id="driftLamp" class="lamp">DRIFT</span></div>
+  <div class="mapwrap"><canvas id="minimap"></canvas><span class="lbl">TRACK</span></div>
+  <div id="hint">SPACE — HANDBRAKE · DRIFT THROUGH THE CORNERS</div>
+</div>
+
+<div id="cd" class="display"></div>
+<div id="banner" class="display"></div>
+
+<!-- MENU -->
+<div id="screen-menu" class="screen active">
+  <div class="hazard top"></div><div class="checker top"></div>
+  <div class="menu-inner">
+    <span class="overline">RACING PHYSICS · DRIFT ARC</span>
+    <h1 class="title display"><span class="t1">APEX</span> <span class="t2">RUSH</span></h1>
+    <div class="tags"><span>3 LAPS</span><span>4 CARS</span><span>DRIFT PHYSICS</span><span>RUBBER-BAND RIVALS</span></div>
+    <div class="menu-cols">
+      <div class="controls">
+        <h3>// CONTROLS</h3>
+        <div class="crow"><span>Drive / Brake</span><span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>&nbsp;<i style="color:#6a7380">or</i>&nbsp;<kbd>↑</kbd><kbd>←</kbd><kbd>↓</kbd><kbd>→</kbd></span></div>
+        <div class="crow"><span>Handbrake — break traction &amp; drift</span><span><kbd>SPACE</kbd></span></div>
+        <div class="crow"><span>Restart race</span><span><kbd>R</kbd></span></div>
+        <div class="crow"><span>Pause</span><span><kbd>P</kbd>&nbsp;<kbd>ESC</kbd></span></div>
+        <div class="crow"><span>Sound on / off</span><span><kbd>M</kbd></span></div>
+      </div>
+      <div class="menu-side">
+        <div class="best-chip" id="bestChip">NO LAPS SET — BEAT THE CLOCK</div>
+        <button id="btnStart" class="btn">START ENGINE ▸</button>
+        <div class="press">OR PRESS ENTER</div>
+        <div class="note">Keyboard required · best lap is saved on this device</div>
+      </div>
+    </div>
+  </div>
+  <div class="checker bot"></div><div class="hazard bot"></div>
+</div>
+
+<!-- PAUSE -->
+<div id="screen-pause" class="screen">
+  <div class="pause-card">
+    <h2 class="display">PAUSED</h2>
+    <div class="btn-row">
+      <button id="btnResume" class="btn">RESUME · P</button>
+      <button id="btnRestartP" class="btn ghost">RESTART · R</button>
+      <button id="btnMenuP" class="btn ghost">MENU</button>
+    </div>
+    <div class="pause-keys mono">SPACE handbrake · M sound: <span id="muteTxt">ON</span></div>
+  </div>
+</div>
+
+<!-- RESULTS -->
+<div id="screen-results" class="screen">
+  <div class="res-card">
+    <div id="resStamp" class="stamp display">2ND</div>
+    <span class="overline">RACE COMPLETE</span>
+    <h2 class="res-title display">FINISH LINE</h2>
+    <p id="resFlavor"></p>
+    <table id="resTable"><thead><tr><th></th><th>DRIVER</th><th>TIME</th><th></th></tr></thead><tbody id="resBody"></tbody></table>
+    <div id="resTotals" class="totals"></div>
+    <div class="btn-row">
+      <button id="btnRestartR" class="btn">RESTART · R</button>
+      <button id="btnMenuR" class="btn ghost">MENU</button>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* ================= helpers ================= */
+const $=id=>document.getElementById(id);
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+const TAU=Math.PI*2;
+function wrapAng(a){while(a>Math.PI)a-=TAU;while(a<-Math.PI)a+=TAU;return a;}
+function fmt(t){if(t==null||!isFinite(t))return '--:--.---';const m=Math.floor(t/60),s=t-m*60;return m+':'+(s<10?'0':'')+s.toFixed(3);}
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function rr(c,x,y,w,h,r){c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);c.closePath();}
+
+/* ================= track ================= */
+const WORLD={w:3400,h:2300};
+const ASPHALT_HALF=58, CURB_W=13, WALL_D=ASPHALT_HALF+CURB_W+46;
+const CP=[[620,1950],[1700,1985],[2560,1930],[3060,1480],[2870,940],[2360,700],[1900,950],[1400,690],[880,430],[380,820],[520,1380]];
+let N,C,TG,NM,SP,START_I,L_TRACK;
+function buildTrack(){
+  const pts=[],n=CP.length,steps=70;
+  for(let i=0;i<n;i++){const p0=CP[(i-1+n)%n],p1=CP[i],p2=CP[(i+1)%n],p3=CP[(i+2)%n];
+    for(let s=0;s<steps;s++){const t=s/steps,t2=t*t,t3=t2*t;
+      pts.push([
+        .5*(2*p1[0]+(-p0[0]+p2[0])*t+(2*p0[0]-5*p1[0]+4*p2[0]-p3[0])*t2+(-p0[0]+3*p1[0]-3*p2[0]+p3[0])*t3),
+        .5*(2*p1[1]+(-p0[1]+p2[1])*t+(2*p0[1]-5*p1[1]+4*p2[1]-p3[1])*t2+(-p0[1]+3*p1[1]-3*p2[1]+p3[1])*t3)]);}}
+  const cum=[0];let L=0;
+  for(let i=1;i<=pts.length;i++){const a=pts[i-1],b=pts[i%pts.length];L+=Math.hypot(b[0]-a[0],b[1]-a[1]);cum.push(L);}
+  N=360;C=new Array(N);TG=new Array(N);NM=new Array(N);
+  let j=0;
+  for(let i=0;i<N;i++){const target=L*i/N;while(cum[j+1]<target)j++;
+    const a=pts[j%pts.length],b=pts[(j+1)%pts.length],seg=(cum[j+1]-cum[j])||1,f=(target-cum[j])/seg;
+    C[i]=[lerp(a[0],b[0],f),lerp(a[1],b[1],f)];}
+  for(let i=0;i<N;i++){const a=C[(i-1+N)%N],b=C[(i+1)%N];let dx=b[0]-a[0],dy=b[1]-a[1];const l=Math.hypot(dx,dy)||1;dx/=l;dy/=l;TG[i]=[dx,dy];NM[i]=[-dy,dx];}
+  SP=L/N;L_TRACK=L;
+  let bi=0,bd=1e9;for(let i=0;i<N;i++){const[x,y]=C[i];if(y>1850&&x>1250&&x<1750){const d=Math.abs(x-1500);if(d<bd){bd=d;bi=i;}}}
+  START_I=bi;
+}
+function wrapIdx(d){d=((d%N)+N)%N;if(d>N/2)d-=N;return d;}
+function nearestTrack(x,y,hint){let bi=hint,bd=1e18;
+  for(let o=-48;o<=48;o++){const i=(hint+o+N)%N;const dx=x-C[i][0],dy=y-C[i][1];const d=dx*dx+dy*dy;if(d<bd){bd=d;bi=i;}}
+  return{idx:bi,px:C[bi][0],py:C[bi][1],d:Math.sqrt(bd)};}
+function surfaceOf(d){return d<=ASPHALT_HALF?'road':(d<=ASPHALT_HALF+CURB_W?'curb':'off');}
+
+/* ================= prerender world ================= */
+let worldCv,mapCv;const MMW=220,MMH=150;
+function trackPath(c){c.beginPath();for(let i=0;i<=N;i++){const p=C[i%N];i?c.lineTo(p[0],p[1]):c.moveTo(p[0],p[1]);}c.closePath();}
+function edgePts(off){const a=[];for(let i=0;i<N;i++){a.push([C[i][0]+NM[i][0]*off,C[i][1]+NM[i][1]*off]);}return a;}
+function strokePts(c,p,w,col,dash){c.beginPath();for(let i=0;i<=p.length;i++){const q=p[i%p.length];i?c.lineTo(q[0],q[1]):c.moveTo(q[0],q[1]);}c.closePath();
+  c.lineWidth=w;c.strokeStyle=col;if(dash)c.setLineDash(dash);c.stroke();c.setLineDash([]);}
+function buildWorld(){
+  worldCv=document.createElement('canvas');worldCv.width=WORLD.w;worldCv.height=WORLD.h;
+  const c=worldCv.getContext('2d'),rng=mulberry32(1337);
+  // grass + mow stripes
+  c.fillStyle='#45812e';c.fillRect(0,0,WORLD.w,WORLD.h);
+  for(let x=0;x<WORLD.w;x+=160){c.fillStyle=(x/160)%2?'#47832f':'#3f7a29';c.fillRect(x,0,160,WORLD.h);}
+  for(let i=0;i<1700;i++){const x=rng()*WORLD.w,y=rng()*WORLD.h;c.fillStyle=rng()<.5?'rgba(0,0,0,.06)':'rgba(255,255,255,.045)';c.fillRect(x,y,2+rng()*3,2+rng()*3);}
+  // trees
+  const gs={x:1000,y:1785},bb=[{x:3270,y:1120},{x:640,y:235}];
+  let placed=0,tries=0;
+  while(placed<70&&tries<900){tries++;const x=60+rng()*(WORLD.w-120),y=60+rng()*(WORLD.h-120);let ok=true;
+    for(let i=0;i<N;i+=3){const dx=x-C[i][0],dy=y-C[i][1];if(dx*dx+dy*dy<205*205){ok=false;break;}}
+    if(ok&&Math.hypot(x-gs.x,y-gs.y)<340)ok=false;
+    for(const b of bb)if(Math.hypot(x-b.x,y-b.y)<190)ok=false;
+    if(!ok)continue;placed++;
+    const r=15+rng()*20;c.fillStyle='rgba(0,0,0,.25)';c.beginPath();c.ellipse(x+4,y+6,r,r*.8,0,0,TAU);c.fill();
+    c.fillStyle='#2e5c22';c.beginPath();c.arc(x,y,r,0,TAU);c.fill();
+    c.fillStyle='#3a7030';c.beginPath();c.arc(x-r*.22,y-r*.24,r*.72,0,TAU);c.fill();
+    c.fillStyle='rgba(255,255,255,.10)';c.beginPath();c.arc(x-r*.35,y-r*.38,r*.3,0,TAU);c.fill();}
+  // grandstand
+  c.save();c.translate(gs.x,gs.y);
+  c.fillStyle='rgba(0,0,0,.3)';c.fillRect(-176,-44+8,352,96);
+  c.fillStyle='#272c34';c.fillRect(-178,-48,356,96);
+  c.fillStyle='#ffd23f';c.fillRect(-178,-48,356,8);
+  const cols=['#e8ebef','#e8402f','#41c7e8','#ffd23f','#9be15d'];
+  for(let rrow=0;rrow<5;rrow++)for(let i2=0;i2<26;i2++){c.fillStyle=cols[(rng()*5)|0];c.fillRect(-166+i2*13,-34+rrow*15,7,8);}
+  c.restore();
+  // billboards
+  const board=(x,y,w,txt,col)=>{c.fillStyle='rgba(0,0,0,.3)';c.fillRect(x-w/2+5,y-21+6,w,42);
+    c.fillStyle='#1b2027';c.fillRect(x-w/2,y-21,w,42);c.strokeStyle=col;c.lineWidth=4;c.strokeRect(x-w/2,y-21,w,42);
+    c.fillStyle=col;c.font='italic 900 26px "Arial Black",system-ui,sans-serif';c.textAlign='center';c.textBaseline='middle';c.fillText(txt,x,y+1);};
+  board(3270,1120,150,'APEX','#e8402f');board(640,235,150,'RUSH','#ffd23f');
+  // shadow + dirt band
+  c.lineJoin='round';c.lineCap='round';
+  trackPath(c);c.lineWidth=WALL_D*2+14;c.strokeStyle='rgba(0,0,0,.2)';c.stroke();
+  trackPath(c);c.lineWidth=WALL_D*2;c.strokeStyle='#93744a';c.stroke();
+  // curbs (white base + red dashes)
+  trackPath(c);c.lineWidth=(ASPHALT_HALF+CURB_W)*2;c.strokeStyle='#e8ebef';c.stroke();
+  trackPath(c);c.setLineDash([34,34]);c.strokeStyle='#d63b2f';c.stroke();c.setLineDash([]);
+  // asphalt
+  trackPath(c);c.lineWidth=ASPHALT_HALF*2;c.strokeStyle='#383d45';c.stroke();
+  strokePts(c,edgePts(20),11,'rgba(0,0,0,.16)');strokePts(c,edgePts(-20),11,'rgba(0,0,0,.16)');
+  for(let i=0;i<950;i++){const idx=(rng()*N)|0;const off=(rng()*2-1)*(ASPHALT_HALF-8);
+    const x=C[idx][0]+NM[idx][0]*off+(rng()-.5)*8,y=C[idx][1]+NM[idx][1]*off+(rng()-.5)*8;
+    c.fillStyle=rng()<.5?'rgba(255,255,255,.05)':'rgba(0,0,0,.14)';c.fillRect(x,y,1.6,1.6);}
+  // edge lines + center dashes
+  strokePts(c,edgePts(ASPHALT_HALF-7),4,'rgba(238,241,245,.85)');
+  strokePts(c,edgePts(-(ASPHALT_HALF-7)),4,'rgba(238,241,245,.85)');
+  trackPath(c);c.setLineDash([16,30]);c.lineWidth=3;c.strokeStyle='rgba(255,255,255,.16)';c.stroke();c.setLineDash([]);
+  // start / finish checker + gantry
+  {const p=C[START_I],t=TG[START_I],n=NM[START_I];const sq=(ASPHALT_HALF*2)/14;
+   for(let rrow=0;rrow<2;rrow++)for(let col=0;col<14;col++){
+     const cx=p[0]+n[0]*(col-6.5)*sq - t[0]*rrow*sq, cy=p[1]+n[1]*(col-6.5)*sq - t[1]*rrow*sq;
+     c.save();c.translate(cx,cy);c.rotate(Math.atan2(t[1],t[0]));
+     c.fillStyle=(rrow+col)%2?'#14181f':'#e8ebef';c.fillRect(-sq/2,-sq/2,sq,sq);c.restore();}
+   c.fillStyle='#151920';c.fillRect(p[0]+n[0]*(WALL_D+26)-t[0]*7,p[1]+n[1]*(WALL_D+26)-t[1]*7,14,14);
+   c.fillRect(p[0]-n[0]*(WALL_D+26)-t[0]*7,p[1]-n[1]*(WALL_D+26)-t[1]*7,14,14);
+   const bw=2*(WALL_D+30),bh=15;
+   c.save();c.translate(p[0],p[1]);c.rotate(Math.atan2(t[1],t[0]));
+   c.fillStyle='#1b2027';c.fillRect(-bw/2,-bh/2,bw,bh);
+   c.fillStyle='#ffd23f';c.font='italic 900 11px "Arial Black",system-ui,sans-serif';c.textAlign='center';c.textBaseline='middle';
+   c.fillText('A P E X   R U S H',0,1);c.restore();}
+  // grid chevrons
+  for(let k=0;k<4;k++){const idx=(START_I-(6+k*9)+N)%N,p=C[idx],t=TG[idx];
+    const off=(k%2?-26:26),x=p[0]+NM[idx][0]*off,y=p[1]+NM[idx][1]*off,a=Math.atan2(t[1],t[0]);
+    c.save();c.translate(x,y);c.rotate(a);c.fillStyle='rgba(255,255,255,.5)';
+    c.beginPath();c.moveTo(14,0);c.lineTo(-6,-9);c.lineTo(-1,0);c.lineTo(-6,9);c.closePath();c.fill();c.restore();}
+  // minimap prerender (2x)
+  mapCv=document.createElement('canvas');mapCv.width=MMW*2;mapCv.height=MMH*2;
+  const m=mapCv.getContext('2d'),ms=Math.min((MMW-16)/WORLD.w,(MMH-16)/WORLD.h)*2;
+  const ox=(MMW*2-WORLD.w*ms)/2,oy=(MMH*2-WORLD.h*ms)/2;
+  m.lineJoin='round';m.lineCap='round';
+  m.beginPath();for(let i=0;i<=N;i++){const p=C[i%N];i?m.lineTo(ox+p[0]*ms,oy+p[1]*ms):m.moveTo(ox+p[0]*ms,oy+p[1]*ms);}m.closePath();
+  m.lineWidth=9;m.strokeStyle='#20262f';m.stroke();m.lineWidth=4.5;m.strokeStyle='#7d8794';m.stroke();
+  const sp=C[START_I];m.fillStyle='#e8ebef';m.fillRect(ox+sp[0]*ms-3,oy+sp[1]*ms-3,6,6);
+}
+
+/* ================= audio ================= */
+let AC=null,master,engOsc,engOsc2,engFilt,engGain,skidGain,skidBP,rumGain,noiseBuf;let muted=false;
+function ensureAudio(){try{
+  if(!AC){const A=window.AudioContext||window.webkitAudioContext;if(!A)return;AC=new A();
+    master=AC.createGain();master.gain.value=muted?0:.6;master.connect(AC.destination);
+    engOsc=AC.createOscillator();engOsc.type='sawtooth';engOsc.frequency.value=60;
+    engOsc2=AC.createOscillator();engOsc2.type='square';engOsc2.frequency.value=34;
+    engFilt=AC.createBiquadFilter();engFilt.type='lowpass';engFilt.frequency.value=500;engFilt.Q.value=.8;
+    engGain=AC.createGain();engGain.gain.value=0;
+    const g2=AC.createGain();g2.gain.value=.5;
+    engOsc.connect(engFilt);engOsc2.connect(g2);g2.connect(engFilt);engFilt.connect(engGain);engGain.connect(master);
+    engOsc.start();engOsc2.start();
+    noiseBuf=AC.createBuffer(1,AC.sampleRate,AC.sampleRate);
+    const d=noiseBuf.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;
+    const s1=AC.createBufferSource();s1.buffer=noiseBuf;s1.loop=true;
+    skidBP=AC.createBiquadFilter();skidBP.type='bandpass';skidBP.frequency.value=900;skidBP.Q.value=.9;
+    skidGain=AC.createGain();skidGain.gain.value=0;s1.connect(skidBP);skidBP.connect(skidGain);skidGain.connect(master);s1.start();
+    const s2=AC.createBufferSource();s2.buffer=noiseBuf;s2.loop=true;
+    const lp=AC.createBiquadFilter();lp.type='lowpass';lp.frequency.value=230;
+    rumGain=AC.createGain();rumGain.gain.value=0;s2.connect(lp);lp.connect(rumGain);rumGain.connect(master);s2.start();}
+  if(AC.state==='suspended')AC.resume();
+}catch(e){}}
+function beep(f,d,type,v){if(!AC)return;try{const t=AC.currentTime,o=AC.createOscillator(),g=AC.createGain();
+  o.type=type||'square';o.frequency.value=f;g.gain.setValueAtTime(v||.22,t);g.gain.exponentialRampToValueAtTime(.001,t+d);
+  o.connect(g).connect(master);o.start(t);o.stop(t+d+.03);}catch(e){}}
+function thud(v){if(!AC)return;try{const t=AC.currentTime,o=AC.createOscillator(),g=AC.createGain();
+  o.type='sine';o.frequency.setValueAtTime(150,t);o.frequency.exponentialRampToValueAtTime(42,t+.22);
+  g.gain.setValueAtTime(clamp(v,.08,.5),t);g.gain.exponentialRampToValueAtTime(.001,t+.26);
+  o.connect(g).connect(master);o.start(t);o.stop(t+.3);
+  const n=AC.createBufferSource();n.buffer=noiseBuf;const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=420;
+  const g2=AC.createGain();g2.gain.setValueAtTime(clamp(v*.7,.05,.35),t);g2.gain.exponentialRampToValueAtTime(.001,t+.15);
+  n.connect(f).connect(g2).connect(master);n.start(t);n.stop(t+.16);}catch(e){}}
+function audioTick(){if(!AC)return;try{const t=AC.currentTime,p=cars[3];
+  const active=(state==='racing'||state==='countdown')&&!paused;
+  let rpm=0,th=0,skid=0,rum=0,vL=0;
+  if(active){rpm=clamp(Math.abs(p.vF)/p.maxV+(p.inp.throttle?.14:0),0,1);th=p.inp.throttle;vL=Math.abs(p.vL);
+    skid=p.drifting?clamp(vL/620,0,.3):0;rum=(p.surface!=='road'&&Math.hypot(p.vx,p.vy)>90)?.13:0;}
+  engOsc.frequency.setTargetAtTime(58+rpm*300,t,.07);
+  engOsc2.frequency.setTargetAtTime((58+rpm*300)*.5+4,t,.07);
+  engFilt.frequency.setTargetAtTime(420+rpm*2100,t,.09);
+  engGain.gain.setTargetAtTime(active?(.04+.11*rpm+.03*th):0,t,.1);
+  skidGain.gain.setTargetAtTime(skid,t,.08);skidBP.frequency.setTargetAtTime(650+vL*2.2,t,.1);
+  rumGain.gain.setTargetAtTime(rum,t,.12);}catch(e){}}
+
+/* ================= cars ================= */
+const SURF={road:{grip:9,cap:1},curb:{grip:6.2,cap:.84},off:{grip:6.5,cap:.5}};
+class Car{
+  constructor(o){Object.assign(this,o);this.vx=0;this.vy=0;this.vF=0;this.vL=0;this.prog=0;this.lapsDone=0;
+    this.drifting=false;this.surface='road';this.d=0;this.stuckT=0;this.hitV=0;this.lastLap=null;this.finishTime=null;
+    this.inp={throttle:0,brake:0,steer:0,hb:false};this.pw1=null;this.pw2=null;}
+  reset(x,y,h,idx,gap){this.x=x;this.y=y;this.h=h;this.vx=0;this.vy=0;this.vF=0;this.vL=0;
+    this.sIdx=idx;this.prevS=idx;this.gap=gap;this.prog=0;this.lapsDone=0;this.lastLap=null;this.finishTime=null;
+    this.drifting=false;this.stuckT=0;this.hitV=0;this.pw1=null;this.pw2=null;this.lapTimes=[];}
+  get raceDist(){return this.prog-this.gap;}
+  update(dt){
+    const inp=this.inp,np=nearestTrack(this.x,this.y,this.sIdx);
+    this.prevS=this.sIdx;this.sIdx=np.idx;this.d=np.d;this.surface=surfaceOf(this.d);
+    const surf=SURF[this.surface];
+    let fx=Math.cos(this.h),fy=Math.sin(this.h),rx=-fy,ry=fx;
+    let vF=this.vx*fx+this.vy*fy,vL=this.vx*rx+this.vy*ry;
+    const maxV=this.maxV*surf.cap;
+    if(inp.throttle)vF+=this.accel*(1-vF/maxV)*dt;
+    if(inp.brake){if(vF>20)vF-=980*dt;else vF-=340*dt;}
+    if(inp.hb)vF*=Math.exp(-1.15*dt);
+    const cd=this.surface==='road'?.4:(this.surface==='curb'?1.1:2.2);
+    vF*=Math.exp(-cd*dt);if(vF<-230)vF=-230;
+    let grip=surf.grip*(inp.hb?.22:1);
+    const sat=clamp((Math.abs(vL)-85)/260,0,1);grip*=(1-.5*sat);
+    vL*=Math.exp(-grip*dt);
+    const sf=clamp(Math.abs(vF)/150,0,1)*(1-.38*clamp(vF/this.maxV,0,1));
+    this.h+=inp.steer*this.steerRate*sf*dt*(inp.hb?1.25:1);
+    fx=Math.cos(this.h);fy=Math.sin(this.h);rx=-fy;ry=fx;
+    this.vx=fx*vF+rx*vL;this.vy=fy*vF+ry*vL;
+    this.x+=this.vx*dt;this.y+=this.vy*dt;
+    this.x=clamp(this.x,20,WORLD.w-20);this.y=clamp(this.y,20,WORLD.h-20);
+    this.vF=vF;this.vL=vL;
+    // wall
+    const lim=WALL_D-13;this.hitV=0;
+    if(this.d>lim){const nx=(this.x-np.px)/this.d,ny=(this.y-np.py)/this.d;
+      this.x=np.px+nx*lim;this.y=np.py+ny*lim;
+      const vn=this.vx*nx+this.vy*ny;
+      if(vn>0){this.vx-=nx*vn*1.35;this.vy-=ny*vn*1.35;this.hitV=vn;}}
+    // progress
+    const dI=wrapIdx(this.sIdx-this.prevS);if(dI>0&&dI<N/2)this.prog+=dI;
+    // drift hysteresis
+    if(!this.drifting&&Math.abs(vL)>85&&Math.hypot(this.vx,this.vy)>130)this.drifting=true;
+    else if(this.drifting&&Math.abs(vL)<45)this.drifting=false;
+  }
+}
+const CAR_COLORS=['#41c7e8','#ff6a3d','#9be15d','#ffd23f'];
+const CAR_NAMES=['VOLT','BLAZE','THORN','YOU'];
+const cars=[
+  new Car({name:'VOLT',color:CAR_COLORS[0],maxV:640,accel:480,steerRate:2.5,skill:.97,lineOff:-20,seed:1.3,ai:true}),
+  new Car({name:'BLAZE',color:CAR_COLORS[1],maxV:640,accel:480,steerRate:2.5,skill:.94,lineOff:0,seed:4.1,ai:true}),
+  new Car({name:'THORN',color:CAR_COLORS[2],maxV:640,accel:480,steerRate:2.5,skill:.91,lineOff:20,seed:7.7,ai:true}),
+  new Car({name:'YOU',color:CAR_COLORS[3],maxV:640,accel:480,steerRate:2.5,isPlayer:true})];
+const player=cars[3];
+function gridSlot(k){const idx=(START_I-(6+k*9)+N)%N,off=(k%2?-26:26);
+  return{x:C[idx][0]+NM[idx][0]*off,y:C[idx][1]+NM[idx][1]*off,h:Math.atan2(TG[idx][1],TG[idx][0]),idx,gap:6+k*9};}
+
+/* ================= AI ================= */
+function aiInput(c,dt){
+  const la=Math.max(4,Math.round((150+c.vF*.3)/SP));
+  let ti=(c.sIdx+la)%N;
+  const a1=c.sIdx,a2=(c.sIdx+la)%N,a3=(c.sIdx+2*la)%N;
+  const angA=Math.atan2(C[a2][1]-C[a1][1],C[a2][0]-C[a1][0]);
+  const angB=Math.atan2(C[a3][1]-C[a2][1],C[a3][0]-C[a2][0]);
+  const sharp=Math.abs(wrapAng(angB-angA));
+  let base=c.maxV*c.skill;
+  // rubber band vs player
+  const diff=player.raceDist-c.raceDist;
+  if(diff>40)base*=1.10;else if(diff<-60)base*=.93;
+  base*=1+.03*Math.sin(nowS*1.7+c.seed);
+  let targetV=clamp(base-Math.max(0,sharp-.1)*540,235,base);
+  if(c.d>WALL_D-26||c.stuckT>1.2){ti=(c.sIdx+8)%N;targetV=Math.min(targetV,base*.7);}
+  const tp=C[ti];
+  const tx=tp[0]+NM[ti][0]*c.lineOff,ty=tp[1]+NM[ti][1]*c.lineOff;
+  let dh=wrapAng(Math.atan2(ty-c.y,tx-c.x)-c.h);
+  c.inp.steer=clamp(dh*2.6-c.vL*.004,-1,1)+(c.stuckT>2?(Math.random()-.5)*.3:0);
+  if(c.finishTime!=null){c.inp.throttle=.4;c.inp.brake=0;}
+  else if(c.vF>targetV+25){c.inp.throttle=0;c.inp.brake=1;}
+  else if(c.vF<targetV-15){c.inp.throttle=1;c.inp.brake=0;}
+  else{c.inp.throttle=.55;c.inp.brake=0;}
+  c.inp.hb=false;
+  if(Math.hypot(c.vx,c.vy)<40&&c.finishTime==null)c.stuckT+=dt;else c.stuckT=Math.max(0,c.stuckT-dt*2);
+}
+
+/* ================= game state ================= */
+let state='menu',paused=false,raceT=0,cdT=0,lastPhase=-1,goShown=false,hintShown=false;
+let finishedAt=0,resultsShown=false,newBestFlag=false;
+let bestSession=loadBest();
+const cam={x:1700,y:1150,z:.6,shake:0};
+let baseZoom=.7,demoIdx=0;
+const keys={};
+function loadBest(){try{const v=parseFloat(localStorage.getItem('apexrush_best'));return isFinite(v)&&v>0?v:null;}catch(e){return null;}}
+function saveBest(v){try{localStorage.setItem('apexrush_best',String(v));}catch(e){}}
+
+/* ================= effects ================= */
+const marks=[],particles=[];const MARK_LIFE=7;
+let lastHitSfx=0;
+function spawnP(x,y,vx,vy,type,life,size){if(particles.length>340)particles.shift();
+  particles.push({x,y,vx,vy,type,t0:nowS,life,size});}
+function updateParticles(dt){for(let i=particles.length-1;i>=0;i--){const p=particles[i];
+  if(nowS-p.t0>p.life){particles.splice(i,1);continue;}
+  const dr=p.type==='spark'?4:1.6;p.vx*=Math.exp(-dr*dt);p.vy*=Math.exp(-dr*dt);
+  p.x+=p.vx*dt;p.y+=p.vy*dt;}}
+function playerFx(dt){
+  const spd=Math.hypot(player.vx,player.vy);
+  if(player.drifting&&player.surface!=='off'){
+    const fx=Math.cos(player.h),fy=Math.sin(player.h),rx=-fy,ry=fx;
+    const b1=[player.x-fx*15+rx*9,player.y-fy*15+ry*9],b2=[player.x-fx*15-rx*9,player.y-fy*15-ry*9];
+    if(player.pw1){marks.push({x1:player.pw1[0],y1:player.pw1[1],x2:b1[0],y2:b1[1],t0:nowS});
+      marks.push({x1:player.pw2[0],y1:player.pw2[1],x2:b2[0],y2:b2[1],t0:nowS});}
+    player.pw1=b1;player.pw2=b2;
+    for(let i=0;i<2;i++){const b=i?b1:b2;spawnP(b[0],b[1],-player.vx*.1+(Math.random()-.5)*40,-player.vy*.1+(Math.random()-.5)*40,'smoke',.7,4+Math.random()*3);}
+  }else{player.pw1=null;player.pw2=null;}
+  if(player.surface!=='road'&&spd>140){spawnP(player.x-Math.cos(player.h)*14,player.y-Math.sin(player.h)*14,
+    -player.vx*.15+(Math.random()-.5)*60,-player.vy*.15+(Math.random()-.5)*60,'dust',.55,5+Math.random()*4);}
+  if(player.hitV>70){
+    const cnt=Math.min(12,(player.hitV/45)|0);
+    for(let i=0;i<cnt;i++){const a=Math.random()*TAU,s=120+Math.random()*player.hitV*.8;
+      spawnP(player.x,player.y,Math.cos(a)*s,Math.sin(a)*s,'spark',.22,2);}
+    cam.shake=Math.min(10,cam.shake+clamp(player.hitV/70,2,9));
+    if(nowS-lastHitSfx>.1){thud(clamp(player.hitV/500,.15,.5));lastHitSfx=nowS;}}
+  if(player.surface==='curb'&&spd>200)cam.shake=Math.max(cam.shake,1.1);
+}
+function carCollisions(){
+  for(let i=0;i<cars.length;i++)for(let j=i+1;j<cars.length;j++){
+    const a=cars[i],b=cars[j];let dx=b.x-a.x,dy=b.y-a.y;const d=Math.hypot(dx,dy),minD=30;
+    if(d<minD&&d>.01){const nx=dx/d,ny=dy/d,ov=(minD-d)/2;
+      a.x-=nx*ov;a.y-=ny*ov;b.x+=nx*ov;b.y+=ny*ov;
+      const rel=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;
+      if(rel<0){const imp=-(1.35)*rel/2;a.vx-=nx*imp;a.vy-=ny*imp;b.vx+=nx*imp;b.vy+=ny*imp;
+        if((a===player||b===player)&&Math.abs(rel)>80&&nowS-lastHitSfx>.15){thud(.18);cam.shake=Math.max(cam.shake,2.6);lastHitSfx=nowS;
+          for(let k2=0;k2<5;k2++){const ang=Math.random()*TAU,s=90+Math.random()*140;
+            spawnP((a.x+b.x)/2,(a.y+b.y)/2,Math.cos(ang)*s,Math.sin(ang)*s,'spark',.2,2);}}}}}
+}
+
+/* ================= laps / flow ================= */
+function lapCheck(c){
+  const rd=c.raceDist;if(rd<=0)return;
+  const ld=Math.floor(rd/N);
+  if(ld>c.lapsDone){c.lapsDone=ld;const t=raceT-c.lapStart;c.lastLap=t;
+    if(c===player){c.lapTimes.push(t);
+      if(ld<3){let nb=false;if(bestSession==null||t<bestSession){bestSession=t;saveBest(t);nb=true;}
+        banner(nb?('★ NEW BEST · '+fmt(t)):( 'LAP '+(ld+1)+' · '+fmt(t)),nb?'gold':'');
+        if(nb)beep(1320,.15,'square',.2);}
+      else{c.finishTime=raceT;finishRace();}}
+    else c.finishTime=t;}
+}
+function finishRace(){
+  state='finished';finishedAt=performance.now();resultsShown=false;
+  banner('FINISH!','gold');beep(990,.3,'square',.25);setTimeout(()=>beep(1480,.4,'square',.22),160);
+}
+function resetRace(){
+  paused=false;hideScreens();
+  for(let k=0;k<4;k++){const s=gridSlot(k);cars[k].reset(s.x,s.y,s.h,s.idx,s.gap);}
+  marks.length=0;particles.length=0;
+  raceT=0;cdT=0;lastPhase=-1;goShown=false;hintShown=false;newBestFlag=false;resultsShown=false;
+  player.lapStart=0;cam.x=player.x;cam.y=player.y;cam.shake=0;
+  state='countdown';document.body.dataset.state='countdown';
+  $('timeLast').textContent='--:--.---';$('hint').classList.remove('show');
+}
+function startRace(){ensureAudio();resetRace();}
+function toMenu(){paused=false;hideScreens();state='menu';document.body.dataset.state='menu';
+  $('screen-menu').classList.add('active');updateBestChip();}
+function hideScreens(){['screen-menu','screen-pause','screen-results'].forEach(id=>$(id).classList.remove('active'));}
+function togglePause(force){
+  if(state!=='racing'&&state!=='countdown')return;
+  paused=force!==undefined?force:!paused;
+  $('screen-pause').classList.toggle('active',paused);
+}
+function updateBestChip(){const el=$('bestChip');
+  if(bestSession!=null)el.innerHTML='SESSION BEST LAP &nbsp;<b>'+fmt(bestSession)+'</b>';
+  else el.textContent='NO LAPS SET — BEAT THE CLOCK';}
+function banner(txt,cls){const b=$('banner');b.textContent=txt;b.className='display '+(cls||'');
+  void b.offsetWidth;b.classList.add('show');}
+function setCd(txt,go){const c=$('cd');c.textContent=txt;c.className='display'+(go?' go':'');
+  void c.offsetWidth;c.classList.add('show');}
+
+/* ================= results ================= */
+const ORD=['1ST','2ND','3RD','4TH'];
+const FLAVOR=['FLAWLESS DRIVE. THE PODIUM IS YOURS.','SO CLOSE — WHEEL-TO-WHEEL ALL RACE.','BACKMARKERS BEHIND YOU… FOR NOW.','THE FIELD GOT AWAY. RE-RACE IT.'];
+function showResults(){
+  if(resultsShown)return;resultsShown=true;
+  const order=[...cars].sort((a,b)=>(a.finishTime??Infinity)-(b.finishTime??Infinity)||b.raceDist-a.raceDist);
+  const pPos=order.indexOf(player)+1;
+  const st=$('resStamp');st.textContent=ORD[pPos-1];st.className='stamp display'+(pPos>2?' late':'');
+  $('resFlavor').textContent=FLAVOR[pPos-1];
+  $('resBody').innerHTML=order.map((c,i)=>{
+    const t=c.finishTime,est=t==null?player.finishTime+(3*N-c.raceDist)*SP/420:null;
+    return '<tr class="'+(c===player?'you':'')+'"><td class="posn">'+(i+1)+'</td>'+
+      '<td><span class="swatch" style="background:'+c.color+'"></span>'+c.name+'</td>'+
+      '<td class="mono '+(t!=null?'fin':'est')+'">'+(t!=null?fmt(t):'~'+fmt(est))+'</td>'+
+      '<td style="color:#6a7380;font-size:11px">'+(t!=null?'FINISHED':'EST.')+'</td></tr>';}).join('');
+  const pb=player.lapTimes.length?Math.min.apply(null,player.lapTimes):null;
+  $('resTotals').innerHTML='TOTAL <b>'+fmt(player.finishTime)+'</b> &nbsp;·&nbsp; BEST LAP <b>'+fmt(pb)+'</b>'+
+    (pb!=null&&bestSession==pb?' <span style="color:var(--yellow)">★ NEW SESSION BEST</span>':'');
+  updateBestChip();$('screen-results').classList.add('active');
+}
+
+/* ================= main update ================= */
+let nowS=0;
+function raceUpdate(dt){
+  raceT+=dt;
+  if(goShown&&raceT>1){goShown=false;$('cd').className='display';}
+  if(!hintShown&&raceT>.4){hintShown=true;const h=$('hint');void h.offsetWidth;h.classList.add('show');}
+  const up=keys['w']||keys['arrowup'],dn=keys['s']||keys['arrowdown'];
+  const lf=keys['a']||keys['arrowleft'],rt2=keys['d']||keys['arrowright'];
+  player.inp.throttle=up?1:0;player.inp.brake=dn?1:0;
+  player.inp.steer=(rt2?1:0)-(lf?1:0);player.inp.hb=!!keys[' '];
+  for(const c of cars){if(c.ai)aiInput(c,dt);c.update(dt);}
+  carCollisions();
+  for(const c of cars)lapCheck(c);
+  playerFx(dt);updateParticles(dt);
+  // camera
+  const spd=Math.hypot(player.vx,player.vy);
+  let lx=clamp(player.vx*.3,-240,240),ly=clamp(player.vy*.3,-240,240);
+  const k=1-Math.exp(-5*dt);
+  cam.x+=(player.x+lx-cam.x)*k;cam.y+=(player.y+ly-cam.y)*k;
+  const zt=baseZoom*(1-.15*clamp(spd/player.maxV,0,1));
+  cam.z+=(zt-cam.z)*(1-Math.exp(-3*dt));
+  cam.shake*=Math.exp(-6.5*dt);
+}
+function cdUpdate(dt){
+  cdT+=dt;
+  if(cdT>=3){state='racing';document.body.dataset.state='racing';raceT=0;goShown=true;
+    for(const c of cars)c.lapStart=0;setCd('GO!',true);beep(990,.4,'square',.28);cam.shake=4;return;}
+  const ph=Math.floor(cdT);
+  if(ph!==lastPhase){lastPhase=ph;setCd(String(3-ph),false);beep(660,.14,'square',.22);}
+}
+function demoUpdate(dt){demoIdx=(demoIdx+dt*24)%N;
+  const p=C[demoIdx|0],k=1-Math.exp(-1.6*dt);
+  cam.x+=((p[0]+TG[demoIdx|0][0]*260)-cam.x)*k;cam.y+=((p[1]+TG[demoIdx|0][1]*260)-cam.y)*k;
+  cam.z+=((baseZoom*.52)-cam.z)*(1-Math.exp(-1.2*dt));}
+
+/* ================= render ================= */
+const cv=$('game'),ctx=cv.getContext('2d');
+let dpr=1;const view={w:0,h:0};
+function resize(){dpr=Math.min(window.devicePixelRatio||1,2);view.w=innerWidth;view.h=innerHeight;
+  cv.width=view.w*dpr;cv.height=view.h*dpr;baseZoom=clamp(Math.min(view.w,view.h)/1050,.4,1.3);}
+window.addEventListener('resize',resize);
+const mm=$('minimap'),mctx=mm.getContext('2d');
+function setupMinimap(){dpr=Math.min(window.devicePixelRatio||1,2);mm.width=MMW*dpr;mm.height=MMH*dpr;}
+
+function drawMarks(z){
+  const x0=cam.x-view.w/2/z-40,x1=cam.x+view.w/2/z+40,y0=cam.y-view.h/2/z-40,y1=cam.y+view.h/2/z+40;
+  for(let i=marks.length-1;i>=0;i--)if(nowS-marks[i].t0>MARK_LIFE)marks.splice(i,1);
+  if(marks.length>900)marks.splice(0,marks.length-900);
+  const buckets=new Map();
+  for(const m of marks){const a=1-(nowS-m.t0)/MARK_LIFE;if(a<=0)continue;
+    if((m.x1<x0&&m.x2<x0)||(m.x1>x1&&m.x2>x1)||(m.y1<y0&&m.y2<y0)||(m.y1>y1&&m.y2>y1))continue;
+    const b=Math.round(a*24)/24;let arr=buckets.get(b);if(!arr){arr=[];buckets.set(b,arr);}arr.push(m);}
+  ctx.lineWidth=4.5;ctx.lineCap='round';
+  for(const[b,arr]of buckets){ctx.strokeStyle='rgba(18,20,26,'+(b*.38).toFixed(3)+')';ctx.beginPath();
+    for(const m of arr){ctx.moveTo(m.x1,m.y1);ctx.lineTo(m.x2,m.y2);}ctx.stroke();}
+}
+function drawParticles(){
+  for(const p of particles){const age=nowS-p.t0,a=1-age/p.life;if(a<=0)continue;
+    if(p.type==='spark'){ctx.strokeStyle='rgba(255,215,106,'+a.toFixed(3)+')';ctx.lineWidth=2;ctx.beginPath();
+      ctx.moveTo(p.x,p.y);ctx.lineTo(p.x-p.vx*.03,p.y-p.vy*.03);ctx.stroke();}
+    else{const r=p.type==='smoke'?p.size+age*26:p.size+age*18;
+      ctx.fillStyle=p.type==='smoke'?'rgba(226,229,236,'+(a*.45).toFixed(3)+')':'rgba(199,170,116,'+(a*.4).toFixed(3)+')';
+      ctx.beginPath();ctx.arc(p.x,p.y,r,0,TAU);ctx.fill();}}}
+function drawCar(c){
+  // shadow (world-aligned)
+  ctx.fillStyle='rgba(0,0,0,.3)';ctx.beginPath();ctx.ellipse(c.x+2,c.y+4,25,15,0,0,TAU);ctx.fill();
+  ctx.save();ctx.translate(c.x,c.y);ctx.rotate(c.h);
+  // wheels
+  ctx.fillStyle='#15181d';
+  const wheel=(x,y,rot)=>{if(rot){ctx.save();ctx.translate(x,y);ctx.rotate(rot);}ctx.fillRect(-4,-2.6,8,5.2);if(rot)ctx.restore();};
+  wheel(13,-9,c.inp.steer*.45);wheel(13,9,c.inp.steer*.45);wheel(-13,-9,0);wheel(-13,9,0);
+  // body
+  ctx.strokeStyle='rgba(0,0,0,.5)';ctx.lineWidth=2.5;
+  rr(ctx,-22,-11,44,22,6);ctx.fillStyle=c.color;ctx.fill();ctx.stroke();
+  ctx.fillStyle='rgba(0,0,0,.2)';ctx.fillRect(-22,-11,15,22);           // rear shade
+  ctx.fillStyle='#181c22';ctx.beginPath();                                 // windshield
+  ctx.moveTo(14,-7);ctx.lineTo(6,-8.5);ctx.lineTo(6,8.5);ctx.lineTo(14,7);ctx.closePath();ctx.fill();
+  if(c.isPlayer){ctx.fillStyle='rgba(255,255,255,.9)';ctx.fillRect(-20,-3.5,36,7);}   // racing stripe
+  ctx.fillStyle='#181c22';ctx.fillRect(-25,-10,4,20);                        // spoiler
+  if(c.inp.brake>0&&c.vF>-10){ctx.fillStyle='rgba(255,70,55,.95)';ctx.fillRect(-26,-8,3,5);ctx.fillRect(-26,3,3,5);}
+  ctx.restore();
+  // name tag / player marker
+  if(c.ai){ctx.font='italic 900 13px "Arial Black",system-ui,sans-serif';ctx.textAlign='center';
+    ctx.lineWidth=3;ctx.strokeStyle='rgba(10,13,18,.75)';ctx.strokeText(c.name,c.x,c.y-22);
+    ctx.fillStyle=c.color;ctx.fillText(c.name,c.x,c.y-22);}
+  else{const by=c.y-26+Math.sin(nowS*7)*3;ctx.fillStyle='rgba(255,255,255,.95)';
+    ctx.beginPath();ctx.moveTo(c.x,by+7);ctx.lineTo(c.x-7,by-4);ctx.lineTo(c.x+7,by-4);ctx.closePath();ctx.fill();}
+}
+function drawMinimap(){
+  const ms=Math.min((MMW-16)/WORLD.w,(MMH-16)/WORLD.h),ox=(MMW-WORLD.w*ms)/2,oy=(MMH-WORLD.h*ms)/2;
+  mctx.setTransform(dpr,0,0,dpr,0,0);mctx.clearRect(0,0,MMW,MMH);
+  mctx.drawImage(mapCv,0,0,MMW,MMH);
+  for(const c of cars){const x=ox+c.x*ms,y=oy+c.y*ms;
+    if(c.isPlayer){mctx.strokeStyle='rgba(255,210,63,'+(0.5+0.4*Math.sin(nowS*5)).toFixed(2)+')';
+      mctx.lineWidth=1.5;mctx.beginPath();mctx.arc(x,y,6+Math.sin(nowS*5)*1.5,0,TAU);mctx.stroke();}
+    mctx.fillStyle=c.color;mctx.beginPath();mctx.arc(x,y,c.isPlayer?3.4:2.6,0,TAU);mctx.fill();}
+}
+function render(){
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle='#3f7a29';ctx.fillRect(0,0,view.w,view.h);
+  const shx=(Math.random()-.5)*cam.shake*2,shy=(Math.random()-.5)*cam.shake*2;
+  ctx.save();ctx.translate(view.w/2,view.h/2);ctx.scale(cam.z,cam.z);ctx.translate(-cam.x+shx,-cam.y+shy);
+  ctx.drawImage(worldCv,0,0);
+  drawMarks(cam.z);drawParticles();
+  for(const c of cars)drawCar(c);
+  ctx.restore();
+  // speed streaks
+  const spd=Math.hypot(player.vx,player.vy),sf=clamp(spd/player.maxV,0,1);
+  if(sf>.78&&(state==='racing')){const a=(sf-.78)/.22*.4;ctx.strokeStyle='rgba(255,255,255,'+a.toFixed(3)+')';ctx.lineWidth=2;
+    for(let i=0;i<14;i++){const ang=i/14*TAU+nowS*.6,r0=Math.max(view.w,view.h)*.55,r1=r0-90-a*160;
+      const cx=view.w/2,cy=view.h/2;ctx.beginPath();
+      ctx.moveTo(cx+Math.cos(ang)*r0,cy+Math.sin(ang)*r0);ctx.lineTo(cx+Math.cos(ang)*r1,cy+Math.sin(ang)*r1);ctx.stroke();}}
+  if(state==='racing'&&raceT<.35){ctx.fillStyle='rgba(255,255,255,'+((.35-raceT)*1.4).toFixed(3)+')';ctx.fillRect(0,0,view.w,view.h);}
+  drawMinimap();
+}
+
+/* ================= HUD ================= */
+const hudCache={};
+function setTxt(id,v){if(hudCache[id]!==v){hudCache[id]=v;$(id).textContent=v;}}
+function hudUpdate(){
+  if(state==='menu')return;
+  const order=[...cars].sort((a,b)=>b.raceDist-a.raceDist);
+  setTxt('posVal','P'+(order.indexOf(player)+1));
+  setTxt('lapVal',Math.min(3,player.lapsDone+1)+' / 3');
+  setTxt('timeCur',state==='racing'?fmt(raceT-player.lapStart):'0:00.000');
+  setTxt('timeLast',fmt(player.lastLap));
+  setTxt('timeBest',fmt(bestSession));
+  setTxt('speedVal',String(Math.round(Math.hypot(player.vx,player.vy)*.42)));
+  $('driftLamp').classList.toggle('on',player.drifting);
+}
+
+/* ================= input ================= */
+window.addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if(['arrowup','arrowdown','arrowleft','arrowright',' '].includes(k))e.preventDefault();
+  ensureAudio();keys[k]=true;
+  if(k==='m'){muted=!muted;if(master)try{master.gain.setTargetAtTime(muted?0:.6,AC.currentTime,.02);}catch(err){}
+    $('muteTxt').textContent=muted?'OFF':'ON';return;}
+  if(state==='menu'&&(k==='enter'||k===' ')){startRace();return;}
+  if(k==='r'&&state!=='menu'){startRace();return;}
+  if((state==='racing'||state==='countdown')&&(k==='p'||k==='escape')){togglePause();return;}
+  if(paused&&k==='enter'){togglePause(false);return;}
+});
+window.addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false;});
+window.addEventListener('blur',()=>{for(const k in keys)keys[k]=false;});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&(state==='racing'||state==='countdown'))togglePause(true);});
+const wire=(id,fn)=>{$(id).addEventListener('click',e=>{ensureAudio();$(id).blur();fn();});};
+wire('btnStart',startRace);
+wire('btnResume',()=>togglePause(false));
+wire('btnRestartP',startRace);
+wire('btnMenuP',toMenu);
+wire('btnRestartR',startRace);
+wire('btnMenuR',toMenu);
+
+/* ================= boot & loop ================= */
+buildTrack();buildWorld();resize();setupMinimap();updateBestChip();
+for(let k=0;k<4;k++){const s=gridSlot(k);cars[k].reset(s.x,s.y,s.h,s.idx,s.gap);}
+cam.x=C[0][0];cam.y=C[0][1];
+let lastT=performance.now();
+function frame(t){
+  requestAnimationFrame(frame);
+  const dt=clamp((t-lastT)/1000,0,.033);lastT=t;nowS=t/1000;
+  if(!paused){
+    if(state==='countdown')cdUpdate(dt);
+    else if(state==='racing')raceUpdate(dt);
+    else if(state==='menu')demoUpdate(dt);
+    else if(state==='finished'){updateParticles(dt);cam.shake*=Math.exp(-6.5*dt);
+      if(!resultsShown&&performance.now()-finishedAt>1400)showResults();}
+  }
+  audioTick();render();hudUpdate();
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
+```
