@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Side Defense</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #1a1a2e; width: 100vw; height: 100vh; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    if (type === 'shoot') {
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(400, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(200, audioCtx.currentTime + 0.1);
+        gain.gain.setValueAtTime(0.08, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+    } else if (type === 'explosion') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.3);
+        gain.gain.setValueAtTime(0.12, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+    } else if (type === 'place') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(600, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.15);
+    } else if (type === 'enemyDie') {
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(200, audioCtx.currentTime + 0.2);
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.2);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.2);
+    } else if (type === 'lose') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(300, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(80, audioCtx.currentTime + 0.5);
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.5);
+    } else if (type === 'wave') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(440, audioCtx.currentTime);
+        osc.frequency.setValueAtTime(660, audioCtx.currentTime + 0.1);
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+    }
+}
+
+// Game constants
+const WORLD_W = 3200;
+const WORLD_H = 600;
+const PATH_WIDTH = 40;
+
+let scale, offsetX, offsetY;
+function calcScale() {
+    scale = Math.min(W / WORLD_W, H / WORLD_H);
+    offsetX = (W - WORLD_W * scale) / 2;
+    offsetY = (H - WORLD_H * scale) / 2;
+}
+calcScale();
+
+// Path waypoints
+const pathPoints = [
+    {x: 3100, y: 350},
+    {x: 2850, y: 450},
+    {x: 2600, y: 280},
+    {x: 2350, y: 420},
+    {x: 2100, y: 250},
+    {x: 1850, y: 400},
+    {x: 1600, y: 280},
+    {x: 1350, y: 450},
+    {x: 1100, y: 300},
+    {x: 850, y: 420},
+    {x: 600, y: 280},
+    {x: 350, y: 400},
+    {x: 50, y: 350}
+];
+
+// Tower slots (positions near the path where towers can be placed)
+const towerSlots = [];
+for (let i = 0; i < pathPoints.length - 1; i++) {
+    const a = pathPoints[i];
+    const b = pathPoints[i + 1];
+    const mx = (a.x + b.x) / 2;
+    const my = (a.y + b.y) / 2;
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len = Math.sqrt(dx*dx + dy*dy);
+    const nx = -dy / len;
+    const ny = dx / len;
+    towerSlots.push({x: mx + nx * 80, y: my + ny * 80});
+    towerSlots.push({x: mx - nx * 80, y: my - ny * 80});
+}
+// Add a few extra
+towerSlots.push({x: 1500, y: 200});
+towerSlots.push({x: 700, y: 500});
+towerSlots.push({x: 2500, y: 480});
+
+// Tower types
+const TOWER_TYPES = [
+    { name: 'Arrow', cost: 30, range: 150, damage: 8, fireRate: 0.4, color: '#4a9eff', projColor: '#aaccff', splash: 0, slow: 0 },
+    { name: 'Cannon', cost: 60, range: 120, damage: 35, fireRate: 1.2, color: '#ff6644', projColor: '#ffaa88', splash: 40, slow: 0 },
+    { name: 'Frost', cost: 50, range: 140, damage: 5, fireRate: 0.8, color: '#44ffee', projColor: '#aaeeff', splash: 0, slow: 0.5 }
+];
+
+// Game state
+let gameState = 'start'; // start, playing, gameover
+let money = 100;
+let lives = 20;
+let wave = 0;
+let score = 0;
+let enemies = [];
+let towers = [];
+let projectiles = [];
+let particles = [];
+let cameraX = WORLD_W / 2 - W / (WORLD_W > W ? scale : 1);
+let cameraXMin = 0;
+let cameraXMax = WORLD_W - W / scale;
+let selectedTowerType = 0;
+let waveTimer = 0;
+let waveActive = false;
+let enemiesToSpawn = 0;
+let spawnTimer = 0;
+let mouseX = 0, mouseY = 0;
+let hoveredSlot = -1;
+
+function resetGame() {
+    money = 100;
+    lives = 20;
+    wave = 0;
+    score = 0;
+    enemies = [];
+    towers = [];
+    projectiles = [];
+    particles = [];
+    cameraX = Math.max(0, Math.min(cameraXMax, WORLD_W / 2 - W / (scale || 1)));
+    waveTimer = 3;
+    waveActive = false;
+    enemiesToSpawn = 0;
+    spawnTimer = 0;
+}
+
+function startWave() {
+    wave++;
+    waveActive = true;
+    enemiesToSpawn = 5 + wave * 2;
+    spawnTimer = 0;
+    playSound('wave');
+}
+
+function getEnemySpeed(w) { return 60 + w * 3; }
+function getEnemyHP(w) { return 30 + w * 15; }
+function getEnemyGold(w) { return 10 + Math.floor(w * 1.5); }
+
+function spawnEnemy() {
+    const hp = getEnemyHP(wave);
+    const speed = getEnemySpeed(wave);
+    enemies.push({
+        x: pathPoints[0].x,
+        y: pathPoints[0].y,
+        pathIndex: 0,
+        hp: hp,
+        maxHp: hp,
+        speed: speed,
+        slowTimer: 0,
+        gold: getEnemyGold(wave)
+    });
+}
+
+function worldToScreen(wx, wy) {
+    return { x: (wx - cameraX) * scale + offsetX, y: wy * scale + offsetY };
+}
+
+function screenToWorld(sx, sy) {
+    return { x: (sx - offsetX) / scale + cameraX, y: (sy - offsetY) / scale };
+}
+
+function dist(a, b) { return Math.sqrt((a.x-b.x)*(a.x-b.x)+(a.y-b.y)*(a.y-b.y)); }
+
+// Input
+let keys = {};
+window.addEventListener('keydown', e => {
+    initAudio();
+    keys[e.key] = true;
+    if (gameState === 'start') {
+        gameState = 'playing';
+        resetGame();
+    } else if (gameState === 'gameover') {
+        gameState = 'playing';
+        resetGame();
+    }
+    if (gameState === 'playing') {
+        if (e.key === '1') selectedTowerType = 0;
+        if (e.key === '2') selectedTowerType = 1;
+        if (e.key === '3') selectedTowerType = 2;
+    }
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+
+canvas.addEventListener('mousemove', e => {
+    mouseX = e.clientX;
+    mouseY = e.clientY;
+});
+
+canvas.addEventListener('click', e => {
+    if (gameState !== 'playing') return;
+    const wp = screenToWorld(e.clientX, e.clientY);
+    // Check if clicking a tower slot
+    for (let i = 0; i < towerSlots.length; i++) {
+        const s = towerSlots[i];
+        const d = Math.sqrt((wp.x - s.x)*(wp.x - s.x) + (wp.y - s.y)*(wp.y - s.y));
+        if (d < 40) {
+            // Check if slot is free
+            const occupied = towers.find(t => t.slotIndex === i);
+            if (!occupied && money >= TOWER_TYPES[selectedTowerType].cost) {
+                money -= TOWER_TYPES[selectedTowerType].cost;
+                towers.push({
+                    x: s.x, y: s.y, slotIndex: i,
+                    type: selectedTowerType,
+                    fireTimer: 0
+                });
+                playSound('place');
+            }
+            break;
+        }
+    }
+});
+
+// Update
+function update(dt) {
+    if (gameState !== 'playing') return;
+
+    // Camera
+    const camSpeed = 500 / scale;
+    if (keys['ArrowLeft'] || keys['a'] || keys['A']) cameraX -= camSpeed * dt;
+    if (keys['ArrowRight'] || keys['d'] || keys['D']) cameraX += camSpeed * dt;
+    cameraX = Math.max(0, Math.min(cameraXMax, cameraX));
+
+    // Wave management
+    if (!waveActive) {
+        waveTimer -= dt;
+        if (waveTimer <= 0) startWave();
+    } else {
+        spawnTimer -= dt;
+        if (spawnTimer <= 0 && enemiesToSpawn > 0) {
+            spawnEnemy();
+            enemiesToSpawn--;
+            spawnTimer = Math.max(0.3, 1.5 - wave * 0.1);
+        }
+        if (enemiesToSpawn === 0 && enemies.length === 0) {
+            waveActive = false;
+            waveTimer = 4;
+        }
+    }
+
+    // Update enemies
+    for (let i = enemies.length - 1; i >= 0; i--) {
+        const e = enemies[i];
+        if (e.slowTimer > 0) e.slowTimer -= dt;
+        const spd = e.slowTimer > 0 ? e.speed * 0.5 : e.speed;
+        
+        if (e.pathIndex < pathPoints.length - 1) {
+            const target = pathPoints[e.pathIndex + 1];
+            const dx = target.x - e.x;
+            const dy = target.y - e.y;
+            const d = Math.sqrt(dx*dx + dy*dy);
+            if (d < spd * dt) {
+                e.x = target.x;
+                e.y = target.y;
+                e.pathIndex++;
+            } else {
+                e.x += (dx/d) * spd * dt;
+                e.y += (dy/d) * spd * dt;
+            }
+        }
+
+        // Reached end
+        if (e.pathIndex >= pathPoints.length - 1) {
+            enemies.splice(i, 1);
+            lives--;
+            playSound('lose');
+            if (lives <= 0) gameState = 'gameover';
+            continue;
+        }
+
+        // Check death
+        if (e.hp <= 0) {
+            money += e.gold;
+            score += e.gold;
+            enemies.splice(i, 1);
+            playSound('enemyDie');
+            for (let p = 0; p < 6; p++) {
+                particles.push({x: e.x, y: e.y, vx: (Math.random()-0.5)*100, vy: (Math.random()-0.5)*100 - 50, life: 0.5, color: '#ffcc44'});
+            }
+        }
+    }
+
+    // Update towers
+    for (let t of towers) {
+        const tt = TOWER_TYPES[t.type];
+        t.fireTimer -= dt;
+        if (t.fireTimer <= 0) {
+            // Find target
+            let best = null, bestDist = Infinity;
+            for (let e of enemies) {
+                const d = Math.sqrt((t.x-e.x)*(t.x-e.x)+(t.y-e.y)*(t.y-e.y));
+                if (d < tt.range && d < bestDist) { bestDist = d; best = e; }
+            }
+            if (best) {
+                t.fireTimer = tt.fireRate;
+                projectiles.push({
+                    x: t.x, y: t.y, tx: best.x, ty: best.y, target: best,
+                    speed: 300, damage: tt.damage, splash: tt.splash, slow: tt.slow,
+                    color: tt.projColor
+                });
+                playSound('shoot');
+            }
+        }
+    }
+
+    // Update projectiles
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+        const p = projectiles[i];
+        if (p.target && p.target.hp > 0) {
+            p.tx = p.target.x;
+            p.ty = p.target.y;
+        }
+        const dx = p.tx - p.x;
+        const dy = p.ty - p.y;
+        const d = Math.sqrt(dx*dx + dy*dy);
+        if (d < 10) {
+            // Hit
+            if (p.splash > 0) {
+                for (let e of enemies) {
+                    const ed = Math.sqrt((e.x-p.tx)*(e.x-p.tx)+(e.y-p.ty)*(e.y-p.ty));
+                    if (ed < p.splash) e.hp -= p.damage;
+                }
+            } else if (p.target) {
+                p.target.hp -= p.damage;
+                if (p.slow > 0) p.target.slowTimer = 2;
+            }
+            playSound('explosion');
+            for (let q = 0; q < 3; q++) {
+                particles.push({x: p.tx, y: p.ty, vx: (Math.random()-0.5)*80, vy: (Math.random()-0.5)*80, life: 0.3, color: p.color});
+            }
+            projectiles.splice(i, 1);
+        } else {
+            p.x += (dx/d) * p.speed * dt;
+            p.y += (dy/d) * p.speed * dt;
+        }
+    }
+
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.life -= dt;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    // Hovered slot
+    hoveredSlot = -1;
+    const wp = screenToWorld(mouseX, mouseY);
+    for (let i = 0; i < towerSlots.length; i++) {
+        const d = Math.sqrt((wp.x - towerSlots[i].x)*(wp.x - towerSlots[i].x) + (wp.y - towerSlots[i].y)*(wp.y - towerSlots[i].y));
+        if (d < 40) { hoveredSlot = i; break; }
+    }
+}
+
+// Render
+function render() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+
+    if (gameState === 'start') {
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('SIDE DEFENSE', W/2, H/2 - 60);
+        ctx.font = '18px monospace';
+        ctx.fillText('A side-scrolling tower defense game', W/2, H/2 - 20);
+        ctx.fillText('← → or A/D: Scroll camera', W/2, H/2 + 30);
+        ctx.fillText('1/2/3: Select tower type (Arrow/Cannon/Frost)', W/2, H/2 + 60);
+        ctx.fillText('Click on glowing spots to place towers', W/2, H/2 + 90);
+        ctx.fillText('Stop enemies before they reach the left!', W/2, H/2 + 120);
+        ctx.fillStyle = '#ffcc44';
+        ctx.font = '24px monospace';
+        ctx.fillText('[ Click to Start ]', W/2, H/2 + 180);
+        return;
+    }
+
+    if (gameState === 'gameover') {
+        ctx.fillStyle = '#ff4444';
+        ctx.font = 'bold 48px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W/2, H/2 - 40);
+        ctx.fillStyle = '#fff';
+        ctx.font = '24px monospace';
+        ctx.fillText('Score: ' + score + '  Wave: ' + wave, W/2, H/2 + 10);
+        ctx.fillStyle = '#ffcc44';
+        ctx.font = '20px monospace';
+        ctx.fillText('[ Click to Restart ]', W/2, H/2 + 70);
+        return;
+    }
+
+    // Draw world
+    const camLeft = cameraX - offsetX / scale;
+    const camRight = cameraX + (W - offsetX) / scale;
+
+    // Ground
+    ctx.save();
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(scale, scale);
+
+    // Sky gradient effect
+    const grad = ctx.createLinearGradient(0, 0, 0, WORLD_H);
+    grad.addColorStop(0, '#16213e');
+    grad.addColorStop(1, '#0f3460');
+    ctx.fillStyle = grad;
+    ctx.fillRect(camLeft, 0, camRight - camLeft, WORLD_H);
+
+    // Ground area
+    ctx.fillStyle = '#2a5a2a';
+    ctx.fillRect(camLeft, 520, camRight - camLeft, 80);
+
+    // Path
+    ctx.strokeStyle = '#8B7355';
+    ctx.lineWidth = PATH_WIDTH;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(pathPoints[0].x, pathPoints[0].y);
+    for (let i = 1; i < pathPoints.length; i++) {
+        const p = pathPoints[i];
+        if (i === 1) ctx.lineTo(p.x, p.y);
+        else {
+            const prev = pathPoints[i-1];
+            const cpx = (prev.x + p.x)/2;
+            ctx.quadraticCurveTo(cpx, p.y, p.x, p.y);
+        }
+    }
+    ctx.stroke();
+
+    // Path border
+    ctx.strokeStyle = '#6B5335';
+    ctx.lineWidth = PATH_WIDTH + 6;
+    ctx.globalAlpha = 0.3;
+    ctx.beginPath();
+    ctx.moveTo(pathPoints[0].x, pathPoints[0].y);
+    for (let i = 1; i < pathPoints.length; i++) {
+        const p = pathPoints[i];
+        if (i === 1) ctx.lineTo(p.x, p.y);
+        else {
+            const prev = pathPoints[i-1];
+            const cpx = (prev.x + p.x)/2;
+            ctx.quadraticCurveTo(cpx, p.y, p.x, p.y);
+        }
+    }
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Base (left end)
+    ctx.fillStyle = '#4488ff';
+    ctx.fillRect(pathPoints[pathPoints.length-1].x - 25, pathPoints[pathPoints.length-1].y - 30, 50, 60);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('BASE', pathPoints[pathPoints.length-1].x, pathPoints[pathPoints.length-1].y + 4);
+
+    // Tower slots
+    for (let i = 0; i < towerSlots.length; i++) {
+        const s = towerSlots[i];
+        if (s.x < camLeft - 50 || s.x > camRight + 50) continue;
+        const occupied = towers.find(t => t.slotIndex === i);
+        if (!occupied) {
+            ctx.fillStyle = hoveredSlot === i ? '#ffcc44' : 'rgba(255,204,68,0.3)';
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, 20, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = '#ffcc44';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        }
+    }
+
+    // Towers
+    for (let t of towers) {
+        if (t.x < camLeft - 50 || t.x > camRight + 50) continue;
+        const tt = TOWER_TYPES[t.type];
+        // Base
+        ctx.fillStyle = '#333';
+        ctx.fillRect(t.x - 15, t.y - 5, 30, 25);
+        // Top
+        ctx.fillStyle = tt.color;
+        ctx.beginPath();
+        ctx.arc(t.x, t.y - 15, 14, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        // Range indicator (subtle)
+        if (hoveredSlot >= 0 && towers.find(tt => tt.slotIndex === hoveredSlot)) {
+            ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.arc(t.x, t.y, tt.range, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+    }
+
+    // Enemies
+    for (let e of enemies) {
+        if (e.x < camLeft - 50 || e.x > camRight + 50) continue;
+        const size = 14;
+        ctx.fillStyle = e.slowTimer > 0 ? '#88ccff' : '#ff4444';
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        // HP bar
+        const hpPct = e.hp / e.maxHp;
+        ctx.fillStyle = '#333';
+        ctx.fillRect(e.x - 15, e.y - 25, 30, 5);
+        ctx.fillStyle = hpPct > 0.5 ? '#4f4' : hpPct > 0.25 ? '#ff4' : '#f44';
+        ctx.fillRect(e.x - 15, e.y - 25, 30 * hpPct, 5);
+    }
+
+    // Projectiles
+    for (let p of projectiles) {
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Particles
+    for (let p of particles) {
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.life / 0.5;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Spawn indicator (right side)
+    if (waveActive || (!waveActive && waveTimer < 2)) {
+        ctx.fillStyle = '#ff6644';
+        ctx.font = '14px monospace';
+        ctx.textAlign = 'center';
+        const spx = pathPoints[0].x;
+        ctx.fillText('⚔ INCOMING', spx, pathPoints[0].y - 40);
+    }
+
+    ctx.restore();
+
+    // HUD
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, 50);
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`♥ Lives: ${lives}`, 15, 32);
+    ctx.fillText(`$ Money: ${money}`, 150, 32);
+    ctx.fillText(`Wave: ${wave}`, 310, 32);
+    ctx.fillText(`Score: ${score}`, 430, 32);
+
+    // Tower selection
+    const types = ['1:Arrow $30', '2:Cannon $60', '3:Frost $50'];
+    const colors = ['#4a9eff', '#ff6644', '#44ffee'];
+    for (let i = 0; i < 3; i++) {
+        ctx.fillStyle = selectedTowerType === i ? colors[i] : '#888';
+        ctx.fillText(types[i], 570 + i * 130, 32);
+    }
+
+    // Camera hint
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText('← → / A D to scroll', W - 15, H - 15);
+
+    // Next wave timer
+    if (!waveActive && gameState === 'playing') {
+        ctx.fillStyle = '#ffcc44';
+        ctx.font = '16px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(`Next wave in ${Math.ceil(waveTimer)}s`, W/2, H - 20);
+    }
+}
+
+// Game loop
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = Math.min((time - lastTime) / 1000, 0.05);
+    lastTime = time;
+    update(dt);
+    render();
+    requestAnimationFrame(gameLoop);
+}
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
