@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Sokoban</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#0a0a1a;font-family:'Segoe UI',system-ui,sans-serif}
+canvas{display:block;width:100%;height:100%}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+
+let W,H,dpr;
+function resize(){
+  dpr=window.devicePixelRatio||1;
+  W=window.innerWidth;H=window.innerHeight;
+  canvas.width=W*dpr;canvas.height=H*dpr;
+  canvas.style.width=W+'px';canvas.style.height=H+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize',resize);
+resize();
+
+// Audio
+let audioCtx=null;
+function initAudio(){if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();}
+function playTone(freq,dur,type='square',vol=0.15){
+  if(!audioCtx)return;
+  const o=audioCtx.createOscillator();const g=audioCtx.createGain();
+  o.type=type;o.frequency.value=freq;
+  g.gain.setValueAtTime(vol,audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001,audioCtx.currentTime+dur);
+  o.connect(g);g.connect(audioCtx.destination);
+  o.start();o.stop(audioCtx.currentTime+dur);
+}
+function sfxMove(){playTone(220,0.08,'square',0.1);}
+function sfxPush(){playTone(150,0.12,'triangle',0.15);}
+function sfxGoal(){playTone(523,0.15,'sine',0.2);setTimeout(()=>playTone(659,0.15,'sine',0.2),80);setTimeout(()=>playTone(784,0.2,'sine',0.2),160);}
+function sfxWin(){[523,659,784,1047].forEach((f,i)=>setTimeout(()=>playTone(f,0.3,'sine',0.2),i*120));}
+function sfxBump(){playTone(100,0.06,'square',0.08);}
+
+// Levels: # wall, _ floor, @ player, $ box, . goal, * box-on-goal, % player-on-goal
+const LEVELS=[
+  [
+    "#######",
+    "#_____#",
+    "#_@$._#",
+    "#_____#",
+    "#######"
+  ],
+  [
+    "#######",
+    "#__.__##",
+    "#_@$__#".replace(/#/g,'#'),
+    "#_____#",
+    "#######"
+  ],
+  [
+    "#########",
+    "#_______#",
+    "#__$__$#".slice(0,9),
+    "#___@___#",
+    "#__._._.#",
+    "#_______#",
+    "#########"
+  ],
+  [
+    "###########",
+    "#________#",
+    "#_$$$_$_.#".slice(0,11),
+    "#___@____#",
+    "#_$_.$__#".slice(0,11),
+    "#________#",
+    "###########"
+  ],
+  [
+    "#############",
+    "#_________##",
+    "#_$$_$_$_.#".slice(0,13),
+    "#___@_____#".slice(0,13),
+    "#_$_.$._.#".slice(0,13),
+    "#_________##".slice(0,13),
+    "#############"
+  ]
+];
+
+// Fix level 2 properly
+LEVELS[1]=[
+  "#######",
+  "#__._##",
+  "#_@$__#",
+  "#_____#",
+  "#######"
+];
+// Actually let me redo all levels carefully with exact char counts:
+
+LEVELS=[
+  // Level 1: 7 wide x 5 tall - push box right
+  [
+    "#######",
+    "#_____#",
+    "#_@$._#",
+    "#_____#",
+    "#######"
+  ],
+  // Level 2: 7 wide x 5 tall - push box up (L path)
+  [
+    "#######",
+    "#__._##",
+    "#_@$__#",
+    "#_____#",
+    "#######"
+  ],
+  // Level 3: 9 wide x 7 tall - two boxes down
+  [
+    "#########",
+    "#_______#",
+    "#__$__$#".slice(0,9),
+    "#___@___#",
+    "#__._._.#",
+    "#_______#",
+    "#########"
+  ],
+  // Level 4: 11 wide x 7 tall - three boxes
+  [
+    "###########",
+    "#________#",
+    "#_$_.$_$#".slice(0,11),
+    "#___@____#",
+    "#_$_.$_$#".slice(0,11),
+    "#________#",
+    "###########"
+  ]
+];
+
+// I need to be very careful with string lengths. Let me define them as arrays of chars:
+function makeLevel(rows){return rows.map(r=>r.split('').filter(c=>' #_$@.*%'.includes(c)||c==='_') );}
+
+// Actually let me just hardcode the parsed levels directly:
+function parseLevel(strs){
+  const walls=[],goals=[],boxes=[];
+  let px=0,py=0;
+  const grid={};
+  for(let y=0;y<strs.length;y++){
+    for(let x=0;x<strs[y].length;x++){
+      const c=strs[y][x];
+      if(c==='#')walls.push([x,y]);
+      else if(c==='@'){px=x;py=y;}
+      else if(c==='$'){boxes.push({x:x,y:y});}
+      else if(c==='*'){boxes.push({x:x,y:y});goals.push([x,y]);}
+      else if(c==='.'){goals.push([x,y]);}
+      else if(c==='_'){grid[x+','+y]=true;}
+      else if(c===' '){}
+    }
+  }
+  return{walls,goals,boxes,px,py,grid};
+}
+
+// Let me define levels very carefully with exact strings:
+const RAW_LEVELS=[
+  // Level 1: 7x5
+  [
+    "#######",
+    "#_____#",
+    "#_@$._#",
+    "#_____#",
+    "#######"
+  ],
+  // Level 2: 7x5  
+  [
+    "#######",
+    "#__._##",
+    "#_@$__#",
+    "#_____#",
+    "#######"
+  ],
+  // Level 3: 9x7
+  [
+    "#########",
+    "#_______#",
+    "#__$__$#".substring(0,9),
+    "#___@___#",
+    "#__._._.#",
+    "#_______#",
+    "#########"
+  ],
+  // Level 4: 11x7
+  [
+    "###########",
+    "#________#",
+    "#_$_.$_$#".substring(0,11),
+    "#___@____#",
+    "#_$_.$_$#".substring(0,11),
+    "#________#",
+    "###########"
+  ]
+];
+
+// Verify lengths and fix:
+function validateLevel(lv){
+  const w=lv[0].length;
+  for(let i=0;i<lv.length;i++){
+    if(lv[i].length!==w) lv[i]=lv[i].substring(0,w).padEnd(w,'#');
+  }
+  return lv;
+}
+RAW_LEVELS.forEach(v=>validateLevel(v));
+
+// Game state
+let gameState='start'; // 'start','playing','levelComplete','gameWin'
+let curLevel=0;
+let walls,goals,boxes,floorSet;
+let px,py;
+let animT=1; // 1=done moving, <1=animating
+let ax,ay,bx,by; // from/to for animation
+let particles=[];
+let moveCount=0;
+
+function loadLevel(i){
+  const p=parseLevel(RAW_LEVELS[i]);
+  walls=p.walls;goals=p.goals;boxes=p.boxes.map(b=>({...b}));
+  px=p.px;py=p.py;
+  floorSet=p.grid;
+  animT=1;moveCount=0;particles=[];
+}
+
+// Isometric helpers
+const TW=64,TH=32,CH=32;
+function isoX(gx,gy){return(gx-gy)*TW/2;}
+function isoY(gx,gy){return(gx+gy)*TH/2;}
+
+function getCamOffset(){
+  // Center the level view
+  let minX=999,maxX=-999,minY=999,maxY=-999;
+  const all=[];
+  walls.forEach(w=>all.push(w));
+  goals.forEach(g=>all.push(g));
+  boxes.forEach(b=>all.push([b.x,b.y]));
+  all.push([px,py]);
+  for(const[gx,gy]of all){
+    const sx=isoX(gx,gy),sy=isoY(gx,gy);
+    minX=Math.min(minX,sx-TW/2);maxX=Math.max(maxX,sx+TW/2);
+    minY=Math.min(minY,sy-CH);maxY=Math.max(maxY,sy+TH/2);
+  }
+  const cw=maxX-minX,ch=maxY-minY;
+  const scale=Math.min((W*0.85)/cw,(H*0.75)/ch,1.5);
+  const cx=(minX+maxX)/2,cy=(minY+maxY)/2;
+  return{ox:W/2-cx*scale,oy:H/2-cy*scale,scale};
+}
+
+function drawCube(sx,sy,h,topC,leftC,rightC){
+  // sx,sy is the "back" corner (topmost) of the base on screen
+  const hw=TW/2,hh=TH/2;
+  // Top face
+  ctx.beginPath();
+  ctx.moveTo(sx,sy-h);
+  ctx.lineTo(sx+hw,sy-h+hh);
+  ctx.lineTo(sx,sy-h+hh*2);
+  ctx.lineTo(sx-hw,sy-h+hh);
+  ctx.closePath();
+  ctx.fillStyle=topC;ctx.fill();
+  // Right face
+  ctx.beginPath();
+  ctx.moveTo(sx+hw,sy-h+hh);
+  ctx.lineTo(sx,sy-h+hh*2);
+  ctx.lineTo(sx,sy+hh*2);
+  ctx.lineTo(sx+hw,sy+hh);
+  ctx.closePath();
+  ctx.fillStyle=rightC;ctx.fill();
+  // Left face
+  ctx.beginPath();
+  ctx.moveTo(sx-hw,sy-h+hh);
+  ctx.lineTo(sx,sy-h+hh*2);
+  ctx.lineTo(sx,sy+hh*2);
+  ctx.lineTo(sx-hw,sy+hh);
+  ctx.closePath();
+  ctx.fillStyle=leftC;ctx.fill();
+}
+
+function drawFloorTile(sx,sy){
+  const hw=TW/2,hh=TH/2;
+  ctx.beginPath();
+  ctx.moveTo(sx,sy);
+  ctx.lineTo(sx+hw,sy+hh);
+  ctx.lineTo(sx,sy+hh*2);
+  ctx.lineTo(sx-hw,sy+hh);
+  ctx.closePath();
+  ctx.fillStyle='#1e1e3a';ctx.fill();
+  ctx.strokeStyle='#2a2a4a';ctx.lineWidth=1;ctx.stroke();
+}
+
+function drawGoalTile(sx,sy,active){
+  const hw=TW/2,hh=TH/2;
+  ctx.beginPath();
+  ctx.moveTo(sx,sy);
+  ctx.lineTo(sx+hw,sy+hh);
+  ctx.lineTo(sx,sy+hh*2);
+  ctx.lineTo(sx-hw,sy+hh);
+  ctx.closePath();
+  const glow=active?0.3:0.6;
+  ctx.fillStyle=`rgba(50,230,120,${glow})`;ctx.fill();
+  ctx.strokeStyle=`rgba(50,230,120,${glow+0.2})`;ctx.lineWidth=2;ctx.stroke();
+  // Inner diamond
+  const ihw=hw*0.5,ihh=hh*0.5;
+  ctx.beginPath();
+  ctx.moveTo(sx,sy+hh-ihh);
+  ctx.lineTo(sx+ihw,sy+hh);
+  ctx.lineTo(sx,sy+hh+ihh);
+  ctx.lineTo(sx-ihw,sy+hh);
+  ctx.closePath();
+  ctx.fillStyle=`rgba(50,230,120,${glow*0.5})`;ctx.fill();
+}
+
+function render(){
+  ctx.clearRect(0,0,W,H);
+  
+  // Background gradient
+  const bg=ctx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0,'#0a0a1a');bg.addColorStop(1,'#151530');
+  ctx.fillStyle=bg;ctx.fillRect(0,0,W,H);
+  
+  if(gameState==='start'){drawStartScreen();return;}
+  
+  const cam=getCamOffset();
+  const{ox,oy,scale}=cam;
+  
+  ctx.save();
+  ctx.translate(ox,oy);
+  ctx.scale(scale,scale);
+  
+  // Collect all drawable objects with depth
+  const drawables=[];
+  
+  // Floor tiles
+  for(const k of Object.keys(floorSet)){
+    const[x,y]=k.split(',').map(Number);
+    drawables.push({depth:x+y,type:'floor',x,y});
+  }
+  // Also add floor under walls, boxes, goals
+  for(const[x,y]of walls)drawables.push({depth:x+y,type:'floor',x,y});
+  for(const[x,y]of goals)drawables.push({depth:x+y,type:'floor',x,y});
+  for(const b of boxes)drawables.push({depth:b.x+b.y,type:'floor',x:b.x,y:b.y});
+  
+  // Goals
+  for(const[x,y]of goals){
+    const hasBox=boxes.some(b=>b.x===x&&b.y===y);
+    drawables.push({depth:x+y+0.1,type:'goal',x,y,active:!hasBox});
+  }
+  
+  // Walls
+  for(const[x,y]of walls)drawables.push({depth:x+y+0.2,type:'wall',x,y});
+  
+  // Boxes
+  for(const b of boxes)drawables.push({depth:b.x+b.y+0.3,type:'box',x:b.x,y:b.y});
+  
+  // Player (with animation)
+  let dispX=px,dispY=py;
+  if(animT<1){
+    const t=1-animT;
+    const ease=t*t*(3-2*t); // smoothstep
+    dispX=ax+(bx-ax)*ease;
+    dispY=ay+(by-ay)*ease;
+  }
+  drawables.push({depth:dispX+dispY+0.4,type:'player',x:dispX,y:dispY});
+  
+  // Sort by depth
+  drawables.sort((a,b)=>a.depth-b.depth);
+  
+  // Draw all
+  for(const d of drawables){
+    const sx=isoX(d.x,d.y),sy=isoY(d.x,d.y);
+    if(d.type==='floor'){drawFloorTile(sx,sy);}
+    else if(d.type==='goal'){drawGoalTile(sx,sy,d.active);}
+    else if(d.type==='wall'){drawCube(sx,sy,CH*0.7,'#5a5a7a','#4a4a6a','#525272');}
+    else if(d.type==='box'){
+      const onGoal=goals.some(g=>g[0]===Math.round(d.x)&&g[1]===Math.round(d.y));
+      if(onGoal)drawCube(sx,sy,CH*0.5,'#30e860','#20c050','#28d858');
+      else drawCube(sx,sy,CH*0.5,'#e8a030','#c08020','#d89028');
+    }
+    else if(d.type==='player'){
+      const bob=Math.sin(Date.now()*0.005)*2;
+      drawCube(sx,sy,CH*0.6+bob,'#40c0ff','#30a0e0','#38b8f0');
+      // Eyes
+      ctx.fillStyle='#fff';
+      ctx.fillRect(sx-4,sy-CH*0.6+bob+4,3,3);
+      ctx.fillRect(sx+2,sy-CH*0.6+bob+4,3,3);
+    }
+  }
+  
+  // Particles
+  for(const p of particles){
+    ctx.globalAlpha=p.life;
+    ctx.fillStyle=p.color;
+    ctx.beginPath();
+    ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha=1;
+  
+  ctx.restore();
+  
+  // HUD
+  if(gameState==='playing'||gameState==='levelComplete'){
+    drawHUD();
+  }
+}
+
+function drawStartScreen(){
+  ctx.fillStyle='#0a0a1a';ctx.fillRect(0,0,W,H);
+  
+  // Title with 3D effect
+  const cx=W/2,cy=H/2-40;
+  ctx.save();
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  
+  // Shadow
+  ctx.font=`bold ${Math.min(64,W*0.08)}px 'Segoe UI',sans-serif`;
+  ctx.fillStyle='#1a1a3a';
+  ctx.fillText('3D SOKOBAN',cx+3,cy+3);
+  ctx.fillStyle='#40c0ff';
+  ctx.fillText('3D SOKOBAN',cx,cy);
+  
+  // Subtitle
+  ctx.font=`${Math.min(20,W*0.03)}px 'Segoe UI',sans-serif`;
+  ctx.fillStyle='#8888cc';
+  ctx.fillText('Push all boxes onto goal tiles!',cx,cy+50);
+  
+  // Controls
+  const ctrlY=cy+110;
+  ctx.font=`${Math.min(16,W*0.022)}px 'Segoe UI',sans-serif`;
+  ctx.fillStyle='#aaa';
+  ctx.fillText('Controls: WASD / Arrow Keys to move',cx,ctrlY);
+  ctx.fillText('Push boxes (orange) onto green goal tiles',cx,ctrlY+28);
+  
+  // Start prompt
+  const pulse=0.5+Math.sin(Date.now()*0.003)*0.5;
+  ctx.font=`${Math.min(24,W*0.03)}px 'Segoe UI',sans-serif`;
+  ctx.fillStyle=`rgba(255,255,255,${pulse})`;
+  ctx.fillText('Press ENTER to Start',cx,cy+180);
+  
+  // Decorative cubes
+  const t=Date.now()*0.001;
+  for(let i=0;i<6;i++){
+    const angle=t*0.5+i*Math.PI/3;
+    const rx=Math.cos(angle)*80,ry=Math.sin(angle)*30;
+    drawCubeAt(cx+rx,cy-20+ry,20,'#40c0ff','#30a0e0','#38b8f0');
+  }
+  
+  ctx.restore();
+}
+
+function drawCubeAt(sx,sy,h,topC,leftC,rightC){
+  const hw=TW/2*0.3,hh=TH/2*0.3;
+  ctx.beginPath();ctx.moveTo(sx,sy-h);ctx.lineTo(sx+hw,sy-h+hh);ctx.lineTo(sx,sy-h+hh*2);ctx.lineTo(sx-hw,sy-h+hh);ctx.closePath();ctx.fillStyle=topC;ctx.fill();
+  ctx.beginPath();ctx.moveTo(sx+hw,sy-h+hh);ctx.lineTo(sx,sy-h+hh*2);ctx.lineTo(sx,sy);ctx.lineTo(sx+hw,sy+hh);ctx.closePath();ctx.fillStyle=rightC;ctx.fill();
+  ctx.beginPath();ctx.moveTo(sx-hw,sy-h+hh);ctx.lineTo(sx,sy-h+hh*2);ctx.lineTo(sx,sy);ctx.lineTo(sx-hw,sy+hh);ctx.closePath();ctx.fillStyle=leftC;ctx.fill();
+}
+
+function drawHUD(){
+  ctx.save();
+  ctx.textAlign='left';ctx.textBaseline='top';
+  ctx.font=`bold ${Math.min(18,W*0.025)}px 'Segoe UI',sans-serif`;
+  ctx.fillStyle='#40c0ff';
+  ctx.fillText(`Level ${curLevel+1}/${RAW_LEVELS.length}`,15,15);
+  ctx.font=`${Math.min(14,W*0.02)}px 'Segoe UI',sans-serif`;
+  ctx.fillStyle='#888';
+  ctx.fillText(`Moves: ${moveCount}`,15,38);
+  
+  // Restart hint
+  ctx.textAlign='right';
+  ctx.font=`${Math.min(12,W*0.016)}px 'Segoe UI',sans-serif`;
+  ctx.fillStyle='#666';
+  ctx.fillText('R = Restart Level',W-15,15);
+  ctx.restore();
+}
+
+function drawLevelComplete(){
+  // Overlay
+  ctx.fillStyle='rgba(10,10,26,0.8)';ctx.fillRect(0,0,W,H);
+  const cx=W/2,cy=H/2;
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  
+  if(gameState==='levelComplete'){
+    ctx.font=`bold ${Math.min(40,W*0.06)}px 'Segoe UI',sans-serif`;
+    ctx.fillStyle='#30e860';
+    ctx.fillText('Level Complete!',cx,cy-20);
+    ctx.font=`${Math.min(20,W*0.028)}px 'Segoe UI',sans-serif`;
+    ctx.fillStyle='#aaa';
+    ctx.fillText(`Moves: ${moveCount}`,cx,cy+30);
+    const pulse=0.5+Math.sin(Date.now()*0.004)*0.5;
+    ctx.font=`${Math.min(18,W*0.025)}px 'Segoe UI',sans-serif`;
+    ctx.fillStyle=`rgba(255,255,255,${pulse})`;
+    ctx.fillText('Press ENTER for next level',cx,cy+70);
+  } else if(gameState==='gameWin'){
+    ctx.font=`bold ${Math.min(40,W*0.06)}px 'Segoe UI',sans-serif`;
+    ctx.fillStyle='#e8a030';
+    ctx.fillText('🎉 All Levels Complete! 🎉',cx,cy-20);
+    ctx.font=`${Math.min(20,W*0.028)}px 'Segoe UI',sans-serif`;
+    ctx.fillStyle='#aaa';
+    ctx.fillText('You are a Sokoban Master!',cx,cy+30);
+    const pulse=0.5+Math.sin(Date.now()*0.004)*0.5;
+    ctx.font=`${Math.min(18,W*0.025)}px 'Segoe UI',sans-serif`;
+    ctx.fillStyle=`rgba(255,255,255,${pulse})`;
+    ctx.fillText('Press R to play again',cx,cy+70);
+  }
+}
+
+// Input
+let keys={};
+window.addEventListener('keydown',e=>{
+  if(e.repeat)return;
+  initAudio();
+  
+  if(gameState==='start'){
+    if(e.key==='Enter'||e.key===' '){startGame();}
+    return;
+  }
+  
+  if(gameState==='levelComplete'){
+    if(e.key==='Enter'||e.key===' '){nextLevel();}
+    return;
+  }
+  
+  if(gameState==='gameWin'){
+    if(e.key==='r'||e.key==='R'){startGame();}
+    return;
+  }
+  
+  if(gameState!=='playing')return;
+  
+  let dx=0,dy=0;
+  if(e.key==='w'||e.key==='W'||e.key==='ArrowUp'){dx=0;dy=-1;}
+  else if(e.key==='s'||e.key==='S'||e.key==='ArrowDown'){dx=0;dy=1;}
+  else if(e.key==='a'||e.key==='A'||e.key==='ArrowLeft'){dx=-1;dy=0;}
+  else if(e.key==='d'||e.key==='D'||e.key==='ArrowRight'){dx=1;dy=0;}
+  else if(e.key==='r'||e.key==='R'){loadLevel(curLevel);return;}
+  
+  if(dx||dy)tryMove(dx,dy);
+});
+
+function tryMove(dx,dy){
+  if(animT<1)return; // Still animating
+  
+  const nx=px+dx,ny=py+dy;
+  
+  // Check wall
+  if(walls.some(w=>w[0]===nx&&w[1]===ny)){sfxBump();return;}
+  
+  // Check box
+  const bi=boxes.findIndex(b=>b.x===nx&&b.y===ny);
+  if(bi!==-1){
+    const bxx=nx+dx,byy=ny+dy;
+    // Can't push into wall or another box
+    if(walls.some(w=>w[0]===bxx&&w[1]===byy)){sfxBump();return;}
+    if(boxes.some(b=>b.x===bxx&&b.y===byy)){sfxBump();return;}
+    // Push!
+    ax=px;ay=py;bx=nx;by=ny;animT=0;
+    boxes[bi].x=bxx;boxes[bi].y=byy;
+    px=nx;py=ny;moveCount++;
+    sfxPush();
+    // Check if box landed on goal
+    if(goals.some(g=>g[0]===bxx&&g[1]===byy)){
+      setTimeout(()=>{sfxGoal();spawnParticles(isoX(bxx,byy),isoY(bxx,byy),'#30e860');},150);
+    }
+    return;
+  }
+  
+  // Walk
+  ax=px;ay=py;bx=nx;by=ny;animT=0;
+  px=nx;py=ny;moveCount++;
+  sfxMove();
+  
+  // Check win
+  setTimeout(checkWin,180);
+}
+
+function checkWin(){
+  const allOnGoals=boxes.every(b=>goals.some(g=>g[0]===b.x&&g[1]===b.y));
+  if(allOnGoals){
+    gameState='levelComplete';
+    sfxWin();
+    spawnParticles(W/2,H/2,'#30e860');
+    spawnParticles(W/2,H/2,'#e8a030');
+    spawnParticles(W/2,H/2,'#40c0ff');
+  }
+}
+
+function startGame(){
+  curLevel=0;
+  loadLevel(0);
+  gameState='playing';
+}
+
+function nextLevel(){
+  curLevel++;
+  if(curLevel>=RAW_LEVELS.length){gameState='gameWin';return;}
+  loadLevel(curLevel);
+  gameState='playing';
+}
+
+function spawnParticles(sx,sy,color){
+  for(let i=0;i<20;i++){
+    const angle=Math.random()*Math.PI*2;
+    const speed=1+Math.random()*3;
+    particles.push({
+      x:sx,y:sy-20,
+      vx:Math.cos(angle)*speed,vy:Math.sin(angle)*speed-2,
+      life:1,r:2+Math.random()*4,color
+    });
+  }
+}
+
+// Particles in screen space for overlay effects
+function updateParticles(){
+  for(const p of particles){
+    p.x+=p.vx;p.y+=p.vy;
+    p.vy+=0.15;
+    p.life-=0.015;
+  }
+  particles=particles.filter(p=>p.life>0);
+}
+
+// Main loop
+let lastTime=0;
+function gameLoop(time){
+  const dt=(time-lastTime)/1000;lastTime=time;
+  
+  if(animT<1){animT=Math.min(1,animT+dt/0.15);}
+  
+  updateParticles();
+  
+  render();
+  
+  if(gameState==='levelComplete'||gameState==='gameWin'){drawLevelComplete();}
+  
+  requestAnimationFrame(gameLoop);
+}
+
+loadLevel(0);
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
