@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Platform Push - Platformer Sokoban</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', sans-serif; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    scale = Math.min(W / 800, H / 600);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const TILE = 40;
+const GRAVITY = 0.6;
+const JUMP_VEL = -12;
+const MOVE_SPEED = 4;
+const FRICTION = 0.85;
+
+let gameState = 'start'; // start, playing, won, allwon
+let currentLevel = 0;
+let player = { x: 0, y: 0, vx: 0, vy: 0, w: 32, h: 32, onGround: false, facing: 1 };
+let boxes = [];
+let targets = [];
+let grid = [];
+let wonLevel = false;
+let winTimer = 0;
+let particles = [];
+let audioCtx = null;
+
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    
+    if (type === 'jump') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(300, audioCtx.currentTime);
+        osc.frequency.linearRampToValueAtTime(600, audioCtx.currentTime + 0.1);
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.15);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.15);
+    } else if (type === 'push') {
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.1);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.1);
+    } else if (type === 'place') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(500, audioCtx.currentTime);
+        osc.frequency.linearRampToValueAtTime(800, audioCtx.currentTime + 0.2);
+        gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
+        gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.3);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.3);
+    } else if (type === 'win') {
+        osc.type = 'sine';
+        const notes = [523, 659, 784, 1047];
+        notes.forEach((f, i) => {
+            osc.frequency.setValueAtTime(f, audioCtx.currentTime + i * 0.12);
+        });
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.5);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.5);
+    } else if (type === 'land') {
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(100, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.08);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.08);
+    }
+}
+
+const levels = [
+    [
+        "####################",
+        "#                  #",
+        "#                  #",
+        "#   P     B       T#",
+        "#                  #",
+        "#                  #",
+        "#                  #",
+        "####################"
+    ],
+    [
+        "######################",
+        "#                    #",
+        "#                    #",
+        "#     P      B    B  #",
+        "#         ####       #",
+        "#                    #",
+        "#   T              T #",
+        "######################"
+    ],
+    [
+        "########################",
+        "#                      #",
+        "#   P          B       #",
+        "#      #####     #######",
+        "#                      #",
+        "#   B                 #",
+        "#   T          B      #",
+        "#              T  T   #",
+        "########################"
+    ],
+    [
+        "############################",
+        "#                          #",
+        "#   P       B     B        #",
+        "#      ##               ##  #",
+        "#         B             B   #",
+        "#   T                  T   #",
+        "#              ####        #",
+        "#   T                       #",
+        "############################"
+    ],
+    [
+        "################################",
+        "#                              #",
+        "#   P         B      B        #",
+        "#       ###                   #",
+        "#           B                #",
+        "#   B                  B     #",
+        "#              ####          #",
+        "#   T   T          T    T   #",
+        "################################"
+    ]
+];
+
+function loadLevel(idx) {
+    if (idx >= levels.length) idx = 0;
+    currentLevel = idx;
+    const lvl = levels[idx];
+    grid = [];
+    boxes = [];
+    targets = [];
+    particles = [];
+    wonLevel = false;
+    winTimer = 0;
+
+    for (let r = 0; r < lvl.length; r++) {
+        grid[r] = [];
+        for (let c = 0; c < lvl[r].length; c++) {
+            const ch = lvl[r][c];
+            if (ch === '#') grid[r][c] = 1;
+            else grid[r][c] = 0;
+            
+            if (ch === 'P') { player.x = c * TILE + 4; player.y = r * TILE + 4; }
+            if (ch === 'B') boxes.push({ x: c * TILE + 4, y: r * TILE + 4, onTarget: false });
+            if (ch === 'T') targets.push({ x: c * TILE, y: r * TILE });
+        }
+    }
+    
+    player.vx = 0;
+    player.vy = 0;
+    player.onGround = false;
+}
+
+function isSolid(col, row) {
+    if (row < 0 || row >= grid.length) return true;
+    if (col < 0 || col >= (grid[0] ? grid[0].length : 0)) return true;
+    return grid[row][col] === 1;
+}
+
+function isBoxAt(px, py) {
+    for (let b of boxes) {
+        const bc = Math.floor((px + player.w/2) / TILE);
+        const br = Math.floor((py + player.h/2) / TILE);
+        const bb = Math.floor((b.x + 16) / TILE);
+        const bb2 = Math.floor((b.y + 16) / TILE);
+        if (bc === bb && br === bb2) return b;
+    }
+    return null;
+}
+
+function boxAt(col, row) {
+    for (let b of boxes) {
+        const bc = Math.floor((b.x + 16) / TILE);
+        const br = Math.floor((b.y + 16) / TILE);
+        if (bc === col && br === row) return b;
+    }
+    return null;
+}
+
+function update() {
+    if (gameState !== 'playing' && gameState !== 'won') return;
+    
+    if (wonLevel) {
+        winTimer++;
+        if (winTimer > 90) {
+            currentLevel++;
+            if (currentLevel >= levels.length) {
+                gameState = 'allwon';
+            } else {
+                loadLevel(currentLevel);
+                gameState = 'playing';
+            }
+        }
+        return;
+    }
+
+    // Player physics
+    if (keys['ArrowLeft'] || keys['KeyA']) { player.vx -= 0.8; player.facing = -1; }
+    if (keys['ArrowRight'] || keys['KeyD']) { player.vx += 0.8; player.facing = 1; }
+    if ((keys['ArrowUp'] || keys['KeyW'] || keys['Space']) && player.onGround) {
+        player.vy = JUMP_VEL;
+        player.onGround = false;
+        playSound('jump');
+    }
+
+    player.vx *= FRICTION;
+    if (Math.abs(player.vx) > 6) player.vx = Math.sign(player.vx) * 6;
+    player.vy += GRAVITY;
+    if (player.vy > 15) player.vy = 15;
+
+    // Move X
+    let newX = player.x + player.vx;
+    let colL = Math.floor(newX / TILE);
+    let colR = Math.floor((newX + player.w - 1) / TILE);
+    let rowT = Math.floor(player.y / TILE);
+    let rowB = Math.floor((player.y + player.h - 1) / TILE);
+
+    if (player.vx > 0) {
+        let col = Math.floor((newX + player.w) / TILE);
+        for (let r = rowT; r <= rowB; r++) {
+            if (isSolid(col, r)) {
+                newX = col * TILE - player.w;
+                // Check box push
+                const box = boxAt(col, Math.floor((player.y + player.h/2) / TILE));
+                if (box) {
+                    const bc = Math.floor((box.x + 16) / TILE);
+                    const nextCol = bc + 1;
+                    if (!isSolid(nextCol, bc !== -1 ? Math.floor((box.y+16)/TILE) : rowT) && !boxAt(nextCol, Math.floor((box.y+16)/TILE))) {
+                        box.x += TILE;
+                        playSound('push');
+                    }
+                }
+                player.vx = 0;
+                break;
+            }
+        }
+    } else if (player.vx < 0) {
+        let col = Math.floor(newX / TILE);
+        for (let r = rowT; r <= rowB; r++) {
+            if (isSolid(col, r)) {
+                newX = (col + 1) * TILE;
+                const box = boxAt(col, Math.floor((player.y + player.h/2) / TILE));
+                if (box) {
+                    const bc = Math.floor((box.x + 16) / TILE);
+                    const nextCol = bc - 1;
+                    if (!isSolid(nextCol, Math.floor((box.y+16)/TILE)) && !boxAt(nextCol, Math.floor((box.y+16)/TILE))) {
+                        box.x -= TILE;
+                        playSound('push');
+                    }
+                }
+                player.vx = 0;
+                break;
+            }
+        }
+    }
+    player.x = newX;
+
+    // Move Y
+    let newY = player.y + player.vy;
+    if (player.vy > 0) {
+        let row = Math.floor((newY + player.h) / TILE);
+        let colC = Math.floor((player.x + player.w/2) / TILE);
+        if (isSolid(colC, row)) {
+            newY = row * TILE - player.h;
+            if (!player.onGround) playSound('land');
+            player.vy = 0;
+            player.onGround = true;
+        } else {
+            player.onGround = false;
+        }
+    } else if (player.vy < 0) {
+        let row = Math.floor(newY / TILE);
+        let colC = Math.floor((player.x + player.w/2) / TILE);
+        if (isSolid(colC, row)) {
+            newY = (row + 1) * TILE;
+            player.vy = 0;
+        }
+    }
+    player.y = newY;
+
+    // Update boxes - check targets and gravity
+    for (let b of boxes) {
+        b.onTarget = false;
+        const bc = Math.floor((b.x + 16) / TILE);
+        const br = Math.floor((b.y + 16) / TILE);
+        for (let t of targets) {
+            if (Math.floor(t.x / TILE) === bc && Math.floor(t.y / TILE) === br) {
+                b.onTarget = true;
+            }
+        }
+        // Box gravity - keep boxes on ground
+        const boxRow = Math.floor((b.y + 36) / TILE);
+        if (!isSolid(Math.floor((b.x+16)/TILE), boxRow)) {
+            b.y += GRAVITY * 2;
+        } else {
+            const snapY = (boxRow - 1) * TILE + 4;
+            if (Math.abs(b.y - snapY) < 5) b.y = snapY;
+        }
+    }
+
+    // Check win
+    if (boxes.length > 0 && boxes.every(b => b.onTarget)) {
+        wonLevel = true;
+        gameState = 'won';
+        playSound('win');
+        spawnWinParticles();
+    }
+}
+
+function spawnWinParticles() {
+    for (let i = 0; i < 30; i++) {
+        particles.push({
+            x: player.x + player.w/2,
+            y: player.y,
+            vx: (Math.random() - 0.5) * 8,
+            vy: -Math.random() * 10 - 3,
+            life: 60 + Math.random() * 30,
+            color: `hsl(${Math.random() * 360}, 100%, 60%)`
+        });
+    }
+}
+
+function updateParticles() {
+    for (let p of particles) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.3;
+        p.life--;
+    }
+    particles = particles.filter(p => p.life > 0);
+}
+
+function draw() {
+    ctx.clearRect(0, 0, W, H);
+    
+    // Background gradient
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+    bgGrad.addColorStop(0, '#16213e');
+    bgGrad.addColorStop(1, '#0f3460');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    if (gameState === 'start') {
+        drawStartScreen();
+        return;
+    }
+    if (gameState === 'allwon') {
+        drawAllWon();
+        return;
+    }
+
+    // Calculate offset to center level
+    const lvlW = grid[0].length * TILE;
+    const lvlH = grid.length * TILE;
+    const offX = (W - lvlW * scale) / 2;
+    const offY = (H - lvlH * scale) / 2;
+
+    ctx.save();
+    ctx.translate(offX, offY);
+    ctx.scale(scale, scale);
+
+    // Draw grid
+    for (let r = 0; r < grid.length; r++) {
+        for (let c = 0; c < grid[r].length; c++) {
+            if (grid[r][c] === 1) {
+                const x = c * TILE;
+                const y = r * TILE;
+                
+                // Tile with depth
+                ctx.fillStyle = '#4a5568';
+                ctx.fillRect(x, y, TILE, TILE);
+                ctx.fillStyle = '#6b7b8d';
+                ctx.fillRect(x + 2, y + 2, TILE - 4, TILE - 4);
+                
+                // Top highlight
+                if (r === 0 || grid[r-1][c] !== 1) {
+                    ctx.fillStyle = '#a0aec0';
+                    ctx.fillRect(x, y, TILE, 4);
+                }
+            }
+        }
+    }
+
+    // Draw targets
+    for (let t of targets) {
+        const x = t.x + TILE/2;
+        const y = t.y + TILE/2;
+        ctx.beginPath();
+        ctx.arc(x, y, 14, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(72, 187, 255, 0.3)';
+        ctx.fill();
+        ctx.strokeStyle = '#48bfff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        // Pulsing effect
+        const pulse = Math.sin(Date.now() * 0.005) * 3;
+        ctx.beginPath();
+        ctx.arc(x, y, 8 + pulse, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(72, 187, 255, 0.5)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+    }
+
+    // Draw boxes
+    for (let b of boxes) {
+        const x = b.x;
+        const y = b.y;
+        
+        if (b.onTarget) {
+            ctx.fillStyle = '#48bb78';
+            ctx.shadowColor = '#48bb78';
+            ctx.shadowBlur = 10;
+        } else {
+            ctx.fillStyle = '#ed8936';
+            ctx.shadowColor = 'transparent';
+            ctx.shadowBlur = 0;
+        }
+        
+        // Box body
+        ctx.fillRect(x + 2, y + 2, 32, 32);
+        ctx.fillStyle = b.onTarget ? '#68d391' : '#f6ad55';
+        ctx.fillRect(x + 4, y + 4, 28, 28);
+        
+        // Box cross pattern
+        ctx.strokeStyle = b.onTarget ? '#276749' : '#c05621';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x + 8, y + 8);
+        ctx.lineTo(x + 32, y + 32);
+        ctx.moveTo(x + 32, y + 8);
+        ctx.lineTo(x + 8, y + 32);
+        ctx.stroke();
+        
+        ctx.shadowBlur = 0;
+    }
+
+    // Draw player
+    const px = player.x;
+    const py = player.y;
+    
+    // Body
+    ctx.fillStyle = '#f6e05e';
+    ctx.fillRect(px + 4, py + 8, 24, 24);
+    
+    // Head
+    ctx.fillStyle = '#fefcbf';
+    ctx.beginPath();
+    ctx.arc(px + 16, py + 10, 12, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Eyes
+    ctx.fillStyle = '#1a202c';
+    const eyeOff = player.facing * 3;
+    ctx.beginPath();
+    ctx.arc(px + 12 + eyeOff, py + 8, 2.5, 0, Math.PI * 2);
+    ctx.arc(px + 20 + eyeOff, py + 8, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Smile
+    ctx.strokeStyle = '#1a202c';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(px + 16 + eyeOff, py + 13, 4, 0.2, Math.PI - 0.2);
+    ctx.stroke();
+
+    // Particles
+    for (let p of particles) {
+        ctx.globalAlpha = p.life / 90;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+    }
+    ctx.globalAlpha = 1;
+
+    // Level indicator
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.font = '14px monospace';
+    ctx.fillText(`Level ${currentLevel + 1}/${levels.length}`, 10, 20);
+    
+    // Box status
+    const onCount = boxes.filter(b => b.onTarget).length;
+    ctx.fillText(`Boxes: ${onCount}/${boxes.length}`, 10, 40);
+
+    ctx.restore();
+
+    if (gameState === 'won') {
+        ctx.save();
+        ctx.translate(W/2, H/2);
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold ${Math.min(48*scale, 60)}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText('Level Complete!', 0, 0);
+        ctx.font = `${Math.min(20*scale, 24)}px sans-serif`;
+        ctx.fillStyle = 'rgba(255,255,255,0.7)';
+        ctx.fillText(`Next: Level ${currentLevel + 2}`, 0, 40);
+        ctx.restore();
+    }
+}
+
+function drawStartScreen() {
+    ctx.textAlign = 'center';
+    
+    // Title
+    const titleSize = Math.min(W * 0.08, 60);
+    ctx.font = `bold ${titleSize}px sans-serif`;
+    ctx.fillStyle = '#f6e05e';
+    ctx.shadowColor = '#f6e05e';
+    ctx.shadowBlur = 20;
+    ctx.fillText('PLATFORM PUSH', W/2, H * 0.3);
+    ctx.shadowBlur = 0;
+    
+    // Subtitle
+    ctx.font = `${Math.min(W*0.03, 24)}px sans-serif`;
+    ctx.fillStyle = '#a0aec0';
+    ctx.fillText('A Platformer Sokoban Game', W/2, H * 0.3 + titleSize * 0.8);
+    
+    // Instructions
+    ctx.font = `${Math.min(W*0.025, 18)}px monospace`;
+    ctx.fillStyle = '#cbd5e0';
+    const instructions = [
+        '← → / A D : Move',
+        '↑ / W / SPACE : Jump',
+        '',
+        'Push boxes onto glowing targets!',
+        'Boxes can only be pushed, not pulled.',
+        'Complete all levels to win!'
+    ];
+    instructions.forEach((line, i) => {
+        ctx.fillText(line, W/2, H * 0.45 + i * 30);
+    });
+    
+    // Start prompt
+    const blink = Math.sin(Date.now() * 0.004) > 0;
+    if (blink) {
+        ctx.font = `bold ${Math.min(W*0.03, 28)}px sans-serif`;
+        ctx.fillStyle = '#63b3ed';
+        ctx.fillText('Press ENTER or SPACE to Start', W/2, H * 0.85);
+    }
+}
+
+function drawAllWon() {
+    ctx.textAlign = 'center';
+    
+    const titleSize = Math.min(W * 0.07, 54);
+    ctx.font = `bold ${titleSize}px sans-serif`;
+    ctx.fillStyle = '#68d391';
+    ctx.shadowColor = '#68d391';
+    ctx.shadowBlur = 20;
+    ctx.fillText('🎉 ALL LEVELS COMPLETE! 🎉', W/2, H * 0.35);
+    ctx.shadowBlur = 0;
+    
+    ctx.font = `${Math.min(W*0.03, 24)}px sans-serif`;
+    ctx.fillStyle = '#e2e8f0';
+    ctx.fillText('You solved all the platform puzzles!', W/2, H * 0.5);
+    
+    const blink = Math.sin(Date.now() * 0.004) > 0;
+    if (blink) {
+        ctx.font = `bold ${Math.min(W*0.03, 26)}px sans-serif`;
+        ctx.fillStyle = '#63b3ed';
+        ctx.fillText('Press R to Play Again', W/2, H * 0.7);
+    }
+    
+    // Confetti particles
+    if (particles.length < 5) {
+        for (let i = 0; i < 3; i++) {
+            particles.push({
+                x: Math.random() * W,
+                y: -10,
+                vx: (Math.random() - 0.5) * 3,
+                vy: Math.random() * 2 + 1,
+                life: 120,
+                color: `hsl(${Math.random()*360}, 80%, 60%)`
+            });
+        }
+    }
+    for (let p of particles) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life--;
+        ctx.globalAlpha = Math.min(p.life / 60, 1);
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - 4, p.y - 4, 8, 8);
+    }
+    ctx.globalAlpha = 1;
+    particles = particles.filter(p => p.life > 0 && p.y < H + 20);
+}
+
+const keys = {};
+window.addEventListener('keydown', (e) => {
+    if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+    
+    keys[e.code] = true;
+    
+    if (gameState === 'start' && (e.code === 'Enter' || e.code === 'Space')) {
+        gameState = 'playing';
+        loadLevel(0);
+    }
+    
+    if (gameState === 'allwon' && e.code === 'KeyR') {
+        gameState = 'playing';
+        currentLevel = 0;
+        loadLevel(0);
+    }
+    
+    if (gameState === 'playing' && e.code === 'KeyR') {
+        loadLevel(currentLevel);
+    }
+    
+    // Prevent scrolling
+    if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
+        e.preventDefault();
+    }
+});
+
+window.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+});
+
+function gameLoop() {
+    update();
+    updateParticles();
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+loadLevel(0);
+gameLoop();
+</script>
+</body>
+</html>
