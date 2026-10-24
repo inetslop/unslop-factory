@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zombie Asteroids</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    
+    if (type === 'laser') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(200, audioCtx.currentTime + 0.15);
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.15);
+    } else if (type === 'explosion') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(100, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(30, audioCtx.currentTime + 0.4);
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.4);
+    } else if (type === 'hit') {
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.3);
+        gain.gain.setValueAtTime(0.4, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.3);
+    } else if (type === 'thrust') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(60, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.05, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.1);
+    } else if (type === 'zombie') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+        osc.frequency.linearRampToValueAtTime(150, audioCtx.currentTime + 0.3);
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        glow.gain = 0;
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.3);
+    }
+}
+
+// Game state
+let gameState = 'start'; // start, playing, gameover
+let score = 0;
+let highScore = 0;
+try { highScore = parseInt(localStorage.getItem('zombieAsteroidsHigh') || '0'); } catch(e) {}
+let lives = 3;
+let wave = 1;
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'start' && (e.code === 'Space' || e.code === 'Enter')) {
+        initAudio();
+        startGame();
+    } else if (gameState === 'gameover' && (e.code === 'Space' || e.code === 'Enter')) {
+        startGame();
+    }
+    e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Stars
+let stars = [];
+function initStars() {
+    stars = [];
+    for (let i = 0; i < 150; i++) {
+        stars.push({ x: Math.random() * W, y: Math.random() * H, s: Math.random() * 2 + 0.5, b: Math.random() });
+    }
+}
+initStars();
+
+// Player
+let ship = {};
+function resetShip() {
+    ship = {
+        x: W / 2, y: H / 2,
+        angle: -Math.PI / 2,
+        vx: 0, vy: 0,
+        thrusting: false,
+        invincible: 0,
+        dead: false,
+        deadTimer: 0
+    };
+}
+
+// Bullets
+let bullets = [];
+let fireCooldown = 0;
+
+// Zombies (asteroids)
+let zombies = [];
+let particles = [];
+let shockwaves = [];
+
+function spawnZombie(size, x, y, vx, vy) {
+    const radius = size * 25;
+    let zvx = vx !== undefined ? vx : (Math.random() - 0.5) * 3;
+    let zvy = vy !== undefined ? vy : (Math.random() - 0.5) * 3;
+    
+    // Some zombies track the player
+    const isTracker = size <= 1 && Math.random() < 0.3;
+    
+    // Generate wobble points for organic look
+    const points = [];
+    const numPoints = 8 + Math.floor(Math.random() * 5);
+    for (let i = 0; i < numPoints; i++) {
+        const a = (i / numPoints) * Math.PI * 2;
+        const r = radius * (0.7 + Math.random() * 0.3);
+        points.push({ angle: a, dist: r });
+    }
+    
+    // Eyes for zombie look
+    const eyes = [];
+    if (size >= 1) {
+        const numEyes = size >= 2 ? 2 : 1;
+        for (let i = 0; i < numEyes; i++) {
+            eyes.push({ ox: (Math.random() - 0.5) * radius * 0.6, oy: (Math.random() - 0.5) * radius * 0.4, r: radius * 0.12 });
+        }
+    }
+    
+    zombies.push({
+        x, y, vx: zvx, vy: zvy,
+        size, radius,
+        angle: Math.random() * Math.PI * 2,
+        rotSpeed: (Math.random() - 0.5) * 0.03,
+        points, eyes,
+        isTracker,
+        wobblePhase: Math.random() * Math.PI * 2,
+        hp: size >= 2 ? 2 : 1
+    });
+}
+
+function spawnWave() {
+    const count = 3 + wave;
+    for (let i = 0; i < count; i++) {
+        let x, y;
+        // Spawn at edges
+        const edge = Math.floor(Math.random() * 4);
+        if (edge === 0) { x = -50; y = Math.random() * H; }
+        else if (edge === 1) { x = W + 50; y = Math.random() * H; }
+        else if (edge === 2) { x = Math.random() * W; y = -50; }
+        else { x = Math.random() * W; y = H + 50; }
+        
+        const size = Math.random() < 0.3 ? 2 : 1;
+        spawnZombie(size, x, y);
+    }
+}
+
+function breakZombie(z) {
+    if (z.size >= 2) {
+        for (let i = 0; i < 4; i++) {
+            const a = (i / 4) * Math.PI * 2 + Math.random() * 0.5;
+            spawnZombie(1, z.x, z.y, Math.cos(a) * 3, Math.sin(a) * 3);
+        }
+    }
+}
+
+function addExplosion(x, y, count, color) {
+    for (let i = 0; i < count; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const speed = Math.random() * 4 + 1;
+        particles.push({
+            x, y,
+            vx: Math.cos(a) * speed,
+            vy: Math.sin(a) * speed,
+            life: 1,
+            decay: 0.02 + Math.random() * 0.02,
+            color: color || '#4f4',
+            size: Math.random() * 3 + 1
+        });
+    }
+}
+
+function addShockwave(x, y) {
+    shockwaves.push({ x, y, r: 5, maxR: 60, life: 1 });
+}
+
+function startGame() {
+    gameState = 'playing';
+    score = 0;
+    lives = 3;
+    wave = 1;
+    bullets = [];
+    zombies = [];
+    particles = [];
+    shockwaves = [];
+    resetShip();
+    spawnWave();
+}
+
+// Game loop
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = Math.min((time - lastTime) / 16.67, 3);
+    lastTime = time;
+    
+    update(dt);
+    render();
+    requestAnimationFrame(gameLoop);
+}
+
+function update(dt) {
+    if (gameState !== 'playing') return;
+    
+    // Ship
+    if (!ship.dead) {
+        if (keys['ArrowLeft'] || keys['KeyA']) ship.angle -= 0.06 * dt;
+        if (keys['ArrowRight'] || keys['KeyD']) ship.angle += 0.06 * dt;
+        
+        ship.thrusting = false;
+        if (keys['ArrowUp'] || keys['KeyW']) {
+            ship.vx += Math.cos(ship.angle) * 0.15 * dt;
+            ship.vy += Math.sin(ship.angle) * 0.15 * dt;
+            ship.thrusting = true;
+            if (Math.random() < 0.3) playSound('thrust');
+        }
+        
+        // Friction
+        ship.vx *= Math.pow(0.98, dt);
+        ship.vy *= Math.pow(0.98, dt);
+        
+        // Speed limit
+        const speed = Math.sqrt(ship.vx * ship.vx + ship.vy * ship.vy);
+        if (speed > 8) {
+            ship.vx = (ship.vx / speed) * 8;
+            ship.vy = (ship.vy / speed) * 8;
+        }
+        
+        ship.x += ship.vx * dt;
+        ship.y += ship.vy * dt;
+        
+        // Wrap
+        if (ship.x < -20) ship.x = W + 20;
+        if (ship.x > W + 20) ship.x = -20;
+        if (ship.y < -20) ship.y = H + 20;
+        if (ship.y > H + 20) ship.y = -20;
+        
+        // Fire
+        fireCooldown -= dt;
+        if ((keys['Space'] || keys['KeyF']) && fireCooldown <= 0) {
+            const bx = ship.x + Math.cos(ship.angle) * 15;
+            const by = ship.y + Math.sin(ship.angle) * 15;
+            bullets.push({
+                x: bx, y: by,
+                vx: Math.cos(ship.angle) * 8 + ship.vx * 0.3,
+                vy: Math.sin(ship.angle) * 8 + ship.vy * 0.3,
+                life: 45
+            });
+            fireCooldown = 12;
+            playSound('laser');
+        }
+        
+        if (ship.invincible > 0) ship.invincible -= dt;
+    } else {
+        ship.deadTimer -= dt;
+        if (ship.deadTimer <= 0) {
+            if (lives <= 0) {
+                gameState = 'gameover';
+                try {
+                    if (score > highScore) {
+                        highScore = score;
+                        localStorage.setItem('zombieAsteroidsHigh', highScore);
+                    }
+                } catch(e) {}
+            } else {
+                resetShip();
+            }
+        }
+    }
+    
+    // Bullets
+    for (let i = bullets.length - 1; i >= 0; i--) {
+        const b = bullets[i];
+        b.x += b.vx * dt;
+        b.y += b.vy * dt;
+        b.life -= dt;
+        
+        if (b.x < -10 || b.x > W + 10 || b.y < -10 || b.y > H + 10) {
+            bullets.splice(i, 1);
+            continue;
+        }
+        if (b.life <= 0) {
+            bullets.splice(i, 1);
+            continue;
+        }
+    }
+    
+    // Zombies
+    for (let i = zombies.length - 1; i >= 0; i--) {
+        const z = zombies[i];
+        
+        if (z.isTracker && !ship.dead) {
+            const dx = ship.x - z.x;
+            const dy = ship.y - z.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > 0) {
+                z.vx += (dx / dist) * 0.02 * dt;
+                z.vy += (dy / dist) * 0.02 * dt;
+                const spd = Math.sqrt(z.vx * z.vx + z.vy * z.vy);
+                if (spd > 1.5) {
+                    z.vx = (z.vx / spd) * 1.5;
+                    z.vy = (z.vy / spd) * 1.5;
+                }
+            }
+        }
+        
+        z.x += z.vx * dt;
+        z.y += z.vy * dt;
+        z.angle += z.rotSpeed * dt;
+        z.wobblePhase += 0.05 * dt;
+        
+        // Wrap
+        if (z.x < -z.radius * 2) z.x = W + z.radius;
+        if (z.x > W + z.radius * 2) z.x = -z.radius;
+        if (z.y < -z.radius * 2) z.y = H + z.radius;
+        if (z.y > H + z.radius * 2) z.y = -z.radius;
+        
+        // Bullet collision
+        for (let j = bullets.length - 1; j >= 0; j--) {
+            const b = bullets[j];
+            const dx = b.x - z.x;
+            const dy = b.y - z.y;
+            if (dx * dx + dy * dy < z.radius * z.radius) {
+                bullets.splice(j, 1);
+                z.hp--;
+                if (z.hp <= 0) {
+                    score += z.size >= 2 ? 20 : 50;
+                    addExplosion(z.x, z.y, 15 + z.size * 10, '#4f4');
+                    addShockwave(z.x, z.y);
+                    breakZombie(z);
+                    zombies.splice(i, 1);
+                    playSound('explosion');
+                } else {
+                    addExplosion(b.x, b.y, 5, '#8f8');
+                    playSound('hit');
+                }
+                break;
+            }
+        }
+        
+        // Ship collision
+        if (!ship.dead && ship.invincible <= 0) {
+            const dx = ship.x - z.x;
+            const dy = ship.y - z.y;
+            if (dx * dx + dy * dy < (z.radius + 12) * (z.radius + 12)) {
+                ship.dead = true;
+                ship.deadTimer = 90;
+                lives--;
+                addExplosion(ship.x, ship.y, 30, '#ff4');
+                addShockwave(ship.x, ship.y);
+                playSound('explosion');
+            }
+        }
+    }
+    
+    // Particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.life -= p.decay * dt;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+    
+    // Shockwaves
+    for (let i = shockwaves.length - 1; i >= 0; i--) {
+        const s = shockwaves[i];
+        s.r += 2 * dt;
+        s.life -= 0.03 * dt;
+        if (s.life <= 0 || s.r > s.maxR) shockwaves.splice(i, 1);
+    }
+    
+    // Wave progression
+    if (zombies.length === 0 && !ship.dead) {
+        wave++;
+        spawnWave();
+    }
+}
+
+function render() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Stars
+    for (const s of stars) {
+        const flicker = 0.5 + Math.sin(Date.now() * 0.001 + s.b * 10) * 0.3;
+        ctx.fillStyle = `rgba(200,220,255,${flicker})`;
+        ctx.fillRect(s.x, s.y, s.s, s.s);
+    }
+    
+    if (gameState === 'start') {
+        renderStartScreen();
+        return;
+    }
+    
+    // Shockwaves
+    for (const s of shockwaves) {
+        ctx.strokeStyle = `rgba(100,255,100,${s.life * 0.5})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+        ctx.stroke();
+    }
+    
+    // Zombies
+    for (const z of zombies) {
+        ctx.save();
+        ctx.translate(z.x, z.y);
+        ctx.rotate(z.angle);
+        
+        // Body
+        const wobble = Math.sin(z.wobblePhase) * 2;
+        ctx.fillStyle = z.isTracker ? '#6a5' : '#4a4';
+        ctx.strokeStyle = '#8f8';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (let i = 0; i < z.points.length; i++) {
+            const p = z.points[i];
+            const px = Math.cos(p.angle) * (p.dist + wobble);
+            const py = Math.sin(p.angle) * (p.dist + wobble);
+            if (i === 0) ctx.moveTo(px, py);
+            else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        
+        // Eyes
+        for (const e of z.eyes) {
+            ctx.fillStyle = '#ff0';
+            ctx.beginPath();
+            ctx.arc(e.ox, e.oy, e.r, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = '#f00';
+            ctx.beginPath();
+            ctx.arc(e.ox, e.oy, e.r * 0.4, 0, Math.PI * 2);
+            ctx.fill();
+        }
+        
+        // Cracks
+        ctx.strokeStyle = 'rgba(100,200,100,0.5)';
+        ctx.lineWidth = 1;
+        const cx = (z.x * 7 + z.y * 3) % 100 / 100;
+        ctx.beginPath();
+        ctx.moveTo(-z.radius * 0.3, -z.radius * 0.2);
+        ctx.lineTo(-z.radius * 0.1, z.radius * 0.1);
+        ctx.lineTo(z.radius * 0.2, z.radius * 0.3);
+        ctx.stroke();
+        
+        ctx.restore();
+    }
+    
+    // Bullets
+    for (const b of bullets) {
+        ctx.fillStyle = '#ff8';
+        ctx.shadowColor = '#ff8';
+        ctx.shadowBlur = 5;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+    }
+    
+    // Particles
+    for (const p of particles) {
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.life;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+    }
+    
+    // Ship
+    if (!ship.dead) {
+        ctx.save();
+        ctx.translate(ship.x, ship.y);
+        ctx.rotate(ship.angle + Math.PI / 2);
+        
+        if (ship.invincible > 0 && Math.floor(ship.invincible / 4) % 2 === 0) {
+            ctx.globalAlpha = 0.5;
+        }
+        
+        // Ship body
+        ctx.fillStyle = '#8cf';
+        ctx.strokeStyle = '#aef';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(0, -15);
+        ctx.lineTo(-10, 12);
+        ctx.lineTo(-4, 8);
+        ctx.lineTo(0, 12);
+        ctx.lineTo(4, 8);
+        ctx.lineTo(10, 12);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        
+        // Thrust flame
+        if (ship.thrusting) {
+            const flameLen = 8 + Math.random() * 6;
+            ctx.fillStyle = `hsl(${40 + Math.random() * 20}, 100%, 60%)`;
+            ctx.beginPath();
+            ctx.moveTo(-4, 12);
+            ctx.lineTo(0, 12 + flameLen);
+            ctx.lineTo(4, 12);
+            ctx.closePath();
+            ctx.fill();
+        }
+        
+        ctx.restore();
+    }
+    
+    // HUD
+    ctx.fillStyle = '#8f8';
+    ctx.font = 'bold 16px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE: ${score}`, 20, 30);
+    ctx.fillText(`WAVE: ${wave}`, 20, 52);
+    
+    // Lives as ship icons
+    for (let i = 0; i < lives; i++) {
+        ctx.save();
+        ctx.translate(40 + i * 25, H - 30);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillStyle = '#8cf';
+        ctx.beginPath();
+        ctx.moveTo(0, -10);
+        ctx.lineTo(-7, 8);
+        ctx.lineTo(7, 8);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+    }
+    
+    // Game Over
+    if (gameState === 'gameover') {
+        renderGameOver();
+    }
+}
+
+function renderStartScreen() {
+    ctx.fillStyle = '#4f4';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('ZOMBIE ASTEROIDS', W / 2, H / 3);
+    
+    ctx.fillStyle = '#8f8';
+    ctx.font = '18px monospace';
+    ctx.fillText('Defend yourself from the undead asteroid horde!', W / 2, H / 3 + 50);
+    
+    ctx.fillStyle = '#aef';
+    ctx.font = '16px monospace';
+    ctx.fillText('[←] [→] / [A] [D] - Rotate', W / 2, H / 2 + 20);
+    ctx.fillText('[↑] / [W] - Thrust', W / 2, H / 2 + 45);
+    ctx.fillText('[SPACE] / [F] - Fire', W / 2, H / 2 + 70);
+    
+    if (highScore > 0) {
+        ctx.fillStyle = '#ff8';
+        ctx.fillText(`HIGH SCORE: ${highScore}`, W / 2, H / 2 + 110);
+    }
+    
+    const pulse = 0.5 + Math.sin(Date.now() * 0.003) * 0.5;
+    ctx.fillStyle = `rgba(144,255,144,${pulse})`;
+    ctx.font = 'bold 22px monospace';
+    ctx.fillText('PRESS SPACE TO START', W / 2, H * 0.75);
+}
+
+function renderGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.fillStyle = '#f44';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('YOU ARE ZOMBIFIED', W / 2, H / 3);
+    
+    ctx.fillStyle = '#8f8';
+    ctx.font = '24px monospace';
+    ctx.fillText(`FINAL SCORE: ${score}`, W / 2, H / 3 + 50);
+    ctx.fillText(`WAVES SURVIVED: ${wave}`, W / 2, H / 3 + 80);
+    
+    if (score >= highScore && score > 0) {
+        ctx.fillStyle = '#ff8';
+        ctx.font = '20px monospace';
+        ctx.fillText('NEW HIGH SCORE!', W / 2, H / 3 + 120);
+    }
+    
+    const pulse = 0.5 + Math.sin(Date.now() * 0.003) * 0.5;
+    ctx.fillStyle = `rgba(144,255,144,${pulse})`;
+    ctx.font = 'bold 22px monospace';
+    ctx.fillText('PRESS SPACE TO RESTART', W / 2, H * 0.7);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
