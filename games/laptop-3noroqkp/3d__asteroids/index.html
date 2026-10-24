@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Asteroids 3D</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; overflow: hidden; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playLaser() {
+    if (!audioCtx) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'sawtooth';
+    o.frequency.setValueAtTime(880, audioCtx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(220, audioCtx.currentTime + 0.15);
+    g.gain.setValueAtTime(0.3, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.15);
+}
+function playExplosion() {
+    if (!audioCtx) return;
+    const bufferSize = audioCtx.sampleRate * 0.4;
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / bufferSize, 3);
+    const src = audioCtx.createBufferSource();
+    const g = audioCtx.createGain();
+    src.buffer = buffer;
+    g.gain.setValueAtTime(0.4, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
+    src.connect(g); g.connect(audioCtx.destination);
+    src.start();
+}
+function playHit() {
+    if (!audioCtx) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = 'square';
+    o.frequency.setValueAtTime(150, audioCtx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.3);
+    g.gain.setValueAtTime(0.4, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.3);
+}
+
+// Game state
+let gameState = 'start'; // start, playing, gameover
+let score = 0;
+let highScore = 0;
+try { highScore = parseInt(localStorage.getItem('asteroids3d_hs')) || 0; } catch(e) {}
+let lives = 3;
+let wave = 1;
+let waveTimer = 0;
+let shakeTime = 0;
+let shakeMag = 0;
+
+// Player
+const player = { x: 0, y: -2, rotX: 0, rotY: 0, vx: 0, vy: 0 };
+let bullets = [];
+let asteroids = [];
+let particles = [];
+let stars = [];
+let gridOffset = 0;
+
+// Stars
+for (let i = 0; i < 150; i++) {
+    stars.push({ x: Math.random() * 2 - 1, y: Math.random() * 0.6, z: Math.random() * 8 + 2, size: Math.random() * 2 + 0.5 });
+}
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'start' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+    if (gameState === 'gameover' && (e.code === 'Space' || e.code === 'Enter' || e.code === 'KeyR')) startGame();
+    initAudio();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function startGame() {
+    gameState = 'playing';
+    score = 0;
+    lives = 3;
+    wave = 1;
+    waveTimer = 0;
+    player.x = 0;
+    player.y = -2;
+    player.vx = 0;
+    player.vy = 0;
+    bullets = [];
+    asteroids = [];
+    particles = [];
+    spawnWave();
+}
+
+function spawnWave() {
+    const count = 3 + wave * 2;
+    for (let i = 0; i < count; i++) {
+        setTimeout(() => {
+            if (gameState !== 'playing') return;
+            spawnAsteroid();
+        }, i * 400);
+    }
+}
+
+function spawnAsteroid() {
+    const size = Math.random() * 1.5 + 0.8;
+    const verts = [];
+    const numVerts = 7 + Math.floor(Math.random() * 5);
+    for (let i = 0; i < numVerts; i++) {
+        const a = (i / numVerts) * Math.PI * 2;
+        const r = size * (0.6 + Math.random() * 0.4);
+        verts.push({ x: Math.cos(a) * r, y: Math.sin(a) * r, z: 0 });
+    }
+    asteroids.push({
+        x: (Math.random() - 0.5) * 20,
+        y: -(Math.random() * 3 + 2),
+        z: 40 + Math.random() * 20,
+        vx: (Math.random() - 0.5) * 0.02,
+        vy: 0.01 + Math.random() * 0.02,
+        rotX: Math.random() * Math.PI * 2,
+        rotY: Math.random() * Math.PI * 2,
+        rotSpdX: (Math.random() - 0.5) * 0.03,
+        rotSpdY: (Math.random() - 0.5) * 0.03,
+        verts: verts,
+        size: size
+    });
+}
+
+function project(x, y, z) {
+    if (z <= 0.1) return null;
+    const fov = 400;
+    const sx = W / 2 + (x - player.x * 0.3) * fov / z;
+    const sy = H / 2 - (y + 2) * fov / z + player.y * fov / z * 0.5;
+    return { x: sx, y: sy, scale: fov / z };
+}
+
+function fireBullet() {
+    if (bullets.length > 4) return;
+    bullets.push({ x: player.x * 0.3, y: -2, z: 2 });
+    playLaser();
+}
+
+function update(dt) {
+    if (gameState !== 'playing') return;
+
+    // Player movement
+    const speed = 4;
+    if (keys['ArrowLeft'] || keys['KeyA']) player.x -= speed * dt;
+    if (keys['ArrowRight'] || keys['KeyD']) player.x += speed * dt;
+    if (keys['ArrowUp'] || keys['KeyW']) player.y -= speed * 0.5 * dt;
+    if (keys['ArrowDown'] || keys['KeyS']) player.y += speed * 0.5 * dt;
+    player.x = Math.max(-8, Math.min(8, player.x));
+    player.y = Math.max(-4, Math.min(2, player.y));
+
+    // Fire
+    if (keys['Space'] && bullets.length < 5) {
+        fireBullet();
+        keys['Space'] = false;
+    }
+
+    // Bullets
+    for (let i = bullets.length - 1; i >= 0; i--) {
+        bullets[i].z += 30 * dt;
+        if (bullets[i].z > 70) bullets.splice(i, 1);
+    }
+
+    // Asteroids
+    for (let i = asteroids.length - 1; i >= 0; i--) {
+        const a = asteroids[i];
+        a.z -= (5 + wave * 0.5) * dt;
+        a.x += a.vx;
+        a.rotX += a.rotSpdX;
+        a.rotY += a.rotSpdY;
+
+        if (a.z < 1) {
+            // Hit player!
+            asteroids.splice(i, 1);
+            createExplosion(a.x, a.y, a.z, 'red');
+            playHit();
+            lives--;
+            shakeTime = 0.5;
+            shakeMag = 10;
+            if (lives <= 0) {
+                gameState = 'gameover';
+                try { 
+                    if (score > highScore) {
+                        highScore = score;
+                        localStorage.setItem('asteroids3d_hs', highScore);
+                    }
+                } catch(e) {}
+            }
+            continue;
+        }
+
+        // Check bullet collisions
+        for (let j = bullets.length - 1; j >= 0; j--) {
+            const b = bullets[j];
+            const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+            if (Math.abs(dz) < 3 && Math.abs(dx) < a.size + 1 && Math.abs(dy) < a.size + 1) {
+                asteroids.splice(i, 1);
+                bullets.splice(j, 1);
+                score += Math.floor(100 / a.z);
+                createExplosion(a.x, a.y, a.z, 'cyan');
+                playExplosion();
+                // Split into smaller ones
+                if (a.size > 1) {
+                    for (let k = 0; k < 2; k++) {
+                        const verts = [];
+                        const nv = 6 + Math.floor(Math.random() * 4);
+                        for (let v = 0; v < nv; v++) {
+                            const ang = (v / nv) * Math.PI * 2;
+                            const r = a.size * 0.5 * (0.6 + Math.random() * 0.4);
+                            verts.push({ x: Math.cos(ang) * r, y: Math.sin(ang) * r, z: 0 });
+                        }
+                        asteroids.push({
+                            x: a.x + (Math.random() - 0.5),
+                            y: a.y,
+                            z: a.z + (Math.random() - 0.5) * 2,
+                            vx: (Math.random() - 0.5) * 0.05,
+                            vy: 0.01 + Math.random() * 0.02,
+                            rotX: Math.random() * Math.PI * 2,
+                            rotY: Math.random() * Math.PI * 2,
+                            rotSpdX: (Math.random() - 0.5) * 0.05,
+                            rotSpdY: (Math.random() - 0.5) * 0.05,
+                            verts: verts,
+                            size: a.size * 0.5
+                        });
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Wave progression
+    waveTimer += dt;
+    if (asteroids.length === 0 && bullets.length <= 1) {
+        if (waveTimer > 2) {
+            wave++;
+            waveTimer = 0;
+            spawnWave();
+        }
+    }
+
+    // Particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.z -= p.vz * dt;
+        p.life -= dt;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    // Shake decay
+    shakeTime = Math.max(0, shakeTime - dt);
+}
+
+function createExplosion(x, y, z, color) {
+    for (let i = 0; i < 20; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const spd = Math.random() * 3 + 1;
+        particles.push({
+            x: x, y: y, z: z,
+            vx: Math.cos(a) * spd,
+            vy: (Math.random() - 0.5) * 2,
+            vz: Math.sin(a) * spd,
+            life: 0.8 + Math.random() * 0.5,
+            color: color
+        });
+    }
+}
+
+function draw3DWireframe(verts, ox, oy, oz, rotX, rotY, scale) {
+    const cosX = Math.cos(rotX), sinX = Math.sin(rotX);
+    const cosY = Math.cos(rotY), sinY = Math.sin(rotY);
+    const pts = [];
+    for (const v of verts) {
+        let x = v.x, y = v.y, z = v.z;
+        // Rotate Y
+        let tx = x * cosY - z * sinY;
+        let tz = x * sinY + z * cosY;
+        x = tx; z = tz;
+        // Rotate X
+        let ty = y * cosX - z * sinX;
+        tz = y * sinX + z * cosX;
+        y = ty; z = tz;
+        const px = ox + x * scale;
+        const py = oy + y * scale;
+        pts.push({ x: px, y: py });
+    }
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+        ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+}
+
+function draw() {
+    let shakeX = 0, shakeY = 0;
+    if (shakeTime > 0) {
+        shakeX = (Math.random() - 0.5) * shakeMag * (shakeTime / 0.5);
+        shakeY = (Math.random() - 0.5) * shakeMag * (shakeTime / 0.5);
+    }
+
+    ctx.save();
+    ctx.translate(shakeX, shakeY);
+
+    // Background
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, '#0a0a2e');
+    grad.addColorStop(0.5, '#1a1a3e');
+    grad.addColorStop(1, '#0d0d1f');
+    ctx.fillStyle = grad;
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+
+    // Stars
+    ctx.fillStyle = '#fff';
+    for (const s of stars) {
+        const p = project(s.x * 10, s.y * 10, s.z);
+        if (p && p.y > -10 && p.y < H + 10 && p.x > -10 && p.x < W + 10) {
+            ctx.globalAlpha = Math.min(1, s.size / (s.z * 0.3));
+            ctx.fillRect(p.x, p.y, s.size, s.size);
+        }
+    }
+    ctx.globalAlpha = 1;
+
+    // Ground grid
+    ctx.strokeStyle = 'rgba(0, 255, 200, 0.15)';
+    ctx.lineWidth = 1;
+    for (let z = 2; z < 60; z += 4) {
+        const p1 = project(-30, -2, z);
+        const p2 = project(30, -2, z);
+        if (p1 && p2) {
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.stroke();
+        }
+    }
+    for (let x = -30; x <= 30; x += 4) {
+        const p1 = project(x, -2, 2);
+        const p2 = project(x, -2, 60);
+        if (p1 && p2) {
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.stroke();
+        }
+    }
+
+    // Horizon glow
+    const horizonY = project(0, -2, 50)?.y || H * 0.4;
+    const hGrad = ctx.createRadialGradient(W/2, horizonY, 0, W/2, horizonY, W * 0.4);
+    hGrad.addColorStop(0, 'rgba(0, 200, 255, 0.1)');
+    hGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = hGrad;
+    ctx.fillRect(0, 0, W, H);
+
+    // Sort asteroids by z (far to near)
+    const sortedAsteroids = [...asteroids].sort((a, b) => b.z - a.z);
+
+    for (const a of sortedAsteroids) {
+        const p = project(a.x, a.y, a.z);
+        if (!p || p.y > H + 100) continue;
+        const scale = p.scale * 2;
+        const distFactor = Math.min(1, 40 / a.z);
+
+        ctx.strokeStyle = `rgba(0, 255, 200, ${distFactor})`;
+        ctx.lineWidth = Math.max(1, 3 * distFactor);
+        ctx.shadowColor = 'rgba(0, 255, 200, 0.5)';
+        ctx.shadowBlur = 10 * distFactor;
+        draw3DWireframe(a.verts, p.x, p.y, a.z, a.rotX, a.rotY, scale);
+
+        // Inner lines for 3D effect
+        const midScale = scale * 0.5;
+        ctx.strokeStyle = `rgba(0, 255, 200, ${distFactor * 0.4})`;
+        ctx.lineWidth = 1;
+        draw3DWireframe(a.verts, p.x, p.y, a.z, a.rotX + 0.3, a.rotY + 0.2, midScale);
+    }
+    ctx.shadowBlur = 0;
+
+    // Bullets
+    for (const b of bullets) {
+        const p = project(b.x, b.y, b.z);
+        if (!p) continue;
+        const size = Math.max(2, p.scale * 0.3);
+        ctx.fillStyle = '#ff0';
+        ctx.shadowColor = '#ff0';
+        ctx.shadowBlur = 15;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, size, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Trail
+        const pt = project(b.x, b.y - 0.5, b.z + 2);
+        if (pt) {
+            ctx.strokeStyle = 'rgba(255, 255, 0, 0.4)';
+            ctx.lineWidth = size * 0.6;
+            ctx.beginPath();
+            ctx.moveTo(p.x, p.y);
+            ctx.lineTo(pt.x, pt.y);
+            ctx.stroke();
+        }
+    }
+    ctx.shadowBlur = 0;
+
+    // Particles
+    for (const p of particles) {
+        const proj = project(p.x, p.y, Math.max(0.5, p.z));
+        if (!proj) continue;
+        const alpha = Math.min(1, p.life * 2);
+        ctx.fillStyle = p.color + '';
+        ctx.globalAlpha = alpha;
+        const sz = Math.max(1, proj.scale * 0.2);
+        ctx.fillRect(proj.x - sz/2, proj.y - sz/2, sz, sz);
+    }
+    ctx.globalAlpha = 1;
+
+    // Player ship
+    const shipP = project(player.x * 0.3, player.y, 1.5);
+    if (shipP) {
+        const s = shipP.scale * 0.8;
+        ctx.strokeStyle = '#0ff';
+        ctx.lineWidth = 2.5;
+        ctx.shadowColor = '#0ff';
+        ctx.shadowBlur = 15;
+
+        // Ship body (triangle pointing up)
+        ctx.beginPath();
+        ctx.moveTo(shipP.x, shipP.y - s);
+        ctx.lineTo(shipP.x - s * 0.7, shipP.y + s * 0.6);
+        ctx.lineTo(shipP.x - s * 0.3, shipP.y + s * 0.3);
+        ctx.lineTo(shipP.x + s * 0.3, shipP.y + s * 0.3);
+        ctx.lineTo(shipP.x + s * 0.7, shipP.y + s * 0.6);
+        ctx.closePath();
+        ctx.stroke();
+
+        // Engine glow
+        const engineFlicker = Math.random() * 5;
+        ctx.strokeStyle = `rgba(255, 150, 0, ${0.5 + Math.random() * 0.3})`;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(shipP.x - s * 0.2, shipP.y + s * 0.4);
+        ctx.lineTo(shipP.x, shipP.y + s * 0.7 + engineFlicker);
+        ctx.lineTo(shipP.x + s * 0.2, shipP.y + s * 0.4);
+        ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+
+    // HUD
+    if (gameState === 'playing') {
+        ctx.fillStyle = '#0ff';
+        ctx.font = 'bold 24px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(`SCORE: ${score}`, 20, 35);
+        ctx.fillText(`WAVE: ${wave}`, 20, 65);
+
+        // Lives
+        for (let i = 0; i < lives; i++) {
+            ctx.beginPath();
+            ctx.moveTo(25 + i * 30, H - 35);
+            ctx.lineTo(15 + i * 30, H - 15);
+            ctx.lineTo(35 + i * 30, H - 15);
+            ctx.closePath();
+            ctx.stroke();
+        }
+
+        // High score
+        ctx.textAlign = 'right';
+        ctx.font = '16px monospace';
+        ctx.fillStyle = '#888';
+        ctx.fillText(`HI: ${Math.max(highScore, score)}`, W - 20, 35);
+    }
+
+    // Start screen
+    if (gameState === 'start') {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#0ff';
+        ctx.font = 'bold 64px monospace';
+        ctx.shadowColor = '#0ff';
+        ctx.shadowBlur = 20;
+        ctx.fillText('ASTEROIDS 3D', W/2, H/2 - 80);
+        ctx.shadowBlur = 0;
+
+        ctx.font = '20px monospace';
+        ctx.fillStyle = '#fff';
+        ctx.fillText('← → or A/D : Move Ship', W/2, H/2 - 10);
+        ctx.fillText('↑ ↓ or W/S : Adjust Position', W/2, H/2 + 25);
+        ctx.fillText('SPACE : Fire', W/2, H/2 + 60);
+        ctx.fillText('', W/2, H/2 + 80);
+
+        ctx.fillStyle = '#ff0';
+        ctx.font = '18px monospace';
+        ctx.fillText('PRESS SPACE TO START', W/2, H/2 + 120);
+
+        if (highScore > 0) {
+            ctx.fillStyle = '#888';
+            ctx.fillText(`HIGH SCORE: ${highScore}`, W/2, H/2 + 160);
+        }
+
+        // Animated asteroid decoration
+        const t = performance.now() * 0.001;
+        ctx.strokeStyle = 'rgba(0, 255, 200, 0.6)';
+        ctx.lineWidth = 2;
+        draw3DWireframe(
+            Array.from({length: 8}, (_, i) => {
+                const a = (i / 8) * Math.PI * 2;
+                return { x: Math.cos(a) * 40, y: Math.sin(a) * 40, z: 0 };
+            }),
+            W/2, H/2 - 180, 0, t, t * 0.7, 1
+        );
+    }
+
+    // Game over
+    if (gameState === 'gameover') {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#f44';
+        ctx.font = 'bold 52px monospace';
+        ctx.shadowColor = '#f44';
+        ctx.shadowBlur = 15;
+        ctx.fillText('GAME OVER', W/2, H/2 - 40);
+        ctx.shadowBlur = 0;
+
+        ctx.fillStyle = '#fff';
+        ctx.font = '28px monospace';
+        ctx.fillText(`FINAL SCORE: ${score}`, W/2, H/2 + 15);
+        ctx.fillText(`WAVE REACHED: ${wave}`, W/2, H/2 + 50);
+
+        if (score >= highScore && score > 0) {
+            ctx.fillStyle = '#ff0';
+            ctx.fillText('★ NEW HIGH SCORE! ★', W/2, H/2 + 90);
+        }
+
+        ctx.fillStyle = '#0ff';
+        ctx.font = '20px monospace';
+        ctx.fillText('PRESS SPACE OR R TO RESTART', W/2, H/2 + 140);
+    }
+
+    ctx.restore();
+}
+
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = Math.min((time - lastTime) / 1000, 0.05);
+    lastTime = time;
+
+    update(dt);
+    draw();
+
+    requestAnimationFrame(gameLoop);
+}
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
