@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Frogger Pinball</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a2a1a; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    scale = Math.min(W / 500, H / 700);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+
+// Game State
+let state = 'start'; // start, playing, gameover
+let score = 0;
+let highScore = 0;
+let balls = 3;
+let combo = 1;
+
+try {
+    highScore = parseInt(localStorage.getItem('frogpinball_high') || '0');
+} catch(e) {}
+
+// Keys
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    initAudio();
+    if (state === 'start' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+    if (state === 'gameover' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Ball
+const ball = { x: 0, y: 0, vx: 0, vy: 0, r: 8 };
+let ballInPlay = false;
+let launcherActive = false;
+let launcherPower = 0;
+
+// Flippers
+const flippers = {
+    left: { restAngle: -0.6, activeAngle: 0.4, len: 50, pivotX: 0, pivotY: 0 },
+    right: { restAngle: Math.PI + 0.6, activeAngle: Math.PI - 0.4, len: 50, pivotX: 0, pivotY: 0 }
+};
+
+function layoutFlippers() {
+    const tableW = 380 * scale;
+    const tableH = 620 * scale;
+    const ox = (W - tableW) / 2;
+    const oy = (H - tableH) / 2;
+    flippers.left.pivotX = ox + tableW * 0.35;
+    flippers.left.pivotY = oy + tableH - 20 * scale;
+    flippers.right.pivotX = ox + tableW * 0.65;
+    flippers.right.pivotY = oy + tableH - 20 * scale;
+}
+
+// Bumpers (lily pads)
+let bumpers = [];
+function layoutBumpers() {
+    const tableW = 380 * scale;
+    const tableH = 620 * scale;
+    const ox = (W - tableW) / 2;
+    const oy = (H - tableH) / 2;
+    bumpers = [
+        { x: ox + tableW * 0.3, y: oy + tableH * 0.25, r: 28 * scale },
+        { x: ox + tableW * 0.7, y: oy + tableH * 0.25, r: 28 * scale },
+        { x: ox + tableW * 0.5, y: oy + tableH * 0.4, r: 28 * scale },
+        { x: ox + tableW * 0.2, y: oy + tableH * 0.55, r: 22 * scale },
+        { x: ox + tableW * 0.8, y: oy + tableH * 0.55, r: 22 * scale }
+    ];
+}
+
+// Walls (table boundaries)
+let walls = [];
+function layoutWalls() {
+    const tableW = 380 * scale;
+    const tableH = 620 * scale;
+    const ox = (W - tableW) / 2;
+    const oy = (H - tableH) / 2;
+    walls = [
+        { x1: ox, y1: oy, x2: ox, y2: oy + tableH }, // left
+        { x1: ox + tableW, y1: oy + tableH * 0.7, x2: ox + tableW, y2: oy + tableH }, // right lower
+        { x1: ox + tableW, y1: oy, x2: ox + tableW, y2: oy + tableH * 0.3 }, // right upper (launcher)
+    ];
+}
+
+// Slingshots / angled walls
+let slings = [];
+function layoutSlings() {
+    const tableW = 380 * scale;
+    const tableH = 620 * scale;
+    const ox = (W - tableW) / 2;
+    const oy = (H - tableH) / 2;
+    slings = [
+        { x1: ox, y1: oy + tableH * 0.75, x2: ox + tableW * 0.35, y2: oy + tableH * 0.8 }, // left upper slope
+        { x1: ox + tableW * 0.65, y1: oy + tableH * 0.8, x2: ox + tableW, y2: oy + tableH * 0.75 }, // right upper slope
+    ];
+}
+
+function getTableBounds() {
+    const tableW = 380 * scale;
+    const tableH = 620 * scale;
+    return { ox: (W - tableW) / 2, oy: (H - tableH) / 2, w: tableW, h: tableH };
+}
+
+function startGame() {
+    state = 'playing';
+    score = 0;
+    balls = 3;
+    combo = 1;
+    ballInPlay = false;
+    launcherActive = true;
+    launcherPower = 0;
+    layoutFlippers();
+    layoutBumpers();
+    layoutWalls();
+    layoutSlings();
+}
+
+function launchBall() {
+    const tb = getTableBounds();
+    ball.x = tb.ox + tb.w - 15 * scale;
+    ball.y = tb.oy + tb.h * 0.85;
+    ball.vx = 0;
+    ball.vy = -(12 + launcherPower * 4) * scale * 0.5;
+    ballInPlay = true;
+    launcherActive = false;
+    playSound(440, 0.2, 'sine', 0.2);
+}
+
+function loseBall() {
+    balls--;
+    combo = 1;
+    if (balls <= 0) {
+        state = 'gameover';
+        try { localStorage.setItem('frogpinball_high', highScore.toString()); } catch(e) {}
+        if (score > highScore) highScore = score;
+    } else {
+        ballInPlay = false;
+        launcherActive = true;
+        launcherPower = 0;
+    }
+}
+
+function update(dt) {
+    if (state !== 'playing') return;
+    
+    layoutFlippers();
+    layoutBumpers();
+    layoutWalls();
+    layoutSlings();
+    
+    const tb = getTableBounds();
+    
+    // Launcher
+    if (launcherActive) {
+        launcherPower += dt * 2;
+        if (keys['Space'] && !ballInPlay) {
+            launchBall();
+        }
+        if (launcherPower > 1) { launcherPower = 0; }
+    }
+    
+    // Flippers
+    const flipSpeed = 0.3;
+    flippers.left.currentAngle = flippers.left.currentAngle !== undefined ? flippers.left.currentAngle : flippers.left.restAngle;
+    flippers.right.currentAngle = flippers.right.currentAngle !== undefined ? flippers.right.currentAngle : flippers.right.restAngle;
+    
+    if (keys['ArrowLeft'] || keys['KeyA']) {
+        if (flippers.left.currentAngle > flippers.left.activeAngle) {
+            flippers.left.currentAngle -= flipSpeed;
+        }
+    } else {
+        if (flippers.left.currentAngle < flippers.left.restAngle) {
+            flippers.left.currentAngle += flipSpeed * 0.7;
+        }
+    }
+    
+    if (keys['ArrowRight'] || keys['KeyD']) {
+        if (flippers.right.currentAngle < flippers.right.activeAngle) {
+            flippers.right.currentAngle += flipSpeed;
+        }
+    } else {
+        if (flippers.right.currentAngle > flippers.right.restAngle) {
+            flippers.right.currentAngle -= flipSpeed * 0.7;
+        }
+    }
+    
+    // Ball physics
+    if (!ballInPlay) return;
+    
+    const gravity = 400 * scale;
+    ball.vy += gravity * dt;
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+    
+    // Bumper collisions
+    for (let b of bumpers) {
+        const dx = ball.x - b.x;
+        const dy = ball.y - b.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const minDist = ball.r + b.r;
+        if (dist < minDist) {
+            const nx = dx / dist;
+            const ny = dy / dist;
+            ball.x = b.x + nx * minDist;
+            ball.y = b.y + ny * minDist;
+            const dot = ball.vx * nx + ball.vy * ny;
+            ball.vx -= 2 * dot * nx;
+            ball.vy -= 2 * dot * ny;
+            // Bounce boost
+            ball.vx += nx * 5 * scale;
+            ball.vy += ny * 5 * scale;
+            score += 100 * combo;
+            combo = Math.min(combo + 1, 5);
+            b.hit = true;
+            playSound(600, 0.15, 'square', 0.3);
+        }
+    }
+    
+    // Wall collisions
+    for (let w of walls) {
+        if (w.x2 === w.x1) {
+            // Vertical wall
+            const wx = w.x1;
+            if (Math.abs(ball.x - wx) < ball.r && ball.y > Math.min(w.y1, w.y2) && ball.y < Math.max(w.y1, w.y2)) {
+                if (ball.vx * (ball.x - wx) < 0) {
+                    ball.x = wx + (ball.x > wx ? ball.r : -ball.r);
+                    ball.vx *= -0.8;
+                    playSound(300, 0.1, 'sine', 0.2);
+                }
+            }
+        }
+    }
+    
+    // Top wall
+    if (ball.y - ball.r < tb.oy) {
+        ball.y = tb.oy + ball.r;
+        ball.vy = Math.abs(ball.vy) * 0.8;
+        playSound(300, 0.1, 'sine', 0.2);
+    }
+    
+    // Slings collisions
+    for (let s of slings) {
+        const dx = s.x2 - s.x1;
+        const dy = s.y2 - s.y1;
+        const len = Math.sqrt(dx * dx + dy * dy);
+        const nx = -dy / len;
+        const ny = dx / len;
+        
+        const px = ball.x - s.x1;
+        const py = ball.y - s.y1;
+        const proj = px * (dx / len) + py * (dy / len);
+        const perp = px * nx + py * ny;
+        
+        if (proj > 0 && proj < len && Math.abs(perp) < ball.r) {
+            const side = perp > 0 ? 1 : -1;
+            ball.y += side * (ball.r - Math.abs(perp)) * ny * -1;
+            ball.x += side * (ball.r - Math.abs(perp)) * nx * -1;
+            
+            const vDotN = ball.vx * nx + ball.vy * ny;
+            if (vDotN > 0) {
+                ball.vx -= 2 * vDotN * nx;
+                ball.vy -= 2 * vDotN * ny;
+                ball.vx *= 0.85;
+                ball.vy *= 0.85;
+                playSound(350, 0.1, 'sine', 0.2);
+            }
+        }
+    }
+    
+    // Flipper collisions (capsule shape)
+    for (let key of ['left', 'right']) {
+        const f = flippers[key];
+        const angle = f.currentAngle;
+        const endX = f.pivotX + Math.cos(angle) * f.len * scale;
+        const endY = f.pivotY + Math.sin(angle) * f.len * scale;
+        
+        // Point-to-segment distance
+        const dx = endX - f.pivotX;
+        const dy = endY - f.pivotY;
+        const len2 = dx * dx + dy * dy;
+        let t = ((ball.x - f.pivotX) * dx + (ball.y - f.pivotY) * dy) / len2;
+        t = Math.max(0, Math.min(1, t));
+        const cx = f.pivotX + t * dx;
+        const cy = f.pivotY + t * dy;
+        
+        const bdx = ball.x - cx;
+        const bdy = ball.y - cy;
+        const dist = Math.sqrt(bdx * bdx + bdy * bdy);
+        const minDist = ball.r + 6 * scale;
+        
+        if (dist < minDist) {
+            const nx = bdx / dist;
+            const ny = bdy / dist;
+            ball.x = cx + nx * minDist;
+            ball.y = cy + ny * minDist;
+            
+            // Add flipper velocity
+            const fActive = (key === 'left' && keys['ArrowLeft']) || (key === 'right' && keys['ArrowRight']);
+            if (fActive) {
+                const boost = 8 * scale;
+                ball.vx += nx * boost;
+                ball.vy += ny * boost - 3 * scale;
+            } else {
+                const dot = ball.vx * nx + ball.vy * ny;
+                if (dot < 0) {
+                    ball.vx -= 2 * dot * nx * 0.7;
+                    ball.vy -= 2 * dot * ny * 0.7;
+                }
+            }
+        }
+    }
+    
+    // Out of bounds (bottom)
+    if (ball.y > tb.oy + tb.h + 50 * scale) {
+        loseBall();
+    }
+    
+    // Speed limit
+    const maxSpeed = 600 * scale;
+    const speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+    if (speed > maxSpeed) {
+        ball.vx = ball.vx / speed * maxSpeed;
+        ball.vy = ball.vy / speed * maxSpeed;
+    }
+    
+    // Bumper hit reset
+    for (let b of bumpers) {
+        if (b.hit && Math.random() < 0.1) b.hit = false;
+    }
+}
+
+function draw() {
+    ctx.fillStyle = '#0d1f0d';
+    ctx.fillRect(0, 0, W, H);
+    
+    const tb = getTableBounds();
+    const ox = tb.ox, oy = tb.oy, tw = tb.w, th = tb.h;
+    
+    // Table background
+    const grad = ctx.createLinearGradient(0, oy, 0, oy + th);
+    grad.addColorStop(0, '#1a3a1a');
+    grad.addColorStop(0.7, '#0d260d');
+    grad.addColorStop(1, '#1a2a4a');
+    ctx.fillStyle = grad;
+    ctx.fillRect(ox, oy, tw, th);
+    
+    // "Road" area at top
+    ctx.fillStyle = '#3a3a2a';
+    ctx.fillRect(ox, oy, tw, th * 0.12);
+    ctx.strokeStyle = '#5a5a3a';
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 5; i++) {
+        const ry = oy + th * 0.03 + i * th * 0.02;
+        ctx.beginPath();
+        ctx.moveTo(ox, ry);
+        ctx.lineTo(ox + tw, ry);
+        ctx.stroke();
+    }
+    
+    // "River" area at bottom
+    const riverY = oy + th * 0.85;
+    ctx.fillStyle = '#1a3a5a';
+    ctx.fillRect(ox, riverY, tw, th * 0.15);
+    // Water waves
+    ctx.strokeStyle = '#2a5a8a';
+    ctx.lineWidth = 1.5;
+    for (let i = 0; i < 6; i++) {
+        const wy = riverY + 10 + i * th * 0.02;
+        ctx.beginPath();
+        ctx.moveTo(ox, wy);
+        for (let x = 0; x <= tw; x += 20) {
+            ctx.lineTo(ox + x, wy + Math.sin(x * 0.1 + performance.now() * 0.003) * 3);
+        }
+        ctx.stroke();
+    }
+    
+    // Table border
+    ctx.strokeStyle = '#4a8a4a';
+    ctx.lineWidth = 4;
+    ctx.strokeRect(ox, oy, tw, th);
+    
+    // Bumpers (lily pads)
+    for (let b of bumpers) {
+        const pulse = b.hit ? 1.2 : 1;
+        const r = b.r * pulse;
+        
+        // Lily pad shape
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, r, 0.3, Math.PI * 1.85);
+        ctx.lineTo(b.x, b.y);
+        ctx.closePath();
+        ctx.fillStyle = b.hit ? '#7aff4a' : '#3a8a2a';
+        ctx.fill();
+        ctx.strokeStyle = '#5aaa3a';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+        
+        // Veins
+        ctx.strokeStyle = '#2a6a1a';
+        ctx.lineWidth = 1.5;
+        for (let a = 0; a < 5; a++) {
+            const angle = 0.5 + a * 0.7;
+            ctx.beginPath();
+            ctx.moveTo(b.x, b.y);
+            ctx.lineTo(b.x + Math.cos(angle) * r * 0.8, b.y + Math.sin(angle) * r * 0.8);
+            ctx.stroke();
+        }
+        
+        // Center dot
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, 5, 0, Math.PI * 2);
+        ctx.fillStyle = '#2a5a1a';
+        ctx.fill();
+    }
+    
+    // Slingshots
+    for (let s of slings) {
+        ctx.strokeStyle = '#4a8a4a';
+        ctx.lineWidth = 6;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(s.x1, s.y1);
+        ctx.lineTo(s.x2, s.y2);
+        ctx.stroke();
+    }
+    
+    // Flippers
+    for (let key of ['left', 'right']) {
+        const f = flippers[key];
+        const angle = f.currentAngle;
+        const endX = f.pivotX + Math.cos(angle) * f.len * scale;
+        const endY = f.pivotY + Math.sin(angle) * f.len * scale;
+        
+        ctx.strokeStyle = '#ffaa3a';
+        ctx.lineWidth = 12 * scale / 50 * 1.5;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(f.pivotX, f.pivotY);
+        ctx.lineTo(endX, endY);
+        ctx.stroke();
+        
+        // Pivot dot
+        ctx.beginPath();
+        ctx.arc(f.pivotX, f.pivotY, 5, 0, Math.PI * 2);
+        ctx.fillStyle = '#ff6a1a';
+        ctx.fill();
+    }
+    
+    // Ball
+    if (ballInPlay) {
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+        const bgrad = ctx.createRadialGradient(ball.x - 3, ball.y - 3, 1, ball.x, ball.y, ball.r);
+        bgrad.addColorStop(0, '#fff');
+        bgrad.addColorStop(0.5, '#ccc');
+        bgrad.addColorStop(1, '#888');
+        ctx.fillStyle = bgrad;
+        ctx.fill();
+        ctx.strokeStyle = '#666';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+    }
+    
+    // Launcher indicator
+    if (launcherActive && state === 'playing') {
+        const lx = ox + tw - 15 * scale;
+        const ly = oy + th * 0.85;
+        const barH = th * 0.15;
+        ctx.fillStyle = '#3a3a3a';
+        ctx.fillRect(lx - 5, ly - barH, 10, barH);
+        ctx.fillStyle = '#ff4a2a';
+        const fillH = barH * launcherPower;
+        ctx.fillRect(lx - 5, ly - fillH, 10, fillH);
+        
+        // Arrow
+        ctx.fillStyle = '#fff';
+        ctx.font = `${14 * scale}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('↑', lx, ly - barH - 8);
+    }
+    
+    // Score
+    ctx.fillStyle = '#7aff4a';
+    ctx.font = `bold ${20 * scale}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE: ${score}`, ox + 10, oy + th * 0.18);
+    
+    // Combo
+    if (combo > 1) {
+        ctx.fillStyle = '#ffaa3a';
+        ctx.font = `${16 * scale}px monospace`;
+        ctx.fillText(`COMBO x${combo}`, ox + 10, oy + th * 0.22);
+    }
+    
+    // Balls remaining (frog icons)
+    for (let i = 0; i < balls; i++) {
+        const fx = ox + tw - 30 - i * 30;
+        const fy = oy + th * 0.18;
+        drawFrog(fx, fy, 12 * scale);
+    }
+    
+    // High score
+    ctx.fillStyle = '#aaa';
+    ctx.font = `${14 * scale}px monospace`;
+    ctx.textAlign = 'right';
+    ctx.fillText(`HI: ${Math.max(highScore, score)}`, ox + tw - 10, oy + th * 0.18);
+    
+    // Start screen
+    if (state === 'start') {
+        drawStartScreen();
+    }
+    
+    // Game over
+    if (state === 'gameover') {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, W, H);
+        
+        ctx.fillStyle = '#ff4a4a';
+        ctx.font = `bold ${36 * scale}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W / 2, H / 2 - 60);
+        
+        ctx.fillStyle = '#fff';
+        ctx.font = `${24 * scale}px monospace`;
+        ctx.fillText(`Final Score: ${score}`, W / 2, H / 2 - 10);
+        ctx.fillText(`High Score: ${Math.max(highScore, score)}`, W / 2, H / 2 + 30);
+        
+        ctx.fillStyle = '#7aff4a';
+        ctx.font = `${18 * scale}px monospace`;
+        ctx.fillText('Press SPACE to play again', W / 2, H / 2 + 80);
+    }
+}
+
+function drawFrog(x, y, size) {
+    // Simple frog face
+    ctx.beginPath();
+    ctx.arc(x, y, size * 0.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#4a9a2a';
+    ctx.fill();
+    
+    // Eyes
+    ctx.beginPath();
+    ctx.arc(x - size * 0.25, y - size * 0.3, size * 0.15, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x + size * 0.25, y - size * 0.3, size * 0.15, 0, Math.PI * 2);
+    ctx.fillStyle = '#fff';
+    ctx.fill();
+    
+    // Pupils
+    ctx.beginPath();
+    ctx.arc(x - size * 0.25, y - size * 0.3, size * 0.08, 0, Math.PI * 2);
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x + size * 0.25, y - size * 0.3, size * 0.08, 0, Math.PI * 2);
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fill();
+    
+    // Smile
+    ctx.beginPath();
+    ctx.arc(x, y + size * 0.1, size * 0.3, 0.2, Math.PI - 0.2);
+    ctx.strokeStyle = '#2a5a1a';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Big frog
+    drawFrog(W / 2, H * 0.25, 40 * scale);
+    
+    ctx.fillStyle = '#7aff4a';
+    ctx.font = `bold ${42 * scale}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('FROG PINBALL', W / 2, H * 0.45);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = `${16 * scale}px monospace`;
+    ctx.fillText('Guide the ball through lily pads!', W / 2, H * 0.53);
+    
+    ctx.fillStyle = '#aaa';
+    ctx.font = `${14 * scale}px monospace`;
+    ctx.fillText('← → or A D : Flippers', W / 2, H * 0.62);
+    ctx.fillText('SPACE : Launch ball', W / 2, H * 0.67);
+    
+    ctx.fillStyle = '#ffaa3a';
+    ctx.font = `${18 * scale}px monospace`;
+    const blink = Math.sin(performance.now() * 0.005) > 0;
+    if (blink) {
+        ctx.fillText('Press SPACE to start', W / 2, H * 0.78);
+    }
+    
+    if (highScore > 0) {
+        ctx.fillStyle = '#ffaa3a';
+        ctx.font = `${14 * scale}px monospace`;
+        ctx.fillText(`High Score: ${highScore}`, W / 2, H * 0.85);
+    }
+}
+
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = Math.min((time - lastTime) / 1000, 0.03);
+    lastTime = time;
+    
+    update(dt);
+    draw();
+    
+    requestAnimationFrame(gameLoop);
+}
+
+// Initialize flipper angles
+flippers.left.currentAngle = flippers.left.restAngle;
+flippers.right.currentAngle = flippers.right.restAngle;
+
+layoutFlippers();
+layoutBumpers();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
