@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Maze Endless</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #0a0a1a; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H, CELL;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    CELL = Math.max(30, Math.min(50, Math.floor(Math.min(W, H) / 18)));
+}
+window.addEventListener('resize', resize);
+resize();
+
+let state = 'start'; // start, play, dead
+let score = 0;
+let highScore = 0;
+try { highScore = parseInt(localStorage.getItem('mazeEndlessHigh') || '0'); } catch(e) {}
+let speed = 1;
+let elapsed = 0;
+let particles = [];
+let shakeTime = 0;
+let shakeMag = 0;
+
+// Maze storage
+let mazeMap = new Map();
+function key(x, y) { return x * 100000 + y; }
+function getCell(x, y) { return mazeMap.get(key(x, y)); }
+function setCell(x, y, d) { mazeMap.set(key(x, y), d); }
+function newCell() { return { t: true, r: true, b: true, l: true }; }
+
+function carve(x1, y1, x2, y2) {
+    let c1 = getCell(x1, y1), c2 = getCell(x2, y2);
+    if (!c1 || !c2) return;
+    if (x2 === x1 + 1) { c1.r = false; c2.l = false; }
+    else if (x2 === x1 - 1) { c1.l = false; c2.r = false; }
+    else if (y2 === y1 + 1) { c1.b = false; c2.t = false; }
+    else if (y2 === y1 - 1) { c1.t = false; c2.b = false; }
+}
+
+function generateRegion(x0, y0, x1, y1) {
+    let cells = [];
+    for (let y = y0; y <= y1; y++)
+        for (let x = x0; x <= x1; x++) {
+            if (!mazeMap.has(key(x, y))) {
+                setCell(x, y, newCell());
+                cells.push([x, y]);
+            }
+        }
+    // Recursive backtracker
+    let visited = new Set();
+    let start = cells[Math.floor(Math.random() * cells.length)];
+    visited.add(key(start[0], start[1]));
+    let stack = [[start[0], start[1]]];
+    while (stack.length > 0) {
+        let [cx, cy] = stack[stack.length - 1];
+        let nbs = [];
+        for (let [dx, dy] of [[0,-1],[1,0],[0,1],[-1,0]]) {
+            let nx = cx+dx, ny = cy+dy;
+            if (nx >= x0 && nx <= x1 && ny >= y0 && ny <= y1) {
+                if (!visited.has(key(nx, ny))) nbs.push([nx, ny]);
+            }
+        }
+        if (nbs.length > 0) {
+            let [nx, ny] = nbs[Math.floor(Math.random() * nbs.length)];
+            carve(cx, cy, nx, ny);
+            visited.add(key(nx, ny));
+            stack.push([nx, ny]);
+        } else {
+            stack.pop();
+        }
+    }
+}
+
+function extendMaze(px, py) {
+    const margin = 8;
+    if (px <= margin || px >= getBounds().maxX - margin || py <= margin || py >= getBounds().maxY - margin) {
+        // Generate new cells in the direction player is heading
+        let bx = getBounds();
+        let size = 12;
+        if (px <= margin) generateRegion(bx.minX - size, bx.minY, bx.maxX, bx.maxY);
+        if (px >= bx.maxX - margin) generateRegion(bx.minX, bx.minY, bx.minX + size, bx.maxY);
+        if (py <= margin) generateRegion(bx.minX, bx.minY - size, bx.maxX, bx.maxY);
+        if (py >= bx.maxY - margin) generateRegion(bx.minX, bx.minY, bx.maxX, bx.minY + size);
+    }
+}
+
+function getBounds() {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let k of mazeMap.keys()) {
+        // key = x*100000+y, decode
+        let x = Math.floor(k / 100000);
+        let y = k % 100000;
+        if (y < 0) y += 100000;
+        minX = Math.min(minX, x); minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+    }
+    return { minX, minY, maxX, maxY };
+}
+
+function pruneMaze(px, py) {
+    const range = 30;
+    let toRemove = [];
+    for (let k of mazeMap.keys()) {
+        let x = Math.floor(k / 100000);
+        let y = k % 100000;
+        if (y < 0) y += 100000;
+        if (Math.abs(x - px) > range || Math.abs(y - py) > range) toRemove.push(k);
+    }
+    for (let k of toRemove) mazeMap.delete(k);
+}
+
+function canMove(x, y, dx, dy) {
+    let c = getCell(x, y);
+    if (!c) return false;
+    if (dx === 1 && c.r) return false;
+    if (dx === -1 && c.l) return false;
+    if (dy === 1 && c.b) return false;
+    if (dy === -1 && c.t) return false;
+    return getCell(x+dx, y+dy) !== undefined;
+}
+
+// Game objects
+let player = { x: 0, y: 0, px: 0, py: 0 };
+let ghost = { x: 0, y: 0, px: 0, py: 0, timer: 0, dir: null };
+let orbs = [];
+
+function initGame() {
+    score = 0; speed = 1; elapsed = 0; particles = []; shakeTime = 0;
+    mazeMap.clear();
+    generateRegion(-20, -20, 20, 20);
+    player.x = 0; player.y = 0; player.px = 0; player.py = 0;
+    ghost.x = -5; ghost.y = -5; ghost.px = -5; ghost.py = -5; ghost.timer = 0; ghost.dir = null;
+    orbs = [];
+    for (let i = 0; i < 8; i++) spawnOrb();
+}
+
+function spawnOrb() {
+    let ox, oy, tries = 0;
+    do {
+        ox = Math.floor(Math.random() * 30) - 15 + player.x;
+        oy = Math.floor(Math.random() * 30) - 15 + player.y;
+        tries++;
+    } while ((Math.abs(ox - ghost.x) < 4 && Math.abs(oy - ghost.y) < 4) && tries < 50);
+    if (!getCell(ox, oy)) return;
+    orbs.push({ x: ox, y: oy, pulse: Math.random() * Math.PI * 2 });
+}
+
+function bfsPath(sx, sy, tx, ty) {
+    let queue = [[sx, sy]];
+    let visited = new Set([key(sx, sy)]);
+    let parent = new Map();
+    while (queue.length > 0) {
+        let [cx, cy] = queue.shift();
+        if (cx === tx && cy === ty) break;
+        for (let [dx, dy] of [[0,-1],[1,0],[0,1],[-1,0]]) {
+            let nx = cx+dx, ny = cy+dy;
+            if (!visited.has(key(nx, ny)) && canMove(cx, cy, dx, dy)) {
+                visited.add(key(nx, ny));
+                parent.set(key(nx, ny), [cx, cy]);
+                queue.push([nx, ny]);
+            }
+        }
+    }
+    if (!parent.has(key(tx, ty))) return null;
+    let path = [];
+    let cur = key(tx, ty);
+    while (cur !== key(sx, sy)) {
+        let x = Math.floor(cur / 100000);
+        let y = cur % 100000;
+        if (y < 0) y += 100000;
+        path.unshift([x, y]);
+        let p = parent.get(cur);
+        cur = key(p[0], p[1]);
+    }
+    return path.length > 0 ? path[0] : null;
+}
+
+function moveGhost() {
+    ghost.timer--;
+    if (ghost.timer <= 0) {
+        ghost.timer = Math.max(6, 14 - Math.floor(speed * 2));
+        let next = bfsPath(ghost.x, ghost.y, player.x, player.y);
+        if (next && (next[0] !== ghost.x || next[1] !== ghost.y)) {
+            ghost.px = ghost.x;
+            ghost.py = ghost.y;
+            ghost.x = next[0];
+            ghost.y = next[1];
+        }
+    }
+}
+
+// Input
+let keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (state === 'start' || state === 'dead') {
+        if (e.code === 'Space' || e.code === 'Enter') {
+            initGame();
+            state = 'play';
+        }
+    }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function handleInput() {
+    let dx = 0, dy = 0;
+    if (keys['ArrowLeft'] || keys['KeyA']) dx = -1;
+    else if (keys['ArrowRight'] || keys['KeyD']) dx = 1;
+    else if (keys['ArrowUp'] || keys['KeyW']) dy = -1;
+    else if (keys['ArrowDown'] || keys['KeyS']) dy = 1;
+    if ((dx !== 0 || dy !== 0) && canMove(player.x, player.y, dx, dy)) {
+        player.px = player.x;
+        player.py = player.y;
+        player.x += dx;
+        player.y += dy;
+        extendMaze(player.x, player.y);
+        pruneMaze(player.x, player.y);
+    }
+}
+
+// Particles
+function addParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        let a = Math.random() * Math.PI * 2;
+        let sp = 1 + Math.random() * 3;
+        particles.push({ x: x*CELL+CELL/2, y: y*CELL+CELL/2, vx: Math.cos(a)*sp, vy: Math.sin(a)*sp, life: 1, color });
+    }
+}
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playTone(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    let osc = audioCtx.createOscillator();
+    let gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.15, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+
+function playCollect() { playTone(880, 0.15, 'sine', 0.2); playTone(1320, 0.1, 'sine', 0.15); }
+function playDeath() { playTone(200, 0.5, 'sawtooth', 0.3); playTone(150, 0.7, 'square', 0.2); }
+
+// Update
+let lastTime = 0;
+function update(dt) {
+    if (state !== 'play') return;
+    elapsed += dt;
+    speed = 1 + elapsed * 0.03;
+    
+    handleInput();
+    moveGhost();
+    
+    // Check orb collection
+    for (let i = orbs.length - 1; i >= 0; i--) {
+        if (orbs[i].x === player.x && orbs[i].y === player.y) {
+            score += Math.floor(10 * speed);
+            addParticles(orbs[i].x, orbs[i].y, '#ffdd44', 12);
+            playCollect();
+            orbs.splice(i, 1);
+        }
+    }
+    if (orbs.length < 6) spawnOrb();
+    
+    // Check death
+    if (ghost.x === player.x && ghost.y === player.y) {
+        state = 'dead';
+        shakeTime = 0.5;
+        shakeMag = 8;
+        playDeath();
+        addParticles(player.x, player.y, '#ff4466', 20);
+        if (score > highScore) {
+            highScore = score;
+            try { localStorage.setItem('mazeEndlessHigh', String(highScore)); } catch(e) {}
+        }
+    }
+    
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        let p = particles[i];
+        p.x += p.vx * CELL * dt * 3;
+        p.y += p.vy * CELL * dt * 3;
+        p.life -= dt * 2.5;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+    
+    // Shake decay
+    if (shakeTime > 0) shakeTime -= dt;
+}
+
+// Render
+function drawMaze(ox, oy) {
+    let startX = Math.floor(ox / CELL) - 1;
+    let startY = Math.floor(oy / CELL) - 1;
+    let cols = Math.ceil(W / CELL) + 2;
+    let rows = Math.ceil(H / CELL) + 2;
+    
+    ctx.strokeStyle = '#2a3a5c';
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    
+    for (let gy = startY; gy < startY + rows; gy++) {
+        for (let gx = startX; gx < startX + cols; gx++) {
+            let c = getCell(gx, gy);
+            if (!c) continue;
+            let sx = (gx - Math.floor(ox / CELL)) * CELL;
+            let sy = (gy - Math.floor(oy / CELL)) * CELL;
+            
+            // Draw walls
+            ctx.beginPath();
+            if (c.t) { ctx.moveTo(sx, sy); ctx.lineTo(sx + CELL, sy); }
+            if (c.l) { ctx.moveTo(sx, sy); ctx.lineTo(sx, sy + CELL); }
+            if (gx === startX + cols - 1 && c.r) { ctx.moveTo(sx+CELL, sy); ctx.lineTo(sx+CELL, sy+CELL); }
+            if (gy === startY + rows - 1 && c.b) { ctx.moveTo(sx, sy+CELL); ctx.lineTo(sx+CELL, sy+CELL); }
+            ctx.stroke();
+        }
+    }
+}
+
+function drawEntity(ex, ey, ox, oy, color, radius, glow) {
+    let sx = (ex - Math.floor(ox / CELL)) * CELL + CELL/2;
+    let sy = (ey - Math.floor(oy / CELL)) * CELL + CELL/2;
+    
+    ctx.save();
+    ctx.shadowColor = color;
+    ctx.shadowBlur = glow || 15;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(sx, sy, radius, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+}
+
+function render(time) {
+    let t = time * 0.001;
+    
+    // Camera
+    let camX = player.px * CELL + (player.x - player.px) * CELL + W/2 - CELL/2;
+    let camY = player.py * CELL + (player.y - player.py) * CELL + H/2 - CELL/2;
+    
+    if (shakeTime > 0) {
+        camX += (Math.random()-0.5) * shakeMag * (shakeTime / 0.5);
+        camY += (Math.random()-0.5) * shakeMag * (shakeTime / 0.5);
+    }
+    
+    ctx.fillStyle = '#0a0e1a';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Subtle grid dots
+    ctx.fillStyle = 'rgba(40,60,100,0.3)';
+    let gs = CELL;
+    let ox = -(camX % gs), oy = -(camY % gs);
+    for (let x = ox; x < W+gs; x += gs)
+        for (let y = oy; y < H+gs; y += gs)
+            ctx.fillRect(x-1, y-1, 2, 2);
+    
+    drawMaze(camX, camY);
+    
+    // Orbs
+    for (let o of orbs) {
+        let sx = (o.x - Math.floor(camX / CELL)) * CELL + CELL/2;
+        let sy = (o.y - Math.floor(camY / CELL)) * CELL + CELL/2;
+        if (sx < -CELL || sx > W+CELL || sy < -CELL || sy > H+CELL) continue;
+        let pulse = 1 + Math.sin(t*3 + o.pulse) * 0.2;
+        ctx.save();
+        ctx.shadowColor = '#ffdd44';
+        ctx.shadowBlur = 12;
+        ctx.fillStyle = '#ffdd44';
+        ctx.beginPath();
+        ctx.arc(sx, sy, CELL*0.2*pulse, 0, Math.PI*2);
+        ctx.fill();
+        ctx.restore();
+    }
+    
+    // Ghost
+    let gsx = (ghost.x - Math.floor(camX / CELL)) * CELL + CELL/2;
+    let gsy = (ghost.y - Math.floor(camY / CELL)) * CELL + CELL/2;
+    if (gsx > -CELL && gsx < W+CELL && gsy > -CELL && gsy < H+CELL) {
+        ctx.save();
+        ctx.shadowColor = '#ff2266';
+        ctx.shadowBlur = 20;
+        ctx.fillStyle = '#ff2266';
+        ctx.beginPath();
+        ctx.arc(gsx, gsy, CELL*0.35, 0, Math.PI*2);
+        ctx.fill();
+        // Eyes
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(gsx - CELL*0.1, gsy - CELL*0.05, CELL*0.07, 0, Math.PI*2);
+        ctx.arc(gsx + CELL*0.1, gsy - CELL*0.05, CELL*0.07, 0, Math.PI*2);
+        ctx.fill();
+        ctx.restore();
+    }
+    
+    // Player
+    let psx = (player.x - Math.floor(camX / CELL)) * CELL + CELL/2;
+    let psy = (player.y - Math.floor(camY / CELL)) * CELL + CELL/2;
+    ctx.save();
+    ctx.shadowColor = '#44ddff';
+    ctx.shadowBlur = 18;
+    ctx.fillStyle = '#44ddff';
+    ctx.beginPath();
+    ctx.arc(psx, psy, CELL*0.3, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+    
+    // Particles
+    for (let p of particles) {
+        let alpha = p.life;
+        ctx.fillStyle = p.color.replace(')', `,${alpha})`).replace('#', 'rgba(').replace(/rgba\(/, '').length > 0 ? `rgba(${parseInt(p.color.slice(1,3),16)},${parseInt(p.color.slice(3,5),16)},${parseInt(p.color.slice(5,7),16)},${alpha})` : p.color;
+        // Simpler: just use globalAlpha
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x - camX, p.y - camY, 3 * alpha, 0, Math.PI*2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    
+    // HUD
+    if (state === 'play') {
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold ${Math.floor(CELL*0.6)}px monospace`;
+        ctx.textAlign = 'left';
+        ctx.fillText(`Score: ${score}`, 20, 35);
+        ctx.font = `${Math.floor(CELL*0.4)}px monospace`;
+        ctx.fillStyle = '#88aacc';
+        ctx.fillText(`Speed: x${speed.toFixed(1)}`, 20, 60);
+    }
+    
+    if (state === 'start') {
+        drawOverlay();
+    }
+    if (state === 'dead') {
+        drawDeathScreen();
+    }
+}
+
+function drawOverlay() {
+    ctx.fillStyle = 'rgba(10,14,26,0.85)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#44ddff';
+    ctx.font = `bold ${Math.min(60, W*0.07)}px monospace`;
+    ctx.shadowColor = '#44ddff';
+    ctx.shadowBlur = 20;
+    ctx.fillText('MAZE ENDLESS', W/2, H*0.3);
+    ctx.shadowBlur = 0;
+    
+    ctx.fillStyle = '#aaccee';
+    ctx.font = `${Math.min(18, W*0.025)}px monospace`;
+    ctx.fillText('Navigate the infinite maze. Collect orbs. Avoid the ghost.', W/2, H*0.45);
+    ctx.fillText('The ghost gets faster the longer you survive.', W/2, H*0.52);
+    
+    ctx.fillStyle = '#8899bb';
+    ctx.font = `${Math.min(16, W*0.02)}px monospace`;
+    ctx.fillText('Controls: Arrow Keys / WASD to move', W/2, H*0.63);
+    
+    if (highScore > 0) {
+        ctx.fillStyle = '#ffdd44';
+        ctx.font = `${Math.min(18, W*0.025)}px monospace`;
+        ctx.fillText(`High Score: ${highScore}`, W/2, H*0.73);
+    }
+    
+    let pulse = 0.5 + Math.sin(Date.now()*0.004) * 0.5;
+    ctx.fillStyle = `rgba(68,221,255,${pulse})`;
+    ctx.font = `${Math.min(20, W*0.03)}px monospace`;
+    ctx.fillText('Press SPACE or ENTER to start', W/2, H*0.85);
+}
+
+function drawDeathScreen() {
+    ctx.fillStyle = 'rgba(10,14,26,0.75)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff2266';
+    ctx.font = `bold ${Math.min(50, W*0.06)}px monospace`;
+    ctx.shadowColor = '#ff2266';
+    ctx.shadowBlur = 15;
+    ctx.fillText('CAUGHT!', W/2, H*0.3);
+    ctx.shadowBlur = 0;
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.min(24, W*0.03)}px monospace`;
+    ctx.fillText(`Score: ${score}`, W/2, H*0.45);
+    
+    if (score >= highScore && score > 0) {
+        ctx.fillStyle = '#ffdd44';
+        ctx.font = `${Math.min(18, W*0.025)}px monospace`;
+        ctx.fillText('NEW HIGH SCORE!', W/2, H*0.53);
+    } else if (highScore > 0) {
+        ctx.fillStyle = '#88aacc';
+        ctx.font = `${Math.min(18, W*0.025)}px monospace`;
+        ctx.fillText(`High: ${highScore}`, W/2, H*0.53);
+    }
+    
+    let pulse = 0.5 + Math.sin(Date.now()*0.004) * 0.5;
+    ctx.fillStyle = `rgba(68,221,255,${pulse})`;
+    ctx.font = `${Math.min(20, W*0.03)}px monospace`;
+    ctx.fillText('Press SPACE or ENTER to retry', W/2, H*0.7);
+}
+
+// Main loop
+function loop(time) {
+    let dt = Math.min((time - lastTime) / 1000, 0.05);
+    lastTime = time;
+    
+    // Smooth interpolation for player and ghost
+    if (state === 'play') {
+        let lerp = 1 - Math.pow(0.001, dt * 8);
+        player.px += (player.x - player.px) * lerp;
+        player.py += (player.y - player.py) * lerp;
+        ghost.px += (ghost.x - ghost.px) * lerp;
+        ghost.py += (ghost.y - ghost.py) * lerp;
+    }
+    
+    update(dt);
+    render(time);
+    requestAnimationFrame(loop);
+}
+
+initGame();
+state = 'start';
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
