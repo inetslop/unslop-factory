@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>3D Pong</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; width: 100vw; }
+canvas { display: block; cursor: none; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, duration, type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+
+// Game constants
+const COURT_DEPTH = 10;
+const COURT_HEIGHT = 4;
+const COURT_WIDTH = 8;
+const PADDLE_W = 2.5;
+const PADDLE_H = 2.5;
+const BALL_R = 0.3;
+
+// Game state
+let gameState = 'start'; // start, playing, scored
+let scorePlayer = 0;
+let scoreAI = 0;
+let firstInput = false;
+
+// Player paddle (left side)
+let playerY = COURT_HEIGHT / 2;
+let playerZ = 0;
+let playerVY = 0;
+let playerVZ = 0;
+
+// AI paddle (right side)
+let aiY = COURT_HEIGHT / 2;
+let aiZ = 0;
+
+// Ball
+let ballX, ballY, ballZ, ballVX, ballVY, ballVZ;
+let ballTrail = [];
+
+function resetBall(direction) {
+    ballX = COURT_DEPTH / 2;
+    ballY = COURT_HEIGHT / 2 + (Math.random() - 0.5) * 1.5;
+    ballZ = (Math.random() - 0.5) * 3;
+    const speed = 4;
+    const angle = (Math.random() - 0.5) * 0.6;
+    ballVX = direction * speed;
+    ballVY = Math.sin(angle) * speed * 0.7;
+    ballVZ = Math.cos(angle) * speed * 0.3;
+    ballTrail = [];
+}
+
+function startGame() {
+    scorePlayer = 0;
+    scoreAI = 0;
+    playerY = COURT_HEIGHT / 2;
+    playerZ = 0;
+    aiY = COURT_HEIGHT / 2;
+    aiZ = 0;
+    resetBall(Math.random() > 0.5 ? 1 : -1);
+    gameState = 'playing';
+}
+
+// Input
+let keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (!firstInput) {
+        firstInput = true;
+        initAudio();
+    }
+    if (gameState === 'start' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+    if (gameState === 'scored' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Perspective projection
+const CAM_X = -6;
+const CAM_Y = 7;
+const CAM_Z = 0;
+const FOCAL = 5;
+
+function project(x, y, z) {
+    let dx = x - CAM_X;
+    let dy = y - CAM_Y;
+    let dz = z - CAM_Z;
+    if (dx < 0.1) dx = 0.1;
+    let scale = FOCAL / dx;
+    let sx = W / 2 + dz * scale * 80;
+    let sy = H / 2 + dy * scale * 80;
+    return { x: sx, y: sy, scale: scale };
+}
+
+// Render functions
+function drawCourt() {
+    // Floor grid
+    for (let i = 0; i <= 20; i++) {
+        let z = -COURT_WIDTH / 2 + (i / 10) * COURT_WIDTH;
+        let p1 = project(0, 0, z);
+        let p2 = project(COURT_DEPTH, 0, z);
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.strokeStyle = `rgba(0, 255, 200, ${0.3 - Math.abs(i - 10) * 0.02})`;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+    }
+    for (let i = 0; i <= 10; i++) {
+        let x = (i / 5) * COURT_DEPTH;
+        let p1 = project(x, 0, -COURT_WIDTH / 2);
+        let p2 = project(x, 0, COURT_WIDTH / 2);
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.strokeStyle = `rgba(0, 255, 200, ${0.3 - Math.abs(i - 5) * 0.03})`;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+    }
+
+    // Court borders
+    let corners = [
+        project(0, 0, -COURT_WIDTH / 2),
+        project(0, 0, COURT_WIDTH / 2),
+        project(COURT_DEPTH, 0, COURT_WIDTH / 2),
+        project(COURT_DEPTH, 0, -COURT_WIDTH / 2)
+    ];
+    ctx.beginPath();
+    ctx.moveTo(corners[0].x, corners[0].y);
+    for (let i = 1; i < 4; i++) ctx.lineTo(corners[i].x, corners[i].y);
+    ctx.closePath();
+    ctx.strokeStyle = 'rgba(0, 255, 200, 0.8)';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // Net (middle line)
+    let netH = 1.5;
+    for (let i = 0; i <= 30; i++) {
+        let z = -COURT_WIDTH / 2 + (i / 30) * COURT_WIDTH;
+        let p1 = project(COURT_DEPTH / 2, 0, z);
+        let p2 = project(COURT_DEPTH / 2, netH, z);
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.strokeStyle = `rgba(255, 255, 0, ${0.4 + Math.abs(i - 15) * 0.01})`;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+    }
+    // Net top line
+    let nt1 = project(COURT_DEPTH / 2, netH, -COURT_WIDTH / 2);
+    let nt2 = project(COURT_DEPTH / 2, netH, COURT_WIDTH / 2);
+    ctx.beginPath();
+    ctx.moveTo(nt1.x, nt1.y);
+    ctx.lineTo(nt2.x, nt2.y);
+    ctx.strokeStyle = 'rgba(255, 255, 0, 0.9)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Side walls (glow)
+    for (let side of [-1, 1]) {
+        let z = side * COURT_WIDTH / 2;
+        let p1 = project(0, 0, z);
+        let p2 = project(COURT_DEPTH, 0, z);
+        ctx.beginPath();
+        ctx.moveTo(p1.x, p1.y);
+        ctx.lineTo(p2.x, p2.y);
+        ctx.strokeStyle = 'rgba(0, 150, 255, 0.6)';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+    }
+}
+
+function drawPaddle(x, y, z, isPlayer) {
+    let color = isPlayer ? '0, 200, 255' : '255, 100, 100';
+    let hw = PADDLE_W / 2;
+    let hh = PADDLE_H / 2;
+
+    // Draw as a 3D box (top face + front face)
+    let corners_top = [
+        project(x - 0.2, y + hh, z - hw),
+        project(x - 0.2, y + hh, z + hw),
+        project(x + 0.2, y + hh, z + hw),
+        project(x + 0.2, y + hh, z - hw)
+    ];
+    let corners_bot = [
+        project(x - 0.2, y - hh, z - hw),
+        project(x - 0.2, y - hh, z + hw),
+        project(x + 0.2, y - hh, z + hw),
+        project(x + 0.2, y - hh, z - hw)
+    ];
+
+    // Top face
+    ctx.beginPath();
+    ctx.moveTo(corners_top[0].x, corners_top[0].y);
+    for (let i = 1; i < 4; i++) ctx.lineTo(corners_top[i].x, corners_top[i].y);
+    ctx.closePath();
+    ctx.fillStyle = `rgba(${color}, 0.9)`;
+    ctx.fill();
+    ctx.strokeStyle = `rgba(${color}, 1)`;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Front face (if player) or back face (if AI)
+    let frontIdx = isPlayer ? [3, 2] : [0, 1];
+    let f1 = corners_top[frontIdx[0]];
+    let f2 = corners_top[frontIdx[1]];
+    let b1 = corners_bot[frontIdx[0]];
+    let b2 = corners_bot[frontIdx[1]];
+    ctx.beginPath();
+    ctx.moveTo(f1.x, f1.y);
+    ctx.lineTo(f2.x, f2.y);
+    ctx.lineTo(b2.x, b2.y);
+    ctx.lineTo(b1.x, b1.y);
+    ctx.closePath();
+    ctx.fillStyle = `rgba(${color}, 0.5)`;
+    ctx.fill();
+}
+
+function drawBall() {
+    // Trail
+    for (let i = 0; i < ballTrail.length; i++) {
+        let t = ballTrail[i];
+        let alpha = (i / ballTrail.length) * 0.6;
+        let p = project(t.x, t.y, t.z);
+        let r = Math.max(2, BALL_R * 80 * p.scale * 0.5);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 255, 100, ${alpha})`;
+        ctx.fill();
+    }
+
+    let p = project(ballX, ballY, ballZ);
+    let r = Math.max(4, BALL_R * 80 * p.scale * 0.7);
+
+    // Glow
+    let grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r * 2.5);
+    grad.addColorStop(0, 'rgba(255, 255, 100, 0.8)');
+    grad.addColorStop(1, 'rgba(255, 255, 100, 0)');
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r * 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Ball
+    let bg = ctx.createRadialGradient(p.x - r * 0.3, p.y - r * 0.3, 0, p.x, p.y, r);
+    bg.addColorStop(0, '#fff');
+    bg.addColorStop(1, '#ff8');
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = bg;
+    ctx.fill();
+
+    // Shadow on floor
+    let sp = project(ballX, 0, ballZ);
+    let sr = Math.max(3, BALL_R * 80 * sp.scale * 0.4);
+    ctx.beginPath();
+    ctx.ellipse(sp.x, sp.y, sr * 1.5, sr * 0.5, 0, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
+    ctx.fill();
+}
+
+function drawHUD() {
+    ctx.font = `bold ${Math.min(W, H) * 0.06}px monospace`;
+    ctx.textAlign = 'center';
+
+    // Player score (left)
+    ctx.fillStyle = 'rgba(0, 200, 255, 0.9)';
+    ctx.fillText(scorePlayer, W * 0.3, H * 0.12);
+
+    // AI score (right)
+    ctx.fillStyle = 'rgba(255, 100, 100, 0.9)';
+    ctx.fillText(scoreAI, W * 0.7, H * 0.12);
+
+    // Labels
+    ctx.font = `${Math.min(W, H) * 0.025}px monospace`;
+    ctx.fillStyle = 'rgba(0, 200, 255, 0.6)';
+    ctx.fillText('YOU', W * 0.3, H * 0.17);
+    ctx.fillStyle = 'rgba(255, 100, 100, 0.6)';
+    ctx.fillText('CPU', W * 0.7, H * 0.17);
+}
+
+function drawStartScreen() {
+    // Background
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+    drawCourt();
+
+    // Title
+    let ts = Math.min(W, H) * 0.12;
+    ctx.font = `bold ${ts}px monospace`;
+    ctx.textAlign = 'center';
+    let grad = ctx.createLinearGradient(W/2 - ts*2, H/2, W/2 + ts*2, H/2);
+    grad.addColorStop(0, '#0ff');
+    grad.addColorStop(1, '#f0f');
+    ctx.fillStyle = grad;
+    ctx.fillText('3D PONG', W / 2, H * 0.35);
+
+    // Instructions
+    let fs = Math.min(W, H) * 0.03;
+    ctx.font = `${fs}px monospace`;
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.fillText('W / S — Move Up / Down', W / 2, H * 0.5);
+    ctx.fillText('A / D — Move Left / Right', W / 2, H * 0.5 + fs * 1.5);
+    ctx.fillText('', W / 2, H * 0.5 + fs * 3);
+
+    let pulse = 0.5 + Math.sin(Date.now() * 0.004) * 0.5;
+    ctx.fillStyle = `rgba(0, 255, 200, ${pulse})`;
+    ctx.font = `bold ${fs * 1.2}px monospace`;
+    ctx.fillText('PRESS SPACE TO START', W / 2, H * 0.7);
+
+    ctx.font = `${fs * 0.7}px monospace`;
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.fillText('First to 7 wins!', W / 2, H * 0.82);
+}
+
+function drawScoredScreen() {
+    let msg = scorePlayer >= 7 ? 'YOU WIN!' : scoreAI >= 7 ? 'CPU WINS' : '';
+    let ts = Math.min(W, H) * 0.1;
+    ctx.font = `bold ${ts}px monospace`;
+    ctx.textAlign = 'center';
+
+    if (scorePlayer >= 7) {
+        ctx.fillStyle = '#0ff';
+    } else {
+        ctx.fillStyle = '#f44';
+    }
+    ctx.fillText(msg, W / 2, H * 0.4);
+
+    let fs = Math.min(W, H) * 0.03;
+    ctx.font = `${fs}px monospace`;
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fillText(`${scorePlayer} — ${scoreAI}`, W / 2, H * 0.5);
+
+    let pulse = 0.5 + Math.sin(Date.now() * 0.004) * 0.5;
+    ctx.fillStyle = `rgba(0, 255, 200, ${pulse})`;
+    ctx.font = `bold ${fs}px monospace`;
+    ctx.fillText('PRESS SPACE TO RESTART', W / 2, H * 0.65);
+}
+
+// AI logic
+function updateAI(dt) {
+    // AI tracks ball Y and Z with some delay/imperfection
+    let targetY = ballY;
+    let targetZ = ballZ;
+
+    // Add imperfection - AI gets worse as score increases
+    let difficulty = 0.7 + Math.min(scorePlayer + scoreAI, 6) * 0.05;
+    let maxSpeed = 3.5 * difficulty;
+
+    let dy = targetY - aiY;
+    let dz = targetZ - aiZ;
+
+    if (Math.abs(dy) > 0.2) {
+        aiY += Math.sign(dy) * Math.min(maxSpeed * dt, Math.abs(dy));
+    }
+    if (Math.abs(dz) > 0.2) {
+        aiZ += Math.sign(dz) * Math.min(maxSpeed * dt, Math.abs(dz));
+    }
+
+    // Clamp AI paddle
+    aiY = Math.max(PADDLE_H / 2, Math.min(COURT_HEIGHT - PADDLE_H / 2, aiY));
+    aiZ = Math.max(-COURT_WIDTH / 2 + PADDLE_W / 2, Math.min(COURT_WIDTH / 2 - PADDLE_W / 2, aiZ));
+}
+
+// Physics
+function updateBall(dt) {
+    ballTrail.push({ x: ballX, y: ballY, z: ballZ });
+    if (ballTrail.length > 15) ballTrail.shift();
+
+    ballX += ballVX * dt;
+    ballY += ballVY * dt;
+    ballZ += ballVZ * dt;
+
+    // Bounce off top/bottom (y walls)
+    if (ballY <= BALL_R) {
+        ballY = BALL_R;
+        ballVY = Math.abs(ballVY);
+        playSound(300, 0.1, 'sine');
+    }
+    if (ballY >= COURT_HEIGHT - BALL_R) {
+        ballY = COURT_HEIGHT - BALL_R;
+        ballVY = -Math.abs(ballVY);
+        playSound(300, 0.1, 'sine');
+    }
+
+    // Bounce off left/right (z walls)
+    if (ballZ <= -COURT_WIDTH / 2 + BALL_R) {
+        ballZ = -COURT_WIDTH / 2 + BALL_R;
+        ballVZ = Math.abs(ballVZ);
+        playSound(400, 0.1, 'sine');
+    }
+    if (ballZ >= COURT_WIDTH / 2 - BALL_R) {
+        ballZ = COURT_WIDTH / 2 - BALL_R;
+        ballVZ = -Math.abs(ballVZ);
+        playSound(400, 0.1, 'sine');
+    }
+
+    // Player paddle collision (x near 0)
+    if (ballX <= 0.5 && ballX >= -0.2 && ballVX < 0) {
+        let dy = ballY - playerY;
+        let dz = ballZ - playerZ;
+        if (Math.abs(dy) < PADDLE_H / 2 + BALL_R && Math.abs(dz) < PADDLE_W / 2 + BALL_R) {
+            ballX = 0.5;
+            ballVX = Math.abs(ballVX);
+            // Add spin based on where ball hits paddle
+            ballVY += dy * 1.5;
+            ballVZ += dz * 1.5;
+            playSound(600, 0.15, 'square');
+        }
+    }
+
+    // AI paddle collision (x near COURT_DEPTH)
+    if (ballX >= COURT_DEPTH - 0.5 && ballX <= COURT_DEPTH + 0.2 && ballVX > 0) {
+        let dy = ballY - aiY;
+        let dz = ballZ - aiZ;
+        if (Math.abs(dy) < PADDLE_H / 2 + BALL_R && Math.abs(dz) < PADDLE_W / 2 + BALL_R) {
+            ballX = COURT_DEPTH - 0.5;
+            ballVX = -Math.abs(ballVX);
+            ballVY += dy * 1.5;
+            ballVZ += dz * 1.5;
+            playSound(600, 0.15, 'square');
+        }
+    }
+
+    // Scoring
+    if (ballX < -1) {
+        scoreAI++;
+        playSound(200, 0.4, 'sawtooth');
+        checkWin();
+    }
+    if (ballX > COURT_DEPTH + 1) {
+        scorePlayer++;
+        playSound(800, 0.3, 'sine');
+        checkWin();
+    }
+
+    // Speed up slightly over time
+    let speed = Math.sqrt(ballVX * ballVX + ballVY * ballVY + ballVZ * ballVZ);
+    if (speed > 7) {
+        let scale = 7 / speed;
+        ballVX *= scale;
+        ballVY *= scale;
+        ballVZ *= scale;
+    }
+}
+
+function checkWin() {
+    if (scorePlayer >= 7 || scoreAI >= 7) {
+        gameState = 'scored';
+    } else {
+        resetBall(scorePlayer > scoreAI ? -1 : 1);
+    }
+}
+
+// Player movement
+function updatePlayer(dt) {
+    let speed = 5 * dt;
+    if (keys['KeyW'] || keys['ArrowUp']) playerY += speed;
+    if (keys['KeyS'] || keys['ArrowDown']) playerY -= speed;
+    if (keys['KeyA'] || keys['ArrowLeft']) playerZ -= speed;
+    if (keys['KeyD'] || keys['ArrowRight']) playerZ += speed;
+
+    // Clamp
+    playerY = Math.max(PADDLE_H / 2, Math.min(COURT_HEIGHT - PADDLE_H / 2, playerY));
+    playerZ = Math.max(-COURT_WIDTH / 2 + PADDLE_W / 2, Math.min(COURT_WIDTH / 2 - PADDLE_W / 2, playerZ));
+}
+
+// Main loop
+let lastTime = 0;
+function gameLoop(timestamp) {
+    let dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+    lastTime = timestamp;
+
+    if (gameState === 'start') {
+        drawStartScreen();
+    } else if (gameState === 'playing') {
+        updatePlayer(dt);
+        updateAI(dt);
+        updateBall(dt);
+
+        // Clear
+        ctx.fillStyle = '#0a0a1a';
+        ctx.fillRect(0, 0, W, H);
+
+        drawCourt();
+        drawPaddle(COURT_DEPTH - 0.2, aiY, aiZ, false);
+        drawPaddle(0.2, playerY, playerZ, true);
+        drawBall();
+        drawHUD();
+    } else if (gameState === 'scored') {
+        // Keep last frame visible
+        ctx.fillStyle = '#0a0a1a';
+        ctx.fillRect(0, 0, W, H);
+        drawCourt();
+        drawPaddle(COURT_DEPTH - 0.2, aiY, aiZ, false);
+        drawPaddle(0.2, playerY, playerZ, true);
+        drawBall();
+        drawHUD();
+        drawScoredScreen();
+    }
+
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
