@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Card Tetris</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    background: #1a1a2e;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Segoe UI', sans-serif;
+}
+#container {
+    position: relative;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+canvas {
+    display: block;
+}
+</style>
+</head>
+<body>
+<div id="container">
+<canvas id="game"></canvas>
+</div>
+<script>
+(function() {
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d');
+
+    let W, H, cellSize, gridX, gridY;
+    const COLS = 8, ROWS = 12;
+
+    function resize() {
+        W = window.innerWidth;
+        H = window.innerHeight;
+        canvas.width = W;
+        canvas.height = H;
+        cellSize = Math.min(Math.floor((W * 0.6) / COLS), Math.floor((H * 0.85) / ROWS));
+        gridX = Math.floor((W - COLS * cellSize) / 2);
+        gridY = Math.floor((H - ROWS * cellSize) / 2);
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // Audio
+    let audioCtx = null;
+    function initAudio() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    function playSound(freq, dur, type, vol) {
+        if (!audioCtx) return;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type || 'square';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + dur);
+    }
+    function playDrop() { playSound(200, 0.08, 'square', 0.08); }
+    function playRotate() { playSound(400, 0.06, 'triangle', 0.08); }
+    function playClear() { playSound(600, 0.2, 'sine', 0.15); playSound(800, 0.3, 'sine', 0.1); }
+    function playGameOver() { playSound(150, 0.5, 'sawtooth', 0.12); }
+
+    // Card data
+    const SUITS = ['♥', '♦', '♣', '♠'];
+    const RANKS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+    const SUIT_COLORS = { '♥': '#e74c3c', '♦': '#e74c3c', '♣': '#2c3e50', '♠': '#2c3e50' };
+
+    function randomCard() {
+        return {
+            suit: SUITS[Math.floor(Math.random() * 4)],
+            rank: RANKS[Math.floor(Math.random() * 13)]
+        };
+    }
+
+    // Game state
+    let grid = [];
+    let score = 0;
+    let linesCleared = 0;
+    let level = 1;
+    let gameRunning = false;
+    let gameOver = false;
+    let startScreen = true;
+    let lastTime = 0;
+    let dropInterval = 800;
+    let animating = false;
+    let clearAnim = null;
+
+    function resetGrid() {
+        grid = [];
+        for (let r = 0; r < ROWS; r++) {
+            grid[r] = [];
+            for (let c = 0; c < COLS; c++) {
+                grid[r][c] = null;
+            }
+        }
+    }
+
+    // Piece types: 'single', 'h-domino', 'v-domino'
+    let currentPiece = null;
+    let nextPiece = null;
+
+    function createPiece() {
+        const type = Math.random() < 0.45 ? 'single' : (Math.random() < 0.5 ? 'h-domino' : 'v-domino');
+        const card1 = randomCard();
+        let card2 = null;
+        if (type !== 'single') {
+            // Sometimes match ranks or suits for bonus potential
+            if (Math.random() < 0.3) {
+                card2 = { suit: card1.suit, rank: RANKS[Math.floor(Math.random() * 13)] };
+            } else if (Math.random() < 0.2) {
+                card2 = { suit: SUITS[Math.floor(Math.random() * 4)], rank: card1.rank };
+            } else {
+                card2 = randomCard();
+            }
+        }
+        return { type, cards: [card1, card2], rot: 0 };
+    }
+
+    function spawnPiece() {
+        const p = nextPiece || createPiece();
+        nextPiece = createPiece();
+        currentPiece = p;
+        let x, y;
+        if (p.type === 'single') {
+            x = Math.floor(COLS / 2);
+            y = 0;
+        } else if (p.type === 'h-domino') {
+            x = Math.floor(COLS / 2) - 1;
+            y = 0;
+        } else {
+            x = Math.floor(COLS / 2);
+            y = 0;
+        }
+        currentPiece.x = x;
+        currentPiece.y = y;
+        if (!canPlace(currentPiece)) {
+            endGame();
+        }
+    }
+
+    function getPieceCells(p) {
+        const cells = [];
+        if (p.type === 'single') {
+            cells.push({ r: p.y, c: p.x });
+        } else if (p.type === 'h-domino') {
+            cells.push({ r: p.y, c: p.x }, { r: p.y, c: p.x + 1 });
+        } else if (p.type === 'v-domino') {
+            cells.push({ r: p.y, c: p.x }, { r: p.y + 1, c: p.x });
+        }
+        return cells;
+    }
+
+    function canPlace(p) {
+        const cells = getPieceCells(p);
+        for (const cell of cells) {
+            if (cell.c < 0 || cell.c >= COLS || cell.r >= ROWS) return false;
+            if (cell.r >= 0 && grid[cell.r][cell.c] !== null) return false;
+        }
+        return true;
+    }
+
+    function placePiece(p) {
+        const cells = getPieceCells(p);
+        for (let i = 0; i < cells.length; i++) {
+            const cell = cells[i];
+            if (cell.r >= 0 && cell.r < ROWS && cell.c >= 0 && cell.c < COLS) {
+                grid[cell.r][cell.c] = p.cards[i];
+            }
+        }
+    }
+
+    function rotatePiece(p) {
+        if (p.type === 'single') return;
+        const oldType = p.type;
+        if (oldType === 'h-domino') {
+            p.type = 'v-domino';
+        } else if (oldType === 'v-domino') {
+            p.type = 'h-domino';
+        }
+        // Try rotation, revert if can't place
+        const oldX = p.x;
+        const oldY = p.y;
+        if (!canPlace(p)) {
+            // Try kick
+            if (p.type === 'v-domino' && oldType === 'h-domino') {
+                p.y -= 1;
+            } else if (p.type === 'h-domino' && oldType === 'v-domino') {
+                p.x += 1;
+            }
+            if (!canPlace(p)) {
+                p.type = oldType;
+                p.x = oldX;
+                p.y = oldY;
+                return;
+            }
+        }
+        playRotate();
+    }
+
+    function checkLines() {
+        const linesToClear = [];
+        for (let r = 0; r < ROWS; r++) {
+            let full = true;
+            for (let c = 0; c < COLS; c++) {
+                if (grid[r][c] === null) { full = false; break; }
+            }
+            if (full) linesToClear.push(r);
+        }
+        if (linesToClear.length > 0) {
+            score += linesToClear.length * 10 * level;
+            // Check suit bonus
+            for (const r of linesToClear) {
+                const suits = new Set();
+                for (let c = 0; c < COLS; c++) {
+                    if (grid[r][c]) suits.add(grid[r][c].suit);
+                }
+                if (suits.size === 1) score += 50 * level;
+            }
+            linesCleared += linesToClear.length;
+            level = Math.floor(linesCleared / 5) + 1;
+            dropInterval = Math.max(200, 800 - (level - 1) * 60);
+            playClear();
+
+            // Animation
+            clearAnim = { rows: linesToClear, time: 0, duration: 300 };
+            animating = true;
+
+            return linesToClear;
+        }
+        return null;
+    }
+
+    function removeLines(rows) {
+        for (const r of rows) {
+            grid.splice(r, 1);
+            grid.unshift(new Array(COLS).fill(null));
+        }
+    }
+
+    function endGame() {
+        gameOver = true;
+        gameRunning = false;
+        playGameOver();
+    }
+
+    function startGame() {
+        resetGrid();
+        score = 0;
+        linesCleared = 0;
+        level = 1;
+        dropInterval = 800;
+        gameOver = false;
+        gameRunning = true;
+        animating = false;
+        clearAnim = null;
+        nextPiece = createPiece();
+        spawnPiece();
+    }
+
+    function hardDrop() {
+        while (canPlace({...currentPiece, y: currentPiece.y + 1})) {
+            currentPiece.y++;
+        }
+        lockPiece();
+    }
+
+    function lockPiece() {
+        placePiece(currentPiece);
+        playDrop();
+        const lines = checkLines();
+        if (lines && lines.length > 0) {
+            // Handle after animation
+            setTimeout(() => {
+                removeLines(lines);
+                animating = false;
+                clearAnim = null;
+                spawnPiece();
+            }, 300);
+        } else {
+            spawnPiece();
+        }
+    }
+
+    function update(dt) {
+        if (!gameRunning || animating) return;
+        if (clearAnim) {
+            clearAnim.time += dt;
+            if (clearAnim.time >= clearAnim.duration) {
+                removeLines(clearAnim.rows);
+                animating = false;
+                clearAnim = null;
+                spawnPiece();
+            }
+            return;
+        }
+
+        const newY = currentPiece.y + 1;
+        const testPiece = {...currentPiece, y: newY};
+        if (canPlace(testPiece)) {
+            currentPiece.y++;
+        } else {
+            lockPiece();
+        }
+    }
+
+    // Drawing
+    function drawCard(x, y, size, card, alpha) {
+        ctx.save();
+        ctx.globalAlpha = alpha || 1;
+        const pad = Math.max(1, size * 0.08);
+        const rx = x + pad, ry = y + pad;
+        const rw = size - pad * 2, rh = size - pad * 2;
+
+        // Card background
+        ctx.fillStyle = '#fff';
+        roundRect(rx, ry, rw, rh, size * 0.1);
+        ctx.fill();
+        ctx.strokeStyle = '#ccc';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        if (card) {
+            const color = SUIT_COLORS[card.suit];
+            // Rank at top-left
+            ctx.fillStyle = color;
+            ctx.font = `bold ${Math.floor(size * 0.35)}px sans-serif`;
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            const rankSize = card.rank === '10' ? size * 0.28 : size * 0.35;
+            ctx.font = `bold ${Math.floor(rankSize)}px sans-serif`;
+            ctx.fillText(card.rank, rx + rw * 0.12, ry + rh * 0.08);
+
+            // Suit in center
+            ctx.font = `${Math.floor(size * 0.45)}px sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(card.suit, rx + rw / 2, ry + rh * 0.6);
+
+            // Small suit at bottom-right (rotated)
+            ctx.save();
+            ctx.translate(rx + rw * 0.85, ry + rh * 0.9);
+            ctx.rotate(Math.PI);
+            ctx.font = `bold ${Math.floor(rankSize)}px sans-serif`;
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            ctx.fillText(card.rank, -rw * 0.15, 0);
+            ctx.restore();
+        }
+        ctx.restore();
+    }
+
+    function roundRect(x, y, w, h, r) {
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.lineTo(x + w - r, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+        ctx.lineTo(x + w, y + h - r);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+        ctx.lineTo(x + r, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+        ctx.lineTo(x, y + r);
+        ctx.quadraticCurveTo(x, y, x + r, y);
+        ctx.closePath();
+    }
+
+    function drawGrid() {
+        // Background
+        ctx.fillStyle = '#16213e';
+        roundRect(gridX - 8, gridY - 8, COLS * cellSize + 16, ROWS * cellSize + 16, 8);
+        ctx.fill();
+
+        // Grid lines (subtle)
+        ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+        ctx.lineWidth = 1;
+        for (let r = 0; r <= ROWS; r++) {
+            ctx.beginPath();
+            ctx.moveTo(gridX, gridY + r * cellSize);
+            ctx.lineTo(gridX + COLS * cellSize, gridY + r * cellSize);
+            ctx.stroke();
+        }
+        for (let c = 0; c <= COLS; c++) {
+            ctx.beginPath();
+            ctx.moveTo(gridX + c * cellSize, gridY);
+            ctx.lineTo(gridX + c * cellSize, gridY + ROWS * cellSize);
+            ctx.stroke();
+        }
+
+        // Placed cards
+        for (let r = 0; r < ROWS; r++) {
+            for (let c = 0; c < COLS; c++) {
+                if (grid[r][c]) {
+                    let alpha = 1;
+                    if (clearAnim && clearAnim.rows.includes(r)) {
+                        const progress = clearAnim.time / clearAnim.duration;
+                        alpha = 1 - progress;
+                    }
+                    drawCard(gridX + c * cellSize, gridY + r * cellSize, cellSize, grid[r][c], alpha);
+                }
+            }
+        }
+
+        // Clear animation glow
+        if (clearAnim) {
+            const progress = clearAnim.time / clearAnim.duration;
+            ctx.fillStyle = `rgba(255, 255, 100, ${0.3 * (1 - progress)})`;
+            for (const r of clearAnim.rows) {
+                ctx.fillRect(gridX, gridY + r * cellSize, COLS * cellSize, cellSize);
+            }
+        }
+
+        // Current piece
+        if (currentPiece && !animating) {
+            const cells = getPieceCells(currentPiece);
+            for (let i = 0; i < cells.length; i++) {
+                const cell = cells[i];
+                if (cell.r >= 0) {
+                    drawCard(gridX + cell.c * cellSize, gridY + cell.r * cellSize, cellSize, currentPiece.cards[i], 1);
+                }
+            }
+
+            // Ghost piece
+            let ghostY = currentPiece.y;
+            const testP = {...currentPiece, y: ghostY};
+            while (canPlace(testP)) {
+                testP.y++;
+                ghostY = testP.y;
+            }
+            const ghostCells = getPieceCells({type: currentPiece.type, x: currentPiece.x, y: ghostY});
+            for (const cell of ghostCells) {
+                if (cell.r >= 0 && grid[cell.r][cell.c] === null) {
+                    ctx.save();
+                    ctx.globalAlpha = 0.3;
+                    drawCard(gridX + cell.c * cellSize, gridY + cell.r * cellSize, cellSize, currentPiece.cards[ghostCells.indexOf(cell)], 0.3);
+                    ctx.restore();
+                }
+            }
+        }
+    }
+
+    function drawNext() {
+        const nx = gridX + COLS * cellSize + 20;
+        const ny = gridY + 10;
+        const label = 'NEXT';
+
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold ${Math.floor(cellSize * 0.4)}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText(label, nx + cellSize / 2, ny);
+
+        if (nextPiece) {
+            const cells = getPieceCells({type: nextPiece.type, x: 0, y: 0});
+            for (let i = 0; i < cells.length; i++) {
+                const cx = nx + cells[i].c * cellSize * 0.7;
+                const cy = ny + 30 + cells[i].r * cellSize * 0.7;
+                drawCard(cx, cy, Math.floor(cellSize * 0.7), nextPiece.cards[i], 1);
+            }
+        }
+    }
+
+    function drawHUD() {
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold ${Math.floor(cellSize * 0.45)}px sans-serif`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'top';
+        const hx = gridX;
+        const hy = gridY - Math.floor(cellSize * 0.6);
+        ctx.fillText(`Score: ${score}`, hx, hy);
+        ctx.font = `${Math.floor(cellSize * 0.3)}px sans-serif`;
+        ctx.fillText(`Level: ${level}  Lines: ${linesCleared}`, hx + cellSize * 2.5, hy);
+    }
+
+    function drawStartScreen() {
+        ctx.fillStyle = '#1a1a2e';
+        ctx.fillRect(0, 0, W, H);
+
+        // Title
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold ${Math.floor(Math.min(W * 0.08, 60))}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('CARD TETRIS', W / 2, H * 0.2);
+
+        // Decorative cards
+        const demoCards = [
+            { suit: '♥', rank: 'A' },
+            { suit: '♠', rank: 'K' },
+            { suit: '♦', rank: 'Q' },
+            { suit: '♣', rank: 'J' }
+        ];
+        const dw = Math.min(60, W * 0.1);
+        const totalW = demoCards.length * (dw + 15) - 15;
+        const startX = W / 2 - totalW / 2;
+        for (let i = 0; i < demoCards.length; i++) {
+            drawCard(startX + i * (dw + 15), H * 0.28, dw, demoCards[i], 1);
+        }
+
+        // Instructions
+        ctx.font = `${Math.floor(Math.min(18, W * 0.03))}px sans-serif`;
+        ctx.fillStyle = '#aaa';
+        const instructions = [
+            '← → : Move',
+            '↑ : Rotate',
+            '↓ : Soft Drop',
+            'SPACE : Hard Drop'
+        ];
+        instructions.forEach((text, i) => {
+            ctx.fillText(text, W / 2, H * 0.45 + i * 28);
+        });
+
+        // Rules
+        ctx.fillStyle = '#7f8c8b';
+        ctx.font = `${Math.floor(Math.min(14, W * 0.02))}px sans-serif`;
+        ctx.fillText('Complete rows to score. All-same-suit rows give bonus!', W / 2, H * 0.65);
+
+        // Start prompt
+        const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 500);
+        ctx.fillStyle = `rgba(255, 255, 255, ${0.5 + 0.5 * pulse})`;
+        ctx.font = `bold ${Math.floor(Math.min(24, W * 0.035))}px sans-serif`;
+        ctx.fillText('Press ENTER to Start', W / 2, H * 0.78);
+    }
+
+    function drawGameOver() {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.fillStyle = '#e74c3c';
+        ctx.font = `bold ${Math.floor(Math.min(50, W * 0.06))}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('GAME OVER', W / 2, H * 0.35);
+
+        ctx.fillStyle = '#fff';
+        ctx.font = `${Math.floor(Math.min(24, W * 0.03))}px sans-serif`;
+        ctx.fillText(`Final Score: ${score}`, W / 2, H * 0.48);
+        ctx.fillText(`Lines Cleared: ${linesCleared}`, W / 2, H * 0.54);
+
+        const pulse = 0.5 + 0.5 * Math.sin(Date.now() / 500);
+        ctx.fillStyle = `rgba(255, 255, 255, ${0.5 + 0.5 * pulse})`;
+        ctx.font = `bold ${Math.floor(Math.min(20, W * 0.03))}px sans-serif`;
+        ctx.fillText('Press R to Restart', W / 2, H * 0.68);
+    }
+
+    function draw() {
+        if (startScreen) {
+            drawStartScreen();
+            return;
+        }
+        ctx.fillStyle = '#1a1a2e';
+        ctx.fillRect(0, 0, W, H);
+        drawGrid();
+        drawNext();
+        drawHUD();
+        if (gameOver) drawGameOver();
+    }
+
+    let dropTimer = 0;
+    function gameLoop(timestamp) {
+        const dt = timestamp - lastTime;
+        lastTime = timestamp;
+
+        if (gameRunning && !animating) {
+            dropTimer += dt;
+            if (dropTimer >= dropInterval) {
+                dropTimer = 0;
+                update(0);
+            }
+        } else if (animating && clearAnim) {
+            clearAnim.time += dt;
+            if (clearAnim.time >= clearAnim.duration) {
+                removeLines(clearAnim.rows);
+                animating = false;
+                clearAnim = null;
+                spawnPiece();
+            }
+        }
+
+        draw();
+        requestAnimationFrame(gameLoop);
+    }
+
+    // Input
+    let dropLockTimer = 0;
+    window.addEventListener('keydown', (e) => {
+        if (startScreen) {
+            if (e.key === 'Enter' || e.key === ' ') {
+                initAudio();
+                startGame();
+                startScreen = false;
+            }
+            return;
+        }
+
+        if (gameOver) {
+            if (e.key === 'r' || e.key === 'R') {
+                startGame();
+            }
+            return;
+        }
+
+        if (!gameRunning || animating) return;
+
+        const now = performance.now();
+        if (now - dropLockTimer < 80) return; // Prevent too-fast input
+
+        switch (e.key) {
+            case 'ArrowLeft':
+                currentPiece.x--;
+                if (!canPlace(currentPiece)) currentPiece.x++;
+                break;
+            case 'ArrowRight':
+                currentPiece.x++;
+                if (!canPlace(currentPiece)) currentPiece.x--;
+                break;
+            case 'ArrowDown':
+                currentPiece.y++;
+                if (!canPlace(currentPiece)) {
+                    currentPiece.y--;
+                    lockPiece();
+                } else {
+                    dropTimer = 0;
+                    score += 1;
+                }
+                break;
+            case 'ArrowUp':
+                rotatePiece(currentPiece);
+                break;
+            case ' ':
+                e.preventDefault();
+                hardDrop();
+                dropLockTimer = now;
+                break;
+        }
+        dropLockTimer = now;
+    });
+
+    // Prevent scrolling
+    window.addEventListener('keydown', (e) => {
+        if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key)) {
+            e.preventDefault();
+        }
+    });
+
+    // Start
+    resetGrid();
+    requestAnimationFrame(gameLoop);
+})();
+</script>
+</body>
+</html>
