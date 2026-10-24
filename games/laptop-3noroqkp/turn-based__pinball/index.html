@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Turn-Based Pinball</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a1a; overflow: hidden; display: flex; align-items: center; justify-content: center; height: 100vh; width: 100vw; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function() {
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+let tableX, tableY, tableW, tableH;
+
+function resize() {
+    const aspect = 3/4;
+    if (window.innerWidth / window.innerHeight < aspect) {
+        W = window.innerWidth;
+        H = W / aspect;
+    } else {
+        H = window.innerHeight;
+        W = H * aspect;
+    }
+    canvas.width = W;
+    canvas.height = H;
+    scale = Math.min(W, H) / 600;
+    tableW = 380 * scale;
+    tableH = 520 * scale;
+    tableX = (W - tableW) / 2;
+    tableY = (H - tableH) / 2;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playBounce(freq, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq || 200;
+    gain.gain.setValueAtTime(vol || 0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.2);
+}
+function playScore() {
+    if (!audioCtx) return;
+    const notes = [440, 554, 659];
+    notes.forEach((f, i) => {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.value = f;
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime + i * 0.1);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + i * 0.1 + 0.2);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start(audioCtx.currentTime + i * 0.1);
+        osc.stop(audioCtx.currentTime + i * 0.1 + 0.3);
+    });
+}
+function playDrain() {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(50, audioCtx.currentTime + 0.4);
+    gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.4);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.5);
+}
+
+// Game state
+const STATE = { MENU: 0, AIMING: 1, PLAYING: 2, RESULT: 3, GAME_OVER: 4 };
+let state = STATE.MENU;
+let score = 0;
+let highScore = 0;
+let lives = 3;
+let turn = 1;
+let angle = -60; // degrees from vertical
+let power = 70; // 1-100
+let ball = { x: 0, y: 0, vx: 0, vy: 0, r: 8 };
+let ballTrail = [];
+let bumpersHitThisTurn = 0;
+let particles = [];
+let resultTimer = 0;
+let resultText = '';
+let shakeTime = 0;
+
+try { highScore = parseInt(localStorage.getItem('pinball_hs') || '0'); } catch(e) {}
+
+// Table geometry (in table-local coords, scaled by scale)
+function getWalls() {
+    const s = scale;
+    const tw = tableW / s, th = tableH / s;
+    return [
+        // Left wall
+        { x1: 20*s, y1: 40*s, x2: 20*s, y2: th*s - 20*s },
+        // Right wall
+        { x1: tw*s-20*s, y1: 40*s, x2: tw*s-20*s, y2: th*s - 20*s },
+        // Top-left angled
+        { x1: 20*s, y1: 40*s, x2: 80*s, y2: 20*s },
+        // Top-right angled
+        { x1: tw*s-20*s, y1: 40*s, x2: tw*s-80*s, y2: 20*s },
+        // Top center V
+        { x1: 80*s, y1: 20*s, x2: tw/2*s, y2: 60*s },
+        { x1: tw/2*s, y1: 60*s, x2: tw-80*s, y2: 20*s },
+        // Bottom-left wall (drain side)
+        { x1: 20*s, y1: th*s-20*s, x2: 60*s, y2: th*s },
+        // Bottom-right launch area wall
+        { x1: tw*s-80*s, y1: th*s-20*s, x2: tw*s-20*s, y2: th*s },
+        // Launch funnel left
+        { x1: tw/2*s+20*s, y1: th*s-80*s, x2: tw*s-80*s, y2: th*s-20*s },
+        // Middle deflector
+        { x1: 60*s, y1: th*s-120*s, x2: tw/2*s+20*s, y2: th*s-80*s },
+    ];
+}
+
+function getBumpers() {
+    const s = scale;
+    return [
+        { x: 130*s, y: 200*s, r: 30*s, points: 50, color: '#ff4444' },
+        { x: 260*s, y: 200*s, r: 30*s, points: 50, color: '#44ff44' },
+        { x: 195*s, y: 280*s, r: 30*s, points: 50, color: '#4444ff' },
+        { x: 100*s, y: 350*s, r: 25*s, points: 100, color: '#ffff44' },
+        { x: 290*s, y: 350*s, r: 25*s, points: 100, color: '#ff44ff' },
+        { x: 195*s, y: 400*s, r: 20*s, points: 200, color: '#ffffff' },
+    ];
+}
+
+let walls = getWalls();
+let bumpers = getBumpers();
+
+function resetBall() {
+    const s = scale;
+    ball.x = tableX + tableW - 50*s;
+    ball.y = tableY + tableH - 30*s;
+    ball.vx = 0;
+    ball.vy = 0;
+    ball.r = 8 * s;
+    ballTrail = [];
+}
+
+function launchBall() {
+    const rad = (angle - 90) * Math.PI / 180;
+    const force = power * 0.15 * scale;
+    ball.vx = Math.cos(rad) * force;
+    ball.vy = Math.sin(rad) * force;
+    state = STATE.PLAYING;
+    bumpersHitThisTurn = 0;
+}
+
+function distToSeg(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const len2 = dx*dx + dy*dy;
+    let t = ((px-x1)*dx + (py-y1)*dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const cx = x1 + t*dx, cy = y1 + t*dy;
+    return { dist: Math.hypot(px-cx, py-cy), nx: (cx-px)/Math.hypot(px-cx,py-cy)||0, ny: (cy-py)/Math.hypot(px-cx,py-cy)||0, cx, cy };
+}
+
+function updatePhysics(dt) {
+    const s = scale;
+    ball.vy += 500 * s * dt;
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+
+    // Trail
+    ballTrail.push({x: ball.x, y: ball.y});
+    if (ballTrail.length > 20) ballTrail.shift();
+
+    // Wall collisions
+    for (const w of walls) {
+        const d = distToSeg(ball.x, ball.y, w.x1, w.y1, w.x2, w.y2);
+        if (d.dist < ball.r) {
+            const nx = d.nx, ny = d.ny;
+            const dot = ball.vx * nx + ball.vy * ny;
+            if (dot < 0) {
+                ball.vx -= 2 * dot * nx * 0.85;
+                ball.vy -= 2 * dot * ny * 0.85;
+                ball.x += nx * (ball.r - d.dist);
+                ball.y += ny * (ball.r - d.dist);
+                playBounce(300, 0.15);
+            }
+        }
+    }
+
+    // Bumper collisions
+    for (const b of bumpers) {
+        const dx = ball.x - b.x;
+        const dy = ball.y - b.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < ball.r + b.r) {
+            const nx = dx / dist, ny = dy / dist;
+            const overlap = ball.r + b.r - dist;
+            ball.x += nx * overlap;
+            ball.y += ny * overlap;
+            const dot = ball.vx * nx + ball.vy * ny;
+            if (dot < 0) {
+                ball.vx -= 2 * dot * nx;
+                ball.vy -= 2 * dot * ny;
+                // Bumper boost
+                ball.vx += nx * 80 * s;
+                ball.vy += ny * 80 * s;
+                bumpersHitThisTurn++;
+                score += b.points;
+                playBounce(500 + Math.random()*200, 0.4);
+                spawnParticles(b.x, b.y, b.color);
+                shakeTime = 0.1;
+            }
+        }
+    }
+
+    // Check drain (ball falls below table)
+    if (ball.y > tableY + tableH + 20*s) {
+        return 'drain';
+    }
+
+    // Check ball stopped in upper area (safe zone = y < 60% of table)
+    const speed = Math.hypot(ball.vx, ball.vy);
+    if (speed < 10 * s && ball.y < tableY + tableH * 0.7) {
+        return 'rest';
+    }
+
+    // Ball too slow overall
+    if (speed < 5 * s) {
+        ball.vy += 5; // nudge to prevent infinite rest
+    }
+
+    // Timeout safety
+    return null;
+}
+
+let playTime = 0;
+
+function spawnParticles(x, y, color) {
+    for (let i = 0; i < 8; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const sp = (1 + Math.random()*3) * scale;
+        particles.push({ x, y, vx: Math.cos(a)*sp, vy: Math.sin(a)*sp, life: 0.5, color });
+    }
+}
+
+function updateParticles(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.life -= dt;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function drawTable() {
+    const s = scale;
+    // Background
+    ctx.fillStyle = '#0d0d2b';
+    ctx.fillRect(tableX, tableY, tableW, tableH);
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(100, 100, 200, 0.1)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < tableW; i += 30*s) {
+        ctx.beginPath();
+        ctx.moveTo(tableX + i, tableY);
+        ctx.lineTo(tableX + i, tableY + tableH);
+        ctx.stroke();
+    }
+    for (let i = 0; i < tableH; i += 30*s) {
+        ctx.beginPath();
+        ctx.moveTo(tableX, tableY + i);
+        ctx.lineTo(tableX + tableW, tableY + i);
+        ctx.stroke();
+    }
+
+    // Walls
+    ctx.strokeStyle = '#66aaff';
+    ctx.lineWidth = 3 * s;
+    ctx.lineCap = 'round';
+    for (const w of walls) {
+        ctx.beginPath();
+        ctx.moveTo(w.x1, w.y1);
+        ctx.lineTo(w.x2, w.y2);
+        ctx.stroke();
+    }
+
+    // Bumpers
+    for (const b of bumpers) {
+        const grad = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, b.r);
+        grad.addColorStop(0, '#fff');
+        grad.addColorStop(0.5, b.color);
+        grad.addColorStop(1, 'rgba(0,0,0,0.3)');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+        ctx.fill();
+        ctx.strokeStyle = b.color;
+        ctx.lineWidth = 2*s;
+        ctx.stroke();
+
+        // Points label
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold ${12*s}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText(b.points, b.x, b.y + 4*s);
+    }
+
+    // Drain area indicator
+    ctx.fillStyle = 'rgba(255,0,0,0.2)';
+    ctx.fillRect(tableX + 20*s, tableY + tableH - 10*s, 60*s, 10*s);
+    ctx.fillStyle = '#ff4444';
+    ctx.font = `${10*s}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('DRAIN', tableX + 50*s, tableY + tableH + 12*s);
+
+    // Launch area
+    ctx.fillStyle = 'rgba(0,255,100,0.1)';
+    ctx.fillRect(tableX + tableW - 80*s, tableY + tableH - 40*s, 60*s, 30*s);
+}
+
+function drawBall() {
+    // Trail
+    for (let i = 0; i < ballTrail.length; i++) {
+        const a = (i / ballTrail.length) * 0.5;
+        ctx.fillStyle = `rgba(100, 200, 255, ${a})`;
+        const r = ball.r * (i / ballTrail.length) * 0.8;
+        ctx.beginPath();
+        ctx.arc(ballTrail[i].x, ballTrail[i].y, r, 0, Math.PI*2);
+        ctx.fill();
+    }
+
+    // Ball
+    const grad = ctx.createRadialGradient(ball.x - ball.r*0.3, ball.y - ball.r*0.3, 0, ball.x, ball.y, ball.r);
+    grad.addColorStop(0, '#fff');
+    grad.addColorStop(0.5, '#aaddff');
+    grad.addColorStop(1, '#4488cc');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI*2);
+    ctx.fill();
+}
+
+function drawAimArrow() {
+    const s = scale;
+    const rad = (angle - 90) * Math.PI / 180;
+    const len = power * 0.8 * s;
+    const ex = ball.x + Math.cos(rad) * len;
+    const ey = ball.y + Math.sin(rad) * len;
+
+    ctx.strokeStyle = `rgba(255, 255, 100, ${0.5 + power/200})`;
+    ctx.lineWidth = 3*s;
+    ctx.setLineDash([8*s, 6*s]);
+    ctx.beginPath();
+    ctx.moveTo(ball.x, ball.y);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Arrow head
+    const aSize = 12*s;
+    const aAngle = Math.atan2(ey - ball.y, ex - ball.x);
+    ctx.fillStyle = '#ffff66';
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    ctx.lineTo(ex - aSize*Math.cos(aAngle - 0.4), ey - aSize*Math.sin(aAngle - 0.4));
+    ctx.lineTo(ex - aSize*Math.cos(aAngle + 0.4), ey - aSize*Math.sin(aAngle + 0.4));
+    ctx.closePath();
+    ctx.fill();
+
+    // Power bar
+    const barX = tableX + tableW - 30*s;
+    const barY = tableY + 60*s;
+    const barH = 150*s;
+    const barW = 12*s;
+    ctx.fillStyle = '#222';
+    ctx.fillRect(barX, barY, barW, barH);
+    const fillH = (power/100) * barH;
+    const pGrad = ctx.createLinearGradient(0, barY+barH-fillH, 0, barY+barH);
+    pGrad.addColorStop(0, '#ff4444');
+    pGrad.addColorStop(1, '#44ff44');
+    ctx.fillStyle = pGrad;
+    ctx.fillRect(barX, barY + barH - fillH, barW, fillH);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(barX, barY, barW, barH);
+}
+
+function drawParticles() {
+    for (const p of particles) {
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.life * 2;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 3*scale, 0, Math.PI*2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+    const s = scale;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(tableX, tableY - 50*s, tableW, 45*s);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${16*s}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE: ${score}`, tableX + 15*s, tableY - 25*s);
+    ctx.textAlign = 'center';
+    ctx.fillText(`TURN ${turn}`, tableX + tableW/2, tableY - 25*s);
+    ctx.textAlign = 'right';
+    ctx.fillText(`LIVES: ${'●'.repeat(lives)}`, tableX + tableW - 15*s, tableY - 25*s);
+
+    if (state === STATE.AIMING) {
+        ctx.textAlign = 'left';
+        ctx.font = `${12*s}px monospace`;
+        ctx.fillStyle = '#aaddff';
+        ctx.fillText(`Angle: ${angle.toFixed(0)}°`, tableX + 15*s, tableY - 7*s);
+        ctx.fillText(`Power: ${power}%`, tableX + 130*s, tableY - 7*s);
+        ctx.fillStyle = '#ffff66';
+        ctx.fillText('[SPACE] to LAUNCH', tableX + tableW/2 - 80*s, tableY - 7*s);
+    }
+}
+
+function drawMenu() {
+    const cx = W/2, cy = H/2;
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = '#66aaff';
+    ctx.font = `bold ${36*scale}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('TURN-BASED', cx, cy - 80*scale);
+    ctx.fillText('PINBALL', cx, cy - 40*scale);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = `${14*scale}px monospace`;
+    const lines = [
+        '← → : Aim angle',
+        '↑ ↓ : Adjust power',
+        'SPACE: Launch ball',
+        '',
+        'Hit bumpers to score!',
+        'Avoid the drain at bottom-left.',
+        'Ball must rest in upper area.',
+        '',
+        `High Score: ${highScore}`,
+        '',
+        '[ ENTER ] to Start'
+    ];
+    lines.forEach((l, i) => {
+        ctx.fillText(l, cx, cy + 10*scale + i*22*scale);
+    });
+}
+
+function drawGameOver() {
+    const cx = W/2, cy = H/2;
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = '#ff4444';
+    ctx.font = `bold ${32*scale}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', cx, cy - 60*scale);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = `${18*scale}px monospace`;
+    ctx.fillText(`Final Score: ${score}`, cx, cy - 20*scale);
+    if (score >= highScore && score > 0) {
+        ctx.fillStyle = '#ffff44';
+        ctx.fillText('★ NEW HIGH SCORE! ★', cx, cy + 15*scale);
+    }
+    ctx.fillStyle = '#aaddff';
+    ctx.font = `${14*scale}px monospace`;
+    ctx.fillText('[ ENTER ] to Play Again', cx, cy + 60*scale);
+}
+
+function drawResult() {
+    const cx = W/2;
+    const y = tableY + tableH/2;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(tableX, y - 40*scale, tableW, 80*scale);
+
+    ctx.fillStyle = resultText.includes('DRAIN') ? '#ff4444' : '#44ff44';
+    ctx.font = `bold ${20*scale}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText(resultText, cx, y - 10*scale);
+
+    if (resultText.includes('SAVED')) {
+        ctx.fillStyle = '#ffff44';
+        ctx.font = `${14*scale}px monospace`;
+        ctx.fillText(`+${bumpersHitThisTurn} bumper hit(s) this turn`, cx, y + 20*scale);
+    }
+}
+
+function startGame() {
+    score = 0;
+    lives = 3;
+    turn = 1;
+    angle = -60;
+    power = 70;
+    particles = [];
+    resetBall();
+    state = STATE.AIMING;
+}
+
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = Math.min((time - lastTime) / 1000, 0.033);
+    lastTime = time;
+
+    // Shake
+    let sx = 0, sy = 0;
+    if (shakeTime > 0) {
+        shakeTime -= dt;
+        sx = (Math.random() - 0.5) * 6 * scale;
+        sy = (Math.random() - 0.5) * 6 * scale;
+    }
+
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    if (state === STATE.MENU) {
+        drawMenu();
+    } else if (state === STATE.GAME_OVER) {
+        drawTable();
+        drawBall();
+        drawHUD();
+        drawGameOver();
+    } else {
+        drawTable();
+
+        if (state === STATE.AIMING) {
+            drawAimArrow();
+            drawBall();
+        } else if (state === STATE.PLAYING) {
+            playTime += dt;
+            const result = updatePhysics(dt);
+            updateParticles(dt);
+            drawBall();
+            drawParticles();
+
+            if (result === 'drain') {
+                lives--;
+                playDrain();
+                resultText = 'DRAIN! Ball lost.';
+                state = STATE.RESULT;
+                resultTimer = 1.5;
+                if (lives <= 0) {
+                    setTimeout(() => {
+                        if (score > highScore) {
+                            highScore = score;
+                            try { localStorage.setItem('pinball_hs', String(highScore)); } catch(e) {}
+                        }
+                        state = STATE.GAME_OVER;
+                    }, 1500);
+                }
+            } else if (result === 'rest') {
+                playScore();
+                resultText = `SAVED! ${bumpersHitThisTurn} bumper(s) hit.`;
+                state = STATE.RESULT;
+                resultTimer = 1.2;
+                turn++;
+            }
+
+            // Safety timeout
+            if (playTime > 8) {
+                resultText = 'Ball settled.';
+                state = STATE.RESULT;
+                resultTimer = 1;
+                turn++;
+            }
+        } else if (state === STATE.RESULT) {
+            drawBall();
+            drawParticles();
+            updateParticles(dt);
+            drawResult();
+
+            resultTimer -= dt;
+            if (resultTimer <= 0) {
+                resetBall();
+                state = STATE.AIMING;
+            }
+        }
+
+        drawHUD();
+    }
+
+    ctx.restore();
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+
+// Input
+window.addEventListener('keydown', (e) => {
+    initAudio();
+
+    if (state === STATE.MENU || state === STATE.GAME_OVER) {
+        if (e.key === 'Enter') startGame();
+        return;
+    }
+
+    if (state === STATE.AIMING) {
+        if (e.key === 'ArrowLeft' || e.key === 'a') angle = Math.max(angle - 3, -80);
+        if (e.key === 'ArrowRight' || e.key === 'd') angle = Math.min(angle + 3, 80);
+        if (e.key === 'ArrowUp' || e.key === 'w') power = Math.min(power + 2, 100);
+        if (e.key === 'ArrowDown' || e.key === 's') power = Math.max(power - 2, 10);
+        if (e.key === ' ') { launchBall(); playTime = 0; }
+    }
+
+    if (state === STATE.PLAYING) {
+        // Nudge! Slight push in aim direction
+        const rad = (angle - 90) * Math.PI / 180;
+        ball.vx += Math.cos(rad) * 50 * scale;
+        ball.vy += Math.sin(rad) * 50 * scale;
+    }
+});
+
+// Mouse/touch for aiming
+let dragging = false;
+canvas.addEventListener('mousedown', (e) => {
+    initAudio();
+    if (state === STATE.MENU || state === STATE.GAME_OVER) { startGame(); return; }
+    if (state === STATE.AIMING) {
+        dragging = true;
+        updateAimFromMouse(e);
+    }
+});
+canvas.addEventListener('mousemove', (e) => {
+    if (dragging && state === STATE.AIMING) updateAimFromMouse(e);
+});
+canvas.addEventListener('mouseup', () => { dragging = false; });
+canvas.addEventListener('click', (e) => {
+    initAudio();
+    if (state === STATE.MENU || state === STATE.GAME_OVER) { startGame(); return; }
+    if (state === STATE.AIMING && !dragging) {
+        // Check if clicking launch area
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const s = scale;
+        if (mx > tableX + tableW - 100*s && my > tableY + tableH - 60*s) {
+            launchBall();
+            playTime = 0;
+        }
+    }
+});
+
+function updateAimFromMouse(e) {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const dx = mx - ball.x;
+    const dy = my - ball.y;
+    let a = Math.atan2(dy, dx) * 180 / Math.PI + 90;
+    angle = Math.max(-80, Math.min(80, a));
+    power = Math.min(100, Math.max(10, Math.hypot(dx, dy) / (scale * 2)));
+}
+
+// Touch support
+canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    initAudio();
+    const t = e.touches[0];
+    if (state === STATE.MENU || state === STATE.GAME_OVER) { startGame(); return; }
+    if (state === STATE.AIMING) { dragging = true; updateAimFromMouse({clientX: t.clientX, clientY: t.clientY}); }
+});
+canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    const t = e.touches[0];
+    if (dragging && state === STATE.AIMING) updateAimFromMouse({clientX: t.clientX, clientY: t.clientY});
+});
+canvas.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    if (dragging && state === STATE.AIMING) { dragging = false; }
+});
+
+})();
+</script>
+</body>
+</html>
