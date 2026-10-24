@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shooter Pong</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; }
+        canvas { display: block; width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+function playSound(freq, type, duration, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+function sfxBounce() { playSound(220, 'square', 0.1, 0.2); }
+function sfxShoot() { playSound(880, 'sawtooth', 0.15, 0.3); }
+function sfxHit() { playSound(440, 'triangle', 0.2, 0.4); }
+function sfxScore() { playSound(660, 'sine', 0.3, 0.3); playSound(880, 'sine', 0.3, 0.2); }
+
+// Game State
+const STATE = { MENU: 0, PLAYING: 1, GAMEOVER: 2 };
+let gameState = STATE.MENU;
+let vsAI = true;
+
+// Particles
+let particles = [];
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = Math.random() * 4 + 1;
+        particles.push({
+            x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+            life: 1, decay: Math.random() * 0.03 + 0.02, color, size: Math.random() * 4 + 2
+        });
+    }
+}
+
+// Paddle
+class Paddle {
+    constructor(x, side) {
+        this.x = x;
+        this.side = side; // 'left' or 'right'
+        this.w = 14;
+        this.h = H * 0.18;
+        this.y = (H - this.h) / 2;
+        this.speed = 7;
+        this.score = 0;
+        this.cooldown = 0;
+        this.color = side === 'left' ? '#4fc3f7' : '#ff5252';
+    }
+    update() {
+        if (this.y < 0) this.y = 0;
+        if (this.y + this.h > H) this.y = H - this.h;
+    }
+    draw() {
+        ctx.fillStyle = this.color;
+        ctx.shadowColor = this.color;
+        ctx.shadowBlur = 15;
+        ctx.fillRect(this.x, this.y, this.w, this.h);
+        ctx.shadowBlur = 0;
+        
+        // Cooldown indicator
+        if (this.cooldown > 0) {
+            const ratio = this.cooldown / COOLDOWN_MAX;
+            ctx.fillStyle = 'rgba(255,255,255,0.3)';
+            ctx.fillRect(this.x, this.y + this.h * ratio * 0.8, this.w, this.h * 0.2);
+        } else {
+            // Ready glow
+            ctx.fillStyle = 'rgba(255,255,255,0.6)';
+            const blink = Math.sin(Date.now() * 0.01) * 0.3 + 0.7;
+            ctx.globalAlpha = blink;
+            ctx.fillRect(this.x - 2, this.y + this.h / 2 - 3, this.w + 4, 6);
+            ctx.globalAlpha = 1;
+        }
+    }
+}
+
+// Ball
+class Ball {
+    constructor() {
+        this.r = 8;
+        this.reset();
+    }
+    reset() {
+        this.x = W / 2;
+        this.y = H / 2;
+        const angle = (Math.random() * 0.8 - 0.4);
+        const dir = Math.random() > 0.5 ? 1 : -1;
+        const speed = 6;
+        this.vx = Math.cos(angle) * speed * dir;
+        this.vy = Math.sin(angle) * speed;
+    }
+    update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        
+        if (this.y - this.r < 0) { this.y = this.r; this.vy *= -1; sfxBounce(); spawnParticles(this.x, this.y, '#fff', 5); }
+        if (this.y + this.r > H) { this.y = H - this.r; this.vy *= -1; sfxBounce(); spawnParticles(this.x, this.y, '#fff', 5); }
+        
+        // Paddle collision
+        for (let p of [paddleL, paddleR]) {
+            if (this.vx * (p.side === 'left' ? 1 : -1) < 0 || true) {
+                const px = this.x, py = this.y;
+                const cx = p.x + p.w / 2, cy = p.y + p.h / 2;
+                if (px > p.x - this.r && px < p.x + p.w + this.r && py > p.y - this.r && py < p.y + p.h + this.r) {
+                    const hitPos = (py - p.y) / p.h;
+                    const angle = (hitPos - 0.5) * 1.2;
+                    const dir = p.side === 'left' ? 1 : -1;
+                    const speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy) * 1.05;
+                    this.vx = Math.cos(angle) * speed * dir;
+                    this.vy = Math.sin(angle) * speed;
+                    sfxBounce();
+                    spawnParticles(px, py, p.color, 8);
+                }
+            }
+        }
+        
+        // Score
+        if (this.x < -20) { paddleR.score++; sfxScore(); this.reset(); checkWin(); }
+        if (this.x > W + 20) { paddleL.score++; sfxScore(); this.reset(); checkWin(); }
+    }
+    draw() {
+        ctx.fillStyle = '#ffffff';
+        ctx.shadowColor = '#ffffff';
+        ctx.shadowBlur = 10;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+    }
+}
+
+// Projectile
+class Projectile {
+    constructor(x, y, dir) {
+        this.x = x;
+        this.y = y;
+        this.vx = dir * 12;
+        this.vy = 0;
+        this.r = 5;
+        this.active = true;
+        this.dir = dir;
+    }
+    update() {
+        this.x += this.vx;
+        if (this.x < -20 || this.x > W + 20) this.active = false;
+        
+        // Hit opponent paddle
+        const target = this.dir === 1 ? paddleR : paddleL;
+        if (this.x + this.r > target.x && this.x - this.r < target.x + target.w &&
+            this.y + this.r > target.y && this.y - this.r < target.y + target.h) {
+            this.active = false;
+            sfxHit();
+            spawnParticles(this.x, this.y, '#ff0', 15);
+            const shooter = this.dir === 1 ? paddleL : paddleR;
+            shooter.score++;
+            sfxScore();
+            checkWin();
+        }
+    }
+    draw() {
+        ctx.fillStyle = '#ffeb3b';
+        ctx.shadowColor = '#ffeb3b';
+        ctx.shadowBlur = 12;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+        ctx.fill();
+        // Trail
+        ctx.globalAlpha = 0.4;
+        ctx.beginPath();
+        ctx.arc(this.x - this.vx * 0.5, this.y, this.r * 0.7, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.shadowBlur = 0;
+    }
+}
+
+// AI Logic
+function aiUpdate(paddle) {
+    // Track ball y position
+    const targetY = ball.y - paddle.h / 2;
+    const diff = targetY - paddle.y;
+    const moveSpeed = 4.5;
+    if (Math.abs(diff) > 5) {
+        paddle.y += Math.sign(diff) * Math.min(moveSpeed, Math.abs(diff));
+    }
+    
+    // AI shooting logic
+    if (paddle.cooldown <= 0 && ball.x > W * 0.6) {
+        // Shoot if ball is coming toward AI side and AI has a clear shot
+        if (Math.random() < 0.03) {
+            shoot(paddle, -1);
+        }
+    }
+}
+
+let paddleL, paddleR, ball;
+let projectiles = [];
+const COOLDOWN_MAX = 90; // frames (~1.5s at 60fps)
+const WIN_SCORE = 5;
+
+function resetGame() {
+    paddleL = new Paddle(30, 'left');
+    paddleR = new Paddle(W - 44, 'right');
+    ball = new Ball();
+    projectiles = [];
+    particles = [];
+}
+
+function checkWin() {
+    if (paddleL.score >= WIN_SCORE || paddleR.score >= WIN_SCORE) {
+        gameState = STATE.GAMEOVER;
+    }
+}
+
+function shoot(paddle, dir) {
+    if (paddle.cooldown > 0) return;
+    const x = dir === 1 ? paddle.x + paddle.w : paddle.x;
+    const y = paddle.y + paddle.h / 2;
+    projectiles.push(new Projectile(x, y, dir));
+    paddle.cooldown = COOLDOWN_MAX;
+    sfxShoot();
+}
+
+// Input
+const keys = {};
+window.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (gameState === STATE.MENU) {
+        initAudio();
+        if (e.code === 'KeyA') { vsAI = true; startGame(); }
+        if (e.code === 'KeyB') { vsAI = false; startGame(); }
+    }
+    if (gameState === STATE.GAMEOVER) {
+        if (e.code === 'Space' || e.code === 'Enter') startGame();
+    }
+});
+window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+function startGame() {
+    resetGame();
+    gameState = STATE.PLAYING;
+}
+
+// Draw functions
+function drawBackground() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Grid lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < W; i += 40) {
+        ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, H); ctx.stroke();
+    }
+    for (let i = 0; i < H; i += 40) {
+        ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(W, i); ctx.stroke();
+    }
+    
+    // Center line
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([10, 15]);
+    ctx.beginPath();
+    ctx.moveTo(W / 2, 0);
+    ctx.lineTo(W / 2, H);
+    ctx.stroke();
+    ctx.setLineDash([]);
+}
+
+function drawScore() {
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText(paddleL.score, W / 2 - 60, 60);
+    ctx.fillText(paddleR.score, W / 2 + 60, 60);
+    
+    // Win score indicator
+    ctx.font = '16px monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.fillText('FIRST TO ' + WIN_SCORE, W / 2, 85);
+}
+
+function drawParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life -= p.decay;
+        if (p.life <= 0) { particles.splice(i, 1); continue; }
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size * p.life, p.size * p.life);
+    }
+    ctx.globalAlpha = 1;
+}
+
+function drawMenu() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Title
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 72px monospace';
+    ctx.fillStyle = '#4fc3f7';
+    ctx.shadowColor = '#4fc3f7';
+    ctx.shadowBlur = 20;
+    ctx.fillText('SHOOTER PONG', W / 2, H * 0.25);
+    ctx.shadowBlur = 0;
+    
+    // Subtitle
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#ffeb3b';
+    ctx.fillText('Classic Pong + Projectiles', W / 2, H * 0.35);
+    
+    // Instructions
+    ctx.font = '18px monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    const lines = [
+        'P1 (Left): W/S to move | SPACE to shoot',
+        'P2 (Right): UP/DOWN to move | ENTER to shoot',
+        '',
+        'Score by getting ball past opponent OR hitting them with a projectile!',
+        `First to ${WIN_SCORE} points wins.`,
+        '',
+        'Press A for 1 Player vs AI',
+        'Press B for 2 Players'
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, W / 2, H * 0.45 + i * 30);
+    });
+    
+    // Animated paddle preview
+    const t = Date.now() * 0.003;
+    const py = H * 0.8 + Math.sin(t) * 20;
+    ctx.fillStyle = '#4fc3f7';
+    ctx.shadowColor = '#4fc3f7';
+    ctx.shadowBlur = 15;
+    ctx.fillRect(W / 2 - 80, py, 14, 60);
+    ctx.fillStyle = '#ff5252';
+    ctx.shadowColor = '#ff5252';
+    ctx.fillRect(W / 2 + 80, py, 14, 60);
+    ctx.shadowBlur = 0;
+    
+    // Ball preview
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(W / 2, H * 0.8 + Math.sin(t * 2) * 15, 8, 0, Math.PI * 2);
+    ctx.fill();
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.textAlign = 'center';
+    const winner = paddleL.score >= WIN_SCORE ? 'PLAYER 1' : 'PLAYER 2';
+    const winColor = paddleL.score >= WIN_SCORE ? '#4fc3f7' : '#ff5252';
+    
+    ctx.font = 'bold 60px monospace';
+    ctx.fillStyle = winColor;
+    ctx.shadowColor = winColor;
+    ctx.shadowBlur = 20;
+    ctx.fillText(winner + ' WINS!', W / 2, H * 0.4);
+    ctx.shadowBlur = 0;
+    
+    ctx.font = '36px monospace';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(paddleL.score + ' - ' + paddleR.score, W / 2, H * 0.55);
+    
+    ctx.font = '20px monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fillText('Press SPACE or ENTER to play again', W / 2, H * 0.7);
+}
+
+// Main loop
+function update() {
+    if (gameState !== STATE.PLAYING) return;
+    
+    // Player 1
+    if (keys['KeyW']) paddleL.y -= paddleL.speed;
+    if (keys['KeyS']) paddleL.y += paddleL.speed;
+    if (keys['Space'] && paddleL.cooldown <= 0) shoot(paddleL, 1);
+    if (paddleL.cooldown > 0) paddleL.cooldown--;
+    
+    // Player 2 / AI
+    if (vsAI) {
+        aiUpdate(paddleR);
+    } else {
+        if (keys['ArrowUp']) paddleR.y -= paddleR.speed;
+        if (keys['ArrowDown']) paddleR.y += paddleR.speed;
+        if (keys['Enter'] && paddleR.cooldown <= 0) shoot(paddleR, -1);
+    }
+    if (paddleR.cooldown > 0) paddleR.cooldown--;
+    
+    paddleL.update();
+    paddleR.update();
+    ball.update();
+    
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+        projectiles[i].update();
+        if (!projectiles[i].active) projectiles.splice(i, 1);
+    }
+}
+
+function draw() {
+    if (gameState === STATE.MENU) {
+        drawMenu();
+        return;
+    }
+    
+    drawBackground();
+    drawScore();
+    paddleL.draw();
+    paddleR.draw();
+    ball.draw();
+    for (let p of projectiles) p.draw();
+    drawParticles();
+    
+    if (gameState === STATE.GAMEOVER) drawGameOver();
+}
+
+function loop() {
+    update();
+    draw();
+    requestAnimationFrame(loop);
+}
+
+resetGame();
+loop();
+</script>
+</body>
+</html>
