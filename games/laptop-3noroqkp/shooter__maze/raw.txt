@@ -1,0 +1,596 @@
+<think>
+The user wants a "maze shooter" game as a single HTML file. Let me think about what this should be:
+
+- A top-down maze/shooter game where the player navigates through a maze and shoots enemies
+- The maze could be procedurally generated or fixed
+- Player moves with WASD/arrow keys, aims with mouse or in direction of movement
+- Enemies spawn and chase the player or shoot at them
+- Walls block movement and bullets
+- Start screen, game over screen, restart functionality
+
+Let me design this:
+- Canvas-based rendering
+- Grid-based maze (walls are 1x1 cells)
+- Player is a small square/circle that moves through corridors
+- Enemies spawn in the maze and move toward the player
+- Bullets can be shot in the direction of mouse cursor or movement direction
+- Multiple levels - clear all enemies to advance to next level
+- Health system, score system
+
+Let me think about the maze generation:
+- Use a recursive backtracker algorithm for perfect mazes
+- Or use a simpler approach with random corridors
+
+I'll go with:
+- Grid-based maze (odd dimensions, walls are 1 cell thick)
+- Player moves smoothly (not grid-locked) but collides with walls
+- Mouse aim + click to shoot
+- Enemies that chase the player through the maze
+- Multiple waves/levels
+- Sound effects via Web Audio API
+
+Let me code this up:
+
+Maze generation: I'll use a recursive backtracker on a grid. The maze will be something like 21x21 cells (with walls), so the actual playable area is defined by the grid.
+
+Player movement: Free movement with collision against wall tiles.
+Shooting: Click to shoot in direction of mouse.
+Enemies: Spawn at random open cells, move toward player using simple pathfinding or just chase.
+
+Actually for simplicity and fun, let me make it so:
+- Maze is generated each level
+- Player starts top-left area
+- Enemies spawn from edges
+- Player shoots with mouse aim
+- Clear all enemies to advance
+- Each level has more/faster enemies
+
+Let me write this out properly.
+
+</think>
+```html
+<!DOCTYPE html>
+<html>
+<head>
+<title>Maze Shooter</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a0f; overflow: hidden; width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
+canvas { display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W; canvas.height = H;
+    scale = Math.min(W / 800, H / 600);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+function playSound(type, freq, dur, vol) {
+    if (!audioCtx) return;
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol || 0.15, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + (dur || 0.1));
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + (dur || 0.1));
+}
+
+// Game state
+let gameState = 'start'; // start, playing, gameover, levelclear
+let score = 0;
+let level = 1;
+let player, bullets, enemies, particles, maze, mazeW, mazeH, tileSize;
+let keys = {};
+let mouse = { x: 0, y: 0, down: false };
+let lastTime = 0;
+let shakeTimer = 0;
+let shakeMag = 0;
+
+// Maze generation (recursive backtracker)
+function generateMaze(cols, rows) {
+    const grid = [];
+    for (let r = 0; r < rows; r++) {
+        grid[r] = [];
+        for (let c = 0; c < cols; c++) grid[r][c] = 1; // 1 = wall
+    }
+    const stack = [];
+    const startC = 1, startR = 1;
+    grid[startR][startC] = 0;
+    stack.push([startC, startR]);
+
+    while (stack.length > 0) {
+        const [cx, cy] = stack[stack.length - 1];
+        const dirs = [[0,-2],[2,0],[0,2],[-2,0]];
+        // Shuffle
+        for (let i = dirs.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [dirs[i], dirs[j]] = [dirs[j], dirs[i]];
+        }
+        let found = false;
+        for (const [dx, dy] of dirs) {
+            const nx = cx + dx, ny = cy + dy;
+            if (nx >= 0 && nx < cols && ny >= 0 && ny < rows && grid[ny][nx] === 1) {
+                grid[cy + dy/2][cx + dx/2] = 0;
+                grid[ny][nx] = 0;
+                stack.push([nx, ny]);
+                found = true;
+                break;
+            }
+        }
+        if (!found) stack.pop();
+    }
+
+    // Remove some extra walls for loops
+    const removeCount = Math.floor(cols * rows * 0.08);
+    for (let i = 0; i < removeCount; i++) {
+        const rx = 2 + Math.floor(Math.random() * (cols - 4));
+        const ry = 2 + Math.floor(Math.random() * (rows - 4));
+        if (grid[ry][rx] === 1) {
+            // Only remove if it creates a loop (check neighbors)
+            const h = grid[ry][rx-1] === 0 && grid[ry][rx+1] === 0;
+            const v = grid[ry-1][rx] === 0 && grid[ry+1][rx] === 0;
+            if (h || v) grid[ry][rx] = 0;
+        }
+    }
+
+    return grid;
+}
+
+function isWall(cx, cy) {
+    if (cx < 0 || cx >= mazeW || cy < 0 || cy >= mazeH) return true;
+    return maze[cy][cx] === 1;
+}
+
+function initLevel(lvl) {
+    tileSize = Math.max(20, Math.floor(Math.min(W / 25, H / 21)) * scale);
+    mazeW = 23;
+    mazeH = 21;
+    maze = generateMaze(mazeW, mazeH);
+
+    // Find open cells
+    const openCells = [];
+    for (let r = 0; r < mazeH; r++)
+        for (let c = 0; c < mazeW; c++)
+            if (maze[r][c] === 0) openCells.push([c, r]);
+
+    player = {
+        x: tileSize * 1.5,
+        y: tileSize * 1.5,
+        size: tileSize * 0.6,
+        hp: 3 + Math.floor(lvl / 3),
+        maxHp: 3 + Math.floor(lvl / 3),
+        speed: tileSize * 4.5,
+        shootCooldown: 0,
+        invincible: 0
+    };
+
+    const enemyCount = 2 + lvl * 2;
+    enemies = [];
+    for (let i = 0; i < enemyCount; i++) {
+        let cell;
+        let attempts = 0;
+        do {
+            cell = openCells[Math.floor(Math.random() * openCells.length)];
+            attempts++;
+        } while (attempts < 100 && Math.abs(cell[0] - 1) + Math.abs(cell[1] - 1) < 5);
+
+        enemies.push({
+            x: cell[0] * tileSize + tileSize / 2,
+            y: cell[1] * tileSize + tileSize / 2,
+            size: tileSize * 0.55,
+            speed: tileSize * (1.8 + lvl * 0.3),
+            hp: 1 + Math.floor(lvl / 4),
+            maxHp: 1 + Math.floor(lvl / 4),
+            type: i % 3 === 2 ? 'fast' : 'normal',
+            hitTimer: 0
+        });
+    }
+
+    bullets = [];
+    particles = [];
+}
+
+function startGame() {
+    score = 0;
+    level = 1;
+    initLevel(level);
+    gameState = 'playing';
+}
+
+// Input
+window.addEventListener('keydown', e => { keys[e.key.toLowerCase()] = true; if (gameState === 'start' || gameState === 'gameover') startGame(); });
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+canvas.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+canvas.addEventListener('mousedown', e => { mouse.down = true; initAudio(); });
+canvas.addEventListener('mouseup', e => { mouse.down = false; });
+
+function collideCircleRect(cx, cy, r, rx, ry, rw, rh) {
+    const dx = cx - Math.max(rx, Math.min(cx, rx + rw));
+    const dy = cy - Math.max(ry, Math.min(cy, ry + rh));
+    return dx * dx + dy * dy < r * r;
+}
+
+function moveEntity(e, dx, dy) {
+    const r = e.size / 2;
+    // Try X
+    let newX = e.x + dx;
+    if (!dx || Math.abs(dx) < 0.01) { /* ok */ }
+    else {
+        // Check collision with walls
+        const minCX = Math.floor((newX - r) / tileSize);
+        const maxCX = Math.floor((newX + r) / tileSize);
+        const minCY = Math.floor((e.y - r) / tileSize);
+        const maxCY = Math.floor((e.y + r) / tileSize);
+        for (let cy = minCY; cy <= maxCY; cy++) {
+            for (let cx = minCX; cx <= maxCX; cx++) {
+                if (isWall(cx, cy)) {
+                    const wx = cx * tileSize, wy = cy * tileSize;
+                    if (collideCircleRect(newX, e.y, r, wx, wy, tileSize, tileSize)) return false;
+                }
+            }
+        }
+        e.x = newX;
+    }
+
+    // Try Y
+    let newY = e.y + dy;
+    const minCX2 = Math.floor((e.x - r) / tileSize);
+    const maxCX2 = Math.floor((e.x + r) / tileSize);
+    const minCY2 = Math.floor((newY - r) / tileSize);
+    const maxCY2 = Math.floor((newY + r) / tileSize);
+    for (let cy = minCY2; cy <= maxCY2; cy++) {
+        for (let cx = minCX2; cx <= maxCX2; cx++) {
+            if (isWall(cx, cy)) {
+                const wx = cx * tileSize, wy = cy * tileSize;
+                if (collideCircleRect(e.x, newY, r, wx, wy, tileSize, tileSize)) return false;
+            }
+        }
+        e.y = newY;
+    }
+    return true;
+}
+
+function shootBullet(x, y, angle, speed) {
+    bullets.push({ x, y, dx: Math.cos(angle) * speed, dy: Math.sin(angle) * speed, size: 4, life: 60 });
+    playSound('square', 800, 0.08, 0.1);
+}
+
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const s = Math.random() * 3 + 1;
+        particles.push({ x, y, dx: Math.cos(a) * s, dy: Math.sin(a) * s, life: 20 + Math.random() * 20, color });
+    }
+}
+
+function update(dt) {
+    if (gameState !== 'playing') return;
+
+    const dtc = Math.min(dt, 0.05);
+
+    // Player movement
+    let dx = 0, dy = 0;
+    if (keys['w'] || keys['arrowup']) dy -= 1;
+    if (keys['s'] || keys['arrowdown']) dy += 1;
+    if (keys['a'] || keys['arrowleft']) dx -= 1;
+    if (keys['d'] || keys['arrowright']) dx += 1;
+    if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
+
+    moveEntity(player, dx * player.speed * dtc, dy * player.speed * dtc);
+
+    // Keep in bounds
+    const pr = player.size / 2;
+    if (player.x < pr) player.x = pr;
+    if (player.y < pr) player.y = pr;
+    if (player.x > mazeW * tileSize - pr) player.x = mazeW * tileSize - pr;
+    if (player.y > mazeH * tileSize - pr) player.y = mazeH * tileSize - pr;
+
+    // Shooting
+    player.shootCooldown -= dtc;
+    if (mouse.down && player.shootCooldown <= 0) {
+        const ox = W / 2;
+        const oy = H / 2;
+        const angle = Math.atan2(mouse.y - oy, mouse.x - ox);
+        shootBullet(player.x, player.y, angle, tileSize * 8);
+        player.shootCooldown = 0.18;
+    }
+
+    // Invincibility timer
+    if (player.invincible > 0) player.invincible -= dtc;
+
+    // Update bullets
+    for (let i = bullets.length - 1; i >= 0; i--) {
+        const b = bullets[i];
+        b.x += b.dx * dtc;
+        b.y += b.dy * dtc;
+        b.life--;
+        if (b.life <= 0) { bullets.splice(i, 1); continue; }
+
+        // Wall collision
+        const bcx = Math.floor(b.x / tileSize);
+        const bcy = Math.floor(b.y / tileSize);
+        if (isWall(bcx, bcy)) {
+            spawnParticles(b.x, b.y, '#88f', 3);
+            bullets.splice(i, 1);
+            continue;
+        }
+
+        // Hit enemy
+        for (let j = enemies.length - 1; j >= 0; j--) {
+            const e = enemies[j];
+            const ddx = b.x - e.x, ddy = b.y - e.y;
+            if (ddx * ddx + ddy * ddy < (b.size + e.size / 2) * (b.size + e.size / 2)) {
+                e.hp--;
+                e.hitTimer = 0.15;
+                playSound('sawtooth', 200, 0.1, 0.12);
+                spawnParticles(e.x, e.y, '#f44', 5);
+                bullets.splice(i, 1);
+                if (e.hp <= 0) {
+                    score += e.type === 'fast' ? 15 : 10;
+                    spawnParticles(e.x, e.y, '#f84', 12);
+                    playSound('square', 150, 0.2, 0.15);
+                    enemies.splice(j, 1);
+                }
+                break;
+            }
+        }
+    }
+
+    // Update enemies
+    for (const e of enemies) {
+        if (e.hitTimer > 0) e.hitTimer -= dtc;
+
+        const angle = Math.atan2(player.y - e.y, player.x - e.x);
+        const spd = e.type === 'fast' ? e.speed * 1.4 : e.speed;
+        moveEntity(e, Math.cos(angle) * spd * dtc, Math.sin(angle) * spd * dtc);
+
+        // Hit player
+        if (player.invincible <= 0) {
+            const ddx = player.x - e.x, ddy = player.y - e.y;
+            if (ddx * ddx + ddy * ddy < (player.size / 2 + e.size / 2) * (player.size / 2 + e.size / 2)) {
+                player.hp--;
+                player.invincible = 1.5;
+                shakeTimer = 0.3;
+                shakeMag = 8;
+                playSound('sawtooth', 100, 0.3, 0.2);
+                spawnParticles(player.x, player.y, '#f44', 8);
+                if (player.hp <= 0) {
+                    gameState = 'gameover';
+                    playSound('sawtooth', 60, 0.5, 0.25);
+                }
+            }
+        }
+    }
+
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.dx;
+        p.y += p.dy;
+        p.dx *= 0.92;
+        p.dy *= 0.92;
+        p.life--;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    // Check level clear
+    if (enemies.length === 0) {
+        gameState = 'levelclear';
+        playSound('sine', 600, 0.3, 0.2);
+        setTimeout(() => { if (gameState === 'levelclear') { level++; initLevel(level); gameState = 'playing'; } }, 1500);
+    }
+
+    // Shake
+    if (shakeTimer > 0) shakeTimer -= dtc;
+}
+
+function render() {
+    ctx.fillStyle = '#0a0a0f';
+    ctx.fillRect(0, 0, W, H);
+
+    if (gameState === 'start') {
+        drawStartScreen();
+        return;
+    }
+
+    // Camera
+    let camX = 0, camY = 0;
+    const ox = W / 2 - player.x;
+    const oy = H / 2 - player.y;
+
+    if (shakeTimer > 0) {
+        camX = (Math.random() - 0.5) * shakeMag * (shakeTimer / 0.3);
+        camY = (Math.random() - 0.5) * shakeMag * (shakeTimer / 0.3);
+    }
+
+    ctx.save();
+    ctx.translate(ox + camX, oy + camY);
+
+    // Draw maze
+    const minCX = Math.max(0, Math.floor((player.x - W/2) / tileSize) - 1);
+    const maxCX = Math.min(mazeW - 1, Math.ceil((player.x + W/2) / tileSize) + 1);
+    const minCY = Math.max(0, Math.floor((player.y - H/2) / tileSize) - 1);
+    const maxCY = Math.min(mazeH - 1, Math.ceil((player.y + H/2) / tileSize) + 1);
+
+    for (let cy = minCY; cy <= maxCY; cy++) {
+        for (let cx = minCX; cx <= maxCX; cx++) {
+            if (maze[cy][cx] === 1) {
+                ctx.fillStyle = '#3a3a5c';
+                ctx.fillRect(cx * tileSize, cy * tileSize, tileSize + 1, tileSize + 1);
+                // Highlight top edge
+                ctx.fillStyle = '#4a4a7a';
+                ctx.fillRect(cx * tileSize, cy * tileSize, tileSize + 1, 2);
+            }
+        }
+    }
+
+    // Draw particles
+    for (const p of particles) {
+        ctx.globalAlpha = p.life / 30;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+    }
+    ctx.globalAlpha = 1;
+
+    // Draw bullets
+    ctx.fillStyle = '#6cf';
+    for (const b of bullets) {
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.size, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Draw enemies
+    for (const e of enemies) {
+        const flash = e.hitTimer > 0;
+        if (e.type === 'fast') {
+            ctx.fillStyle = flash ? '#fff' : '#f84';
+        } else {
+            ctx.fillStyle = flash ? '#fff' : '#c44';
+        }
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, e.size / 2, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Eyes
+        const ea = Math.atan2(player.y - e.y, player.x - e.x);
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(e.x + Math.cos(ea) * e.size * 0.15, e.y + Math.sin(ea) * e.size * 0.15, e.size * 0.12, 0, Math.PI * 2);
+        ctx.fill();
+
+        // HP bar
+        if (e.hp < e.maxHp) {
+            ctx.fillStyle = '#333';
+            ctx.fillRect(e.x - e.size/2, e.y - e.size/2 - 8, e.size, 4);
+            ctx.fillStyle = '#f44';
+            ctx.fillRect(e.x - e.size/2, e.y - e.size/2 - 8, e.size * (e.hp / e.maxHp), 4);
+        }
+    }
+
+    // Draw player
+    const pFlash = player.invincible > 0 && Math.floor(player.invincible * 10) % 2 === 0;
+    if (!pFlash) {
+        ctx.fillStyle = '#4f8';
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, player.size / 2, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Aim indicator
+        const aimAngle = Math.atan2(mouse.y - H/2, mouse.x - W/2);
+        ctx.strokeStyle = '#4f8';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(player.x, player.y);
+        ctx.lineTo(player.x + Math.cos(aimAngle) * player.size * 0.8, player.y + Math.sin(aimAngle) * player.size * 0.8);
+        ctx.stroke();
+    }
+
+    ctx.restore();
+
+    // HUD
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE: ${score}`, 20, 30);
+    ctx.fillText(`LEVEL: ${level}`, 20, 52);
+    ctx.fillText(`ENEMIES: ${enemies.length}`, 20, 74);
+
+    // HP bar
+    const hpW = 120;
+    ctx.fillStyle = '#333';
+    ctx.fillRect(W - hpW - 20, 20, hpW, 16);
+    ctx.fillStyle = player.hp > 1 ? '#4f8' : '#f44';
+    ctx.fillRect(W - hpW - 20, 20, hpW * (player.hp / player.maxHp), 16);
+    ctx.strokeStyle = '#fff';
+    ctx.strokeRect(W - hpW - 20, 20, hpW, 16);
+
+    if (gameState === 'gameover') {
+        drawGameOver();
+    } else if (gameState === 'levelclear') {
+        ctx.fillStyle = '#4f8';
+        ctx.font = 'bold 32px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('LEVEL CLEAR!', W/2, H/2);
+    }
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#0a0a0f';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title
+    ctx.fillStyle = '#4f8';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('MAZE SHOOTER', W/2, H/3);
+
+    // Decorative maze
+    ctx.strokeStyle = '#3a3a5c';
+    ctx.lineWidth = 3;
+    for (let i = 0; i < 8; i++) {
+        const x = W/2 - 150 + i * 40;
+        const y = H/2 - 20;
+        if (i % 2 === 0) { ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + 60); ctx.stroke(); }
+        else { ctx.beginPath(); ctx.moveTo(x, y + 30); ctx.lineTo(x + 40, y + 30); ctx.stroke(); }
+    }
+
+    ctx.fillStyle = '#aaa';
+    ctx.font = '18px monospace';
+    ctx.fillText('WASD / Arrows - Move', W/2, H/2 + 70);
+    ctx.fillText('Mouse Aim + Click - Shoot', W/2, H/2 + 95);
+    ctx.fillText('Clear all enemies to advance!', W/2, H/2 + 130);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = '22px monospace';
+    const blink = Math.floor(Date.now() / 500) % 2 === 0;
+    if (blink) ctx.fillText('Press any key to start', W/2, H * 0.8);
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = '#f44';
+    ctx.font = 'bold 42px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', W/2, H/2 - 30);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = '22px monospace';
+    ctx.fillText(`Final Score: ${score}  |  Level: ${level}`, W/2, H/2 + 20);
+
+    const blink = Math.floor(Date.now() / 500) % 2 === 0;
+    if (blink) {
+        ctx.fillStyle = '#aaa';
+        ctx.font = '18px monospace';
+        ctx.fillText('Press any key to restart', W/2, H/2 + 70);
+    }
+}
+
+function gameLoop(t) {
+    const dt = (t - lastTime) / 1000;
+    lastTime = t;
+    update(dt);
+    render();
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
+```
