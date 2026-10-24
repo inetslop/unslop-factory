@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Frogger Tower Defense</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b1a12;overflow:hidden;font-family:Arial,Helvetica,sans-serif;}
+  #wrap{position:relative;width:100vw;height:100vh;}
+  canvas{display:block;width:100%;height:100%;}
+  .overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:14px;text-align:center;color:#e8f5e9;background:rgba(6,20,12,.82);z-index:5;}
+  .overlay h1{font-size:clamp(30px,6vw,64px);margin:0;letter-spacing:2px;color:#7CFC00;text-shadow:0 0 12px #2e7d32;}
+  .overlay p{max-width:520px;line-height:1.5;margin:0;font-size:clamp(13px,1.6vw,18px);}
+  .overlay .keys{background:#123; border-radius:10px;padding:14px 18px;font-size:14px;color:#bfe;}
+  button{font:inherit;cursor:pointer;border:none;border-radius:10px;padding:12px 26px;background:#2e7d32;color:#fff;font-size:clamp(15px,2vw,20px);box-shadow:0 4px 0 #1b4a1e;}
+  button:active{transform:translateY(2px);box-shadow:0 2px 0 #1b4a1e;}
+  .hide{display:none!important;}
+  .big{font-size:clamp(26px,5vw,52px);color:#ff5252;margin:0;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+
+  <div class="overlay" id="startScreen">
+    <h1>FROGGER<br>TOWER&nbsp;DEFENSE</h1>
+    <p>Cars (enemies) pour in from the top and drive down toward your <b style="color:#7CFC00">Home Row</b>.
+       Place <b>frog turrets</b> on the grass islands to shoot them. Stop the traffic or you run out of lives!</p>
+    <div class="keys">
+      <b>CLICK</b> a grass cell → build frog (20c)<br>
+      <b>CLICK</b> a frog → upgrade it (Lv1→2→3)<br>
+      <b>P / Esc</b> pause &nbsp;•&nbsp; <b>R</b> restart &nbsp;•&nbsp; <b>M</b> mute<br>
+      Earn coins per kill. Survive as long as you can!
+    </div>
+    <button id="startBtn">▶ START GAME</button>
+  </div>
+
+  <div class="overlay hide" id="overScreen">
+    <h1 class="big">GAME OVER</h1>
+    <p id="finalStats" style="font-size:20px;"></p>
+    <button id="restartBtn">↻ PLAY AGAIN</button>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+const COLS=8, ROWS=11;
+const BUILD_ROWS=[2,5,8];
+const cvs=document.getElementById('c');
+const ctx=cvs.getContext('2d');
+let W=0,H=0,cw=0,ch=0,dpr=Math.max(1,window.devicePixelRatio||1);
+
+function resize(){
+  W=window.innerWidth; H=window.innerHeight;
+  cvs.width=W*dpr; cvs.height=H*dpr;
+  cvs.style.width=W+'px'; cvs.style.height=H+'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  cw=W/COLS; ch=H/ROWS;
+}
+window.addEventListener('resize',resize);
+
+// ---------- audio ----------
+let actx=null, muted=false;
+function ensureAudio(){ if(!actx){ try{actx=new (window.AudioContext||window.webkitAudioContext)();}catch(e){} } if(actx&&actx.state==='suspended') actx.resume(); }
+function beep(f,d,type,g){
+  if(muted||!actx) return;
+  const o=actx.createOscillator(), g2=actx.createGain();
+  o.type=type||'square'; o.frequency.value=f;
+  g2.gain.setValueAtTime(g||0.15, actx.currentTime);
+  g2.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime+d);
+  o.connect(g2); g2.connect(actx.destination); o.start(); o.stop(actx.currentTime+d);
+}
+
+// ---------- state ----------
+let enemies=[], frogs={}, projectiles=[];
+let coins=60, lives=20, score=0, wave=1, spawnTimer=0, waveTimer=0, time=0;
+let running=false, paused=false, gameOver=false;
+let best=0; try{ best=parseInt(localStorage.getItem('frogtd_best')||'0',10)||0; }catch(e){}
+
+const FROG={
+  dmg:[9,16,28], rangeRows:[3,4,5], rate:[1.4,1.7,2.1]
+};
+const BUILD_COST=20, UP_COST=[30,50]; // up to lvl2, then lvl3
+
+function reset(){
+  enemies=[]; frogs={}; projectiles=[];
+  coins=60; lives=20; score=0; wave=1; spawnTimer=0.5; waveTimer=0; time=0;
+  gameOver=false; paused=false; running=true;
+}
+
+// ---------- helpers ----------
+function isBuildRow(r){ return BUILD_ROWS.indexOf(r)!==-1; }
+function frogAt(c,r){ return frogs[c+','+r]; }
+function frogCenter(f){ return {x:(f.col+0.5)*cw, y:(f.row+0.5)*ch}; }
+function enemyPx(e){ return {x:(e.col+0.5)*cw, y:e.row*ch}; }
+
+function spawnEnemy(){
+  const hp = 18 + wave*5;
+  enemies.push({
+    col:Math.floor(Math.random()*COLS),
+    targetCol:Math.floor(Math.random()*COLS),
+    row:-0.6, hp:hp, maxHp:hp,
+    speed: (0.72 + Math.min(0.65,wave*0.03)) * (0.85+Math.random()*0.35)
+  });
+}
+
+function leak(){
+  lives--; beep(120,0.25,'sawtooth',0.2);
+  if(lives<=0){ endGame(); }
+}
+
+function endGame(){
+  running=false; gameOver=true;
+  try{ if(score>best){ best=score; localStorage.setItem('frogtd_best',String(best)); } }catch(e){}
+  document.getElementById('finalStats').innerHTML =
+    'Score: <b>'+score+'</b> &nbsp;•&nbsp; Wave: <b>'+wave+'</b><br>Best: '+best;
+  document.getElementById('overScreen').classList.remove('hide');
+}
+
+// ---------- update ----------
+function update(dt){
+  time+=dt;
+  // waves
+  waveTimer+=dt;
+  if(waveTimer>=25){ waveTimer=0; wave++; }
+
+  // spawn
+  spawnTimer-=dt;
+  const interval=Math.max(0.45, 1.6 - wave*0.13);
+  if(spawnTimer<=0){ spawnTimer=interval; spawnEnemy(); }
+
+  // enemies
+  for(let i=enemies.length-1;i>=0;i--){
+    const e=enemies[i];
+    e.row += e.speed*dt;
+    // drift toward target column
+    const d=e.targetCol-e.col;
+    if(Math.abs(d)>0.02){ e.col += Math.sign(d)*Math.min(1.4,Math.abs(d))*dt; }
+    else { if(Math.random()<dt*0.6){ const nc=Math.max(0,Math.min(COLS-1,e.targetCol+(Math.random()<0.5?-1:1))); e.targetCol=nc; } }
+    if(e.row>=ROWS-0.35){ enemies.splice(i,1); leak(); if(gameOver) break; }
+  }
+
+  // frogs shoot
+  for(const k in frogs){
+    const f=frogs[k];
+    f.cd-=dt;
+    if(f.cd>0) continue;
+    const c=frogCenter(f);
+    const rangePx=FROG.rangeRows[f.level-1]*ch;
+    let bestT=null, bd=1e9;
+    for(const e of enemies){
+      const p=enemyPx(e); const dx=p.x-c.x, dy=p.y-c.y; const dist=Math.hypot(dx,dy);
+      if(dist<=rangePx && dist<bd){ bd=dist; bestT=e; }
+    }
+    if(bestT){
+      f.cd=1/FROG.rate[f.level-1];
+      projectiles.push({x:c.x,y:c.y,target:bestT,dmg:FROG.dmg[f.level-1],spd:ch*3.2,life:0});
+      beep(660+f.level*120,0.06,'square',0.08);
+    }
+  }
+
+  // projectiles (homing)
+  for(let i=projectiles.length-1;i>=0;i--){
+    const p=projectiles[i]; p.life+=dt;
+    if(!p.target || p.target.hp<=0){ 
+      // dissipate straight a bit then remove
+      p.dissipate=(p.dissipate||0)+dt; if(p.dissipate>0.15) projectiles.splice(i,1); continue;
+    }
+    const t=enemyPx(p.target); const dx=t.x-p.x, dy=t.y-p.y, d=Math.hypot(dx,dy)||1;
+    p.x+=dx/d*p.spd*dt; p.y+=dy/d*p.spd*dt;
+    if(d<Math.max(6,cw*0.2)){ // hit
+      p.target.hp-=p.dmg; beep(300,0.05,'triangle',0.1);
+      projectiles.splice(i,1);
+      if(p.target.hp<=0){ killEnemy(p.target); }
+    } else if(p.life>2){ projectiles.splice(i,1); }
+  }
+
+  // remove dead enemies not from projectile (safety)
+  for(let i=enemies.length-1;i>=0;i--){ if(enemies[i].hp<=0) killEnemy(enemies[i]); }
+}
+
+function killEnemy(e){
+  const idx=enemies.indexOf(e); if(idx>=0) enemies.splice(idx,1);
+  coins+=7; score+=7; beep(900,0.12,'square',0.14);
+  // little burst handled in draw via nothing; keep simple
+}
+
+// ---------- draw ----------
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // background
+  ctx.fillStyle='#0b1a12'; ctx.fillRect(0,0,W,H);
+
+  // build rows (grass)
+  for(const r of BUILD_ROWS){
+    ctx.fillStyle='#14351c'; ctx.fillRect(0,r*ch,W,ch);
+    ctx.strokeStyle='rgba(124,252,0,.25)'; ctx.lineWidth=1;
+    for(let c=0;c<COLS;c++){ ctx.strokeRect(c*cw+3, r*ch+3, cw-6, ch-6); }
+  }
+  // roads (non-build rows get subtle lane lines)
+  ctx.strokeStyle='rgba(255,255,255,.05)'; ctx.lineWidth=1;
+  for(let r=0;r<ROWS;r++){ if(!isBuildRow(r)){ ctx.beginPath(); ctx.moveTo(0,r*ch); ctx.lineTo(W,r*ch); ctx.stroke(); } }
+  // vertical lane lines
+  for(let c=0;c<=COLS;c++){ ctx.strokeStyle='rgba(255,255,255,.04)'; ctx.beginPath(); ctx.moveTo(c*cw,0); ctx.lineTo(c*cw,H); ctx.stroke(); }
+
+  // spawn + base bars
+  ctx.fillStyle='#3a1010'; ctx.fillRect(0,0,W,ch*0.35);
+  ctx.fillStyle='#2e7d32'; ctx.fillRect(0,(ROWS-1)*ch,W,ch);
+  ctx.fillStyle='#b6ff9c'; ctx.font='bold '+(ch*0.4)+'px Arial'; ctx.textAlign='center';
+  ctx.fillText('SPAWN', W/2, ch*0.28);
+  ctx.fillText('⌂ HOME ROW ⌂', W/2, (ROWS-1)*ch+ch*0.72);
+
+  // frogs
+  for(const k in frogs){ const f=frogs[k]; drawFrog(f,false); }
+
+  // enemies
+  for(const e of enemies) drawEnemy(e);
+
+  // projectiles
+  ctx.fillStyle='#fff59d';
+  for(const p of projectiles){ ctx.beginPath(); ctx.arc(p.x,p.y,Math.max(3,cw*0.12),0,7); ctx.fill(); }
+
+  // hover ghost / tooltip
+  if(running && !paused && mouse.in) drawHover();
+
+  // HUD
+  drawHUD();
+
+  if(paused){ ctx.fillStyle='rgba(0,0,0,.55)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#7CFC00'; ctx.font='bold '+(H*0.1)+'px Arial'; ctx.textAlign='center'; ctx.fillText('PAUSED',W/2,H/2); }
+}
+
+function drawFrog(f,ghost){
+  const c=frogCenter(f); const rad=Math.min(cw,ch)*0.36;
+  ctx.globalAlpha=ghost?0.5:1;
+  ctx.fillStyle='#4CAF50'; ctx.beginPath(); ctx.arc(c.x,c.y,rad,0,7); ctx.fill();
+  ctx.fillStyle='#2e7d32'; ctx.beginPath(); ctx.arc(c.x,c.y,rad*0.62,0,7); ctx.fill();
+  // eyes
+  ctx.fillStyle='#fff';
+  ctx.beginPath(); ctx.arc(c.x-rad*0.4,c.y-rad*0.5,rad*0.28,0,7); ctx.fill();
+  ctx.beginPath(); ctx.arc(c.x+rad*0.4,c.y-rad*0.5,rad*0.28,0,7); ctx.fill();
+  ctx.fillStyle='#000';
+  ctx.beginPath(); ctx.arc(c.x-rad*0.35,c.y-rad*0.45,rad*0.12,0,7); ctx.fill();
+  ctx.beginPath(); ctx.arc(c.x+rad*0.45,c.y-rad*0.45,rad*0.12,0,7); ctx.fill();
+  // level pips
+  ctx.fillStyle='#fff';
+  for(let i=0;i<f.level;i++){ ctx.beginPath(); ctx.arc(c.x+(i-(f.level-1)/2)*8,c.y+rad*0.55,3,0,7); ctx.fill(); }
+  ctx.globalAlpha=1;
+}
+
+function drawEnemy(e){
+  const p=enemyPx(e); const w=Math.min(cw,ch)*0.8,h=Math.min(cw,ch)*0.5;
+  ctx.save(); ctx.translate(p.x,p.y);
+  // body
+  const cols=['#e74c3c','#f39c12','#9b59b6','#1abc9c','#e67e23'];
+  ctx.fillStyle=cols[(Math.floor(e.col)+wave)%cols.length];
+  roundRect(-w/2,-h/2,w,h,8); ctx.fill();
+  // windshield
+  ctx.fillStyle='rgba(255,255,255,.35)'; roundRect(-w*0.28,-h*0.14,w*0.56,h*0.28,4); ctx.fill();
+  ctx.restore();
+  // hp bar
+  const bw=Math.min(cw,ch)*0.7;
+  ctx.fillStyle='#300'; ctx.fillRect(p.x-bw/2,p.y-h*0.7,bw,5);
+  ctx.fillStyle='#e74c3c'; ctx.fillRect(p.x-bw/2,p.y-h*0.7,bw*Math.max(0,e.hp/e.maxHp),5);
+}
+function roundRect(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h);ctx.arcTo(x+w,y+h,x,y+h);ctx.arcTo(x,y+h,x,y);ctx.arcTo(x,y,x+w,y);ctx.closePath();}
+
+function drawHUD(){
+  const fs=Math.max(14,Math.min(20,W*0.02));
+  ctx.textAlign='left'; ctx.font='bold '+fs+'px Arial';
+  ctx.fillStyle='#ffe08a'; ctx.fillText('🪙 '+coins, 14, fs+6);
+  ctx.fillStyle='#ff6b6b'; ctx.fillText('❤ '+lives, 14, fs*2+6);
+  ctx.textAlign='center';
+  ctx.fillStyle='#9be7ff'; ctx.fillText('Wave '+wave, W/2, fs+6);
+  ctx.fillStyle='#c9f7c9'; ctx.fillText('Score '+score+'   Best '+Math.max(best,score), W/2, fs*2+6);
+  ctx.textAlign='right'; ctx.fillStyle='#8fe'; ctx.font=(fs*0.8)+'px Arial';
+  ctx.fillText('P pause · R restart · M '+(muted?'unmute':'mute'), W-14, fs+6);
+}
+
+function drawHover(){
+  const c=Math.floor(mouse.x/cw), r=Math.floor(mouse.y/ch);
+  if(c<0||c>=COLS||r<0||r>=ROWS) return;
+  if(isBuildRow(r)){
+    const f=frogAt(c,r);
+    if(!f){
+      if(coins>=BUILD_COST){ drawFrog({col:c,row:r,level:1},true); }
+      ctx.fillStyle= coins>=BUILD_COST?'#7CFC00':'#ff5252';
+      ctx.font='bold '+(ch*0.34)+'px Arial'; ctx.textAlign='center';
+      ctx.fillText('🪙'+BUILD_COST, (c+0.5)*cw, r*ch+ch*0.4);
+    } else {
+      if(f.level<3 && coins>=UP_COST[f.level-1]){
+        ctx.strokeStyle='#7CFC00'; ctx.lineWidth=3; ctx.strokeRect(c*cw+2,r*ch+2,cw-4,ch-4);
+        ctx.fillStyle='#7CFC00'; ctx.font='bold '+(ch*0.3)+'px Arial'; ctx.textAlign='center';
+        ctx.fillText('⬆ '+UP_COST[f.level-1], (c+0.5)*cw, r*ch+ch*0.4);
+      } else {
+        ctx.fillStyle='#ffe08a'; ctx.font='bold '+(ch*0.3)+'px Arial'; ctx.textAlign='center';
+        ctx.fillText('MAX', (c+0.5)*cw, r*ch+ch*0.4);
+      }
+    }
+  }
+}
+
+// ---------- input ----------
+const mouse={x:0,y:0,in:false};
+cvs.addEventListener('mousemove',e=>{ const rc=cvs.getBoundingClientRect(); mouse.x=e.clientX-rc.left; mouse.y=e.clientY-rc.top; mouse.in=true; });
+cvs.addEventListener('mouseleave',()=>mouse.in=false);
+
+cvs.addEventListener('mousedown',e=>{
+  ensureAudio(); if(!running||paused) return;
+  const c=Math.floor(mouse.x/cw), r=Math.floor(mouse.y/ch);
+  if(c<0||c>=COLS||r<0||r>=ROWS||!isBuildRow(r)) return;
+  const f=frogAt(c,r);
+  if(!f){
+    if(coins>=BUILD_COST){ coins-=BUILD_COST; frogs[c+','+r]={col:c,row:r,level:1,cd:0}; beep(520,0.1,'square',0.14); }
+    else beep(160,0.15,'sawtooth',0.15);
+  } else if(f.level<3){
+    const cost=UP_COST[f.level-1];
+    if(coins>=cost){ coins-=cost; f.level++; beep(700+f.level*120,0.12,'square',0.16); }
+    else beep(160,0.15,'sawtooth',0.15);
+  }
+});
+
+window.addEventListener('keydown',e=>{
+  ensureAudio();
+  const k=e.key.toLowerCase();
+  if(k==='p'||k==='escape'){ if(running){ paused=!paused; } }
+  else if(k==='r'){ reset(); document.getElementById('overScreen').classList.add('hide'); document.getElementById('startScreen').classList.add('hide'); }
+  else if(k==='m'){ muted=!muted; }
+});
+
+document.getElementById('startBtn').addEventListener('click',()=>{ ensureAudio(); reset(); document.getElementById('startScreen').classList.add('hide'); });
+document.getElementById('restartBtn').addEventListener('click',()=>{ ensureAudio(); reset(); document.getElementById('overScreen').classList.add('hide'); });
+
+// ---------- loop ----------
+let last=performance.now();
+function frame(now){
+  let dt=(now-last)/1000; last=now; if(dt>0.05)dt=0.05;
+  if(running && !paused && !gameOver) update(dt);
+  draw();
+  if(gameOver){ /* static */ }
+  requestAnimationFrame(frame);
+}
+
+resize();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
