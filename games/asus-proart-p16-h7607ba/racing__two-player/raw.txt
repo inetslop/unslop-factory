@@ -1,0 +1,706 @@
+<think>
+Let me make a 2-player top-down car racing game. Two players on the same keyboard: Player 1 uses WASD, Player 2 uses arrow keys. A course drawn on canvas, laps to win, lap counting via checkpoints, restart, start screen, sound via Web Audio.
+
+Design: Track is a rounded-rect / oval circuit. Cars are rectangles that rotate with velocity/steering physics. Off-track slows them down. Lap count: pass through the start line after passing through a checkpoint. First to 3 laps wins.
+
+Implementation:
+- Canvas fills the window, resize handler.
+- Track defined in normalized coords (0..1) and scaled to canvas. Draw track as thick path (stroked with a big lineWidth). Off-track detection: distance from the nearest point on the centerline > trackHalfWidth → off-track (grass), slower max speed.
+- Centerline: parametric points of an oval-ish circuit. Use array of points, compute distance to segments for off-track check.
+- Car physics: position, angle, velocity; acceleration, friction, steering proportional to speed.
+- Collision between cars: simple circle collision push-out.
+- Lap logic: 2 checkpoints (start line and midpoint). Passing start after mid → lap++.
+- HUD: laps, timer, positions.
+- Start screen with title and controls, Enter/Space or click to start. R for restart on end screen / anytime.
+- Sound: engine hum via oscillator? Keep it simple — beeps on lap complete, countdown beep, win jingle. Audio context created on first input.
+
+Track shape: use a fun closed loop. Points defined in unit space, e.g., rounded rectangle with chicanes. Simpler: oval with some curves. Let me define control points and smooth them via Catmull-Rom sampling to get dense centerline points. Good for off-track distance check (dense sample).
+
+Track points (unit coords):
+(0.5,0.1), (0.8,0.12), (0.9,0.3), (0.75,0.45), (0.85,0.65), (0.9,0.85), (0.6,0.92), (0.4,0.8), (0.25,0.9), (0.1,0.85), (0.08,0.55), (0.25,0.45), (0.12,0.3), (0.15,0.12) — closed loop. Catmull-Rom sample each segment ~ enough points.
+
+Track half-width: scale with min(canvas dims), e.g., 0.06 * S where S = min(w,h)? Actually track width should scale so it fits; use unit coords scaled by canvas size (non-uniform x/y scaling would distort distance). Better: compute a transform that maps unit square to canvas preserving aspect: scale = min(w,h)... but track is defined in 0..1 for both axes. To keep distances consistent, define track in square space and letterbox it: draw area = centered square of size M = min(w,h), offset ox,oy. All game coords in "world" units where world spans [0,1]² mapped to that square. Car sizes in world units.
+
+Off-track check: for a car at (x,y) world coords, find min distance to centerline polyline; if > trackHalf (say 0.075), on grass → lower top speed and more drag.
+
+Lap checkpoints: start line index 0 (point at (0.5,0.1)?). Checkpoint A = point index 0, checkpoint B = middle index. Detect crossing by checking if car is within radius of the checkpoint points, or better crossing detection by segment crossing. Simpler robust approach: track progress along centerline — find nearest sample index each frame; when index wraps from high to low near start and midpoint was passed → lap. Use "nearest index" progression with hysteresis. Let me do this: for each car, maintain lastIdx. Each frame compute nearest idx (search window around lastIdx ± 40 samples). If crossing from idx > N-10 to idx < 10 and midPassed flag is set → lap++, midPassed=false. When idx near N/2 → midPassed=true. This works with a dense polyline.
+
+Countdown: 3-2-1-GO before controls enabled.
+
+Car rendering: draw a rotated rectangle with details.
+
+Minimap not needed since track fills screen.
+
+HUD top: "P1 (WASD) Lap x/3" and timer, "P2 (Arrows) Lap x/3".
+
+Collision: circle radius ~0.02; push apart, damp velocity.
+
+Win: first to complete 3 laps → end screen with winner, R to restart, Enter to restart too.
+
+Sound: beep(freq, dur). Countdown beeps, lap beep, win arpeggio. Engine sound optional — skip engine loop for simplicity? Could add a simple oscillator per car whose freq changes with speed. Nice touch; but 2 oscillators + gain, start after first input. Let me include modest engine sounds that start when the race starts and stop on end/restart.
+
+Let me code it up.
+
+Key handling: track pressed keys in a set. Keys: WASD for P1, arrows for P2. PreventDefault on arrows/space to prevent scrolling (no scrollbars anyway).
+
+Structure:
+- state: 'menu' | 'countdown' | 'racing' | 'finished'
+- resetGame(): place cars behind start line, oriented along track direction at sample index near N-5... Start positions: P1 at idx N-8 with offset -0.03 perpendicular, P2 at idx N-14 with +0.03? Actually staggered grid on starting straight. Use points near start: car at centerline point p, angle = direction of track.
+
+Start line orientation: sample[0] is (0.5,0.1), next point goes rightward. Cars face direction of travel.
+
+Per-frame physics with dt clamp:
+- accel 0.25/s²? Use units: world unit 1 ≈ screen min dim. Speed ~ max 0.45 units/sec on asphalt. Let me tune: engine force a = 0.35, max speed on asphalt 0.42, on grass 0.18. Steering: angle += steerRate * dt * (speed/maxSpeed factor) * sign(speed). Reverse slower.
+
+Friction: v *= (1 - drag*dt); lateral grip: decompose velocity into forward/lateral, dampen lateral strongly.
+
+Keep simple arcade: scalar speed along heading + slight drift? Simplest: car has vx,vy; add thrust along heading; apply friction; clamp speed; steering rotates heading proportional to speed. Add lateral damping: project velocity onto heading and perpendicular, multiply perpendicular by 0.9 per frame (grip). Good.
+
+Let me code it up carefully.
+
+Countdown: 3 seconds, showing big number; cars locked.
+
+Restart: R key resets to countdown anytime; on end screen Enter/R → restart. On menu, Space/Enter/click → start race.
+
+Audio:
+```js
+let AC=null;
+function initAudio(){ if(!AC){ try{AC=new (window.AudioContext||window.webkitAudioContext)();}catch(e){} } }
+function beep(f,d,t=0,type='square',vol=0.15){...}
+```
+Engine: per-car oscillator + gain, sawtooth, freq = 60 + speed*300, low gain 0.04. Start when race starts; stop on finish/menu.
+
+Resize: canvas width/height = window.innerWidth/innerHeight * devicePixelRatio? Keep simple: set canvas.width=innerWidth etc., ctx.setTransform(dpr...). Use dpr for crispness.
+
+Draw:
+- Background grass green, subtle stripes.
+- Track: stroke centerline path with lineWidth = trackW*2 in world units — but line width is in pixels; convert: pxPerUnit = M (square size in css px) * dpr... I'll use ctx.scale to set up transform so 1 unit = M px. Simpler: compute scale s and offset ox,oy in device pixels and manually multiply coords via helper? Easier: ctx.setTransform(s,0,0,s,ox,oy) then draw everything in world units, lineWidth in world units too (lineWidth is affected by transform). Yes, canvas line width scales with transform. So set transform each frame after clear.
+
+Track drawing:
+1. Stroke path with lineWidth trackHalf*2 + 0.03 in gray (curb/edge) — actually draw outer white edge, then asphalt darker, plus dashed center? Keep: stroke with color '#c94f4f'?? Let me do: first stroke width W+0.025 white (edge line), then asphalt #444 width W, then thin yellow dashed centerline width 0.006 setLineDash([0.03,0.03]).
+- Start/finish: draw a checkered strip perpendicular at sample[0]. Compute perpendicular direction; draw small rect of alternating squares — simpler: just draw a thick white line across the track at start with a checker pattern of 2 cols. Draw as a series of small squares along the width.
+
+Cars: rectangle length 0.045, width 0.024, colored (red P1, blue P2), darker windshield, wheels optional. Draw in world units under transform — text won't be affected since HUD drawn with identity transform after resetTransform.
+
+HUD: draw with ctx.setTransform(dpr,0,0,dpr,0,0) in css px.
+
+Nearest index search: N samples ~ 200 or so. Window search ±30 from lastIdx each frame is O(60), fine. Init: full search.
+
+Lap logic details:
+```
+function updateProgress(car){
+  let best=car.lastIdx, bd=1e9;
+  for(let k=-40;k<=40;k++){ let i=(car.lastIdx+k+N)%N; const d=dist2(car, pts[i]); if(d<bd){bd=d;best=i;} }
+  car.lastIdx=best;
+  // mid checkpoint: near N/2 within range
+  if(Math.abs(best - N/2) < 15 || Math.abs(best - N/2 - N) < 15 ...) 
+```
+Simpler: when best is in [N/2-10, N/2+10] → car.mid=true. When previous lastIdx > N-30 and new best < 30 (wrap) and car.mid → lap++, mid=false. Also handle reverse wrap (best > N-30 and prev < 30) → nothing (or invalid).
+
+Edge: cars starting at idx near N-8 — start with lastIdx set to that, mid=false; they'll drive forward increasing idx and wrap → but need mid first. Good, prevents cheating.
+
+Win check: laps >= LAPS(3) → state finished, winner.
+
+Timer: raceTime accumulates during racing.
+
+Let me write the full HTML now.
+
+Controls list on start screen:
+P1: W/S accel/brake-reverse, A/D steer. P2: arrow keys. R: restart. Enter/Space: start.
+
+Also show "First to 3 laps wins".
+
+Grass visual effect: when off-track, could tint car? Skip; just slow down + maybe a small shake. Fine.
+
+Let me code it up.
+
+```html
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Twin Turbo Rumble — Two-Player Racing</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#111;}
+canvas{display:block;width:100vw;height:100vh;}
+</style></head><body>
+<canvas id="c"></canvas>
+<script>
+... 
+</script></body></html>
+```
+
+JS details:
+
+Track points and Catmull-Rom:
+```js
+const CTRL=[[0.5,0.10],[0.82,0.12],[0.90,0.32],[0.74,0.46],[0.86,0.62],[0.90,0.84],[0.62,0.92],[0.42,0.80],[0.26,0.90],[0.10,0.84],[0.07,0.56],[0.24,0.46],[0.10,0.30],[0.14,0.11]];
+function catmull(p0,p1,p2,p3,t){...}
+const PTS=[];
+const SEG=28; // samples per segment
+for(let i=0;i<CTRL.length;i++){
+ const p0=CTRL[(i-1+L)%L],p1=CTRL[i],p2=CTRL[(i+1)%L],p3=CTRL[(i+2)%L];
+ for(let j=0;j<SEG;j++){ t=j/SEG; PTS.push(catmull(...)); }
+}
+const N=PTS.length;
+```
+
+Start index 0 corresponds to CTRL[0] (0.5,0.1) heading toward (0.82,0.12) → facing right. Good starting straight.
+
+Car init:
+```js
+function makeCar(x,y,a,color){return {x,y,a,vx:0,vy:0,lastIdx:nearestIdx(x,y),mid:false,laps:0,color,offtrack:false};}
+Grid: p1 at PTS[N-6] with perpendicular offset -0.028; p2 at PTS[N-14] with +0.028? Actually staggered grid on starting straight. Use points near start: car at centerline point p, angle = track direction at that index.
+```
+Perpendicular: dir = normalize(PTS[(i+1)%N]-PTS[i]); perp=(-dir.y,dir.x).
+
+Physics constants (world units/sec):
+- ACC=0.42, REV_ACC=0.25, MAXF=0.46, MAXR=0.18, drag: v*=Math.pow(0.35,dt)? Use linear: vx -= vx*1.6*dt; plus lateral grip: decompose.
+- Grass: max 0.16, extra drag.
+
+Steering: turn = 2.6 rad/s * steerInput * clamp(speed/0.15, -1, 1)*... use factor = Math.min(1, Math.abs(sp)/0.12); a += turn*dt*factor*Math.sign(fSpeed).
+
+Collision radius r=0.024; if dist<2r: push apart half each along normal, swap some velocity — just separate and dampen both velocities by 0.85.
+
+World bounds: keep car within [0.01,0.99] with bounce? Cars going way off track into grass are fine since grass is slow; still clamp to canvas square for safety.
+
+Engine audio:
+```js
+let eng=[]; // per-car {osc,gain}
+function startEngines(){ stopEngines(); if(!AC)return; for each car create osc sawtooth, gain 0.03, connect, start }
+function updateEngines(dt){ freq=50+ speed*260; }
+function stopEngines(){ stop and disconnect }
+```
+
+Countdown: countdownT = 3.999? state 'countdown', t decreasing; beep at integer transitions. When t<=0 → 'racing', "GO!" flash, start engines.
+
+Render loop with requestAnimationFrame, dt clamped to 0.033.
+
+Menu screen: overlay drawn on canvas (translucent) over the track preview? Easier: draw track and cars in menu behind translucent panel. Nice. Draw game scene always, then overlay per state.
+
+Text: use fillText with font 'bold Xpx monospace'.
+
+Start line checkered: at i=0, dir d, perp p. Squares: along width from -W/2 to W/2, 2 columns of size 0.015.
+```js
+const s=0.014; const c=PTS[0]; const d=dirAt(0), pp=perp(d);
+for(let r=0;r<2;r++)for(let k=-3;k<3;k++){ // trackHalf 0.07 → 6 half? width total 0.14, /0.014 ≈ 10 squares... use k from -Math.floor(half/s) .. }
+```
+trackHalf=0.07; n=Math.floor(0.07/s)=5 → k=-5..4 (10 squares). Color alternating by (k+r)%2. Position: c + d*(r*s - s/2?) let me do: base = c + pp*(k*s + s/2) + d*(r*s); draw rect rotated — easier to draw small rotated rects with save/translate/rotate. That's 10*2=20 saves, fine.
+
+Actually simpler: draw a white thick line (lineWidth 0.02, from c+pp*half to c-pp*half) and overlay black squares for checker. Let me do the rotated rects properly.
+
+HUD: top-left P1 panel: "P1 — LAP 1/3" red; top-right P2 blue; top-center timer. Also speed? Skip.
+
+Finish screen: "PLAYER 1 WINS!" + time, "Press R to race again".
+
+Draw "GO!" for 1s after racing starts (raceTime<1).
+
+Let me write it all out now. Careful with keydown repeat and initAudio on any keydown/pointerdown.
+
+Prevent default: e.preventDefault() for arrow keys, space, WASD? Only preventDefault for arrows/space.
+
+Restart R: resetGame() → state 'countdown'. On menu, R does nothing (or starts?). Enter/Space/click on menu → start.
+
+Let me write the final code.
+
+One more detail: nearestIdx full search function.
+
+Off-track check: min distance to PTS within a window (reuse progress update — compute bd from windowed search). Offtrack if sqrt(bd) > trackHalf - 0.005? Use > trackHalf*0.98. Actually car center off asphalt edge → grass. Car is small; use trackHalf - 0.01 as threshold so car visibly half-off... Let me use: distToCenter > trackHalf → grass (car center past edge). Fine.
+
+Let me write it out.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Twin Turbo Rumble — Two-Player Racing</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#12351a;}
+  canvas{display:block;width:100vw;height:100vh;cursor:pointer;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+
+/* ---------- Canvas setup ---------- */
+var cv = document.getElementById('c');
+var ctx = cv.getContext('2d');
+var dpr = 1, W = 0, H = 0; // css px
+function resize(){
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W*dpr); cv.height = Math.round(H*dpr);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------- Track (unit square world) ---------- */
+var CTRL = [
+  [0.50,0.10],[0.82,0.12],[0.90,0.32],[0.74,0.46],[0.86,0.62],
+  [0.90,0.84],[0.62,0.92],[0.42,0.80],[0.26,0.90],[0.10,0.84],
+  [0.07,0.56],[0.24,0.46],[0.10,0.30],[0.14,0.11]
+];
+function catmull(p0,p1,p2,p3,t){
+  var t2=t*t, t3=t2*t;
+  return [
+    0.5*((2*p1[0])+(-p0[0]+p2[0])*t+(2*p0[0]-5*p1[0]+4*p2[0]-p3[0])*t2+(-p0[0]+3*p1[0]-3*p2[0]+p3[0])*t3),
+    0.5*((2*p1[1])+(-p0[1]+p2[1])*t+(2*p0[1]-5*p1[1]+4*p2[1]-p3[1])*t2+(-p0[1]+3*p1[1]-3*p2[1]+p3[1])*t3)
+  ];
+}
+var PTS = [];
+(function build(){
+  var L=CTRL.length, SEG=26;
+  for(var i=0;i<L;i++){
+    var p0=CTRL[(i-1+L)%L], p1=CTRL[i], p2=CTRL[(i+1)%L], p3=CTRL[(i+2)%L];
+    for(var j=0;j<SEG;j++) PTS.push(catmull(p0,p1,p2,p3,j/SEG));
+  }
+})();
+var N = PTS.length;
+var TRACK_HALF = 0.072;
+
+function dirAt(i){
+  var a=PTS[i], b=PTS[(i+1)%N];
+  var dx=b[0]-a[0], dy=b[1]-a[1], l=Math.hypot(dx,dy)||1;
+  return [dx/l, dy/l];
+}
+function nearestIdx(x,y){
+  var bd=1e9, bi=0;
+  for(var i=0;i<N;i++){
+    var dx=x-PTS[i][0], dy=y-PTS[i][1], d=dx*dx+dy*dy;
+    if(d<bd){bd=d;bi=i;}
+  }
+  return bi;
+}
+
+/* ---------- Audio (Web Audio, starts on first input) ---------- */
+var AC = null;
+function initAudio(){
+  if(!AC){ try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ AC=null; } }
+  if(AC && AC.state==='suspended'){ try{ AC.resume(); }catch(e){} }
+}
+function beep(freq, dur, type, vol, when){
+  if(!AC) return;
+  try{
+    var t = AC.currentTime + (when||0);
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type||'square'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol||0.12, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t); o.stop(t+dur+0.05);
+  }catch(e){}
+}
+var engines = []; // {osc,gain}
+function startEngines(){
+  stopEngines();
+  if(!AC) return;
+  for(var i=0;i<2;i++){
+    try{
+      var o=AC.createOscillator(), g=AC.createGain();
+      o.type='sawtooth'; o.frequency.value=60;
+      g.gain.value=0.035;
+      o.connect(g); g.connect(AC.destination); o.start();
+      engines.push({osc:o,gain:g});
+    }catch(e){}
+  }
+}
+function stopEngines(){
+  for(var i=0;i<engines.length;i++){
+    try{ engines[i].osc.stop(); engines[i].osc.disconnect(); engines[i].gain.disconnect(); }catch(e){}
+  }
+  engines=[];
+}
+function updateEngine(i, speed){
+  if(engines[i]){
+    try{
+      engines[i].osc.frequency.value = 55 + Math.min(1,speed/0.46)*280;
+      engines[i].gain.gain.value = 0.02 + Math.min(1,speed/0.46)*0.03;
+    }catch(e){}
+  }
+}
+
+/* ---------- Game state ---------- */
+var LAPS_TO_WIN = 3;
+var state = 'menu'; // menu | countdown | racing | finished
+var cars = [];
+var raceTime = 0, countdownT = 0, winner = -1, lastBeepNum = 4;
+
+function makeCar(idxOff, side, color, name){
+  var i = (N - idxOff) % N;
+  var d = dirAt(i);
+  var pp = [-d[1], d[0]];
+  var p = PTS[i];
+  return {
+    x: p[0] + pp[0]*side, y: p[1] + pp[1]*side,
+    a: Math.atan2(d[1],d[0]),
+    vx:0, vy:0,
+    lastIdx: i, mid:false, laps:0, offtrack:false,
+    color:color, name:name
+  };
+}
+function resetGame(){
+  cars = [ makeCar(7, -0.032, '#e8412a', 'PLAYER 1'),
+           makeCar(15,  0.032, '#2a6fe8', 'PLAYER 2') ];
+  raceTime = 0; countdownT = 3.6; winner = -1; lastBeepNum = 4;
+  state = 'countdown';
+  stopEngines();
+}
+
+/* ---------- Input ---------- */
+var keys = {};
+window.addEventListener('keydown', function(e){
+  initAudio();
+  var k = e.key.length===1 ? e.key.toLowerCase() : e.key;
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].indexOf(e.key)>=0) e.preventDefault();
+  keys[k]=true;
+
+  if(k==='r' && state!=='menu'){ resetGame(); return; }
+  if((k==='Enter'||k===' ') ){
+    if(state==='menu'){ beep(880,0.12,'square',0.15); resetGame(); }
+    else if(state==='finished'){ beep(880,0.12,'square',0.15); resetGame(); }
+  }
+});
+window.addEventListener('keyup', function(e){
+  var k = e.key.length===1 ? e.key.toLowerCase() : e.key;
+  keys[k]=false;
+});
+cv.addEventListener('pointerdown', function(){
+  initAudio();
+  if(state==='menu'){ beep(880,0.12,'square',0.15); resetGame(); }
+  else if(state==='finished'){ beep(880,0.12,'square',0.15); resetGame(); }
+});
+
+/* ---------- Physics ---------- */
+function control(car, up, dn, lf, rt){
+  var th = car.a;
+  var fx = Math.cos(th), fy = Math.sin(th);
+  // forward speed
+  var fSpd = car.vx*fx + car.vy*fy;
+  // throttle / brake
+  if(up)      { car.vx += fx*0.42*dt; car.vy += fy*0.42*dt; }
+  if(dn)      {
+    if(fSpd > 0.02){ car.vx -= fx*0.55*dt; car.vy -= fy*0.55*dt; }        // brake
+    else           { car.vx -= fx*0.28*dt; car.vy -= fy*0.28*dt; }        // reverse
+  }
+  // drag
+  var dr = car.offtrack ? 3.4 : 1.5;
+  car.vx -= car.vx*dr*dt; car.vy -= car.vy*dr*dt;
+  // lateral grip
+  var latX = car.vx - fSpd*fx, latY = car.vy - fSpd*fy;
+  var grip = car.offtrack ? 0.86 : 0.94;
+  car.vx = fSpd*fx + latX*grip;
+  car.vy = fSpd*fy + latY*grip;
+  // speed clamp
+  var sp = Math.hypot(car.vx,car.vy);
+  var maxF = car.offtrack ? 0.17 : 0.46;
+  var maxR = 0.16;
+  if(fSpd > maxF){ var s=maxF/sp; car.vx*=s; car.vy*=s; }
+  else if(fSpd < -maxR){ var s2=(-maxR)/sp; car.vx*=s2; car.vy*=s2; }
+  // steering
+  var steer = (rt?1:0) - (lf?1:0);
+  if(steer){
+    var fac = Math.min(1, Math.abs(fSpd)/0.13);
+    car.a += steer * 2.7 * dt * fac * (fSpd<0?-1:1);
+  }
+}
+
+function updateProgress(car){
+  var bd=1e9, bi=car.lastIdx;
+  for(var k=-45;k<=45;k++){
+    var i=(car.lastIdx+k+N)%N;
+    var dx=car.x-PTS[i][0], dy=car.y-PTS[i][1], d=dx*dx+dy*dy;
+    if(d<bd){bd=d;bi=i;}
+  }
+  car.offtrack = Math.sqrt(bd) > TRACK_HALF - 0.004;
+  var prev = car.lastIdx;
+  car.lastIdx = bi;
+  // midpoint checkpoint
+  var half = N/2;
+  if(Math.abs(bi-half) < 18) car.mid = true;
+  // start line crossing (forward wrap)
+  if(prev > N-30 && bi < 30){
+    if(car.mid){
+      car.laps++;
+      car.mid = false;
+      beep(1200,0.15,'square',0.18);
+      setTimeout(function(){ beep(1600,0.18,'square',0.18); }, 90);
+    }
+  }
+}
+
+var dt = 0;
+function step(dtg){
+  dt = Math.min(dtg, 0.033);
+  if(state==='countdown'){
+    countdownT -= dt;
+    var num = Math.ceil(countdownT - 0.6); // 3,2,1 then GO at <=0.6? simpler:
+    var shown = Math.ceil(countdownT/1.0) + 0; 
+    if(shown !== lastBeepNum && shown >= 1 && shown <= 3){ lastBeepNum = shown; beep(440,0.15,'square',0.2); }
+    if(countdownT <= 0){
+      state='racing';
+      beep(880,0.35,'square',0.22);
+      startEngines();
+    }
+    return;
+  }
+  if(state!=='racing') return;
+
+  raceTime += dt;
+
+  var c1=cars[0], c2=cars[1];
+  control(c1, !!keys['w'], !!keys['s'], !!keys['a'], !!keys['d']);
+  control(c2, !!keys['ArrowUp'], !!keys['ArrowDown'], !!keys['ArrowLeft'], !!keys['ArrowRight']);
+
+  for(var i=0;i<2;i++){
+    var c=cars[i];
+    c.x += c.vx*dt; c.y += c.vy*dt;
+    // keep inside world square
+    if(c.x<0.015){c.x=0.015;c.vx=Math.abs(c.vx)*0.4;}
+    if(c.x>0.985){c.x=0.985;c.vx=-Math.abs(c.vx)*0.4;}
+    if(c.y<0.015){c.y=0.015;c.vy=Math.abs(c.vy)*0.4;}
+    if(c.y>0.985){c.y=0.985;c.vy=-Math.abs(c.vy)*0.4;}
+    updateProgress(c);
+    updateEngine(i, Math.hypot(c.vx,c.vy));
+  }
+
+  // car-car collision
+  var dx=c2.x-c1.x, dy=c2.y-c1.y, d=Math.hypot(dx,dy), R=0.030;
+  if(d>0 && d< R*2){
+    var nx=dx/d, ny=dy/d, push=(R*2-d)/2;
+    c1.x-=nx*push; c1.y-=ny*push; c2.x+=nx*push; c2.y+=ny*push;
+    c1.vx*=0.82; c1.vy*=0.82; c2.vx*=0.82; c2.vy*=0.82;
+    if(Math.random()<0.5) beep(180,0.06,'sawtooth',0.1);
+  }
+
+  // win
+  for(var j=0;j<2;j++){
+    if(cars[j].laps >= LAPS_TO_WIN){
+      winner = j; state='finished'; stopEngines();
+      beep(523,0.15,'square',0.2); 
+      setTimeout(function(){beep(659,0.15,'square',0.2);},140);
+      setTimeout(function(){beep(784,0.15,'square',0.2);},280);
+      setTimeout(function(){beep(1047,0.4,'square',0.22);},430);
+      break;
+    }
+  }
+}
+
+/* ---------- Rendering ---------- */
+function worldTransform(){
+  var M = Math.min(W,H), s = M*dpr;
+  var ox = (W - M)*dpr/1, oy = (H - M)*dpr/1;
+  // center the square
+  ox = (W*dpr - s)/2; oy = (H*dpr - s)/2;
+  ctx.setTransform(s,0,0,s,ox,oy);
+}
+
+function drawTrack(){
+  // grass
+  ctx.fillStyle = '#1e5c2a';
+  ctx.fillRect(-0.3,-0.3,1.6,1.6);
+  // mow stripes
+  ctx.fillStyle = 'rgba(255,255,255,0.04)';
+  for(var i=0;i<10;i+=2) ctx.fillRect(-0.3, i*0.1-0.3, 1.6, 0.1);
+
+  function strokePath(w,color,dash){
+    ctx.beginPath();
+    ctx.moveTo(PTS[0][0],PTS[0][1]);
+    for(var i=1;i<N;i++) ctx.lineTo(PTS[i][0],PTS[i][1]);
+    ctx.closePath();
+    ctx.lineJoin='round'; ctx.lineCap='round';
+    ctx.setLineDash(dash||[]);
+    ctx.lineWidth=w; ctx.strokeStyle=color; ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  strokePath(TRACK_HALF*2+0.030, '#d8d8d8');   // edge lines
+  strokePath(TRACK_HALF*2, '#4a4a52');          // asphalt
+  strokePath(0.006, 'rgba(255,215,0,0.7)', [0.03,0.035]); // center dashes
+
+  // start / finish checkered line
+  var d = dirAt(0), pp=[-d[1],d[0]], c=PTS[0];
+  var sq=0.014, cols=Math.floor(TRACK_HALF/sq);
+  ctx.save();
+  for(var r=0;r<2;r++){
+    for(var k=-cols;k<cols;k++){
+      var bx = c[0] + pp[0]*(k*sq + sq/2) + d[0]*(r*sq - sq/2);
+      var by = c[1] + pp[1]*(k*sq + sq/2) + d[1]*(r*sq - sq/2);
+      ctx.save();
+      ctx.translate(bx,by);
+      ctx.rotate(Math.atan2(d[1],d[0]));
+      ctx.fillStyle = ((k+r)%2===0)?'#f4f4f4':'#111';
+      ctx.fillRect(-sq/2,-sq/2,sq,sq);
+      ctx.restore();
+    }
+  }
+  ctx.restore();
+}
+
+function drawCar(car, ghost){
+  ctx.save();
+  ctx.translate(car.x, car.y);
+  ctx.rotate(car.a);
+  var L=0.048, Wd=0.026;
+  // shadow
+  ctx.fillStyle='rgba(0,0,0,0.3)';
+  ctx.fillRect(-L/2+0.004, -Wd/2+0.005, L, Wd);
+  // wheels
+  ctx.fillStyle='#111';
+  ctx.fillRect(-L*0.42,-Wd/2-0.004,L*0.2,0.008);
+  ctx.fillRect(-L*0.42, Wd/2-0.004,L*0.2,0.008);
+  ctx.fillRect( L*0.18,-Wd/2-0.004,L*0.2,0.008);
+  ctx.fillRect( L*0.18, Wd/2-0.004,L*0.2,0.008);
+  // body
+  ctx.fillStyle = ghost? 'rgba(255,255,255,0.35)' : car.color;
+  roundRect(-L/2,-Wd/2,L,Wd,0.006); ctx.fill();
+  // nose highlight
+  ctx.fillStyle='rgba(255,255,255,0.35)';
+  roundRect(L*0.08,-Wd/2+0.004,L*0.36,Wd-0.008,0.004); ctx.fill();
+  // cockpit
+  ctx.fillStyle='#1b2735';
+  roundRect(-L*0.22,-Wd/2+0.005,L*0.34,Wd-0.010,0.004); ctx.fill();
+  ctx.restore();
+}
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+function screenTransform(){ ctx.setTransform(dpr,0,0,dpr,0,0); }
+
+function fmt(t){
+  var m=Math.floor(t/60), s=t-m*60;
+  return m+':'+(s<10?'0':'')+s.toFixed(2);
+}
+
+function panel(x,y,w,h,bg){
+  ctx.fillStyle=bg||'rgba(0,0,0,0.55)';
+  roundRect(x,y,w,h,10); ctx.fill();
+}
+
+function drawHUD(){
+  screenTransform();
+  var fs = Math.max(13, Math.min(20, W*0.02));
+  ctx.textBaseline='top';
+  // P1 left
+  panel(12,12, 200, 58);
+  ctx.fillStyle=cars[0].color; ctx.fillRect(20,22,6,40);
+  ctx.fillStyle='#fff'; ctx.font='bold '+fs+'px monospace'; ctx.textAlign='left';
+  ctx.fillText('P1  WASD', 36, 20);
+  ctx.font=(fs*0.9)+'px monospace';
+  ctx.fillText('LAP '+Math.min(cars[0].laps+1,LAPS_TO_WIN)+' / '+LAPS_TO_WIN, 36, 48);
+  // P2 right
+  panel(W-212,12, 200, 58);
+  ctx.fillStyle=cars[1].color; ctx.fillRect(W-204,22,6,40);
+  ctx.fillStyle='#fff'; ctx.font='bold '+fs+'px monospace'; ctx.textAlign='left';
+  ctx.fillText('P2  ARROWS', W-198, 20);
+  ctx.font=(fs*0.9)+'px monospace';
+  ctx.fillText('LAP '+Math.min(cars[1].laps+1,LAPS_TO_WIN)+' / '+LAPS_TO_WIN, W-198, 48);
+  // timer center
+  panel(W/2-70,12, 140, 34);
+  ctx.fillStyle='#ffd54a'; ctx.font='bold '+fs+'px monospace'; ctx.textAlign='center';
+  ctx.fillText(fmt(raceTime), W/2, 22);
+}
+
+function drawBigText(txt, y, color, size){
+  screenTransform();
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.font='bold '+size+'px monospace';
+  ctx.fillStyle='rgba(0,0,0,0.6)';
+  ctx.fillText(txt, W/2+4, y+4);
+  ctx.fillStyle=color;
+  ctx.fillText(txt, W/2, y);
+}
+
+function render(){
+  screenTransform();
+  // clear letterbox bars
+  ctx.fillStyle='#0d2b14';
+  ctx.fillRect(0,0,W,H);
+  worldTransform();
+  drawTrack();
+  for(var i=0;i<cars.length;i++) drawCar(cars[i], false);
+
+  if(state==='menu'){
+    screenTransform();
+    panel(W/2-320, H/2-190, 640, 380, 'rgba(5,20,10,0.88)');
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillStyle='#ffd54a'; ctx.font='bold '+Math.min(46,W*0.055)+'px monospace';
+    ctx.fillText('TWIN TURBO RUMBLE', W/2, H/2-130);
+    ctx.fillStyle='#fff'; ctx.font=Math.min(18,W*0.02)+'px monospace';
+    ctx.fillText('Two-player arcade racing — first to '+LAPS_TO_WIN+' laps wins!', W/2, H/2-85);
+
+    ctx.fillStyle='#e8412a'; ctx.font='bold 17px monospace';
+    ctx.fillText('PLAYER 1', W/2-160, H/2-35);
+    ctx.fillStyle='#2a6fe8';
+    ctx.fillText('PLAYER 2', W/2+160, H/2-35);
+
+    ctx.fillStyle='#cfe8d4'; ctx.font='15px monospace';
+    var lines=[
+      ['W — accelerate','↑ — accelerate'],
+      ['S — brake / reverse','↓ — brake / reverse'],
+      ['A / D — steer','← / → — steer']
+    ];
+    for(var i=0;i<lines.length;i++){
+      ctx.textAlign='right'; ctx.fillText(lines[i][0], W/2-40, H/2+5+i*26);
+      ctx.textAlign='left';  ctx.fillText(lines[i][1], W/2+40, H/2+5+i*26);
+    }
+    ctx.textAlign='center';
+    ctx.fillStyle='#9fb8a6'; ctx.font='14px monospace';
+    ctx.fillText('Stay on the asphalt — grass is slow!   •   R = restart race', W/2, H/2+105);
+
+    var pulse = 0.6 + 0.4*Math.sin(performance.now()/280);
+    ctx.fillStyle='rgba(255,255,255,'+pulse.toFixed(2)+')';
+    ctx.font='bold 20px monospace';
+    ctx.fillText('PRESS  ENTER / SPACE  (or click)  TO RACE', W/2, H/2+150);
+    return;
+  }
+
+  drawHUD();
+
+  if(state==='countdown'){
+    var num = Math.ceil(countdownT);
+    drawBigText(num>0 ? String(num) : 'GO!', H*0.4, num>0?'#ff5252':'#6dff7c', Math.min(120,W*0.15));
+  } else if(state==='racing' && raceTime < 1){
+    drawBigText('GO!', H*0.4, '#6dff7c', Math.min(120,W*0.15));
+  }
+
+  if(state==='finished'){
+    screenTransform();
+    panel(W/2-300, H/2-140, 600, 280, 'rgba(5,20,10,0.9)');
+    ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillStyle=cars[winner].color;
+    ctx.font='bold '+Math.min(44,W*0.05)+'px monospace';
+    ctx.fillText(cars[winner].name + ' WINS!', W/2, H/2-70);
+    ctx.fillStyle='#fff'; ctx.font=Math.min(20,W*0.024)+'px monospace';
+    ctx.fillText('Finish time:  '+fmt(raceTime), W/2, H/2-15);
+    ctx.fillStyle='#cfe8d4'; ctx.font='16px monospace';
+    ctx.fillText('P1 laps: '+cars[0].laps+'      P2 laps: '+cars[1].laps, W/2, H/2+25);
+    var pulse = 0.6 + 0.4*Math.sin(performance.now()/280);
+    ctx.fillStyle='rgba(255,255,255,'+pulse.toFixed(2)+')';
+    ctx.font='bold 19px monospace';
+    ctx.fillText('PRESS  R  OR  ENTER  TO RACE AGAIN', W/2, H/2+85);
+  }
+}
+
+/* ---------- Main loop ---------- */
+var last = performance.now();
+function frame(now){
+  var gdt = (now-last)/1000; last=now;
+  step(gdt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
+```
