@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Asteroids Tetris</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W; canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+}
+function playSound(freq, dur, type, vol) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || 'square';
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + dur);
+}
+function sMove() { playSound(200, 0.05, 'square', 0.05); }
+function sRotate() { playSound(300, 0.08, 'triangle', 0.08); }
+function sDrop() { playSound(150, 0.1, 'sawtooth', 0.06); }
+function sClear() { playSound(500, 0.2, 'square', 0.1); setTimeout(()=>playSound(700,0.2,'square',0.1),80); setTimeout(()=>playSound(900,0.3,'square',0.1),160); }
+function sGameOver() { playSound(200, 0.5, 'sawtooth', 0.12); setTimeout(()=>playSound(150,0.5,'sawtooth',0.12),200); setTimeout(()=>playSound(100,0.8,'sawtooth',0.12),400); }
+function sLevelUp() { playSound(600, 0.15, 'triangle', 0.1); setTimeout(()=>playSound(800,0.15,'triangle',0.1),100); setTimeout(()=>playSound(1000,0.2,'triangle',0.1),200); }
+
+// Stars
+let stars = [];
+function genStars() {
+  stars = [];
+  for (let i = 0; i < 150; i++) {
+    stars.push({ x: Math.random() * W, y: Math.random() * H, s: Math.random() * 2 + 0.5, b: Math.random(), sp: Math.random() * 0.02 + 0.005 });
+  }
+}
+genStars();
+
+// Game constants
+const COLS = 10, ROWS = 20;
+let cellSize, boardX, boardY, scoreX, infoX;
+
+function calcLayout() {
+  cellSize = Math.min(Math.floor((H - 80) / ROWS), Math.floor(W * 0.5 / COLS));
+  if (cellSize > 40) cellSize = 40;
+  boardX = Math.floor((W - COLS * cellSize) / 2);
+  boardY = Math.floor((H - ROWS * cellSize) / 2);
+  scoreX = boardX + COLS * cellSize + 30;
+  infoX = boardX;
+}
+
+// Tetrominoes
+const SHAPES = [
+  [[1,1,1,1]], // I
+  [[1,1],[1,1]], // O
+  [[0,1,0],[1,1,1]], // T
+  [[0,1,1],[1,1,0]], // S
+  [[1,1,0],[0,1,1]], // Z
+  [[1,0,0],[1,1,1]], // J
+  [[0,0,1],[1,1,1]]  // L
+];
+
+const COLORS = [
+  '#7a8c9e', // I - steel blue
+  '#c4a265', // O - sand
+  '#b87373', // T - rust red
+  '#6db86d', // S - moss green
+  '#c46565', // Z - dark red
+  '#6579c4', // J - indigo
+  '#c4a24a'  // L - amber
+];
+
+function getRotated(shape, rot) {
+  const rows = shape.length;
+  const cols = shape[0].length;
+  let r = shape.map(r => [...r]);
+  for (let i = 0; i < rot % 4; i++) {
+    // Rotate clockwise
+    let nr = [];
+    for (let c = 0; c < r[0].length; c++) {
+      let col = [];
+      for (let rr = r.length - 1; rr >= 0; rr--) col.push(r[rr][c]);
+      nr.push(col);
+    }
+    r = nr;
+  }
+  return r;
+}
+
+// 7-bag
+let bag = [];
+function nextFromBag() {
+  if (bag.length === 0) {
+    bag = [0,1,2,3,4,5,6];
+    for (let i = bag.length - 1; i > 0; i--) {
+      let j = Math.floor(Math.random() * (i + 1));
+      [bag[i], bag[j]] = [bag[j], bag[i]];
+    }
+  }
+  return bag.pop();
+}
+
+// Game state
+let board, current, next, score, lines, level, speed, dropInterval;
+let gameRunning = false, gameOver = false, started = false;
+let clearing = null, clearTimer = 0;
+let particles = [];
+let lastTime = 0, accumulator = 0;
+let highScore = 0;
+
+try { highScore = parseInt(localStorage.getItem('asteroidsTetrisHigh') || '0'); } catch(e) {}
+
+function resetGame() {
+  board = Array.from({length: ROWS}, () => Array(COLS).fill(null));
+  score = 0; lines = 0; level = 1;
+  speed = 800; dropInterval = speed;
+  bag = [];
+  next = nextFromBag();
+  spawnPiece();
+  clearing = null; clearTimer = 0;
+  particles = [];
+  gameOver = false;
+}
+
+function spawnPiece() {
+  const shapeId = current ? next : nextFromBag();
+  next = nextFromBag();
+  const shape = getRotated(SHAPES[shapeId], 0);
+  let px = Math.floor((COLS - shape[0].length) / 2);
+  let py = 0;
+  // Check spawn collision
+  if (collides(shape, px, py)) {
+    gameOver = true;
+    sGameOver();
+    try { localStorage.setItem('asteroidsTetrisHigh', String(score)); } catch(e) {}
+    return;
+  }
+  current = { shape: shapeId, rot: 0, x: px, y: py };
+}
+
+function collides(shape, px, py) {
+  for (let r = 0; r < shape.length; r++) {
+    for (let c = 0; c < shape[r].length; c++) {
+      if (shape[r][c]) {
+        let nx = px + c, ny = py + r;
+        if (nx < 0 || nx >= COLS || ny >= ROWS) return true;
+        if (ny >= 0 && board[ny][nx]) return true;
+      }
+    }
+  }
+  return false;
+}
+
+function lockPiece() {
+  let shape = getRotated(SHAPES[current.shape], current.rot);
+  for (let r = 0; r < shape.length; r++) {
+    for (let c = 0; c < shape[r].length; c++) {
+      if (shape[r][c]) {
+        let ny = current.y + r, nx = current.x + c;
+        if (ny >= 0) board[ny][nx] = current.shape;
+      }
+    }
+  }
+  // Check line clears
+  let fullRows = [];
+  for (let r = 0; r < ROWS; r++) {
+    if (board[r].every(c => c !== null)) fullRows.push(r);
+  }
+  if (fullRows.length > 0) {
+    clearing = fullRows;
+    clearTimer = 300;
+    sClear();
+    spawnClearParticles(fullRows);
+  } else {
+    spawnPiece();
+  }
+}
+
+function spawnClearParticles(rows) {
+  for (let r of rows) {
+    for (let c = 0; c < COLS; c++) {
+      let bx = boardX + c * cellSize + cellSize/2;
+      let by = boardY + r * cellSize + cellSize/2;
+      for (let i = 0; i < 4; i++) {
+        particles.push({
+          x: bx, y: by,
+          vx: (Math.random()-0.5)*4,
+          vy: (Math.random()-0.5)*4 - 2,
+          life: 1,
+          color: COLORS[board[r][c] || 0],
+          s: Math.random()*4+2
+        });
+      }
+    }
+  }
+}
+
+function processClear() {
+  for (let r of clearing) {
+    board.splice(r, 1);
+    board.unshift(Array(COLS).fill(null));
+  }
+  let n = clearing.length;
+  let pts = [0, 40, 100, 300, 1200];
+  score += pts[n] * level;
+  lines += n;
+  let newLevel = Math.floor(lines / 10) + 1;
+  if (newLevel > level) {
+    level = newLevel;
+    speed = Math.max(80, 800 - (level-1)*70);
+    dropInterval = speed;
+    sLevelUp();
+  }
+  clearing = null;
+  spawnPiece();
+}
+
+function move(dx) {
+  if (!current || gameOver || !gameRunning) return;
+  let shape = getRotated(SHAPES[current.shape], current.rot);
+  if (!collides(shape, current.x + dx, current.y)) {
+    current.x += dx;
+    sMove();
+  }
+}
+
+function rotate() {
+  if (!current || gameOver || !gameRunning) return;
+  let newRot = (current.rot + 1) % 4;
+  let shape = getRotated(SHAPES[current.shape], newRot);
+  // Simple wall kicks
+  let kicks = [0, -1, 1, -2, 2];
+  for (let k of kicks) {
+    if (!collides(shape, current.x + k, current.y)) {
+      current.rot = newRot;
+      current.x += k;
+      sRotate();
+      return;
+    }
+    // Try up
+    if (!collides(shape, current.x + k, current.y - 1)) {
+      current.rot = newRot;
+      current.x += k;
+      current.y -= 1;
+      sRotate();
+      return;
+    }
+  }
+}
+
+function hardDrop() {
+  if (!current || gameOver || !gameRunning) return;
+  let shape = getRotated(SHAPES[current.shape], current.rot);
+  while (!collides(shape, current.x, current.y + 1)) {
+    current.y++;
+  }
+  score += 2 * (ROWS - current.y);
+  sDrop();
+  lockPiece();
+}
+
+function getGhostY() {
+  if (!current) return ROWS;
+  let shape = getRotated(SHAPES[current.shape], current.rot);
+  let y = current.y;
+  while (!collides(shape, current.x, y + 1)) y++;
+  return y;
+}
+
+// Drawing
+function drawStar(x, y, s, b) {
+  ctx.fillStyle = `rgba(255,255,255,${b * 0.8})`;
+  ctx.beginPath();
+  ctx.arc(x, y, s/2, 0, Math.PI*2);
+  ctx.fill();
+}
+
+function drawAsteroidBlock(x, y, size, colorIdx, alpha) {
+  let c = COLORS[colorIdx];
+  let a = alpha || 1;
+  // Base rock shape - slightly irregular
+  let pad = size * 0.06;
+  ctx.globalAlpha = a;
+  ctx.fillStyle = c;
+  roundRect(x+pad, y+pad, size-pad*2, size-pad*2, size*0.15);
+  ctx.fill();
+
+  // Darker border
+  ctx.strokeStyle = darken(c, 0.4);
+  ctx.lineWidth = 1.5;
+  roundRect(x+pad, y+pad, size-pad*2, size-pad*2, size*0.15);
+  ctx.stroke();
+
+  // Craters
+  let seed = colorIdx * 7 + 3;
+  for (let i = 0; i < 3; i++) {
+    let sx = x + pad + (hash(seed+i*13) % 100)/100 * (size - pad*2 - size*0.3);
+    let sy = y + pad + (hash(seed+i*29+7) % 100)/100 * (size - pad*2 - size*0.3);
+    let sr = size * (0.08 + hash(seed+i*41) % 50 / 500);
+    ctx.fillStyle = darken(c, 0.3);
+    ctx.beginPath();
+    ctx.arc(sx + size*0.15, sy + size*0.15, sr, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // Highlight
+  ctx.fillStyle = lighten(c, 0.2);
+  ctx.globalAlpha = a * 0.3;
+  ctx.beginPath();
+  ctx.arc(x + size*0.35, y + size*0.35, size*0.15, 0, Math.PI*2);
+  ctx.fill();
+
+  ctx.globalAlpha = 1;
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.lineTo(x+w-r, y);
+  ctx.quadraticCurveTo(x+w, y, x+w, y+r);
+  ctx.lineTo(x+w, y+h-r);
+  ctx.quadraticCurveTo(x+w, y+h, x+w-r, y+h);
+  ctx.lineTo(x+r, y+h);
+  ctx.quadraticCurveTo(x, y+h, x, y+h-r);
+  ctx.lineTo(x, y+r);
+  ctx.quadraticCurveTo(x, y, x+r, y);
+  ctx.closePath();
+}
+
+function hash(n) { return (n * 16807 + 12345) % 2147483647; }
+
+function darken(hex, amt) {
+  let r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+  r = Math.floor(r * (1-amt)); g = Math.floor(g*(1-amt)); b = Math.floor(b*(1-amt));
+  return `rgb(${r},${g},${b})`;
+}
+function lighten(hex, amt) {
+  let r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+  r = Math.min(255, Math.floor(r + (255-r)*amt));
+  g = Math.min(255, Math.floor(g + (255-g)*amt));
+  b = Math.min(255, Math.floor(b + (255-b)*amt));
+  return `rgb(${r},${g},${b})`;
+}
+
+function drawBoard() {
+  // Background frame
+  ctx.fillStyle = '#1a1a2e';
+  roundRect(boardX - 8, boardY - 8, COLS*cellSize + 16, ROWS*cellSize + 16, 8);
+  ctx.fill();
+  ctx.strokeStyle = '#4a4a6a';
+  ctx.lineWidth = 2;
+  roundRect(boardX - 8, boardY - 8, COLS*cellSize + 16, ROWS*cellSize + 16, 8);
+  ctx.stroke();
+
+  // Grid
+  ctx.strokeStyle = 'rgba(80,80,120,0.15)';
+  ctx.lineWidth = 1;
+  for (let r = 0; r <= ROWS; r++) {
+    ctx.beginPath(); ctx.moveTo(boardX, boardY + r*cellSize); ctx.lineTo(boardX + COLS*cellSize, boardY + r*cellSize); ctx.stroke();
+  }
+  for (let c = 0; c <= COLS; c++) {
+    ctx.beginPath(); ctx.moveTo(boardX + c*cellSize, boardY); ctx.lineTo(boardX + c*cellSize, boardY + ROWS*cellSize); ctx.stroke();
+  }
+
+  // Locked blocks
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (board[r][c] !== null) {
+        drawAsteroidBlock(boardX + c*cellSize, boardY + r*cellSize, cellSize, board[r][c], 1);
+      }
+    }
+  }
+
+  // Clearing flash
+  if (clearing) {
+    for (let r of clearing) {
+      ctx.fillStyle = `rgba(255,255,200,${0.3 + Math.sin(clearTimer/50)*0.3})`;
+      ctx.fillRect(boardX, boardY + r*cellSize, COLS*cellSize, cellSize);
+    }
+  }
+
+  // Ghost piece
+  if (current && !gameOver) {
+    let ghostY = getGhostY();
+    let shape = getRotated(SHAPES[current.shape], current.rot);
+    for (let r = 0; r < shape.length; r++) {
+      for (let c = 0; c < shape[r].length; c++) {
+        if (shape[r][c]) {
+          let gx = boardX + (current.x + c) * cellSize;
+          let gy = boardY + (ghostY + r) * cellSize;
+          ctx.globalAlpha = 0.25;
+          ctx.strokeStyle = COLORS[current.shape];
+          ctx.lineWidth = 2;
+          roundRect(gx+3, gy+3, cellSize-6, cellSize-6, 4);
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+      }
+    }
+  }
+
+  // Current piece
+  if (current && !gameOver) {
+    let shape = getRotated(SHAPES[current.shape], current.rot);
+    for (let r = 0; r < shape.length; r++) {
+      for (let c = 0; c < shape[r].length; c++) {
+        if (shape[r][c]) {
+          let px = boardX + (current.x + c) * cellSize;
+          let py = boardY + (current.y + r) * cellSize;
+          drawAsteroidBlock(px, py, cellSize, current.shape, 1);
+        }
+      }
+    }
+  }
+
+  // Particles
+  for (let p of particles) {
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.s * p.life, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawInfo() {
+  calcLayout();
+  let ix = scoreX;
+  if (ix + 150 > W) ix = boardX;
+
+  ctx.fillStyle = '#aaaacc';
+  ctx.font = `bold ${Math.max(14, cellSize*0.5)}px monospace`;
+  ctx.textAlign = 'left';
+
+  // Score panel
+  let py = boardY + 10;
+  ctx.fillText('SCORE', ix, py);
+  ctx.fillStyle = '#fff';
+  ctx.font = `${Math.max(16, cellSize*0.55)}px monospace`;
+  ctx.fillText(String(score).padStart(6,'0'), ix, py + Math.max(20, cellSize*0.7));
+
+  py += Math.max(35, cellSize*1.2);
+  ctx.fillStyle = '#aaaacc';
+  ctx.font = `bold ${Math.max(14, cellSize*0.5)}px monospace`;
+  ctx.fillText('LINES', ix, py);
+  ctx.fillStyle = '#fff';
+  ctx.font = `${Math.max(16, cellSize*0.55)}px monospace`;
+  ctx.fillText(String(lines), ix, py + Math.max(20, cellSize*0.7));
+
+  py += Math.max(35, cellSize*1.2);
+  ctx.fillStyle = '#aaaacc';
+  ctx.font = `bold ${Math.max(14, cellSize*0.5)}px monospace`;
+  ctx.fillText('LEVEL', ix, py);
+  ctx.fillStyle = '#ffcc66';
+  ctx.font = `${Math.max(16, cellSize*0.55)}px monospace`;
+  ctx.fillText(String(level), ix, py + Math.max(20, cellSize*0.7));
+
+  py += Math.max(35, cellSize*1.2);
+  ctx.fillStyle = '#aaaacc';
+  ctx.font = `bold ${Math.max(14, cellSize*0.5)}px monospace`;
+  ctx.fillText('HIGH', ix, py);
+  ctx.fillStyle = '#88ff88';
+  ctx.font = `${Math.max(16, cellSize*0.55)}px monospace`;
+  let hs = Math.max(highScore, score);
+  ctx.fillText(String(hs), ix, py + Math.max(20, cellSize*0.7));
+
+  // Next piece
+  let nx = ix;
+  let ny = py + Math.max(50, cellSize*1.8);
+  ctx.fillStyle = '#aaaacc';
+  ctx.font = `bold ${Math.max(14, cellSize*0.5)}px monospace`;
+  ctx.fillText('NEXT', nx, ny);
+  ny += Math.max(20, cellSize*0.7);
+
+  if (next !== undefined) {
+    let nextShape = SHAPES[next];
+    let bs = cellSize * 0.6;
+    let nw = nextShape[0].length * bs;
+    let nh = nextShape.length * bs;
+    for (let r = 0; r < nextShape.length; r++) {
+      for (let c = 0; c < nextShape[r].length; c++) {
+        if (nextShape[r][c]) {
+          drawAsteroidBlock(nx + c*bs, ny + r*bs, bs, next, 1);
+        }
+      }
+    }
+  }
+}
+
+function drawBackground() {
+  ctx.fillStyle = '#0a0a1a';
+  ctx.fillRect(0, 0, W, H);
+  let t = performance.now();
+  for (let s of stars) {
+    s.b += s.sp;
+    if (s.b > 1.5) s.b = 0;
+    let brightness = Math.sin(s.b * Math.PI) * 0.7 + 0.3;
+    drawStar(s.x, s.y, s.s, brightness);
+  }
+}
+
+function drawStartScreen() {
+  drawBackground();
+  calcLayout();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#fff';
+  ctx.font = `bold ${Math.min(W*0.08, 48)}px monospace`;
+  ctx.fillText('ASTEROIDS TETRIS', W/2, H*0.3);
+
+  ctx.font = `${Math.min(W*0.03, 18)}px monospace`;
+  ctx.fillStyle = '#aaaacc';
+  let ty = H*0.42;
+  let lines_text = [
+    '← → : Move',
+    '↑ / Z : Rotate CW',
+    'X : Rotate CCW',
+    '↓ : Soft Drop',
+    'SPACE : Hard Drop',
+    'ENTER : Start / Restart'
+  ];
+  for (let i = 0; i < lines_text.length; i++) {
+    ctx.fillText(lines_text[i], W/2, ty + i * Math.min(H*0.04, 28));
+  }
+
+  // Animated asteroids
+  let t = performance.now() * 0.001;
+  for (let i = 0; i < 5; i++) {
+    let ax = W/2 + Math.cos(t*0.5 + i*1.3) * W*0.3;
+    let ay = H*0.7 + Math.sin(t*0.7 + i*2.1) * H*0.1;
+    drawAsteroidBlock(ax-15, ay-15, 30, i % 7, 0.8);
+  }
+
+  ctx.fillStyle = '#fff';
+  ctx.font = `bold ${Math.min(W*0.04, 24)}px monospace`;
+  let blink = Math.sin(t*3) > 0;
+  if (blink) ctx.fillText('PRESS ENTER TO START', W/2, H*0.85);
+
+  // High score
+  if (highScore > 0) {
+    ctx.fillStyle = '#88ff88';
+    ctx.font = `${Math.min(W*0.03, 16)}px monospace`;
+    ctx.fillText('HIGH SCORE: ' + highScore, W/2, H*0.92);
+  }
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, W, H);
+  calcLayout();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ff6666';
+  ctx.font = `bold ${Math.min(W*0.08, 42)}px monospace`;
+  ctx.fillText('GAME OVER', W/2, H*0.35);
+
+  ctx.fillStyle = '#fff';
+  ctx.font = `${Math.min(W*0.04, 22)}px monospace`;
+  ctx.fillText('SCORE: ' + score, W/2, H*0.48);
+  ctx.fillText('LINES: ' + lines, W/2, H*0.55);
+
+  if (score >= highScore && score > 0) {
+    ctx.fillStyle = '#ffcc00';
+    ctx.font = `bold ${Math.min(W*0.04, 20)}px monospace`;
+    ctx.fillText('NEW HIGH SCORE!', W/2, H*0.63);
+  }
+
+  let blink = Math.sin(performance.now()*0.003) > 0;
+  if (blink) {
+    ctx.fillStyle = '#aaaacc';
+    ctx.font = `${Math.min(W*0.03, 18)}px monospace`;
+    ctx.fillText('PRESS ENTER TO RESTART', W/2, H*0.75);
+  }
+}
+
+function update(dt) {
+  if (!gameRunning || gameOver) return;
+  if (clearing) {
+    clearTimer -= dt;
+    if (clearTimer <= 0) processClear();
+    return;
+  }
+  accumulator += dt;
+  while (accumulator >= dropInterval) {
+    accumulator -= dropInterval;
+    let shape = getRotated(SHAPES[current.shape], current.rot);
+    if (!collides(shape, current.x, current.y + 1)) {
+      current.y++;
+    } else {
+      lockPiece();
+    }
+  }
+  // Update particles
+  for (let p of particles) {
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.15;
+    p.life -= 0.02;
+  }
+  particles = particles.filter(p => p.life > 0);
+}
+
+function render() {
+  drawBackground();
+  calcLayout();
+  if (!started) {
+    drawStartScreen();
+  } else {
+    drawBoard();
+    drawInfo();
+    if (gameOver) drawGameOver();
+  }
+}
+
+let lastFrame = 0;
+function gameLoop(timestamp) {
+  let dt = timestamp - lastFrame;
+  lastFrame = timestamp;
+  if (dt > 100) dt = 16;
+  update(dt);
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+// Input
+window.addEventListener('keydown', function(e) {
+  initAudio();
+  if (e.key === 'Enter' || e.key === ' ') {
+    if (!started) {
+      started = true;
+      gameRunning = true;
+      resetGame();
+      calcLayout();
+      e.preventDefault();
+      return;
+    }
+    if (gameOver) {
+      gameRunning = true;
+      resetGame();
+      calcLayout();
+      e.preventDefault();
+      return;
+    }
+  }
+
+  if (!started || gameOver) return;
+
+  if (e.key === 'ArrowLeft') { move(-1); e.preventDefault(); }
+  else if (e.key === 'ArrowRight') { move(1); e.preventDefault(); }
+  else if (e.key === 'ArrowDown') {
+    let shape = getRotated(SHAPES[current.shape], current.rot);
+    if (!collides(shape, current.x, current.y + 1)) {
+      current.y++;
+      score += 1;
+      sMove();
+    }
+    e.preventDefault();
+  }
+  else if (e.key === 'ArrowUp' || e.key === 'z' || e.key === 'Z') { rotate(); e.preventDefault(); }
+  else if (e.key === 'x' || e.key === 'X') {
+    // CCW rotation
+    let newRot = (current.rot + 3) % 4;
+    let shape = getRotated(SHAPES[current.shape], newRot);
+    let kicks = [0, -1, 1, -2, 2];
+    for (let k of kicks) {
+      if (!collides(shape, current.x + k, current.y)) {
+        current.rot = newRot;
+        current.x += k;
+        sRotate();
+        break;
+      }
+      if (!collides(shape, current.x + k, current.y - 1)) {
+        current.rot = newRot;
+        current.x += k;
+        current.y -= 1;
+        sRotate();
+        break;
+      }
+    }
+    e.preventDefault();
+  }
+  else if (e.key === ' ') { hardDrop(); e.preventDefault(); }
+});
+
+// Touch / click to start
+canvas.addEventListener('click', function() {
+  initAudio();
+  if (!started) { started = true; gameRunning = true; resetGame(); calcLayout(); }
+  else if (gameOver) { gameRunning = true; resetGame(); calcLayout(); }
+});
+
+// Start
+requestAnimationFrame(gameLoop);
+})();
+</script>
+</body>
+</html>
