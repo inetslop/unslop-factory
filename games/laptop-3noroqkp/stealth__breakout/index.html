@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Shadow Break — Stealth Breakout</title>
+<style>
+  html,body{margin:0;height:100%;background:#05070d;overflow:hidden;}
+  canvas{display:block;width:100vw;height:100vh;touch-action:none;cursor:crosshair;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* ============================================================
+   SHADOW BREAK — a stealth take on Breakout
+   You are a shadow operative. Your paddle is your CLOAK.
+   • Hold SHIFT to cloak: phase through the patrol scanner and
+     guard fire — but your cloak shrinks your cover (shorter paddle)
+     and drains your Stealth meter. Let it drain too far and you'll
+     be exposed until it recharges.
+   Break every brick to complete the operation. Survive the waves.
+   ============================================================ */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// ---- Design-space (fixed) coordinates; we scale to fit window ----
+const W = 800, H = 600;
+let dpr = 1, cw = 0, ch = 0, scale = 1, offX = 0, offY = 0;
+
+function resize(){
+  cw = window.innerWidth; ch = window.innerHeight;
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.floor(cw*dpr);
+  canvas.height = Math.floor(ch*dpr);
+  canvas.style.width = cw+'px'; canvas.style.height = ch+'px';
+  scale = Math.min(cw/W, ch/H);
+  offX = (cw - W*scale)/2;
+  offY = (ch - H*scale)/2;
+}
+window.addEventListener('resize', resize);
+
+// ---- Audio (Web Audio, starts after first user input) ----
+let audioCtx = null;
+function initAudio(){ if(!audioCtx){ try{ audioCtx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } if(audioCtx && audioCtx.state==='suspended') audioCtx.resume(); }
+function beep(freq, dur, type, gain, slideTo){
+  if(!audioCtx) return;
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.type = type||'square'; o.frequency.value = freq;
+  if(slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, audioCtx.currentTime + dur);
+  g.gain.setValueAtTime(gain||0.12, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start(); o.stop(audioCtx.currentTime + dur);
+}
+const sfx = {
+  bounce(){ beep(220,0.06,'square',0.10); },
+  wall(){ beep(180,0.05,'square',0.08); },
+  brick(){ beep(520,0.09,'triangle',0.14,300); },
+  armor(){ beep(760,0.08,'square',0.12,400); },
+  guard(){ beep(120,0.18,'sawtooth',0.16,60); },
+  launch(){ beep(300,0.12,'triangle',0.14,600); },
+  cloakOn(){ beep(700,0.10,'sine',0.12,1200); },
+  cloakOff(){ beep(500,0.10,'sine',0.12,300); },
+  hurt(){ beep(90,0.28,'sawtooth',0.22,50); },
+  win(){ [440,554,659,880].forEach((f,i)=>setTimeout(()=>beep(f,0.18,'triangle',0.16), i*110)); },
+  lose(){ [300,220,150,90].forEach((f,i)=>setTimeout(()=>beep(f,0.22,'sawtooth',0.18), i*120)); }
+};
+
+// ---- High score (safe localStorage) ----
+let highScore = 0;
+try { highScore = parseInt(localStorage.getItem('shadowBreakHigh')||'0',10)||0; } catch(e){}
+function saveHigh(){ try{ localStorage.setItem('shadowBreakHigh', String(highScore)); }catch(e){} }
+
+// ---- Input state ----
+const keys = {};
+let pointerX = null; // design-space x from mouse/touch (or null)
+
+window.addEventListener('keydown', e=>{
+  const k = e.key;
+  keys[k] = true;
+  if([' ','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(k)) e.preventDefault();
+  initAudio();
+  handleKey(k);
+});
+window.addEventListener('keyup', e=>{ keys[e.key]=false; });
+window.addEventListener('mousemove', e=>{ pointerX = toDesignX(e.clientX); });
+canvas.addEventListener('pointermove', e=>{ pointerX = toDesignX(e.clientX); });
+canvas.addEventListener('click', ()=>{ initAudio(); handleKey(' '); });
+
+function toDesignX(clientX){ return (clientX - offX)/scale; }
+
+// ---- Game state ----
+const S = { start:'start', playing:'playing', win:'win', lose:'lose' };
+let state = S.start;
+
+let paddle, ball, bricks, bullets, scanner, hearts, score, wave, stealth, invuln, time, lastTs;
+
+function reset(){
+  paddle = { x: W/2, y: H-46, w: 120, h: 14, vx:0 };
+  ball   = { x: W/2, y: H-70, r: 7, vx:0, vy:0, stuck:true, speed:380 };
+  bullets = [];
+  hearts = 3; score = 0; wave = 1; stealth = 100; invuln = 0; time = 0;
+  scanner = { x: W/2, dir:1, on:true, blinkPhase:0 };
+  makeBricks(1);
+}
+
+function makeBricks(w){
+  const cols = 8, rows = 5;
+  const margin = 24, top = 64, gap = 6, bh = 24;
+  const bw = (W - margin*2 - (cols-1)*gap)/cols;
+  bricks = [];
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<cols;c++){
+      let type='normal';
+      // guards appear in lower rows and grow with wave
+      const guardChance = Math.min(0.15 + w*0.06, 0.5);
+      const roll = Math.random();
+      if(r>=2 && roll < guardChance) type='guard';
+      else if(roll < guardChance + 0.18) type='armor';
+      bricks.push({ x: margin + c*(bw+gap), y: top + r*(bh+gap), w:bw, h:bh, hp: type==='armor'?2:1, type, alive:true, fireCd: 1 + Math.random()*3 });
+    }
+  }
+}
+
+function handleKey(k){
+  if(state===S.start){
+    if(k===' '||k==='Enter'){ startGame(); }
+    return;
+  }
+  if(k==='r'||k==='R'){ reset(); state=S.playing; ball.stuck=true; ball.x=paddle.x; ball.y=paddle.y-paddle.h-10; return; }
+  if(state===S.lose){
+    if(k===' '||k==='Enter'){ reset(); state=S.playing; ball.stuck=true; ball.x=paddle.x; ball.y=paddle.y-paddle.h-10; }
+    return;
+  }
+  if(state===S.win){
+    // next wave on space / enter
+    if(k===' '||k==='Enter'){ nextWave(); }
+    return;
+  }
+  if(state===S.playing && k===' '){ launchBall(); }
+}
+
+function startGame(){ reset(); state=S.playing; ball.stuck=true; ball.x=paddle.x; ball.y=paddle.y-paddle.h-10; sfx.launch&&0; }
+
+function nextWave(){ wave++; makeBricks(wave); bullets=[]; ball.speed = 380 + (wave-1)*24; ball.stuck=true; ball.x=paddle.x; ball.y=paddle.y-paddle.h-10; state=S.playing; invuln=1.2; }
+
+function launchBall(){
+  if(!ball.stuck) return;
+  ball.stuck=false;
+  const a = -Math.PI/2 + (Math.random()*0.6 - 0.3);
+  ball.vx = Math.cos(a)*ball.speed;
+  ball.vy = Math.sin(a)*ball.speed;
+  sfx.launch();
+}
+
+function loseHeart(){
+  if(invuln>0) return;
+  hearts--; invuln = 1.0; sfx.hurt();
+  if(hearts<=0){ state=S.lose; saveHigh(); sfx.lose(); }
+}
+
+// ---- Update ----
+function update(dt){
+  time += dt;
+  // stealth meter
+  const cloaked = (keys['Shift']||keys['ShiftLeft']||keys['ShiftRight']) && state===S.playing;
+  if(state!==S.playing) return;
+
+  if(cloaked && stealth>0){ stealth = Math.max(0, stealth - 42*dt); }
+  else { stealth = Math.min(100, stealth + 26*dt); }
+  const canCloak = cloaked && stealth>0.5;
+
+  // paddle width depends on cloak
+  paddle.w = canCloak ? 72 : 120;
+
+  // paddle movement (keys velocity)
+  let mv = 0;
+  if(keys['ArrowLeft']) mv -= 1;
+  if(keys['ArrowRight']) mv += 1;
+  if(mv!==0){ paddle.x += mv*560*dt; pointerX=null; }
+  else if(pointerX!==null){ const t=pointerX; paddle.x += (t - paddle.x)*Math.min(1, dt*22); }
+  paddle.x = Math.max(paddle.w/2+8, Math.min(W-8-paddle.w/2, paddle.x));
+
+  // scanner motion + blink
+  const per = 5.2; const tt=(time % per)/per;
+  if(tt<0.5) scanner.x = 30 + (W-60)*(tt*2); else scanner.x = 30 + (W-60)*(1-(tt-0.5)*2);
+  scanner.blinkPhase = (time*1.4)%1;
+  scanner.on = scanner.blinkPhase < 0.72;
+
+  // invulnerability timer
+  if(invuln>0) invuln=Math.max(0,invuln-dt);
+
+  // guard bricks fire bullets
+  for(const b of bricks){
+    if(b.alive && b.type==='guard'){
+      b.fireCd -= dt;
+      if(b.fireCd<=0){
+        b.fireCd = 2.4 + Math.random()*3.5 - Math.min(wave*0.15,1.5);
+        bullets.push({ x:b.x+b.w/2, y:b.y+b.h, vy:230+wave*12, r:4 });
+      }
+    }
+  }
+
+  // ball physics
+  if(ball.stuck){ ball.x=paddle.x; ball.y=paddle.y-paddle.h-10; }
+  else {
+    ball.x += ball.vx*dt; ball.y += ball.vy*dt;
+    // walls
+    if(ball.x-ball.r<4){ ball.x=ball.r+4; ball.vx=Math.abs(ball.vx); sfx.wall(); }
+    if(ball.x+ball.r>W-4){ ball.x=W-4-ball.r; ball.vx=-Math.abs(ball.vx); sfx.wall(); }
+    if(ball.y-ball.r<4){ ball.y=ball.r+4; ball.vy=Math.abs(ball.vy); sfx.wall(); }
+
+    // paddle collision (only when not falling off)
+    if(ball.vy>0 && ball.y+ball.r>=paddle.y && ball.y-ball.r<=paddle.y+paddle.h){
+      const within = Math.abs(ball.x - paddle.x) <= paddle.w/2 + ball.r;
+      if(within){
+        const rel = (ball.x - paddle.x)/(paddle.w/2);
+        const ang = (-Math.PI/2) + rel*1.05; // up to ~60deg
+        ball.vx = Math.cos(ang)*ball.speed;
+        ball.vy = Math.sin(ang)*ball.speed;
+        if(ball.vy>-40) ball.vy=-40;
+        sfx.bounce();
+      }
+    }
+
+    // bricks
+    for(const b of bricks){
+      if(!b.alive) continue;
+      if(hitBrick(b)){ 
+        b.hp--;
+        if(b.hp<=0){
+          b.alive=false;
+          score += b.type==='guard'?40 : b.type==='armor'?25 : 10;
+          sfx[b.type==='armor'?'armor':(b.type==='guard'?'guard':'brick')]();
+        } else { sfx.armor(); }
+      }
+    }
+
+    // ball off bottom
+    if(ball.y-ball.r>H+20){ loseHeart(); if(state===S.playing){ ball.stuck=true; ball.x=paddle.x; ball.y=paddle.y-paddle.h-10; } }
+  }
+
+  // bullets
+  for(const bl of bullets){ bl.y += bl.vy*dt; }
+  bullets = bullets.filter(b=>{
+    if(b.y>H+20) return false;
+    if(!canCloak && invuln<=0){
+      if(Math.abs(b.x-paddle.x)<=paddle.w/2+b.r && b.y>=paddle.y-b.r && b.y<=paddle.y+paddle.h+b.r){ loseHeart(); return false; }
+    }
+    return true;
+  });
+
+  // scanner damage
+  if(scanner.on && !canCloak && invuln<=0){
+    const beamW=8;
+    if(Math.abs(scanner.x - paddle.x) <= (paddle.w/2 + beamW/2)){ loseHeart(); }
+  }
+
+  // win check
+  if(bricks.every(b=>!b.alive)){
+    state=S.win; highScore=Math.max(highScore,score); saveHigh(); sfx.win();
+  }
+}
+
+function hitBrick(b){
+  const cx=ball.x, cy=ball.y, r=ball.r;
+  const nx = Math.max(b.x, Math.min(cx,b.x+b.w));
+  const ny = Math.max(b.y, Math.min(cy,b.y+b.h));
+  const dx=cx-nx, dy=cy-ny;
+  if(dx*dx+dy*dy > r*r) return false;
+  // bounce by side
+  const fromLeft = cx < b.x + b.w/2;
+  const fromTop  = cy < b.y + b.h/2;
+  if(fromTop===fromLeft){ ball.vx=-ball.vx; } else { ball.vy=-ball.vy; }
+  return true;
+}
+
+// ---- Render ----
+function render(){
+  // full-window backdrop (device px)
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle='#05070d'; ctx.fillRect(0,0,cw,ch);
+  // subtle vignette dots
+  ctx.fillStyle='rgba(80,120,180,0.04)';
+  for(let i=0;i<40;i++){ const x=(i*97)%cw, y=(i*53)%ch; ctx.fillRect(x,y,2,2); }
+
+  // game transform (letterbox)
+  ctx.setTransform(dpr*scale,0,0,dpr*scale, dpr*offX, dpr*offY);
+
+  // playfield bg
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#0b1226'); g.addColorStop(1,'#070a14');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+
+  // border glow
+  ctx.strokeStyle='rgba(80,200,255,0.35)'; ctx.lineWidth=2;
+  ctx.strokeRect(4,4,W-8,H-8);
+
+  if(state===S.playing){ drawPlayfield(); }
+  else { drawPlayfield(true); drawOverlay(); }
+}
+
+function drawPlayfield(demo){
+  // bricks
+  for(const b of bricks){
+    if(!b.alive) continue;
+    let col, glow;
+    if(b.type==='guard'){ col='#ff4d6a'; glow='rgba(255,77,106,'; }
+    else if(b.type==='armor'){ col = b.hp>1 ? '#c9d3e0' : '#8b97ab'; glow='rgba(200,215,235,'; }
+    else { col='#3aa0ff'; glow='rgba(58,160,255,'; }
+    ctx.fillStyle=col; roundRect(b.x,b.y,b.w,b.h,4); ctx.fill();
+    // sheen
+    ctx.fillStyle='rgba(255,255,255,0.18)'; roundRect(b.x+3,b.y+3,b.w-6,5,2); ctx.fill();
+    if(b.type==='guard'){
+      // eye
+      ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(b.x+b.w/2, b.y+b.h/2, 4,0,7); ctx.fill();
+      ctx.fillStyle='#7a1020'; ctx.beginPath(); ctx.arc(b.x+b.w/2, b.y+b.h/2, 2,0,7); ctx.fill();
+    }
+    if(b.type==='armor' && b.hp>1){
+      ctx.strokeStyle='rgba(255,255,255,0.5)'; ctx.lineWidth=1; 
+      for(let i=1;i<3;i++){ const yy=b.y+i*(b.h/3); ctx.beginPath(); ctx.moveTo(b.x+4,yy); ctx.lineTo(b.x+b.w-4,yy); ctx.stroke(); }
+    }
+  }
+
+  // scanner beam
+  if(state===S.playing && scanner.on){
+    const grd=ctx.createLinearGradient(scanner.x-10,0,scanner.x+10,0);
+    grd.addColorStop(0,'rgba(255,60,80,0)');
+    grd.addColorStop(0.5,'rgba(255,60,80,0.9)');
+    grd.addColorStop(1,'rgba(255,60,80,0)');
+    ctx.fillStyle=grd; ctx.fillRect(scanner.x-10,4,20,H-8);
+    // emitters
+    ctx.fillStyle='#ff3c50';
+    ctx.beginPath(); ctx.arc(scanner.x,10,7,0,7); ctx.fill();
+    ctx.beginPath(); ctx.arc(scanner.x,H-10,7,0,7); ctx.fill();
+  } else if(state===S.playing){
+    // standby faint line
+    ctx.fillStyle='rgba(255,60,80,0.12)'; ctx.fillRect(scanner.x-3,4,6,H-8);
+  }
+
+  // bullets
+  for(const b of bullets){
+    ctx.fillStyle='#ffd23f'; ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,7); ctx.fill();
+    ctx.fillStyle='rgba(255,210,63,0.4)'; ctx.beginPath(); ctx.arc(b.x,b.y-b.vy*0.02,b.r*1.6,0,7); ctx.fill();
+  }
+
+  // ball
+  if(ball && state!==S.start){
+    ctx.save();
+    ctx.shadowColor='rgba(150,240,255,0.9)'; ctx.shadowBlur=16;
+    const bg=ctx.createRadialGradient(ball.x-2,ball.y-2,1,ball.x,ball.y,ball.r);
+    bg.addColorStop(0,'#eaffff'); bg.addColorStop(1,'#37b6ff');
+    ctx.fillStyle=bg; ctx.beginPath(); ctx.arc(ball.x,ball.y,ball.r,0,7); ctx.fill();
+    ctx.restore();
+  }
+
+  // paddle / cloak
+  if(paddle){
+    const canCloak=(keys['Shift']||keys['ShiftLeft']||keys['ShiftRight']) && state===S.playing;
+    let alpha = invuln>0 ? (Math.floor(time*20)%2?0.4:1) : 1;
+    ctx.save();
+    if(canCloak){ ctx.globalAlpha=0.5; ctx.shadowColor='rgba(180,120,255,0.9)'; ctx.shadowBlur=22; }
+    else { ctx.shadowColor='rgba(90,220,255,0.7)'; ctx.shadowBlur=12; }
+    const pg=ctx.createLinearGradient(0,paddle.y,0,paddle.y+paddle.h);
+    if(canCloak){ pg.addColorStop(0,'#c9a6ff'); pg.addColorStop(1,'#5b3fb0'); }
+    else { pg.addColorStop(0,'#dff4ff'); pg.addColorStop(1,'#2f8fd0'); }
+    ctx.fillStyle=pg; roundRect(paddle.x-paddle.w/2,paddle.y,paddle.w,paddle.h,6); ctx.fill();
+    ctx.restore();
+  }
+
+  // HUD
+  drawHUD();
+}
+
+function drawHUD(){
+  // hearts (shields)
+  for(let i=0;i<3;i++){
+    const x=18+i*24;
+    ctx.fillStyle = i<hearts ? 'rgba(90,220,255,0.9)' : 'rgba(90,220,255,0.15)';
+    shield(x, 16); 
+  }
+  // score / wave / high
+  ctx.fillStyle='rgba(180,230,255,0.9)';
+  ctx.font='700 15px system-ui, sans-serif';
+  ctx.textBaseline='top'; ctx.textAlign='left';
+  ctx.fillText('SCORE '+score, 104, 12);
+  ctx.textAlign='right';
+  ctx.fillText('WAVE '+wave+'   HI '+(Math.max(highScore,score)), W-16, 12);
+  // stealth meter bottom-left
+  const mw=180, mx=16, my=H-24;
+  const canCloak=(keys['Shift']||keys['ShiftLeft']||keys['ShiftRight']) && state===S.playing;
+  ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.textAlign='left'; ctx.font='700 11px system-ui, sans-serif';
+  ctx.fillText('STEALTH', mx, my-14);
+  ctx.fillStyle='rgba(255,255,255,0.12)'; roundRect(mx,my,mw,8,4); ctx.fill();
+  const fill=stealth/100;
+  ctx.fillStyle = canCloak ? 'rgba(200,150,255,0.9)' : 'rgba(120,235,255,0.85)';
+  roundRect(mx,my,mw*fill,8,4); ctx.fill();
+}
+
+function shield(x,y){
+  ctx.beginPath();
+  ctx.moveTo(x,y-6); ctx.lineTo(x+7,y-3); ctx.lineTo(x+7,y+3);
+  ctx.quadraticCurveTo(x+7,y+9,x,y+12); ctx.quadraticCurveTo(x-7,y+9,x-7,y+3);
+  ctx.lineTo(x-7,y-3); ctx.closePath(); ctx.fill();
+}
+
+function roundRect(x,y,w,h,r){ 
+  if(w< r*2) r=w/2; if(h<r*2) r=h/2;
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+function drawOverlay(){
+  // dim + scanline vibe
+  ctx.fillStyle='rgba(4,8,16,0.72)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+
+  if(state===S.start){
+    title('SHADOW BREAK', W/2, H/2-90, 'rgba(150,240,255,0.95)', 52);
+    subtitle('A stealth take on Breakout', W/2, H/2-58, 'rgba(160,200,255,0.7)', 18);
+
+    ctx.font='600 15px system-ui, sans-serif';
+    const lines=[
+      'Move   ← →  /  Mouse',
+      'Launch & Deploy   SPACE',
+      'Cloak   hold SHIFT  (phase past scanner & guard fire)',
+      'Restart   R',
+      '',
+      'Break every brick. Watch the meter — cloaking shrinks your cover.'
+    ];
+    ctx.fillStyle='rgba(200,235,255,0.85)';
+    lines.forEach((ln,i)=>ctx.fillText(ln, W/2, H/2-18 + i*24));
+
+    pulse(W/2, H/2+150);
+  } else if(state===S.win){
+    title('WAVE CLEARED', W/2, H/2-70, 'rgba(140,255,200,0.95)', 46);
+    ctx.font='600 18px system-ui,sans-serif';
+    ctx.fillStyle='rgba(200,235,255,0.9)';
+    ctx.fillText('Score  '+score+'     Best  '+Math.max(highScore,score), W/2, H/2-24);
+    ctx.font='600 15px system-ui,sans-serif';
+    ctx.fillStyle='rgba(180,230,255,0.7)';
+    ctx.fillText('Next wave: more guards, faster ball', W/2, H/2+8);
+    pulse(W/2, H/2+60,'PRESS SPACE — NEXT OPERATION');
+  } else if(state===S.lose){
+    title('EXPOSED', W/2, H/2-70, 'rgba(255,90,110,0.95)', 48);
+    ctx.font='600 18px system-ui,sans-serif';
+    ctx.fillStyle='rgba(220,235,255,0.9)';
+    ctx.fillText('Score  '+score+'     Best  '+Math.max(highScore,score), W/2, H/2-24);
+    pulse(W/2, H/2+50,'PRESS SPACE — REDEPLOY');
+  }
+}
+
+function title(t,x,y,c,s){ ctx.font='800 '+s+'px system-ui, sans-serif'; ctx.fillStyle=c; 
+  ctx.shadowColor=c; ctx.shadowBlur=18; ctx.fillText(t,x,y); ctx.shadowBlur=0; }
+function subtitle(t,x,y,c,s){ ctx.font='600 '+s+'px system-ui,sans-serif'; ctx.fillStyle=c; ctx.fillText(t,x,y); }
+function pulse(x,y,txt){ const a=0.5+0.5*Math.sin(time*4); ctx.globalAlpha=a; 
+  ctx.font='800 17px system-ui,sans-serif'; ctx.fillStyle='rgba(150,240,255,1)';
+  ctx.fillText(txt||'PRESS SPACE TO DEPLOY', x,y); ctx.globalAlpha=1; }
+
+// ---- Main loop ----
+lastTs = performance.now();
+function frame(ts){
+  let dt=(ts-lastTs)/1000; lastTs=ts; if(dt>0.05) dt=0.05; // clamp
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+resize(); reset(); state=S.start;
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
