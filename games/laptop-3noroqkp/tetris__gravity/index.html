@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gravity Tetris</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a1a; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; font-family: monospace; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H, cellSize, boardX, boardY;
+const COLS = 10, ROWS = 20;
+
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    cellSize = Math.floor(Math.min(W / 14, H / 24));
+    boardX = Math.floor((W - COLS * cellSize) / 2);
+    boardY = Math.floor((H - ROWS * cellSize) / 2) - 10;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const COLORS = [
+    null,
+    '#ff6b6b', '#4ecdc4', '#ffe66d', '#a855f7',
+    '#ff8c42', '#6bffb8', '#ff6b9d'
+];
+
+const SHAPES = [
+    [], 
+    [[1,1,1,1]], // I
+    [[1,1],[1,1]], // O
+    [[0,1,0],[1,1,1]], // T
+    [[0,1,1],[1,1,0]], // S
+    [[1,1,0],[0,1,1]], // Z
+    [[1,0,0],[1,1,1]], // J
+    [[0,0,1],[1,1,1]]  // L
+];
+
+const GRAVITY_DIRS = [
+    {dx: 0, dy: 1},   // DOWN
+    {dx: 1, dy: 0},   // RIGHT
+    {dx: 0, dy: -1},  // UP
+    {dx: -1, dy: 0}   // LEFT
+];
+
+const GRAVITY_NAMES = ['DOWN', 'RIGHT', 'UP', 'LEFT'];
+const GRAVITY_ARROWS = ['↓', '→', '↑', '←'];
+
+let board, activePiece, nextPiece, score, lines, level, gameOver, paused;
+let gravityDir, dropInterval, lastDrop, animationId;
+let particles = [];
+let audioCtx = null;
+let screenShake = 0;
+
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+
+function playSound(freq, dur, type='square', vol=0.1) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+
+function spawnPiece() {
+    const type = nextPiece || Math.floor(Math.random() * 7) + 1;
+    nextPiece = Math.floor(Math.random() * 7) + 1;
+    
+    let shape = SHAPES[type].map(r => [...r]);
+    let x, y;
+    
+    if (gravityDir === 0) { // DOWN - spawn at top
+        x = Math.floor((COLS - shape[0].length) / 2);
+        y = 0;
+    } else if (gravityDir === 2) { // UP - spawn at bottom
+        x = Math.floor((COLS - shape[0].length) / 2);
+        y = ROWS - shape.length;
+    } else if (gravityDir === 1) { // RIGHT - spawn at left
+        y = Math.floor((ROWS - shape[0].length) / 2);
+        x = 0;
+    } else { // LEFT - spawn at right
+        y = Math.floor((ROWS - shape[0].length) / 2);
+        x = COLS - shape.length;
+    }
+    
+    return { type, shape, x, y };
+}
+
+function rotateShape(shape) {
+    return shape[0].map((_, i) => shape.map(row => row[i])[i]);
+}
+
+function validPosition(piece, ox=0, oy=0) {
+    const s = piece.shape;
+    for (let r = 0; r < s.length; r++) {
+        for (let c = 0; c < s[r].length; c++) {
+            if (s[r][c]) {
+                let nx = piece.x + ox + c;
+                let ny = piece.y + oy + r;
+                if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) return false;
+                if (board[ny][nx]) return false;
+            }
+        }
+    }
+    return true;
+}
+
+function lockPiece() {
+    const s = activePiece.shape;
+    for (let r = 0; r < s.length; r++) {
+        for (let c = 0; c < s[r].length; c++) {
+            if (s[r][c]) {
+                board[activePiece.y + r][activePiece.x + c] = activePiece.type;
+            }
+        }
+    }
+    playSound(200, 0.1, 'square', 0.08);
+    clearLines();
+    activePiece = spawnPiece();
+    if (!validPosition(activePiece)) {
+        gameOver = true;
+    }
+}
+
+function clearLines() {
+    let cleared = 0;
+    
+    if (gravityDir === 0 || gravityDir === 2) {
+        // Clear full rows
+        for (let r = ROWS - 1; r >= 0; r--) {
+            if (board[r].every(v => v !== 0)) {
+                board.splice(r, 1);
+                board.unshift(new Array(COLS).fill(0));
+                cleared++;
+                for (let c = 0; c < COLS; c++) {
+                    addParticle(boardX + (c + 0.5) * cellSize, boardY + (r + 0.5) * cellSize);
+                }
+            }
+        }
+    } else {
+        // Clear full columns
+        for (let c = COLS - 1; c >= 0; c--) {
+            let full = true;
+            for (let r = 0; r < ROWS; r++) {
+                if (!board[r][c]) { full = false; break; }
+            }
+            if (full) {
+                for (let r = 0; r < ROWS; r++) board[r].splice(c, 1);
+                for (let r = 0; r < ROWS; r++) board[r].push(0);
+                cleared++;
+                for (let r = 0; r < ROWS; r++) {
+                    addParticle(boardX + (c + 0.5) * cellSize, boardY + (r + 0.5) * cellSize);
+                }
+            }
+        }
+    }
+    
+    if (cleared > 0) {
+        screenShake = 8;
+        score += [0, 100, 300, 500, 800][cleared] * level;
+        lines += cleared;
+        level = Math.floor(lines / 10) + 1;
+        playSound(400 + cleared * 100, 0.2, 'sine', 0.15);
+    }
+}
+
+function addParticle(x, y) {
+    for (let i = 0; i < 3; i++) {
+        particles.push({
+            x, y,
+            vx: (Math.random() - 0.5) * 4,
+            vy: (Math.random() - 0.5) * 4,
+            life: 1,
+            color: COLORS[Math.floor(Math.random() * 7) + 1]
+        });
+    }
+}
+
+function getGravityOffset() {
+    const d = GRAVITY_DIRS[gravityDir];
+    return { dx: d.dx, dy: d.dy };
+}
+
+function dropPiece() {
+    const d = GRAVITY_DIRS[gravityDir];
+    if (validPosition(activePiece, d.dx, d.dy)) {
+        activePiece.x += d.dx;
+        activePiece.y += d.dy;
+    } else {
+        lockPiece();
+    }
+}
+
+function hardDrop() {
+    const d = GRAVITY_DIRS[gravityDir];
+    while (validPosition(activePiece, d.dx, d.dy)) {
+        activePiece.x += d.dx;
+        activePiece.y += d.dy;
+        score += 2;
+    }
+    lockPiece();
+}
+
+function rotateGravity(dir) {
+    gravityDir = (gravityDir + dir + 4) % 4;
+    playSound(300 + gravityDir * 80, 0.15, 'sine', 0.12);
+}
+
+function startGame() {
+    board = Array.from({length: ROWS}, () => new Array(COLS).fill(0));
+    score = 0; lines = 0; level = 1;
+    gameOver = false; paused = false;
+    gravityDir = 0;
+    particles = [];
+    screenShake = 0;
+    nextPiece = Math.floor(Math.random() * 7) + 1;
+    activePiece = spawnPiece();
+    dropInterval = Math.max(500, 800 - (level - 1) * 50);
+    lastDrop = performance.now();
+}
+
+function getInterval() {
+    return Math.max(200, 800 - (level - 1) * 60);
+}
+
+function update(time) {
+    if (!gameOver && !paused && activePiece) {
+        const interval = getInterval();
+        if (time - lastDrop > interval) {
+            dropPiece();
+            lastDrop = time;
+        }
+    }
+    
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        particles[i].x += particles[i].vx;
+        particles[i].y += particles[i].vy;
+        particles[i].life -= 0.03;
+        if (particles[i].life <= 0) particles.splice(i, 1);
+    }
+    
+    if (screenShake > 0) screenShake *= 0.85;
+    if (screenShake < 0.5) screenShake = 0;
+}
+
+function draw() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+    
+    let ox = 0, oy = 0;
+    if (screenShake > 0) {
+        ox = (Math.random() - 0.5) * screenShake;
+        oy = (Math.random() - 0.5) * screenShake;
+    }
+    
+    ctx.save();
+    ctx.translate(ox, oy);
+    
+    // Draw board
+    ctx.strokeStyle = '#1a1a3a';
+    ctx.lineWidth = 1;
+    for (let r = 0; r <= ROWS; r++) {
+        ctx.beginPath();
+        ctx.moveTo(boardX, boardY + r * cellSize);
+        ctx.lineTo(boardX + COLS * cellSize, boardY + r * cellSize);
+        ctx.stroke();
+    }
+    for (let c = 0; c <= COLS; c++) {
+        ctx.beginPath();
+        ctx.moveTo(boardX + c * cellSize, boardY);
+        ctx.lineTo(boardX + c * cellSize, boardY + ROWS * cellSize);
+        ctx.stroke();
+    }
+    
+    // Draw board cells
+    for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+            if (board[r][c]) {
+                drawCell(boardX + c * cellSize, boardY + r * cellSize, board[r][c], 0.9);
+            }
+        }
+    }
+    
+    // Draw active piece
+    if (activePiece && !gameOver) {
+        const s = activePiece.shape;
+        for (let r = 0; r < s.length; r++) {
+            for (let c = 0; c < s[r].length; c++) {
+                if (s[r][c]) {
+                    drawCell(boardX + (activePiece.x + c) * cellSize, boardY + (activePiece.y + r) * cellSize, activePiece.type, 1);
+                }
+            }
+        }
+        
+        // Ghost piece (where it will land)
+        const d = GRAVITY_DIRS[gravityDir];
+        let gx = activePiece.x, gy = activePiece.y;
+        while (validPosition({x: gx + d.dx, y: gy + d.dy, shape: s}, 0, 0)) {
+            // Can't just check offset this way; need to check at new position
+            if (canPlaceAt(gx + d.dx, gy + d.dy, s)) {
+                gx += d.dx; gy += d.dy;
+            } else break;
+        }
+        ctx.globalAlpha = 0.3;
+        for (let r = 0; r < s.length; r++) {
+            for (let c = 0; c < s[r].length; c++) {
+                if (s[r][c]) {
+                    drawCell(boardX + (gx + c) * cellSize, boardY + (gy + r) * cellSize, activePiece.type, 0.3);
+                }
+            }
+        }
+        ctx.globalAlpha = 1;
+    }
+    
+    // Draw particles
+    for (const p of particles) {
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.life;
+        ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+    }
+    ctx.globalAlpha = 1;
+    
+    // Draw gravity indicator
+    drawGravityIndicator();
+    
+    // Draw next piece
+    drawNextPiece();
+    
+    // Draw HUD
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.max(14, cellSize * 0.5)}px monospace`;
+    ctx.textAlign = 'left';
+    const hudX = boardX + COLS * cellSize + 20;
+    ctx.fillText(`SCORE: ${score}`, hudX, boardY + 30);
+    ctx.fillText(`LINES: ${lines}`, hudX, boardY + 60);
+    ctx.fillText(`LEVEL: ${level}`, hudX, boardY + 90);
+    
+    // Controls hint
+    ctx.fillStyle = '#555';
+    ctx.font = '12px monospace';
+    const ctrlX = boardX;
+    ctx.fillText('← → Move', ctrlX, boardY + ROWS * cellSize + 20);
+    ctx.fillText('↑ Rotate', ctrlX, boardY + ROWS * cellSize + 36);
+    ctx.fillText('Space: Hard Drop', ctrlX, boardY + ROWS * cellSize + 52);
+    ctx.fillText('Q/E: Rotate Gravity', ctrlX, boardY + ROWS * cellSize + 68);
+    ctx.fillText('P: Pause', ctrlX, boardY + ROWS * cellSize + 84);
+    
+    // Game over / Start screen
+    if (gameOver || startScreen) {
+        drawOverlay();
+    }
+    
+    if (paused && !startScreen) {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#fff';
+        ctx.font = `${cellSize * 1.5}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('PAUSED', W/2, H/2);
+        ctx.font = '16px monospace';
+        ctx.fillText('Press P to resume', W/2, H/2 + 40);
+    }
+    
+    ctx.restore();
+}
+
+function canPlaceAt(x, y, shape) {
+    for (let r = 0; r < shape.length; r++) {
+        for (let c = 0; c < shape[r].length; c++) {
+            if (shape[r][c]) {
+                let nx = x + c, ny = y + r;
+                if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) return false;
+                if (board[ny][nx]) return false;
+            }
+        }
+    }
+    return true;
+}
+
+function drawCell(x, y, type, alpha) {
+    const color = COLORS[type];
+    ctx.fillStyle = color;
+    ctx.globalAlpha = alpha;
+    ctx.fillRect(x + 2, y + 2, cellSize - 4, cellSize - 4);
+    
+    // Highlight
+    ctx.fillStyle = '#fff';
+    ctx.globalAlpha = alpha * 0.3;
+    ctx.fillRect(x + 2, y + 2, cellSize - 4, 4);
+    ctx.globalAlpha = 1;
+}
+
+function drawGravityIndicator() {
+    const gx = boardX - 40;
+    const gy = boardY + ROWS * cellSize / 2;
+    
+    ctx.fillStyle = 'rgba(255,255,255,0.1)';
+    ctx.beginPath();
+    ctx.arc(gx, gy, 20, 0, Math.PI * 2);
+    ctx.fill();
+    
+    const d = GRAVITY_DIRS[gravityDir];
+    ctx.strokeStyle = '#4ecdc4';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(gx - d.dx * 12, gy - d.dy * 12);
+    ctx.lineTo(gx + d.dx * 12, gy + d.dy * 12);
+    ctx.stroke();
+    
+    // Arrow head
+    const ax = gx + d.dx * 12, ay = gy + d.dy * 12;
+    ctx.beginPath();
+    if (d.dx !== 0) {
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(ax - d.dx * 6, ay - 5);
+        ctx.lineTo(ax - d.dx * 6, ay + 5);
+    } else {
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(ax - 5, ay - d.dy * 6);
+        ctx.lineTo(ax + 5, ay - d.dy * 6);
+    }
+    ctx.closePath();
+    ctx.fillStyle = '#4ecdc4';
+    ctx.fill();
+    
+    ctx.fillStyle = '#4ecdc4';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('GRAVITY', gx, gy + 35);
+}
+
+function drawNextPiece() {
+    const nx = boardX + COLS * cellSize + 20;
+    const ny = boardY + 140;
+    
+    ctx.fillStyle = 'rgba(255,255,255,0.05)';
+    ctx.fillRect(nx - 5, ny - 5, 4 * cellSize, 3 * cellSize);
+    
+    const s = SHAPES[nextPiece];
+    if (s) {
+        const offX = nx + (4 * cellSize - s[0].length * cellSize) / 2;
+        const offY = ny + (3 * cellSize - s.length * cellSize) / 2;
+        for (let r = 0; r < s.length; r++) {
+            for (let c = 0; c < s[r].length; c++) {
+                if (s[r][c]) {
+                    drawCell(offX + c * cellSize, offY + r * cellSize, nextPiece, 0.8);
+                }
+            }
+        }
+    }
+}
+
+function drawOverlay() {
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#4ecdc4';
+    ctx.font = `bold ${Math.min(48, cellSize * 2)}px monospace`;
+    ctx.fillText('GRAVITY TETRIS', W/2, H/2 - 80);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = '16px monospace';
+    ctx.fillText('Rotate gravity to change where blocks fall!', W/2, H/2 - 40);
+    ctx.fillText('Lines clear based on gravity direction.', W/2, H/2 - 20);
+    
+    ctx.fillStyle = '#aaa';
+    ctx.font = '14px monospace';
+    ctx.fillText('← → : Move', W/2, H/2 + 30);
+    ctx.fillText('↑ : Rotate Piece', W/2, H/2 + 52);
+    ctx.fillText('Space : Hard Drop (in gravity dir)', W/2, H/2 + 74);
+    ctx.fillText('Q / E : Rotate Gravity CCW/CW', W/2, H/2 + 96);
+    ctx.fillText('P : Pause', W/2, H/2 + 118);
+    
+    if (gameOver) {
+        ctx.fillStyle = '#ff6b6b';
+        ctx.font = 'bold 24px monospace';
+        ctx.fillText(`GAME OVER - Score: ${score}`, W/2, H/2 + 160);
+    }
+    
+    ctx.fillStyle = '#4ecdc4';
+    ctx.font = '18px monospace';
+    ctx.fillText('Press ENTER to Start', W/2, H/2 + 200);
+}
+
+let startScreen = true;
+
+function loop(time) {
+    update(time);
+    draw();
+    animationId = requestAnimationFrame(loop);
+}
+
+document.addEventListener('keydown', (e) => {
+    initAudio();
+    
+    if (e.key === 'Enter' || e.key === ' ') {
+        if (startScreen || gameOver) {
+            startGame();
+            return;
+        }
+    }
+    
+    if (gameOver || startScreen) return;
+    
+    if (e.key === 'p' || e.key === 'P') {
+        paused = !paused;
+        lastDrop = performance.now();
+        return;
+    }
+    
+    if (paused) return;
+    
+    const d = GRAVITY_DIRS[gravityDir];
+    
+    switch(e.key) {
+        case 'ArrowLeft':
+            if (validPosition(activePiece, -1, 0)) { activePiece.x--; playSound(150, 0.05, 'sine', 0.05); }
+            break;
+        case 'ArrowRight':
+            if (validPosition(activePiece, 1, 0)) { activePiece.x++; playSound(150, 0.05, 'sine', 0.05); }
+            break;
+        case 'ArrowUp':
+            const rotated = rotateShape(activePiece.shape);
+            if (validPosition({...activePiece, shape: rotated})) {
+                activePiece.shape = rotated;
+                playSound(250, 0.08, 'sine', 0.06);
+            } else if (validPosition({...activePiece, shape: rotated}, -1, 0)) {
+                activePiece.shape = rotated; activePiece.x--;
+            } else if (validPosition({...activePiece, shape: rotated}, 1, 0)) {
+                activePiece.shape = rotated; activePiece.x++;
+            }
+            break;
+        case 'ArrowDown':
+            // Soft drop in gravity direction
+            if (validPosition(activePiece, d.dx, d.dy)) {
+                activePiece.x += d.dx;
+                activePiece.y += d.dy;
+                score += 1;
+                lastDrop = performance.now();
+            } else {
+                lockPiece();
+            }
+            break;
+        case ' ':
+            e.preventDefault();
+            hardDrop();
+            break;
+        case 'q': case 'Q':
+            rotateGravity(-1);
+            lastDrop = performance.now();
+            break;
+        case 'e': case 'E':
+            rotateGravity(1);
+            lastDrop = performance.now();
+            break;
+    }
+});
+
+startGame();
+startScreen = true;
+animationId = requestAnimationFrame(loop);
+</script>
+</body>
+</html>
