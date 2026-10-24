@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Pinball Clicker</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a1a; overflow: hidden; width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; font-family: 'Segoe UI', Arial, sans-serif; }
+canvas { display: block; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    const r = Math.min(window.innerWidth / 500, window.innerHeight / 700);
+    W = Math.floor(500 * r);
+    H = Math.floor(700 * r);
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + (dur || 0.1));
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + (dur || 0.1));
+}
+
+// Game state
+const STATE = { MENU: 0, PLAYING: 1, GAMEOVER: 2, SHOP: 3 };
+let state = STATE.MENU;
+let score = 0;
+let highScore = 0;
+let ballsLeft = 3;
+let clickPower = 1;
+let multiplier = 1;
+let upgradeCosts = { clickPower: 50, multiplier: 200 };
+let totalBumperHits = 0;
+
+// Ball
+let ball = { x: 0, y: 0, vx: 0, vy: 0, r: 8, active: false, launched: false };
+const GRAVITY = 0.35;
+const FRICTION = 0.999;
+
+// Bumpers
+let bumpers = [];
+function initBumpers() {
+    const s = Math.min(W / 500, H / 700);
+    bumpers = [
+        { x: W * 0.3, y: H * 0.18, r: 22 * s, hits: 0, glow: 0 },
+        { x: W * 0.5, y: H * 0.12, r: 22 * s, hits: 0, glow: 0 },
+        { x: W * 0.7, y: H * 0.18, r: 22 * s, hits: 0, glow: 0 }
+    ];
+}
+
+// Flippers
+let leftFlipper = { px: 0, py: 0, len: 0, angle: 0, targetAngle: 0 };
+let rightFlipper = { px: 0, py: 0, len: 0, angle: 0, targetAngle: 0 };
+const FLIPPER_SPEED = 0.25;
+
+function initFlippers() {
+    const s = Math.min(W / 500, H / 700);
+    leftFlipper.px = W * 0.12;
+    leftFlipper.py = H * 0.82;
+    leftFlipper.len = W * 0.28;
+    leftFlipper.angle = 0.45;
+    leftFlipper.targetAngle = 0.45;
+
+    rightFlipper.px = W * 0.88;
+    rightFlipper.py = H * 0.82;
+    rightFlipper.len = W * 0.28;
+    rightFlipper.angle = -0.45;
+    rightFlipper.targetAngle = -0.45;
+}
+
+// Particles
+let particles = [];
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const sp = 1 + Math.random() * 4;
+        particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 30 + Math.random() * 20, color, r: 2 + Math.random() * 3 });
+    }
+}
+
+// Keys
+let keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (state === STATE.MENU && (e.code === 'Space' || e.code === 'Enter')) startGame();
+    else if (state === STATE.GAMEOVER && (e.code === 'Space' || e.code === 'Enter')) startGame();
+    else if (state === STATE.PLAYING && e.code === 'KeyU') state = STATE.SHOP;
+    else if (state === STATE.SHOP && e.code === 'KeyU') state = STATE.PLAYING;
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Mouse
+canvas.addEventListener('mousedown', e => {
+    initAudio();
+    if (state === STATE.MENU || state === STATE.GAMEOVER) { startGame(); return; }
+    if (state === STATE.PLAYING && ball.active && ball.launched) {
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        addScore(clickPower * multiplier);
+        spawnParticles(mx, my, '#4fc3f7', 5);
+        playSound(800 + Math.random() * 200, 0.08, 'sine', 0.15);
+    }
+});
+
+function startGame() {
+    state = STATE.PLAYING;
+    score = 0;
+    ballsLeft = 3;
+    clickPower = 1;
+    multiplier = 1;
+    totalBumperHits = 0;
+    upgradeCosts = { clickPower: 50, multiplier: 200 };
+    particles = [];
+    initBumpers();
+    initFlippers();
+    resetBall();
+}
+
+function resetBall() {
+    const s = Math.min(W / 500, H / 700);
+    ball.x = W * 0.5;
+    ball.y = H * 0.92;
+    ball.vx = 0;
+    ball.vy = 0;
+    ball.active = true;
+    ball.launched = false;
+}
+
+function addScore(pts) {
+    score += Math.floor(pts);
+    if (score > highScore) {
+        highScore = score;
+        try { localStorage.setItem('pinballClickerHigh', highScore); } catch(e) {}
+    }
+}
+
+try {
+    const hs = localStorage.getItem('pinballClickerHigh');
+    if (hs) highScore = parseInt(hs) || 0;
+} catch(e) {}
+
+function launchBall() {
+    if (!ball.launched && ball.active) {
+        ball.vy = -12;
+        ball.vx = (Math.random() - 0.5) * 3;
+        ball.launched = true;
+        playSound(200, 0.15, 'square', 0.2);
+    }
+}
+
+function updateBall() {
+    if (!ball.active) return;
+
+    // Launch with space
+    if (keys['Space'] && !ball.launched) launchBall();
+
+    ball.vy += GRAVITY;
+    ball.vx *= FRICTION;
+    ball.vy *= FRICTION;
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+
+    const s = Math.min(W / 500, H / 700);
+    const wallThick = 8 * s;
+
+    // Wall collisions
+    if (ball.x - ball.r < wallThick) { ball.x = wallThick + ball.r; ball.vx = Math.abs(ball.vx) * 0.8; playSound(300, 0.05, 'square', 0.1); }
+    if (ball.x + ball.r > W - wallThick) { ball.x = W - wallThick - ball.r; ball.vx = -Math.abs(ball.vx) * 0.8; playSound(300, 0.05, 'square', 0.1); }
+    if (ball.y - ball.r < wallThick) { ball.y = wallThick + ball.r; ball.vy = Math.abs(ball.vy) * 0.8; playSound(300, 0.05, 'square', 0.1); }
+
+    // Bumper collisions
+    for (let b of bumpers) {
+        const dx = ball.x - b.x;
+        const dy = ball.y - b.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < ball.r + b.r) {
+            const nx = dx / dist;
+            const ny = dy / dist;
+            ball.x = b.x + nx * (ball.r + b.r + 1);
+            ball.y = b.y + ny * (ball.r + b.r + 1);
+            const speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+            ball.vx = nx * (speed + 8);
+            ball.vy = ny * (speed + 8);
+            b.glow = 1;
+            b.hits++;
+            totalBumperHits++;
+            addScore(10 * multiplier);
+            spawnParticles(ball.x, ball.y, '#ff4081', 8);
+            playSound(400 + Math.random() * 200, 0.12, 'triangle', 0.3);
+        }
+    }
+
+    // Flipper collisions
+    checkFlipperCollision(leftFlipper, 1);
+    checkFlipperCollision(rightFlipper, -1);
+
+    // Ball lost (fell below)
+    if (ball.y > H + 20) {
+        ball.active = false;
+        ballsLeft--;
+        playSound(150, 0.3, 'sawtooth', 0.2);
+        if (ballsLeft <= 0) {
+            state = STATE.GAMEOVER;
+        } else {
+            setTimeout(() => { if (state === STATE.PLAYING) resetBall(); }, 800);
+        }
+    }
+}
+
+function checkFlipperCollision(flip, side) {
+    const ex = flip.px + Math.cos(flip.angle) * flip.len;
+    const ey = flip.py + Math.sin(flip.angle) * flip.len;
+
+    // Point-to-line distance
+    const ax = ball.x - flip.px;
+    const ay = ball.y - flip.py;
+    const bx = ex - flip.px;
+    const by = ey - flip.py;
+    const len2 = bx * bx + by * by;
+    let t = (ax * bx + ay * by) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const cx = flip.px + t * bx;
+    const cy = flip.py + t * by;
+    const dx = ball.x - cx;
+    const dy = ball.y - cy;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    if (dist < ball.r + 5) {
+        const nx = dx / (dist || 1);
+        const ny = dy / (dist || 1);
+        ball.x = cx + nx * (ball.r + 6);
+        ball.y = cy + ny * (ball.r + 6);
+
+        // Add flipper velocity boost
+        const isPressed = side === 1 ? keys['KeyA'] || keys['ArrowLeft'] : keys['KeyD'] || keys['ArrowRight'];
+        const boost = isPressed ? 10 : 4;
+        ball.vx = nx * boost + (Math.random() - 0.5) * 2;
+        ball.vy = ny * boost - 3;
+
+        playSound(500, 0.06, 'square', 0.15);
+    }
+}
+
+function updateFlippers() {
+    const leftPressed = keys['KeyA'] || keys['ArrowLeft'];
+    const rightPressed = keys['KeyD'] || keys['ArrowRight'];
+
+    if (leftPressed) leftFlipper.targetAngle = -0.35;
+    else leftFlipper.targetAngle = 0.45;
+
+    if (rightPressed) rightFlipper.targetAngle = Math.PI + 0.35;
+    else rightFlipper.targetAngle = Math.PI - 0.45;
+
+    leftFlipper.angle += (leftFlipper.targetAngle - leftFlipper.angle) * FLIPPER_SPEED;
+    rightFlipper.angle += (rightFlipper.targetAngle - rightFlipper.angle) * FLIPPER_SPEED;
+}
+
+function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.1;
+        p.life--;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function drawBumpers() {
+    for (let b of bumpers) {
+        b.glow *= 0.92;
+        const glow = Math.max(0, b.glow);
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+        const grad = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, b.r);
+        grad.addColorStop(0, `rgba(255, 100, 150, ${0.8 + glow * 0.2})`);
+        grad.addColorStop(0.7, `rgba(255, 64, 129, ${0.6 + glow * 0.3})`);
+        grad.addColorStop(1, `rgba(180, 30, 80, 0.8)`);
+        ctx.fillStyle = grad;
+        ctx.fill();
+
+        // Glow ring
+        if (glow > 0.1) {
+            ctx.beginPath();
+            ctx.arc(b.x, b.y, b.r + 4 + glow * 6, 0, Math.PI * 2);
+            ctx.strokeStyle = `rgba(255, 100, 180, ${glow * 0.7})`;
+            ctx.lineWidth = 3;
+            ctx.stroke();
+        }
+
+        // Inner circle
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r * 0.5, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 180, 220, ${0.7 + glow * 0.3})`;
+        ctx.fill();
+
+        // Points text
+        ctx.font = `${Math.max(10, b.r * 0.5)}px monospace`;
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${10 * multiplier}`, b.x, b.y + 4);
+    }
+}
+
+function drawFlippers() {
+    function drawFlipper(f) {
+        const ex = f.px + Math.cos(f.angle) * f.len;
+        const ey = f.py + Math.sin(f.angle) * f.len;
+        ctx.beginPath();
+        ctx.arc(f.px, f.py, 8, 0, Math.PI * 2);
+        ctx.fillStyle = '#4fc3f7';
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.moveTo(f.px, f.py);
+        ctx.lineTo(ex, ey);
+        ctx.strokeStyle = '#4fc3f7';
+        ctx.lineWidth = 8;
+        ctx.lineCap = 'round';
+        ctx.stroke();
+
+        // Glow
+        ctx.beginPath();
+        ctx.moveTo(f.px, f.py);
+        ctx.lineTo(ex, ey);
+        ctx.strokeStyle = `rgba(79, 195, 247, 0.3)`;
+        ctx.lineWidth = 14;
+        ctx.stroke();
+    }
+    drawFlipper(leftFlipper);
+    drawFlipper(rightFlipper);
+}
+
+function drawBall() {
+    if (!ball.active) return;
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+    const grad = ctx.createRadialGradient(ball.x - 2, ball.y - 2, 0, ball.x, ball.y, ball.r);
+    grad.addColorStop(0, '#fff');
+    grad.addColorStop(0.5, '#ffd54f');
+    grad.addColorStop(1, '#ff8f00');
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Glow
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.r + 3, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255, 213, 79, 0.4)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+}
+
+function drawParticles() {
+    for (let p of particles) {
+        ctx.globalAlpha = p.life / 50;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.fillStyle = p.color;
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+}
+
+function drawWalls() {
+    const s = Math.min(W / 500, H / 700);
+    const t = 8 * s;
+    ctx.fillStyle = '#1a237e';
+    ctx.fillRect(0, 0, t, H);
+    ctx.fillRect(W - t, 0, t, H);
+    ctx.fillRect(0, 0, W, t);
+
+    // Wall glow
+    ctx.strokeStyle = 'rgba(102, 153, 255, 0.4)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(t, t, W - t * 2, H - t);
+}
+
+function drawHUD() {
+    const s = Math.min(W / 500, H / 700);
+    ctx.font = `bold ${18 * s}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`SCORE: ${score}`, 15, 30 * s);
+    ctx.fillStyle = '#4fc3f7';
+    ctx.fillText(`BALLS: ${ballsLeft}`, 15, 52 * s);
+
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#ffd54f';
+    ctx.fillText(`x${multiplier}`, W - 15, 30 * s);
+    ctx.fillStyle = '#a5d6a7';
+    ctx.fillText(`CLICK: ${clickPower}`, W - 15, 52 * s);
+
+    if (highScore > 0) {
+        ctx.textAlign = 'center';
+        ctx.font = `${12 * s}px monospace`;
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        ctx.fillText(`BEST: ${highScore}`, W / 2, 30 * s);
+    }
+
+    // Shop hint
+    ctx.textAlign = 'center';
+    ctx.font = `${11 * s}px monospace`;
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.fillText('[U] SHOP', W / 2, H - 10);
+
+    if (!ball.launched && ball.active) {
+        ctx.font = `${16 * s}px monospace`;
+        ctx.fillStyle = `rgba(255,255,255,${0.5 + Math.sin(Date.now() / 300) * 0.3})`;
+        ctx.fillText('SPACE to LAUNCH', W / 2, H * 0.7);
+    }
+}
+
+function drawShop() {
+    ctx.fillStyle = 'rgba(0,0,0,0.85)';
+    ctx.fillRect(0, 0, W, H);
+
+    const s = Math.min(W / 500, H / 700);
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${24 * s}px monospace`;
+    ctx.fillStyle = '#ffd54f';
+    ctx.fillText('UPGRADE SHOP', W / 2, H * 0.15);
+
+    ctx.font = `${16 * s}px monospace`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`Score: ${score}`, W / 2, H * 0.25);
+
+    // Click Power upgrade
+    const cpCost = upgradeCosts.clickPower;
+    ctx.fillStyle = clickPower > 1 ? '#a5d6a7' : '#4fc3f7';
+    ctx.fillText(`[1] CLICK POWER: ${clickPower} → ${clickPower + 1}`, W / 2, H * 0.4);
+    ctx.fillStyle = score >= cpCost ? '#a5d6a7' : '#ef5350';
+    ctx.fillText(`Cost: ${cpCost}`, W / 2, H * 0.45);
+
+    // Multiplier upgrade
+    const mCost = upgradeCosts.multiplier;
+    ctx.fillStyle = multiplier > 1 ? '#a5d6a7' : '#ff4081';
+    ctx.fillText(`[2] MULTIPLIER: x${multiplier} → x${multiplier + 1}`, W / 2, H * 0.55);
+    ctx.fillStyle = score >= mCost ? '#a5d6a7' : '#ef5350';
+    ctx.fillText(`Cost: ${mCost}`, W / 2, H * 0.6);
+
+    // Extra ball
+    const bCost = 150;
+    ctx.fillStyle = ballsLeft < 5 ? '#ffd54f' : '#888';
+    ctx.fillText(`[3] EXTRA BALL: ${ballsLeft} → ${Math.min(ballsLeft + 1, 5)}`, W / 2, H * 0.7);
+    ctx.fillStyle = score >= bCost ? '#a5d6a7' : '#ef5350';
+    ctx.fillText(`Cost: ${bCost}`, W / 2, H * 0.75);
+
+    ctx.font = `${14 * s}px monospace`;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText('[U] or [ESC] to close', W / 2, H * 0.88);
+}
+
+function drawMenu() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    const s = Math.min(W / 500, H / 700);
+    ctx.textAlign = 'center';
+
+    // Title
+    ctx.font = `bold ${36 * s}px monospace`;
+    const tGrad = ctx.createLinearGradient(0, H * 0.2, W, H * 0.2);
+    tGrad.addColorStop(0, '#4fc3f7');
+    tGrad.addColorStop(0.5, '#ff4081');
+    tGrad.addColorStop(1, '#ffd54f');
+    ctx.fillStyle = tGrad;
+    ctx.fillText('PINBALL', W / 2, H * 0.2);
+    ctx.font = `bold ${28 * s}px monospace`;
+    ctx.fillText('CLICKER', W / 2, H * 0.27);
+
+    // Decorative bumpers
+    for (let i = 0; i < 3; i++) {
+        const bx = W * 0.3 + i * W * 0.2;
+        const by = H * 0.4;
+        ctx.beginPath();
+        ctx.arc(bx, by, 18 * s, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 64, 129, ${0.5 + Math.sin(Date.now() / 500 + i) * 0.3})`;
+        ctx.fill();
+    }
+
+    // Controls
+    ctx.font = `${14 * s}px monospace`;
+    ctx.fillStyle = '#aaa';
+    const lines = [
+        'SPACE - Launch Ball',
+        'A / ← - Left Flipper',
+        'D / → - Right Flipper',
+        'CLICK - Earn Points (x power)',
+        'U - Upgrade Shop'
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, W / 2, H * 0.5 + i * 24 * s);
+    });
+
+    // Start prompt
+    ctx.font = `bold ${18 * s}px monospace`;
+    ctx.fillStyle = `rgba(255,255,255,${0.5 + Math.sin(Date.now() / 400) * 0.4})`;
+    ctx.fillText('PRESS SPACE TO START', W / 2, H * 0.85);
+
+    if (highScore > 0) {
+        ctx.font = `${13 * s}px monospace`;
+        ctx.fillStyle = '#ffd54f';
+        ctx.fillText(`HIGH SCORE: ${highScore}`, W / 2, H * 0.92);
+    }
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.fillRect(0, 0, W, H);
+
+    const s = Math.min(W / 500, H / 700);
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${32 * s}px monospace`;
+    ctx.fillStyle = '#ef5350';
+    ctx.fillText('GAME OVER', W / 2, H * 0.3);
+
+    ctx.font = `${18 * s}px monospace`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`Final Score: ${score}`, W / 2, H * 0.45);
+    ctx.fillText(`Bumper Hits: ${totalBumperHits}`, W / 2, H * 0.52);
+
+    if (score >= highScore && score > 0) {
+        ctx.fillStyle = '#ffd54f';
+        ctx.fillText('NEW HIGH SCORE!', W / 2, H * 0.62);
+    } else if (highScore > 0) {
+        ctx.fillStyle = '#aaa';
+        ctx.fillText(`Best: ${highScore}`, W / 2, H * 0.62);
+    }
+
+    ctx.font = `${16 * s}px monospace`;
+    ctx.fillStyle = `rgba(255,255,255,${0.5 + Math.sin(Date.now() / 400) * 0.3})`;
+    ctx.fillText('SPACE to Restart', W / 2, H * 0.78);
+}
+
+function drawTable() {
+    // Background
+    ctx.fillStyle = '#0d1b2a';
+    ctx.fillRect(0, 0, W, H);
+
+    // Table surface
+    const s = Math.min(W / 500, H / 700);
+    ctx.fillStyle = '#1a2744';
+    ctx.fillRect(8 * s, 8 * s, W - 16 * s, H - 16 * s);
+
+    // Grid lines (subtle)
+    ctx.strokeStyle = 'rgba(100, 150, 255, 0.05)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < W / (30 * s); i++) {
+        ctx.beginPath();
+        ctx.moveTo(i * 30 * s, 8 * s);
+        ctx.lineTo(i * 30 * s, H - 8 * s);
+        ctx.stroke();
+    }
+    for (let i = 0; i < H / (30 * s); i++) {
+        ctx.beginPath();
+        ctx.moveTo(8 * s, i * 30 * s);
+        ctx.lineTo(W - 8 * s, i * 30 * s);
+        ctx.stroke();
+    }
+
+    drawWalls();
+}
+
+function buyUpgrade(key) {
+    const s = Math.min(W / 500, H / 700);
+    if (key === '1' && score >= upgradeCosts.clickPower) {
+        score -= upgradeCosts.clickPower;
+        clickPower++;
+        upgradeCosts.clickPower = Math.floor(upgradeCosts.clickPower * 1.5);
+        playSound(600, 0.15, 'sine', 0.3);
+    } else if (key === '2' && score >= upgradeCosts.multiplier) {
+        score -= upgradeCosts.multiplier;
+        multiplier++;
+        upgradeCosts.multiplier = Math.floor(upgradeCosts.multiplier * 1.6);
+        playSound(700, 0.15, 'sine', 0.3);
+    } else if (key === '3' && score >= 150 && ballsLeft < 5) {
+        score -= 150;
+        ballsLeft++;
+        playSound(800, 0.15, 'sine', 0.3);
+    } else {
+        playSound(200, 0.1, 'square', 0.2);
+    }
+}
+
+// Shop key handling
+let shopKeyBuffer = {};
+window.addEventListener('keydown', e => {
+    if (state === STATE.SHOP) {
+        if (e.code === 'Digit1' || e.code === 'Numpad1') buyUpgrade('1');
+        else if (e.code === 'Digit2' || e.code === 'Numpad2') buyUpgrade('2');
+        else if (e.code === 'Digit3' || e.code === 'Numpad3') buyUpgrade('3');
+        else if (e.code === 'Escape') state = STATE.PLAYING;
+    }
+});
+
+function gameLoop() {
+    if (state === STATE.MENU) {
+        drawMenu();
+    } else if (state === STATE.GAMEOVER) {
+        drawTable();
+        drawBumpers();
+        drawFlippers();
+        drawParticles();
+        drawHUD();
+        drawGameOver();
+    } else if (state === STATE.PLAYING || state === STATE.SHOP) {
+        updateFlippers();
+        if (state === STATE.PLAYING) updateBall();
+        updateParticles();
+
+        drawTable();
+        drawBumpers();
+        drawFlippers();
+        drawBall();
+        drawParticles();
+        drawHUD();
+
+        if (state === STATE.SHOP) drawShop();
+    }
+
+    requestAnimationFrame(gameLoop);
+}
+
+initBumpers();
+initFlippers();
+gameLoop();
+</script>
+</body>
+</html>
