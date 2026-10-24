@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drift Racer</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #1a1a2e; display: flex; align-items: center; justify-content: center; width: 100vw; height: 100vh; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// Audio
+let audioCtx = null;
+let engineOsc = null;
+let engineGain = null;
+let engineFilter = null;
+
+function initAudio() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    engineOsc = audioCtx.createOscillator();
+    engineOsc.type = 'sawtooth';
+    engineOsc.frequency.value = 80;
+    engineFilter = audioCtx.createBiquadFilter();
+    engineFilter.type = 'lowpass';
+    engineFilter.frequency.value = 400;
+    engineGain = audioCtx.createGain();
+    engineGain.gain.value = 0;
+    engineOsc.connect(engineFilter);
+    engineFilter.connect(engineGain);
+    engineGain.connect(audioCtx.destination);
+    engineOsc.start();
+}
+
+function playEngineSound(speed, throttle) {
+    if (!audioCtx) return;
+    const freq = 60 + speed * 2.5 + throttle * 30;
+    engineOsc.frequency.setTargetAtTime(freq, audioCtx.currentTime, 0.05);
+    engineFilter.frequency.setTargetAtTime(200 + speed * 10, audioCtx.currentTime, 0.05);
+    engineGain.gain.setTargetAtTime(throttle > 0 ? 0.08 : 0.03, audioCtx.currentTime, 0.05);
+}
+
+function playDriftSound() {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.value = 200 + Math.random() * 100;
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0.02;
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 800;
+    osc.connect(filter);
+    filter.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.15);
+}
+
+function playLapSound() {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.value = 880;
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0.15;
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.5);
+}
+
+// Game state
+let gameState = 'menu'; // menu, playing, finished
+let keys = {};
+let particles = [];
+let skidMarks = [];
+
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'menu' && (e.code === 'Enter' || e.code === 'Space')) {
+        initAudio();
+        startGame();
+    }
+    if (gameState === 'finished' && e.code === 'KeyR') {
+        startGame();
+    }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Track definition
+const trackWidth = 90;
+const trackPoints = [
+    {x: 0, y: -400},
+    {x: 200, y: -500},
+    {x: 450, y: -480},
+    {x: 600, y: -380},
+    {x: 650, y: -200},
+    {x: 600, y: -50},
+    {x: 500, y: 50},
+    {x: 400, y: 100},
+    {x: 350, y: 250},
+    {x: 380, y: 400},
+    {x: 300, y: 520},
+    {x: 150, y: 560},
+    {x: -50, y: 540},
+    {x: -200, y: 480},
+    {x: -300, y: 380},
+    {x: -350, y: 250},
+    {x: -380, y: 100},
+    {x: -400, y: -50},
+    {x: -450, y: -200},
+    {x: -400, y: -350},
+];
+
+function getTrackPoint(t) {
+    const n = trackPoints.length;
+    const idx = t * n;
+    const i = Math.floor(idx);
+    const f = idx - i;
+    const p1 = trackPoints[i % n];
+    const p2 = trackPoints[(i + 1) % n];
+    return {
+        x: p1.x + (p2.x - p1.x) * f,
+        y: p1.y + (p2.y - p1.y) * f
+    };
+}
+
+function getTrackDirection(t) {
+    const dt = 0.005;
+    const p1 = getTrackPoint((t - dt + 1) % 1);
+    const p2 = getTrackPoint((t + dt) % 1);
+    return Math.atan2(p2.y - p1.y, p2.x - p1.x);
+}
+
+// Checkpoints
+const numCheckpoints = trackPoints.length;
+let checkpointIndex = 0;
+
+function distToSegment(px, py, ax, ay, bx, by) {
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const cx = ax + t * dx, cy = ay + t * dy;
+    return Math.sqrt((px - cx) ** 2 + (py - cy) ** 2);
+}
+
+function distToTrack(px, py) {
+    let minDist = Infinity;
+    for (let i = 0; i < trackPoints.length; i++) {
+        const p1 = trackPoints[i];
+        const p2 = trackPoints[(i + 1) % trackPoints.length];
+        const d = distToSegment(px, py, p1.x, p1.y, p2.x, p2.y);
+        if (d < minDist) minDist = d;
+    }
+    return minDist;
+}
+
+// Car
+let car = {};
+function resetCar() {
+    const startDir = getTrackDirection(0);
+    car = {
+        x: trackPoints[0].x,
+        y: trackPoints[0].y,
+        angle: startDir,
+        speed: 0,
+        vx: 0,
+        vy: 0,
+        angularVel: 0,
+        drifting: false,
+        offTrack: false
+    };
+}
+
+// Particles
+function spawnParticle(x, y, type) {
+    particles.push({
+        x: x + (Math.random() - 0.5) * 10,
+        y: y + (Math.random() - 0.5) * 10,
+        vx: (Math.random() - 0.5) * 3,
+        vy: (Math.random() - 0.5) * 3,
+        life: 1,
+        type: type // 'smoke', 'spark'
+    });
+}
+
+// Skid marks
+function addSkidMark(x, y) {
+    skidMarks.push({x, y, angle: car.angle});
+    if (skidMarks.length > 500) skidMarks.shift();
+}
+
+// Timer
+let raceTime = 0;
+let lapTimes = [];
+let currentLapStart = 0;
+let bestLap = null;
+let lastCheckpointTime = 0;
+
+function startGame() {
+    gameState = 'playing';
+    resetCar();
+    particles = [];
+    skidMarks = [];
+    raceTime = 0;
+    lapTimes = [];
+    currentLapStart = 0;
+    checkpointIndex = 0;
+    bestLap = null;
+}
+
+// Physics constants
+const ENGINE_FORCE = 350;
+const BRAKE_FORCE = 400;
+const REVERSE_FORCE = -150;
+const FRICTION = 0.98;
+const LATERAL_FRICTION = 0.92;
+const DRIFT_FRICTION = 0.97;
+const MAX_STEER = 0.06;
+const OFF_TRACK_FRICTION = 0.9;
+
+function updatePhysics(dt) {
+    const throttle = keys['KeyW'] || keys['ArrowUp'];
+    const brake = keys['KeyS'] || keys['ArrowDown'];
+    const left = keys['KeyA'] || keys['ArrowLeft'];
+    const right = keys['KeyD'] || keys['ArrowRight'];
+    const handbrake = keys['Space'];
+
+    // Steering
+    const steerSpeed = 3;
+    if (left) car.angularVel -= steerSpeed * dt * 60;
+    if (right) car.angularVel += steerSpeed * dt * 60;
+    car.angularVel *= 0.85;
+    const maxAngVel = MAX_STEER * (1 + Math.abs(car.speed) / 20);
+    car.angularVel = Math.max(-maxAngVel, Math.min(maxAngVel, car.angularVel));
+
+    // Apply steering
+    if (Math.abs(car.speed) > 0.5 || throttle) {
+        car.angle += car.angularVel * dt * 60;
+    }
+
+    // Forward direction
+    const fx = Math.cos(car.angle);
+    const fy = Math.sin(car.angle);
+
+    // Engine force
+    if (throttle) {
+        car.vx += fx * ENGINE_FORCE * dt;
+        car.vy += fy * ENGINE_FORCE * dt;
+    }
+    if (brake) {
+        if (car.speed > 5) {
+            car.vx -= fx * BRAKE_FORCE * dt;
+            car.vy -= fy * BRAKE_FORCE * dt;
+        } else {
+            car.vx -= fx * REVERSE_FORCE * dt;
+            car.vy -= fy * REVERSE_FORCE * dt;
+        }
+    }
+
+    // Decompose velocity into forward and lateral components
+    const dotForward = car.vx * fx + car.vy * fy;
+    const dotLateral = -car.vx * fy + car.vy * fx;
+
+    // Apply friction
+    let latFriction = LATERAL_FRICTION;
+    if (handbrake) latFriction = DRIFT_FRICTION;
+    if (car.offTrack) latFriction = 0.95;
+
+    const newLat = dotLateral * Math.pow(latFriction, dt * 60);
+    const newFwd = dotForward * Math.pow(FRICTION, dt * 60);
+
+    // Reconstruct velocity
+    car.vx = fx * newFwd + (-fy) * newLat;
+    car.vy = fy * newFwd + fx * newLat;
+
+    // Off-track check
+    const dToTrack = distToTrack(car.x, car.y);
+    car.offTrack = dToTrack > trackWidth / 2;
+    if (car.offTrack) {
+        car.vx *= Math.pow(OFF_TRACK_FRICTION, dt * 60);
+        car.vy *= Math.pow(OFF_TRACK_FRICTION, dt * 60);
+    }
+
+    // Speed calculation
+    car.speed = dotForward;
+
+    // Drift detection
+    const driftAmount = Math.abs(dotLateral);
+    car.drifting = driftAmount > 30 && handbrake && !car.offTrack;
+
+    if (car.drifting) {
+        spawnParticle(car.x - fx * 15, car.y - fy * 15, 'smoke');
+        if (Math.random() < 0.3) playDriftSound();
+        addSkidMark(car.x - fx * 12, car.y - fy * 12);
+    }
+
+    // Position update
+    car.x += car.vx * dt;
+    car.y += car.vy * dt;
+
+    // Checkpoint system
+    const t = getTrackProgress();
+    const expectedT = checkpointIndex / numCheckpoints;
+    const diff = Math.abs(t - expectedT);
+    if (diff < 0.03) {
+        if (checkpointIndex === 0 && raceTime > 1) {
+            // Completed lap!
+            const lapTime = raceTime - currentLapStart;
+            lapTimes.push(lapTime);
+            currentLapStart = raceTime;
+            if (!bestLap || lapTime < bestLap) bestLap = lapTime;
+            playLapSound();
+        }
+        checkpointIndex++;
+    }
+
+    // Particles update
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life -= dt * 2;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    // Engine sound
+    playEngineSound(Math.abs(car.speed), throttle ? 1 : 0);
+}
+
+function getTrackProgress() {
+    let minDist = Infinity;
+    let bestT = 0;
+    for (let i = 0; i < 200; i++) {
+        const t = i / 200;
+        const p = getTrackPoint(t);
+        const d = Math.sqrt((car.x - p.x) ** 2 + (car.y - p.y) ** 2);
+        if (d < minDist) {
+            minDist = d;
+            bestT = t;
+        }
+    }
+    return bestT;
+}
+
+// Rendering
+function drawTrack() {
+    // Track surface
+    ctx.beginPath();
+    const steps = 200;
+    for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const p = getTrackPoint(t);
+        if (i === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+    ctx.lineWidth = trackWidth;
+    ctx.strokeStyle = '#4a4a5e';
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+
+    // Track border
+    ctx.lineWidth = trackWidth + 6;
+    ctx.strokeStyle = '#2d2d44';
+    ctx.globalAlpha = 0.3;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Center line (dashed)
+    ctx.setLineDash([20, 20]);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#ffffff44';
+    ctx.beginPath();
+    for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const p = getTrackPoint(t);
+        if (i === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Start/finish line
+    const sp = getTrackPoint(0);
+    const sd = getTrackDirection(0);
+    const perpX = Math.cos(sd + Math.PI / 2) * trackWidth / 2;
+    const perpY = Math.sin(sd + Math.PI / 2) * trackWidth / 2;
+    ctx.beginPath();
+    ctx.moveTo(sp.x - perpX, sp.y - perpY);
+    ctx.lineTo(sp.x + perpX, sp.y + perpY);
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = '#ffffff';
+    ctx.stroke();
+
+    // Checkpoint markers
+    const nextCP = trackPoints[checkpointIndex % numCheckpoints];
+    ctx.beginPath();
+    ctx.arc(nextCP.x, nextCP.y, 15, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 200, 0, 0.4)';
+    ctx.fill();
+}
+
+function drawSkidMarks() {
+    for (const m of skidMarks) {
+        ctx.beginPath();
+        ctx.arc(m.x, m.y, 3, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(20, 20, 20, 0.3)';
+        ctx.fill();
+    }
+}
+
+function drawCar() {
+    ctx.save();
+    ctx.translate(car.x, car.y);
+    ctx.rotate(car.angle);
+
+    // Car body
+    const carLen = 24;
+    const carWid = 12;
+
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(-carLen/2 + 2, -carWid/2 + 2, carLen, carWid);
+
+    // Body
+    const grad = ctx.createLinearGradient(-carLen/2, 0, carLen/2, 0);
+    grad.addColorStop(0, '#cc2200');
+    grad.addColorStop(1, '#ff4400');
+    ctx.fillStyle = grad;
+    ctx.fillRect(-carLen/2, -carWid/2, carLen, carWid);
+
+    // Windshield
+    ctx.fillStyle = '#88ccff';
+    ctx.fillRect(carLen/2 - 8, -carWid/2 + 2, 5, carWid - 4);
+
+    // Rear lights
+    ctx.fillStyle = '#ff0000';
+    ctx.fillRect(-carLen/2, -carWid/2, 3, 4);
+    ctx.fillRect(-carLen/2, carWid/2 - 4, 3, 4);
+
+    // Wheels
+    ctx.fillStyle = '#111';
+    ctx.fillRect(-carLen/2 + 2, -carWid/2 - 2, 6, 3);
+    ctx.fillRect(-carLen/2 + 2, carWid/2 - 1, 6, 3);
+    ctx.fillRect(carLen/2 - 8, -carWid/2 - 2, 6, 3);
+    ctx.fillRect(carLen/2 - 8, carWid/2 - 1, 6, 3);
+
+    ctx.restore();
+}
+
+function drawParticles() {
+    for (const p of particles) {
+        const alpha = p.life * 0.5;
+        const size = (1 - p.life) * 8 + 4;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, size, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(200, 200, 200, ${alpha})`;
+        ctx.fill();
+    }
+}
+
+function drawMinimap() {
+    const mapSize = 140;
+    const mapX = W - mapSize - 15;
+    const mapY = 15;
+    const scale = 0.12;
+
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.fillRect(mapX - 5, mapY - 5, mapSize + 10, mapSize + 10);
+
+    // Track on minimap
+    ctx.beginPath();
+    const cx = mapX + mapSize / 2;
+    const cy = mapY + mapSize / 2;
+    for (let i = 0; i <= trackPoints.length; i++) {
+        const p = trackPoints[i % trackPoints.length];
+        const mx = cx + p.x * scale;
+        const my = cy + p.y * scale;
+        if (i === 0) ctx.moveTo(mx, my);
+        else ctx.lineTo(mx, my);
+    }
+    ctx.closePath();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+    ctx.stroke();
+
+    // Car on minimap
+    const carMX = cx + car.x * scale;
+    const carMY = cy + car.y * scale;
+    ctx.beginPath();
+    ctx.arc(carMX, carMY, 3, 0, Math.PI * 2);
+    ctx.fillStyle = '#ff4400';
+    ctx.fill();
+}
+
+function drawHUD() {
+    // Speed
+    const speed = Math.abs(car.speed) * 3.6;
+    ctx.font = 'bold 24px monospace';
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'left';
+    ctx.fillText(`${speed.toFixed(0)} km/h`, 20, H - 40);
+
+    // Lap info
+    const lapNum = lapTimes.length + 1;
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#aaa';
+    ctx.fillText(`Lap: ${lapNum}`, 20, H - 70);
+
+    if (bestLap) {
+        ctx.fillText(`Best: ${bestLap.toFixed(2)}s`, 20, H - 90);
+    }
+
+    const currentLap = raceTime - currentLapStart;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`${currentLap.toFixed(2)}s`, 140, H - 70);
+
+    // Drift indicator
+    if (car.drifting) {
+        ctx.font = 'bold 18px monospace';
+        ctx.fillStyle = '#ffaa00';
+        ctx.textAlign = 'center';
+        ctx.fillText('DRIFT!', W / 2, H - 30);
+    }
+
+    if (car.offTrack) {
+        ctx.font = 'bold 16px monospace';
+        ctx.fillStyle = '#ff4444';
+        ctx.textAlign = 'center';
+        ctx.fillText('OFF TRACK', W / 2, H - 50);
+    }
+
+    // Timer
+    ctx.font = '14px monospace';
+    ctx.fillStyle = '#888';
+    ctx.textAlign = 'right';
+    ctx.fillText(`Time: ${raceTime.toFixed(2)}s`, W - 20, H - 20);
+}
+
+function drawMenu() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title
+    ctx.font = 'bold 64px monospace';
+    ctx.textAlign = 'center';
+    const grad = ctx.createLinearGradient(W/2 - 150, 0, W/2 + 150, 0);
+    grad.addColorStop(0, '#ff4400');
+    grad.addColorStop(1, '#ffaa00');
+    ctx.fillStyle = grad;
+    ctx.fillText('DRIFT RACER', W / 2, H / 2 - 80);
+
+    // Car icon
+    ctx.save();
+    ctx.translate(W / 2, H / 2 + 10);
+    ctx.rotate(-Math.PI / 4);
+    const carLen = 60;
+    const carWid = 30;
+    const cgrad = ctx.createLinearGradient(-carLen/2, 0, carLen/2, 0);
+    cgrad.addColorStop(0, '#cc2200');
+    cgrad.addColorStop(1, '#ff4400');
+    ctx.fillStyle = cgrad;
+    ctx.fillRect(-carLen/2, -carWid/2, carLen, carWid);
+    ctx.fillStyle = '#88ccff';
+    ctx.fillRect(carLen/2 - 15, -carWid/2 + 4, 10, carWid - 8);
+    ctx.restore();
+
+    // Controls
+    ctx.font = '18px monospace';
+    ctx.fillStyle = '#aaa';
+    const lines = [
+        'W / ↑ — Accelerate',
+        'S / ↓ — Brake / Reverse',
+        'A D / ← → — Steer',
+        'SPACE — Handbrake (Drift)',
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, W / 2, H / 2 + 80 + i * 28);
+    });
+
+    // Start prompt
+    ctx.font = 'bold 20px monospace';
+    const pulse = Math.sin(Date.now() / 500) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(255, 255, 255, ${pulse})`;
+    ctx.fillText('Press ENTER or SPACE to Start', W / 2, H - 60);
+
+    // Track preview
+    ctx.save();
+    ctx.translate(W / 2, H / 2);
+    ctx.scale(0.3, 0.3);
+    ctx.beginPath();
+    for (let i = 0; i <= trackPoints.length; i++) {
+        const p = trackPoints[i % trackPoints.length];
+        if (i === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+    }
+    ctx.closePath();
+    ctx.lineWidth = 20;
+    ctx.strokeStyle = 'rgba(100, 100, 150, 0.3)';
+    ctx.stroke();
+    ctx.restore();
+}
+
+function drawFinished() {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('RACE COMPLETE!', W / 2, H / 2 - 60);
+
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#aaa';
+    if (bestLap) {
+        ctx.fillText(`Best Lap: ${bestLap.toFixed(3)}s`, W / 2, H / 2);
+    }
+    lapTimes.forEach((lt, i) => {
+        ctx.fillText(`Lap ${i + 1}: ${lt.toFixed(3)}s`, W / 2, H / 2 + 40 + i * 30);
+    });
+
+    ctx.font = 'bold 18px monospace';
+    const pulse = Math.sin(Date.now() / 500) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(255, 255, 255, ${pulse})`;
+    ctx.fillText('Press R to Restart', W / 2, H - 60);
+}
+
+// Main loop
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = Math.min((time - lastTime) / 1000, 0.05);
+    lastTime = time;
+
+    if (gameState === 'menu') {
+        drawMenu();
+    } else if (gameState === 'playing') {
+        raceTime += dt;
+
+        updatePhysics(dt);
+
+        // Check for finish (3 laps)
+        if (lapTimes.length >= 3) {
+            gameState = 'finished';
+            if (engineGain) engineGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1);
+        }
+
+        // Render
+        ctx.fillStyle = '#2a2a3e';
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.save();
+        const camX = car.x - W / 2;
+        const camY = car.y - H / 2;
+        ctx.translate(-camX, -camY);
+
+        // Draw grass texture (simple dots)
+        ctx.fillStyle = 'rgba(40, 60, 30, 0.3)';
+        const gridSpacing = 100;
+        const startX = Math.floor(camX / gridSpacing) * gridSpacing;
+        const startY = Math.floor(camY / gridSpacing) * gridSpacing;
+        for (let gx = startX; gx < camX + W; gx += gridSpacing) {
+            for (let gy = startY; gy < camY + H; gy += gridSpacing) {
+                ctx.fillRect(gx, gy, 4, 4);
+            }
+        }
+
+        drawTrack();
+        drawSkidMarks();
+        drawParticles();
+        drawCar();
+
+        ctx.restore();
+
+        drawMinimap();
+        drawHUD();
+
+    } else if (gameState === 'finished') {
+        // Still render the scene behind
+        ctx.fillStyle = '#2a2a3e';
+        ctx.fillRect(0, 0, W, H);
+        ctx.save();
+        const camX = car.x - W / 2;
+        const camY = car.y - H / 2;
+        ctx.translate(-camX, -camY);
+        drawTrack();
+        drawCar();
+        ctx.restore();
+        drawFinished();
+    }
+
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
