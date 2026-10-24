@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Tetris Snake</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a1a; overflow: hidden; width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const COLS = 12, ROWS = 15;
+let cellSize = 30;
+let W, H;
+
+function resize() {
+    const maxW = window.innerWidth;
+    const maxH = window.innerHeight;
+    cellSize = Math.floor(Math.min(maxW / (COLS + 4), maxH / (ROWS + 6)));
+    W = cellSize * COLS + cellSize * 2;
+    H = cellSize * ROWS + cellSize * 3;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const TETRO_COLORS = ['#FF6B6B','#4ECDC4','#FFE66D','#A78BFA','#6BCB77','#FF9F43','#F072B6'];
+const GHOST = 'rgba(255,255,255,0.15)';
+
+let gameState = 'start'; // start, playing, over
+let snake = [];
+let snakeDir = {x: 1, y: 0};
+let snakeSpeed = 8; // frames per move
+let frameCount = 0;
+let blocks = []; // falling blocks
+let staticGrid = []; // placed blocks in grid
+let score = 0;
+let highScore = 0;
+let spawnTimer = 0;
+let fallTimer = 0;
+let fallSpeed = 40;
+let particles = [];
+let lineClearFlash = 0;
+let audioCtx = null;
+
+try { highScore = parseInt(localStorage.getItem('tetrisSnakeHigh') || '0'); } catch(e) {}
+
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+
+function playSound(freq, duration, type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+
+function playEat() { playSound(440, 0.1, 'square'); }
+function playLine() { playSound(880, 0.2, 'triangle'); setTimeout(() => playSound(1100, 0.15, 'triangle'), 100); }
+function playGameOver() { playSound(200, 0.4, 'sawtooth'); }
+
+function resetGame() {
+    snake = [{x: 3, y: 12}, {x: 2, y: 12}];
+    snakeDir = {x: 1, y: 0};
+    blocks = [];
+    staticGrid = Array.from({length: ROWS}, () => Array(COLS).fill(null));
+    score = 0;
+    frameCount = 0;
+    spawnTimer = 0;
+    fallTimer = 0;
+    particles = [];
+    lineClearFlash = 0;
+}
+
+function getGridPos(px, py) {
+    const gx = px - cellSize;
+    const gy = py - cellSize * 2;
+    return {gx, gy};
+}
+
+function spawnBlock() {
+    let x = Math.floor(Math.random() * COLS);
+    // Try to avoid spawning on top of existing blocks
+    let attempts = 0;
+    while (attempts < 20) {
+        if (!staticGrid[0][x] && !blocks.some(b => b.x === x && b.y <= 1)) break;
+        x = Math.floor(Math.random() * COLS);
+        attempts++;
+    }
+    const color = TETRO_COLORS[Math.floor(Math.random() * TETRO_COLORS.length)];
+    blocks.push({x, y: -1, color});
+}
+
+function canMove(nx, ny) {
+    if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) return false;
+    if (staticGrid[ny][nx]) return false;
+    for (let i = 1; i < snake.length; i++) {
+        if (snake[i].x === nx && snake[i].y === ny) return false;
+    }
+    return true;
+}
+
+function moveSnake() {
+    const head = {x: snake[0].x + snakeDir.x, y: snake[0].y + snakeDir.y};
+    
+    // Check if eating a block
+    let ateBlock = null;
+    for (let i = blocks.length - 1; i >= 0; i--) {
+        if (blocks[i].x === head.x && blocks[i].y === head.y) {
+            ateBlock = blocks.splice(i, 1)[0];
+            break;
+        }
+    }
+
+    if (!canMove(head.x, head.y)) {
+        gameState = 'over';
+        playGameOver();
+        try { localStorage.setItem('tetrisSnakeHigh', highScore.toString()); } catch(e) {}
+        return;
+    }
+
+    snake.unshift(head);
+    
+    if (ateBlock) {
+        staticGrid[head.y][head.x] = ateBlock.color;
+        score += 10;
+        playEat();
+        spawnParticles(head.x, head.y, ateBlock.color);
+        checkLineClear();
+    } else {
+        snake.pop();
+    }
+}
+
+function checkLineClear() {
+    for (let y = ROWS - 1; y >= 0; y--) {
+        let full = true;
+        for (let x = 0; x < COLS; x++) {
+            if (!staticGrid[y][x]) { full = false; break; }
+        }
+        if (full) {
+            lineClearFlash = 20;
+            score += 50;
+            playLine();
+            // Remove row and shift down
+            for (let yy = y; yy > 0; yy--) {
+                for (let x = 0; x < COLS; x++) {
+                    staticGrid[yy][x] = staticGrid[yy-1][x];
+                }
+            }
+            for (let x = 0; x < COLS; x++) staticGrid[0][x] = null;
+            
+            // Shift blocks up
+            blocks.forEach(b => { b.y--; });
+            
+            // Adjust snake if it was below the cleared line
+            // Actually snake is on the grid, so shift snake parts at/below y
+            for (let i = 0; i < snake.length; i++) {
+                if (snake[i].y >= y) snake[i].y--;
+            }
+            
+            spawnParticles(6, y, '#FFFFFF');
+            break; // re-check from same y since rows shifted
+        }
+    }
+}
+
+function spawnParticles(gx, gy, color) {
+    const cx = cellSize + gx * cellSize + cellSize/2;
+    const cy = cellSize*2 + gy * cellSize + cellSize/2;
+    for (let i = 0; i < 8; i++) {
+        const angle = Math.PI * 2 * i / 8;
+        particles.push({
+            x: cx, y: cy,
+            vx: Math.cos(angle) * 2,
+            vy: Math.sin(angle) * 2,
+            life: 30, color
+        });
+    }
+}
+
+function update() {
+    if (gameState !== 'playing') return;
+    
+    frameCount++;
+    
+    // Move snake
+    if (frameCount % snakeSpeed === 0) moveSnake();
+    
+    // Fall blocks
+    fallTimer++;
+    if (fallTimer >= fallSpeed) {
+        fallTimer = 0;
+        for (let i = blocks.length - 1; i >= 0; i--) {
+            blocks[i].y++;
+            // Check collision with static grid or snake
+            if (blocks[i].y >= ROWS) {
+                // Game over - block reached bottom
+                gameState = 'over';
+                playGameOver();
+                try { localStorage.setItem('tetrisSnakeHigh', highScore.toString()); } catch(e) {}
+                return;
+            }
+            if (staticGrid[blocks[i].y][blocks[i].x]) {
+                // Block lands on static grid - game over
+                gameState = 'over';
+                playGameOver();
+                try { localStorage.setItem('tetrisSnakeHigh', highScore.toString()); } catch(e) {}
+                return;
+            }
+        }
+    }
+    
+    // Spawn blocks
+    spawnTimer++;
+    const spawnRate = Math.max(25, 45 - Math.floor(score / 100));
+    if (spawnTimer >= spawnRate) {
+        spawnTimer = 0;
+        spawnBlock();
+    }
+    
+    // Particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        particles[i].x += particles[i].vx;
+        particles[i].y += particles[i].vy;
+        particles[i].life--;
+        if (particles[i].life <= 0) particles.splice(i, 1);
+    }
+    
+    if (lineClearFlash > 0) lineClearFlash--;
+    
+    if (score > highScore) highScore = score;
+}
+
+function draw() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+    
+    const ox = cellSize, oy = cellSize * 2;
+    
+    // Grid lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x <= COLS; x++) {
+        ctx.beginPath();
+        ctx.moveTo(ox + x * cellSize, oy);
+        ctx.lineTo(ox + x * cellSize, oy + ROWS * cellSize);
+        ctx.stroke();
+    }
+    for (let y = 0; y <= ROWS; y++) {
+        ctx.beginPath();
+        ctx.moveTo(ox, oy + y * cellSize);
+        ctx.lineTo(ox + COLS * cellSize, oy + y * cellSize);
+        ctx.stroke();
+    }
+    
+    // Static blocks
+    for (let y = 0; y < ROWS; y++) {
+        for (let x = 0; x < COLS; x++) {
+            if (staticGrid[y][x]) {
+                const px = ox + x * cellSize;
+                const py = oy + y * cellSize;
+                ctx.fillStyle = staticGrid[y][x];
+                ctx.globalAlpha = 0.7;
+                roundRect(px+1, py+1, cellSize-2, cellSize-2, 3);
+                ctx.fill();
+                ctx.globalAlpha = 1;
+            }
+        }
+    }
+    
+    // Falling blocks
+    blocks.forEach(b => {
+        const px = ox + b.x * cellSize;
+        const py = oy + b.y * cellSize;
+        if (py < oy) return;
+        ctx.fillStyle = b.color;
+        ctx.globalAlpha = 0.9;
+        roundRect(px+2, py+2, cellSize-4, cellSize-4, 4);
+        ctx.fill();
+        // Highlight
+        ctx.fillStyle = 'rgba(255,255,255,0.3)';
+        roundRect(px+4, py+4, cellSize-8, (cellSize-8)/3, 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+    });
+    
+    // Snake
+    for (let i = snake.length - 1; i >= 0; i--) {
+        const s = snake[i];
+        const px = ox + s.x * cellSize;
+        const py = oy + s.y * cellSize;
+        
+        if (i === 0) {
+            ctx.fillStyle = '#4ECDC4';
+            roundRect(px+1, py+1, cellSize-2, cellSize-2, 5);
+            ctx.fill();
+            // Eyes
+            const ex = px + cellSize/2 + snakeDir.x * 3;
+            const ey = py + cellSize/2 + snakeDir.y * 3;
+            ctx.fillStyle = '#fff';
+            ctx.beginPath();
+            ctx.arc(ex, ey, 4, 0, Math.PI*2);
+            ctx.fill();
+            ctx.fillStyle = '#000';
+            ctx.beginPath();
+            ctx.arc(ex + snakeDir.x * 1.5, ey + snakeDir.y * 1.5, 2, 0, Math.PI*2);
+            ctx.fill();
+        } else {
+            const t = i / snake.length;
+            const r = Math.floor(78 - t * 30);
+            const g = Math.floor(205 - t * 80);
+            const b2 = Math.floor(196 - t * 60);
+            ctx.fillStyle = `rgb(${r},${g},${b2})`;
+            roundRect(px+2, py+2, cellSize-4, cellSize-4, 4);
+            ctx.fill();
+        }
+    }
+    
+    // Particles
+    particles.forEach(p => {
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.life / 30;
+        ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+        ctx.globalAlpha = 1;
+    });
+    
+    // Line clear flash
+    if (lineClearFlash > 0) {
+        ctx.fillStyle = `rgba(255,255,255,${lineClearFlash / 60})`;
+        ctx.fillRect(ox, oy, COLS * cellSize, ROWS * cellSize);
+    }
+    
+    // HUD
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${cellSize * 0.7}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE: ${score}`, ox, oy - cellSize * 0.4);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#888';
+    ctx.font = `${cellSize * 0.55}px monospace`;
+    ctx.fillText(`BEST: ${highScore}`, ox + COLS * cellSize, oy - cellSize * 0.4);
+    
+    // Start screen
+    if (gameState === 'start') {
+        drawOverlay();
+        ctx.fillStyle = '#4ECDC4';
+        ctx.font = `bold ${cellSize * 1.2}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('TETRIS SNAKE', W/2, H/2 - cellSize * 2);
+        
+        ctx.fillStyle = '#ccc';
+        ctx.font = `${cellSize * 0.55}px monospace`;
+        ctx.fillText('Steer the snake to eat falling blocks!', W/2, H/2 - cellSize * 1);
+        ctx.fillText('Fill a row to clear it for bonus points.', W/2, H/2 - cellSize * 0.4);
+        ctx.fillText('', W/2, H/2 + cellSize * 0.5);
+        
+        ctx.fillStyle = '#888';
+        ctx.font = `${cellSize * 0.5}px monospace`;
+        ctx.fillText('Arrow Keys / WASD: Change direction', W/2, H/2 + cellSize * 1.2);
+        ctx.fillText('Space / Enter: Start', W/2, H/2 + cellSize * 1.8);
+        
+        // Animated snake preview
+        const t = Date.now() / 500;
+        for (let i = 0; i < 6; i++) {
+            const sx = W/2 - cellSize * 3 + i * cellSize * 0.7;
+            const sy = H/2 + cellSize * 2.8 + Math.sin(t + i * 0.5) * cellSize * 0.3;
+            ctx.fillStyle = `rgba(78, 205, 196, ${1 - i * 0.12})`;
+            roundRect(sx, sy, cellSize * 0.6, cellSize * 0.6, 4);
+            ctx.fill();
+        }
+    }
+    
+    // Game over
+    if (gameState === 'over') {
+        drawOverlay();
+        ctx.fillStyle = '#FF6B6B';
+        ctx.font = `bold ${cellScore(1.2)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W/2, H/2 - cellSize * 1);
+        
+        ctx.fillStyle = '#fff';
+        ctx.font = `${cellSize * 0.7}px monospace`;
+        ctx.fillText(`Score: ${score}`, W/2, H/2);
+        ctx.fillStyle = '#888';
+        ctx.font = `${cellSize * 0.55}px monospace`;
+        ctx.fillText('Space / Enter to Restart', W/2, H/2 + cellSize * 1);
+    }
+}
+
+function cellScore(mult) { return cellSize * mult; }
+
+function drawOverlay() {
+    ctx.fillStyle = 'rgba(10,10,26,0.85)';
+    ctx.fillRect(0, 0, W, H);
+}
+
+function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+}
+
+let lastDir = {x: 1, y: 0};
+
+window.addEventListener('keydown', (e) => {
+    initAudio();
+    
+    if (gameState === 'start' || gameState === 'over') {
+        if (e.key === ' ' || e.key === 'Enter') {
+            resetGame();
+            gameState = 'playing';
+        }
+        return;
+    }
+    
+    if (gameState !== 'playing') return;
+    
+    let dx = 0, dy = 0;
+    switch(e.key) {
+        case 'ArrowUp': case 'w': case 'W': dx = 0; dy = -1; break;
+        case 'ArrowDown': case 's': case 'S': dx = 0; dy = 1; break;
+        case 'ArrowLeft': case 'a': case 'A': dx = -1; dy = 0; break;
+        case 'ArrowRight': case 'd': case 'D': dx = 1; dy = 0; break;
+        default: return;
+    }
+    
+    // Prevent 180° reversal
+    if (dx === -snakeDir.x && dy === -snakeDir.y) return;
+    
+    snakeDir = {x: dx, y: dy};
+});
+
+function gameLoop() {
+    update();
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+resetGame();
+gameState = 'start';
+gameLoop();
+</script>
+</body>
+</html>
