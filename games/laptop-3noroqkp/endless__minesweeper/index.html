@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Minesweeper Endless</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0f0f1a; overflow: hidden; width: 100vw; height: 100vh; font-family: 'Segoe UI', Tahoma, sans-serif; }
+canvas { display: block; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(function(){
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W; canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Game state
+let cells = new Map();
+let score = 0;
+let highScore = 0;
+try { highScore = parseInt(localStorage.getItem('ms_endless_hs') || '0'); } catch(e) {}
+let gameActive = false;
+let gameOver = false;
+let firstClick = true;
+let seed = 0;
+let overrides = new Map();
+let cameraX = 0, cameraY = 0;
+let targetCamX = 0, targetCamY = 0;
+let tileW = 40, tileH = 40;
+let hoverX = -999, hoverY = -999;
+let gameStartTime = 0;
+let state = 'menu'; // menu, playing, over
+
+const NUMBER_COLORS = [
+  '', '#4fc3f7', '#69f0ae', '#ff5252', '#ffd54f',
+  '#ff8a65', '#e040fb', '#ffffff', '#ff1744'
+];
+
+function cellKey(x, y) { return x + ',' + y; }
+
+function getCell(x, y) {
+  const key = cellKey(x, y);
+  if (!cells.has(key)) {
+    cells.set(key, { x, y, state: 'hidden', number: 0 });
+  }
+  return cells.get(key);
+}
+
+function hashCoords(x, y) {
+  let h = (x * 374761393 + y * 668265263 + seed) | 0;
+  h = ((h ^ (h >> 13)) * 1274126177) | 0;
+  h = h ^ (h >> 16);
+  return (h >>> 0) / 4294967296;
+}
+
+function getDensity(x, y) {
+  const d = Math.max(Math.abs(x), Math.abs(y));
+  return Math.min(0.5, 0.10 + d * 0.018);
+}
+
+function isMineAt(x, y) {
+  const key = cellKey(x, y);
+  if (overrides.has(key)) return overrides.get(key);
+  return hashCoords(x, y) < getDensity(x, y);
+}
+
+function calcNumber(x, y) {
+  let n = 0;
+  for (let dx = -1; dx <= 1; dx++)
+    for (let dy = -1; dy <= 1; dy++) {
+      if (dx === 0 && dy === 0) continue;
+      if (isMineAt(x + dx, y + dy)) n++;
+    }
+  return n;
+}
+
+function initGame() {
+  cells = new Map();
+  score = 0;
+  firstClick = true;
+  gameOver = false;
+  gameActive = true;
+  seed = (Math.random() * 2147483647) | 0;
+  overrides = new Map();
+  cameraX = 0; cameraY = 0;
+  targetCamX = 0; targetCamY = 0;
+  gameStartTime = Date.now();
+  state = 'playing';
+}
+
+function revealCell(x, y) {
+  const cell = getCell(x, y);
+  if (cell.state === 'flagged') return;
+  if (cell.state === 'revealed') return;
+
+  if (firstClick) {
+    overrides.set(cellKey(x, y), false);
+    firstClick = false;
+  }
+
+  if (isMineAt(x, y)) {
+    cell.state = 'revealed';
+    triggerGameOver();
+    return;
+  }
+
+  cell.state = 'revealed';
+  cell.number = calcNumber(x, y);
+  score++;
+
+  if (cell.number === 0) {
+    const queue = [[x, y]];
+    while (queue.length > 0) {
+      const [cx, cy] = queue.shift();
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = cx + dx, ny = cy + dy;
+          const n = getCell(nx, ny);
+          if (n.state === 'hidden' && !isMineAt(nx, ny)) {
+            n.state = 'revealed';
+            n.number = calcNumber(nx, ny);
+            score++;
+            if (n.number === 0) queue.push([nx, ny]);
+          }
+        }
+      }
+    }
+  }
+
+  targetCamX += 0; // keep camera stable, just ensure cell is in view
+}
+
+function toggleFlag(x, y) {
+  const cell = getCell(x, y);
+  if (cell.state === 'revealed') return;
+  if (cell.state === 'flagged') cell.state = 'hidden';
+  else cell.state = 'flagged';
+}
+
+function triggerGameOver() {
+  gameOver = true;
+  gameActive = false;
+  state = 'over';
+  if (score > highScore) {
+    highScore = score;
+    try { localStorage.setItem('ms_endless_hs', String(highScore)); } catch(e) {}
+  }
+}
+
+function updateCamera() {
+  // Center camera on the explored area
+  let minX = 999, maxX = -999, minY = 999, maxY = -999;
+  let found = false;
+  for (const [key, cell] of cells) {
+    if (cell.state !== 'hidden' || cell.state === 'flagged') {
+      found = true;
+      minX = Math.min(minX, cell.x); maxX = Math.max(maxX, cell.x);
+      minY = Math.min(minY, cell.y); maxY = Math.max(maxY, cell.y);
+    }
+  }
+  if (found) {
+    targetCamX = (minX + maxX) / 2;
+    targetCamY = (minY + maxY) / 2;
+  }
+}
+
+function getTileSize() {
+  let size = 40;
+  // Fit at least ~15x15 tiles on screen
+  const minDim = Math.min(W, H);
+  size = Math.max(28, Math.min(56, (minDim / 16) | 0));
+  return size;
+}
+
+function draw() {
+  ctx.fillStyle = '#0f0f1a';
+  ctx.fillRect(0, 0, W, H);
+
+  if (state === 'menu') {
+    drawMenu();
+    return;
+  }
+
+  tileW = tileH = getTileSize();
+  const offsetX = W / 2 - cameraX * tileW;
+  const offsetY = H / 2 - cameraY * tileH;
+
+  const startX = Math.floor(-offsetX / tileW) - 1;
+  const endX = Math.ceil((W - offsetX) / tileW) + 1;
+  const startY = Math.floor(-offsetY / tileH) - 1;
+  const endY = Math.ceil((H - offsetY) / tileH) + 1;
+
+  // Draw cells
+  for (let x = startX; x <= endX; x++) {
+    for (let y = startY; y <= endY; y++) {
+      const cell = getCell(x, y);
+      if (cell.state === 'hidden' && !isAdjacentToRevealed(x, y)) continue;
+      drawCell(cell, offsetX, offsetY);
+    }
+  }
+
+  // Draw hover
+  if (state === 'playing') {
+    const hx = Math.floor((mouseX - offsetX) / tileW);
+    const hy = Math.floor((mouseY - offsetY) / tileH);
+    if (hx !== hoverX || hy !== hoverY) { hoverX = hx; hoverY = hy; }
+    drawHover(offsetX, offsetY);
+  }
+
+  // HUD
+  drawHUD();
+
+  if (state === 'over') drawGameOver();
+}
+
+function isAdjacentToRevealed(x, y) {
+  for (let dx = -1; dx <= 1; dx++)
+    for (let dy = -1; dy <= 1; dy++) {
+      const n = getCell(x + dx, y + dy);
+      if (n.state === 'revealed' || n.state === 'flagged') return true;
+    }
+  return false;
+}
+
+function drawCell(cell, ox, oy) {
+  const sx = ox + cell.x * tileW;
+  const sy = oy + cell.y * tileH;
+  const pad = 2;
+  const w = tileW - pad * 2;
+  const h = tileH - pad * 2;
+
+  if (cell.state === 'hidden') {
+    // Hidden tile
+    ctx.fillStyle = '#1e2a3a';
+    ctx.fillRect(sx + pad, sy + pad, w, h);
+    ctx.strokeStyle = '#2a3a4a';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(sx + pad + 0.5, sy + pad + 0.5, w, h);
+    // Subtle gradient
+    const g = ctx.createLinearGradient(sx+pad, sy+pad, sx+pad, sy+pad+h);
+    g.addColorStop(0, 'rgba(255,255,255,0.04)');
+    g.addColorStop(1, 'rgba(0,0,0,0.08)');
+    ctx.fillStyle = g;
+    ctx.fillRect(sx + pad, sy + pad, w, h);
+  } else if (cell.state === 'flagged') {
+    ctx.fillStyle = '#2a3a4a';
+    ctx.fillRect(sx + pad, sy + pad, w, h);
+    // Draw flag
+    const fx = sx + tileW/2;
+    const fy = sy + tileH/2;
+    ctx.strokeStyle = '#ff8a65';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(fx - 4, fy + 10);
+    ctx.lineTo(fx - 4, fy - 10);
+    ctx.stroke();
+    ctx.fillStyle = '#ff5252';
+    ctx.beginPath();
+    ctx.moveTo(fx - 4, fy - 10);
+    ctx.lineTo(fx + 6, fy - 5);
+    ctx.lineTo(fx - 4, fy);
+    ctx.fill();
+  } else if (cell.state === 'revealed') {
+    if (isMineAt(cell.x, cell.y)) {
+      // Revealed mine (game over)
+      ctx.fillStyle = '#b71c1c';
+      ctx.fillRect(sx + pad, sy + pad, w, h);
+      drawMine(sx + tileW/2, sy + tileH/2);
+    } else {
+      ctx.fillStyle = cell.number === 0 ? '#141e28' : '#1a2535';
+      ctx.fillRect(sx + pad, sy + pad, w, h);
+      if (cell.number > 0) {
+        ctx.fillStyle = NUMBER_COLORS[cell.number];
+        ctx.font = `bold ${tileW * 0.5}px 'Segoe UI', sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(cell.number, sx + tileW/2, sy + tileH/2 + 1);
+      }
+    }
+  }
+}
+
+function drawMine(cx, cy) {
+  const r = tileW * 0.25;
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fill();
+  // Spikes
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 4; i++) {
+    const a = i * Math.PI / 2;
+    ctx.beginPath();
+    ctx.moveTo(cx - Math.cos(a) * r, cy - Math.sin(a) * r);
+    ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+    ctx.stroke();
+  }
+  // Diagonals
+  const d = r * 0.7;
+  ctx.beginPath();
+  ctx.moveTo(cx - d, cy - d); ctx.lineTo(cx + d, cy + d);
+  ctx.moveTo(cx + d, cy - d); ctx.lineTo(cx - d, cy + d);
+  ctx.stroke();
+}
+
+function drawHover(ox, oy) {
+  const cell = getCell(hoverX, hoverY);
+  if (cell.state !== 'hidden') return;
+  const sx = ox + hoverX * tileW;
+  const sy = oy + hoverY * tileH;
+  ctx.fillStyle = 'rgba(100,180,255,0.15)';
+  ctx.fillRect(sx + 2, sy + 2, tileW - 4, tileH - 4);
+  ctx.strokeStyle = 'rgba(100,180,255,0.5)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(sx + 2.5, sy + 2.5, tileW - 5, tileH - 5);
+}
+
+function drawHUD() {
+  // Score panel
+  ctx.fillStyle = 'rgba(15,15,26,0.85)';
+  ctx.fillRect(0, 0, W, 50);
+  ctx.strokeStyle = '#2a3a4a';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, 50); ctx.lineTo(W, 50);
+  ctx.stroke();
+
+  ctx.fillStyle = '#e0e0e0';
+  ctx.font = 'bold 18px "Segoe UI", sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('SCORE: ' + score, 20, 25);
+
+  const elapsed = Math.floor((Date.now() - gameStartTime) / 1000);
+  ctx.fillStyle = '#90a4ae';
+  ctx.font = '14px "Segoe UI", sans-serif';
+  ctx.fillText('Time: ' + formatTime(elapsed), 180, 25);
+
+  const dist = Math.max(Math.abs(hoverX), Math.abs(hoverY));
+  const dens = getDensity(0, 0); // show max density in view
+  let maxD = 0;
+  for (const [k, c] of cells) {
+    if (c.state !== 'hidden') {
+      const d = Math.max(Math.abs(c.x), Math.abs(c.y));
+      maxD = Math.max(maxD, d);
+    }
+  }
+  const viewDens = getDensity(0, maxD);
+  ctx.fillText('Mine density: ' + (viewDens * 100).toFixed(0) + '%', 320, 25);
+
+  ctx.fillStyle = '#ffd54f';
+  ctx.font = 'bold 14px "Segoe UI", sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText('BEST: ' + highScore, W - 20, 25);
+}
+
+function formatTime(s) {
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return (m > 0 ? m + ':' : '') + (sec < 10 ? '0' : '') + sec + 's';
+}
+
+function drawMenu() {
+  ctx.fillStyle = '#0f0f1a';
+  ctx.fillRect(0, 0, W, H);
+
+  // Title
+  const cx = W / 2, cy = H / 2;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  ctx.fillStyle = '#ff5252';
+  ctx.font = `bold ${Math.min(W*0.08, 64)}px "Segoe UI", sans-serif`;
+  ctx.fillText('MINESWEEPER', cx, cy - 100);
+  ctx.fillStyle = '#4fc3f7';
+  ctx.font = `bold ${Math.min(W*0.06, 48)}px "Segoe UI", sans-serif`;
+  ctx.fillText('ENDLESS', cx, cy - 50);
+
+  // Decorative mines
+  for (let i = 0; i < 6; i++) {
+    const mx = cx + Math.cos(i * Math.PI / 3) * 140;
+    const my = cy - 75 + Math.sin(i * Math.PI / 3) * 40;
+    drawMine(mx, my);
+  }
+
+  ctx.fillStyle = '#90a4ae';
+  ctx.font = '16px "Segoe UI", sans-serif';
+  ctx.fillText('Left Click: Reveal cell', cx, cy + 30);
+  ctx.fillText('Right Click: Flag / Unflag', cx, cy + 55);
+  ctx.fillText('The board is infinite — how far can you go?', cx, cy + 90);
+  ctx.fillText('Mine density increases with distance from center.', cx, cy + 115);
+
+  // Start button
+  const bw = 220, bh = 50;
+  ctx.fillStyle = '#1a2535';
+  ctx.fillRect(cx - bw/2, cy + 150, bw, bh);
+  ctx.strokeStyle = '#4fc3f7';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cx - bw/2, cy + 150, bw, bh);
+  ctx.fillStyle = '#e0e0e0';
+  ctx.font = 'bold 20px "Segoe UI", sans-serif';
+  ctx.fillText('CLICK TO START', cx, cy + 175);
+
+  if (highScore > 0) {
+    ctx.fillStyle = '#ffd54f';
+    ctx.font = '14px "Segoe UI", sans-serif';
+    ctx.fillText('Best: ' + highScore, cx, cy + 230);
+  }
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(15,15,26,0.8)';
+  ctx.fillRect(0, 0, W, H);
+
+  const cx = W / 2, cy = H / 2;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  ctx.fillStyle = '#ff5252';
+  ctx.font = `bold ${Math.min(W*0.07, 56)}px "Segoe UI", sans-serif`;
+  ctx.fillText('BOOM!', cx, cy - 80);
+
+  ctx.fillStyle = '#e0e0e0';
+  ctx.font = '24px "Segoe UI", sans-serif';
+  ctx.fillText('Score: ' + score, cx, cy - 20);
+
+  const elapsed = Math.floor((Date.now() - gameStartTime) / 1000);
+  ctx.fillStyle = '#90a4ae';
+  ctx.font = '18px "Segoe UI", sans-serif';
+  ctx.fillText('Time: ' + formatTime(elapsed), cx, cy + 20);
+
+  if (score >= highScore && score > 0) {
+    ctx.fillStyle = '#ffd54f';
+    ctx.font = 'bold 18px "Segoe UI", sans-serif';
+    ctx.fillText('★ NEW HIGH SCORE! ★', cx, cy + 60);
+  }
+
+  // Restart button
+  const bw = 220, bh = 50;
+  ctx.fillStyle = '#1a2535';
+  ctx.fillRect(cx - bw/2, cy + 90, bw, bh);
+  ctx.strokeStyle = '#4fc3f7';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cx - bw/2, cy + 90, bw, bh);
+  ctx.fillStyle = '#e0e0e0';
+  ctx.font = 'bold 18px "Segoe UI", sans-serif';
+  ctx.fillText('PLAY AGAIN', cx, cy + 115);
+}
+
+// Input
+let mouseX = 0, mouseY = 0;
+let mouseDown = false;
+
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = e.clientX - rect.left;
+  mouseY = e.clientY - rect.top;
+});
+
+canvas.addEventListener('mousedown', e => {
+  if (state === 'menu') { initGame(); return; }
+  if (state === 'over') {
+    const cx = W/2, cy = H/2;
+    const bw = 220, bh = 50;
+    if (mouseX >= cx-bw/2 && mouseX <= cx+bw/2 && mouseY >= cy+90 && mouseY <= cy+90+bh) {
+      initGame();
+    }
+    return;
+  }
+  if (!gameActive) return;
+
+  const ox = W / 2 - cameraX * tileW;
+  const oy = H / 2 - cameraY * tileH;
+  const gx = Math.floor((mouseX - ox) / tileW);
+  const gy = Math.floor((mouseY - oy) / tileH);
+
+  if (e.button === 0) { // Left click
+    revealCell(gx, gy);
+  } else if (e.button === 2) { // Right click
+    toggleFlag(gx, gy);
+  }
+
+  updateCamera();
+});
+
+// Keyboard restart
+window.addEventListener('keydown', e => {
+  if (e.key === 'r' || e.key === 'R') {
+    if (state !== 'playing') initGame();
+  }
+  if (e.key === 'Enter' && state !== 'playing') initGame();
+});
+
+// Render loop
+let lastTime = 0;
+function loop(t) {
+  const dt = Math.min((t - lastTime) / 1000, 0.1);
+  lastTime = t;
+
+  // Smooth camera
+  cameraX += (targetCamX - cameraX) * 0.08;
+  cameraY += (targetCamY - cameraY) * 0.08;
+
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
