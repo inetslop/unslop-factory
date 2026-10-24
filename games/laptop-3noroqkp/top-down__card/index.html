@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Top-Down Tactix</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', sans-serif; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W;
+  canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, dur, type='sine', vol=0.15) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + dur);
+}
+function sfxPlace() { playSound(440, 0.15, 'triangle'); }
+function sfxAttack() { playSound(200, 0.2, 'sawtooth', 0.2); }
+function sfxDeath() { playSound(150, 0.3, 'square', 0.1); }
+function sfxWin() { playSound(660, 0.4, 'sine'); setTimeout(()=>playSound(880,0.4,'sine'),200); }
+function sfxLose() { playSound(200, 0.5, 'sawtooth', 0.2); }
+function sfxSpell() { playSound(800, 0.2, 'sine'); setTimeout(()=>playSound(1000,0.15,'sine'),100); }
+
+// Game State
+const COLS = 5, ROWS = 7;
+let cellW, cellH, gridX, gridY, gridW, gridH;
+let gameState = 'start'; // start, playing, won, lost
+let turn = 0;
+let playerHP = 20, enemyHP = 20;
+let playerMana = 3, maxMana = 3;
+let hand = [];
+let deck = [];
+let selectedCard = -1;
+let grid = []; // grid[row][col] = unit or null
+let animQueue = [];
+let messages = [];
+let particles = [];
+
+const CARD_TYPES = {
+  knight: { name:'Knight', cost:2, atk:3, hp:5, type:'unit', color:'#4a90d9' },
+  archer: { name:'Archer', cost:3, atk:4, hp:3, type:'unit', color:'#7b68ee' },
+  tank: { name:'Tank', cost:4, atk:2, hp:9, type:'unit', color:'#cd7f32' },
+  goblin: { name:'Goblin', cost:1, atk:2, hp:2, type:'unit', color:'#6b8e23' },
+  fireball: { name:'Fireball', cost:3, atk:5, hp:0, type:'spell', color:'#ff4444' },
+  heal: { name:'Heal', cost:2, atk:0, hp:5, type:'spell', color:'#44ff88' }
+};
+
+function createDeck() {
+  const d = [];
+  for (let i=0;i<3;i++) d.push('goblin');
+  for (let i=0;i<2;i++) d.push('knight');
+  for (let i=0;i<2;i++) d.push('archer');
+  for (let i=0;i<1;i++) d.push('tank');
+  for (let i=0;i<2;i++) d.push('fireball');
+  for (let i=0;i<2;i++) d.push('heal');
+  // shuffle
+  for (let i=d.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[d[i],d[j]]=[d[j],d[i]];}
+  return d;
+}
+
+function newGame() {
+  gameState = 'playing';
+  turn = 0;
+  playerHP = 20; enemyHP = 20;
+  maxMana = 3; playerMana = 3;
+  grid = Array.from({length:ROWS}, ()=>Array(COLS).fill(null));
+  deck = createDeck();
+  hand = [];
+  for(let i=0;i<4;i++) drawCard();
+  selectedCard = -1;
+  messages = [];
+  particles = [];
+  animQueue = [];
+}
+
+function drawCard() {
+  if (deck.length === 0) deck = createDeck();
+  hand.push(deck.pop());
+}
+
+function layoutGrid() {
+  const margin = 20;
+  gridW = Math.min(W * 0.6, 500);
+  cellW = gridW / COLS;
+  cellH = Math.min(cellW * 0.8, (H - 180) / ROWS);
+  gridX = (W - gridW) / 2;
+  gridY = 40;
+  gridH = cellH * ROWS;
+}
+
+function addMessage(text, color) {
+  messages.push({ text, color: color||'#fff', alpha:1, y:0 });
+  if (messages.length > 3) messages.shift();
+}
+
+function addParticles(x, y, color, count) {
+  for(let i=0;i<count;i++) {
+    const angle = Math.random()*Math.PI*2;
+    const speed = 1+Math.random()*3;
+    particles.push({ x, y, vx:Math.cos(angle)*speed, vy:Math.sin(angle)*speed, life:1, color });
+  }
+}
+
+function placeUnit(row, col, side) {
+  const types = ['goblin','knight','archer','tank'];
+  const t = types[Math.floor(Math.random()*types.length)];
+  const c = CARD_TYPES[t];
+  grid[row][col] = { type:t, atk:c.atk, hp:c.hp, maxHp:c.hp, side, color:c.color };
+}
+
+function enemyPlay() {
+  // Enemy AI: place units in rows 0-2
+  let placed = false;
+  for(let r=1;r>=0;r--) {
+    for(let c=0;c<COLS;c++) {
+      if(!grid[r][c] && Math.random()<0.6) {
+        const types=['goblin','knight','archer'];
+        const t = types[Math.floor(Math.random()*types.length)];
+        grid[r][c] = { type:t, atk:CARD_TYPES[t].atk, hp:CARD_TYPES[t].hp, maxHp:CARD_TYPES[t].hp, side:'enemy', color:CARD_TYPES[t].color };
+        placed = true;
+        break;
+      }
+    }
+    if(placed) break;
+  }
+}
+
+function resolveTurn() {
+  // Player units move up (row-1), enemy units move down (row+1)
+  const toFight = [];
+  
+  // Move player units up
+  for(let r=0;r<ROWS;r++) {
+    for(let c=0;c<COLS;c++) {
+      if(grid[r][c] && grid[r][c].side==='player') {
+        const nr = r-1;
+        if(nr >= 0) {
+          if(!grid[nr][c]) {
+            grid[nr][c] = grid[r][c];
+            grid[r][c] = null;
+          } else {
+            // Fight!
+            toFight.push({ row:nr, col:c });
+          }
+        }
+      }
+    }
+  }
+  
+  // Move enemy units down
+  for(let r=ROWS-1;r>=0;r--) {
+    for(let c=0;c<COLS;c++) {
+      if(grid[r][c] && grid[r][c].side==='enemy') {
+        const nr = r+1;
+        if(nr < ROWS) {
+          if(!grid[nr][c]) {
+            grid[nr][c] = grid[r][c];
+            grid[r][c] = null;
+          } else if(grid[nr][c].side==='player') {
+            toFight.push({ row:nr, col:c });
+          }
+        } else {
+          // Reached player back row - deal damage
+          enemyHP -= grid[r][c].atk;
+          addParticles(gridX + c*cellW+cellW/2, gridY + r*cellH+cellH/2, '#ff0', 8);
+          grid[r][c] = null;
+          sfxAttack();
+        }
+      }
+    }
+  }
+  
+  // Player units reaching enemy back row
+  for(let c=0;c<COLS;c++) {
+    if(grid[0][c] && grid[0][c].side==='player') {
+      enemyHP -= grid[0][c].atk;
+      addParticles(gridX + c*cellW+cellW/2, gridY + cellH/2, '#ff0', 8);
+      grid[0][c] = null;
+      sfxAttack();
+    }
+  }
+  
+  // Enemy units reaching player back row
+  for(let c=0;c<COLS;c++) {
+    if(grid[ROWS-1][c] && grid[ROWS-1][c].side==='enemy') {
+      playerHP -= grid[ROWS-1][c].atk;
+      addParticles(gridX + c*cellW+cellW/2, gridY + (ROWS-1)*cellH+cellH/2, '#f00', 8);
+      grid[ROWS-1][c] = null;
+      sfxAttack();
+    }
+  }
+  
+  // Fighting
+  for(const f of toFight) {
+    const a = grid[f.row][f.col];
+    if(!a) continue;
+    let otherSide, otherRow;
+    if(a.side==='player') { otherSide='enemy'; otherRow=f.row+1; }
+    else { otherSide='player'; otherRow=f.row-1; }
+    
+    // Actually the unit that couldn't move fights the one in its target cell
+    const target = grid[f.row][f.col];
+    if(target && target.side !== a.side) {
+      // Find the blocked unit - it's at f.row+1 or f.row-1... 
+      // Let me restructure: the unit that tried to move into an occupied cell fights
+      // The occupant is at f.row, the mover was at f.row±1
+    }
+  }
+  
+  // Simplified combat: check all adjacent enemies
+  for(let r=0;r<ROWS;r++) {
+    for(let c=0;c<COLS;c++) {
+      const u = grid[r][c];
+      if(!u) continue;
+      // Check down (for player units) or up (for enemy units)
+      let targetR, targetC;
+      if(u.side==='player') { targetR=r-1; } else { targetR=r+1; }
+      
+      // Actually combat happens when units are adjacent in same column
+      const otherR = u.side==='player' ? r+1 : r-1;
+      if(otherR>=0 && otherR<ROWS) {
+        const o = grid[otherR][c];
+        if(o && o.side !== u.side) {
+          // Combat!
+          o.hp -= u.atk;
+          addParticles(gridX+c*cellW+cellW/2, gridY+otherR*cellH+cellH/2, '#ff4444', 5);
+          sfxAttack();
+          if(o.hp <= 0) {
+            addParticles(gridX+c*cellW+cellW/2, gridY+otherR*cellH+cellH/2, '#888', 10);
+            grid[otherR][c] = null;
+            sfxDeath();
+          }
+        }
+      }
+    }
+  }
+  
+  // Check win/lose
+  if(enemyHP <= 0) { gameState='won'; sfxWin(); }
+  if(playerHP <= 0) { gameState='lost'; sfxLose(); }
+}
+
+function nextTurn() {
+  turn++;
+  maxMana = Math.min(10, 3 + Math.floor(turn/2));
+  playerMana = maxMana;
+  drawCard();
+  if(hand.length > 7) hand.pop();
+  
+  resolveTurn();
+  enemyPlay();
+  resolveTurn();
+  
+  selectedCard = -1;
+}
+
+function playCard(col, row) {
+  if(selectedCard < 0 || selectedCard >= hand.length) return;
+  const cardName = hand[selectedCard];
+  const c = CARD_TYPES[cardName];
+  if(playerMana < c.cost) { addMessage('Not enough mana!','#ff6'); return; }
+  
+  if(c.type === 'unit') {
+    if(row >= 4 && !grid[row][col]) {
+      grid[row][col] = { type:cardName, atk:c.atk, hp:c.hp, maxHp:c.hp, side:'player', color:c.color };
+      playerMana -= c.cost;
+      hand.splice(selectedCard, 1);
+      selectedCard = -1;
+      addMessage(c.name + ' deployed!','#4a90d9');
+      sfxPlace();
+      nextTurn();
+    } else {
+      addMessage('Invalid position!','#f66');
+    }
+  } else if(cardName === 'fireball') {
+    // Target: find an enemy unit in range (rows 0-3)
+    let target = null;
+    for(let r=0;r<4;r++) {
+      for(let cc=0;cc<COLS;cc++) {
+        if(grid[r][cc] && grid[r][cc].side==='enemy') { target={r,c:cc}; break; }
+      }
+      if(target) break;
+    }
+    if(!target) { addMessage('No enemy in range!','#f66'); return; }
+    playerMana -= c.cost;
+    grid[target.r][target.c].hp -= c.atk;
+    addParticles(gridX+target.c*cellW+cellW/2, gridY+target.r*cellH+cellH/2, '#ff4400', 15);
+    if(grid[target.r][target.c].hp <= 0) {
+      grid[target.r][target.c] = null;
+      sfxDeath();
+    }
+    hand.splice(selectedCard, 1);
+    selectedCard = -1;
+    addMessage('Fireball!','#ff4444');
+    sfxSpell();
+    nextTurn();
+  } else if(cardName === 'heal') {
+    // Heal lowest HP player unit
+    let best = null;
+    for(let r=3;r<ROWS;r++) {
+      for(let cc=0;cc<COLS;cc++) {
+        const u = grid[r][cc];
+        if(u && u.side==='player' && u.hp < u.maxHp) {
+          if(!best || u.hp/u.maxHp < best.u.hp/best.u.maxHp) best={r:r,c:cc,u:u};
+        }
+      }
+    }
+    if(!best) { addMessage('No unit to heal!','#f66'); return; }
+    playerMana -= c.cost;
+    best.u.hp = Math.min(best.u.maxHp, best.u.hp + 5);
+    addParticles(gridX+best.c*cellW+cellW/2, gridY+best.r*cellH+cellH/2, '#44ff88', 10);
+    hand.splice(selectedCard, 1);
+    selectedCard = -1;
+    addMessage('Healed!','#4f8');
+    sfxSpell();
+    nextTurn();
+  }
+}
+
+// Input
+let mouseX=0, mouseY=0;
+canvas.addEventListener('mousemove', e=>{ mouseX=e.clientX; mouseY=e.clientY; });
+canvas.addEventListener('click', e=>{
+  initAudio();
+  if(gameState==='start') { newGame(); return; }
+  if(gameState==='won'||gameState==='lost') { newGame(); return; }
+  
+  // Check hand clicks
+  const cardW = Math.min(100, W/6);
+  const handY = H - 90;
+  for(let i=0;i<hand.length;i++) {
+    const cx = (W - hand.length*cardW)/2 + i*cardW + 5;
+    if(e.clientX>=cx && e.clientX<=cx+cardW-10 && e.clientY>=handY && e.clientY<=handY+80) {
+      selectedCard = (selectedCard===i) ? -1 : i;
+      sfxPlace();
+      return;
+    }
+  }
+  
+  // Check grid clicks
+  const gx = Math.floor((e.clientX - gridX)/cellW);
+  const gy = Math.floor((e.clientY - gridY)/cellH);
+  if(gx>=0 && gx<COLS && gy>=0 && gy<ROWS) {
+    playCard(gx, gy);
+  }
+});
+
+window.addEventListener('keydown', e=>{
+  initAudio();
+  if(gameState==='start' || gameState==='won' || gameState==='lost') {
+    newGame();
+  }
+  if(e.key==='Escape') selectedCard=-1;
+});
+
+// Rendering
+function draw() {
+  layoutGrid();
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0,0,W,H);
+  
+  if(gameState==='start') {
+    drawStartScreen();
+    return;
+  }
+  
+  // Grid
+  for(let r=0;r<ROWS;r++) {
+    for(let c=0;c<COLS;c++) {
+      let color = '#2a2a4e';
+      if(r<2) color='#3d1f1f';
+      else if(r>4) color='#1f2d3d';
+      else color='#2d2d3d';
+      ctx.fillStyle = color;
+      ctx.fillRect(gridX+c*cellW, gridY+r*cellH, cellW-2, cellH-2);
+      
+      // Hover highlight
+      if(selectedCard>=0 && r>=4 && r<ROWS) {
+        const cRect = gridX+c*cellW, rRect=gridY+r*cellH;
+        if(mouseX>=cRect&&mouseX<cRect+cellW&&mouseY>=rRect&&mouseY<rRect+cellH) {
+          ctx.fillStyle='rgba(100,200,255,0.3)';
+          ctx.fillRect(gridX+c*cellW, gridY+r*cellH, cellW-2, cellH-2);
+        }
+      }
+    }
+  }
+  
+  // Units
+  for(let r=0;r<ROWS;r++) {
+    for(let c=0;c<COLS;c++) {
+      const u = grid[r][c];
+      if(!u) continue;
+      const ux = gridX+c*cellW+cellW/2;
+      const uy = gridY+r*cellH+cellH/2;
+      const rad = Math.min(cellW,cellH)*0.35;
+      
+      ctx.beginPath();
+      ctx.arc(ux,uy,rad,0,Math.PI*2);
+      ctx.fillStyle=u.color;
+      ctx.fill();
+      ctx.strokeStyle='#fff';
+      ctx.lineWidth=2;
+      ctx.stroke();
+      
+      // HP bar
+      const bw = rad*1.5;
+      ctx.fillStyle='#333';
+      ctx.fillRect(ux-bw/2, uy+rad+4, bw, 6);
+      ctx.fillStyle = u.hp>u.maxHp*0.5?'#4f8':'#f44';
+      ctx.fillRect(ux-bw/2, uy+rad+4, bw*(u.hp/u.maxHp), 6);
+      
+      // ATK text
+      ctx.fillStyle='#fff';
+      ctx.font=`bold ${Math.min(rad*0.7,14)}px sans-serif`;
+      ctx.textAlign='center';
+      ctx.fillText(u.atk, ux, uy+5);
+    }
+  }
+  
+  // Particles
+  for(let i=particles.length-1;i>=0;i--) {
+    const p=particles[i];
+    p.x+=p.vx; p.y+=p.vy; p.life-=0.03;
+    if(p.life<=0) { particles.splice(i,1); continue; }
+    ctx.globalAlpha=p.life;
+    ctx.fillStyle=p.color;
+    ctx.beginPath();
+    ctx.arc(p.x,p.y,4,0,Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha=1;
+  }
+  
+  // Hand
+  const cardW = Math.min(100, W/6);
+  const handY = H - 90;
+  for(let i=0;i<hand.length;i++) {
+    const cx = (W - hand.length*cardW)/2 + i*cardW + 5;
+    const c = CARD_TYPES[hand[i]];
+    ctx.fillStyle = selectedCard===i ? 'rgba(100,200,255,0.4)' : 'rgba(40,40,80,0.8)';
+    ctx.fillRect(cx, handY, cardW-10, 80);
+    ctx.strokeStyle = selectedCard===i ? '#4af' : '#666';
+    ctx.lineWidth=2;
+    ctx.strokeRect(cx, handY, cardW-10, 80);
+    
+    ctx.fillStyle=c.color;
+    ctx.font=`bold ${Math.min(12,cardW/8)}px sans-serif`;
+    ctx.textAlign='center';
+    ctx.fillText(c.name, cx+(cardW-10)/2, handY+25);
+    ctx.fillStyle='#ff0';
+    ctx.font=`${Math.min(11,cardW/9)}px sans-serif`;
+    ctx.fillText(`⚡${c.cost}`, cx+(cardW-10)/2, handY+45);
+    if(c.type==='unit') {
+      ctx.fillStyle='#fff';
+      ctx.fillText(`ATK:${c.atk} HP:${c.hp}`, cx+(cardW-10)/2, handY+65);
+    } else {
+      ctx.fillStyle='#fff';
+      ctx.fillText(c.type==='fireball'?`DMG:${c.atk}`:`HEAL:${c.hp}`, cx+(cardW-10)/2, handY+65);
+    }
+  }
+  
+  // HUD
+  ctx.fillStyle='#fff';
+  ctx.font='bold 18px sans-serif';
+  ctx.textAlign='left';
+  ctx.fillText(`♥ ${playerHP}/20`, gridX, gridY-10);
+  ctx.textAlign='right';
+  ctx.fillText(`♥ ${enemyHP}/20`, gridX+gridW, gridY-10);
+  
+  ctx.textAlign='center';
+  ctx.fillStyle='#ff0';
+  ctx.font='bold 16px sans-serif';
+  ctx.fillText(`⚡ Mana: ${playerMana}/${maxMana}`, W/2, H-10);
+  ctx.fillStyle='#aaa';
+  ctx.font='14px sans-serif';
+  ctx.fillText(`Turn ${turn+1}`, W/2, 25);
+  
+  // Messages
+  for(let i=messages.length-1;i>=0;i--) {
+    const m=messages[i];
+    ctx.globalAlpha=m.alpha;
+    ctx.fillStyle=m.color;
+    ctx.font='bold 16px sans-serif';
+    ctx.textAlign='center';
+    ctx.fillText(m.text, W/2, H*0.4 + i*25);
+    m.alpha -= 0.005;
+    if(m.alpha<=0) messages.splice(i,1);
+  }
+  ctx.globalAlpha=1;
+  
+  // End screens
+  if(gameState==='won'||gameState==='lost') {
+    ctx.fillStyle='rgba(0,0,0,0.7)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle=gameState==='won'?'#4f8':'#f44';
+    ctx.font='bold 48px sans-serif';
+    ctx.textAlign='center';
+    ctx.fillText(gameState==='won'?'VICTORY!':'DEFEAT', W/2, H/2-20);
+    ctx.fillStyle='#fff';
+    ctx.font='20px sans-serif';
+    ctx.fillText('Click to restart', W/2, H/2+30);
+  }
+  
+  requestAnimationFrame(draw);
+}
+
+function drawStartScreen() {
+  ctx.fillStyle='#1a1a2e';
+  ctx.fillRect(0,0,W,H);
+  
+  // Title
+  ctx.fillStyle='#4af';
+  ctx.font='bold 42px sans-serif';
+  ctx.textAlign='center';
+  ctx.fillText('TOP-DOWN TACTIX', W/2, H*0.25);
+  
+  // Subtitle
+  ctx.fillStyle='#aaa';
+  ctx.font='18px sans-serif';
+  ctx.fillText('A Top-Down Card Battle Game', W/2, H*0.33);
+  
+  // Instructions
+  const lines = [
+    '• Deploy units on your side (bottom rows) of the grid',
+    '• Units advance each turn and fight enemies in their path',
+    '• Units reaching the enemy back row deal damage to enemy HP',
+    '• Reduce enemy HP to 0 before yours runs out!',
+    '',
+    'CONTROLS:',
+    '• Click a card in hand, then click a grid cell to deploy',
+    '• Spells auto-target (Fireball hits nearest enemy, Heal targets lowest HP)',
+    '• Mana refills each turn and increases over time',
+    '• ESC to deselect a card'
+  ];
+  ctx.fillStyle='#ccc';
+  ctx.font='15px sans-serif';
+  lines.forEach((l,i)=>{
+    ctx.fillText(l, W/2, H*0.42 + i*24);
+  });
+  
+  // Start prompt
+  ctx.fillStyle = Math.sin(Date.now()/500)>0 ? '#4f8' : '#2a6';
+  ctx.font='bold 24px sans-serif';
+  ctx.fillText('CLICK TO START', W/2, H*0.88);
+}
+
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
