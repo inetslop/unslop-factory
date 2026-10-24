@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Pinball Match-3</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #0f0f23; display: flex; align-items: center; justify-content: center; height: 100vh; width: 100vw; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+function resize() {
+    const aspect = 480 / 720;
+    if (window.innerWidth / window.innerHeight > aspect) {
+        H = window.innerHeight;
+        W = H * aspect;
+    } else {
+        W = window.innerWidth;
+        H = W / aspect;
+    }
+    canvas.width = W;
+    canvas.height = H;
+    scale = W / 480;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Game constants (in virtual 480x720 space)
+const VW = 480, VH = 720;
+const BALL_R = 18;
+const GRID_COLS = 8, GRID_ROWS = 10;
+const GRID_X = (VW - GRID_COLS * BALL_R * 2) / 2;
+const GRID_Y = 50;
+const GRID_W = GRID_COLS * BALL_R * 2;
+const GRID_H = GRID_ROWS * BALL_R * 2;
+const PINBALL_TOP = GRID_Y + GRID_H;
+const COLORS = ['#ff4444','#4488ff','#44dd44','#ffcc00','#ff66cc','#ff8833'];
+const COLOR_NAMES = ['red','blue','green','yellow','pink','orange'];
+
+let gameState = 'START'; // START, PLAYING, GAMEOVER
+let score = 0;
+let shotsLeft = 20;
+let bestScore = 0;
+
+try { bestScore = parseInt(localStorage.getItem('pinballMatch3Best') || '0'); } catch(e) {}
+
+// Grid
+let grid = [];
+function initGrid() {
+    grid = [];
+    for (let r = 0; r < GRID_ROWS; r++) {
+        grid[r] = [];
+        for (let c = 0; c < GRID_COLS; c++) {
+            grid[r][c] = Math.floor(Math.random() * COLORS.length);
+        }
+    }
+}
+
+// Ball
+let ball = { x: VW/2, y: VH - 60, vx: 0, vy: 0, active: false, color: 3 };
+let collectedColors = []; // track what's been collected this shot
+let collecting = false;
+
+// Flippers
+let leftFlipper = { angle: 0.6, targetAngle: 0.6, active: false };
+let rightFlipper = { angle: -0.6, targetAngle: -0.6, active: false };
+const FLIPPER_LEN = 55;
+const FLIPPER_LEFT_PIVOT = { x: VW/2 - 40, y: VH - 30 };
+const FLIPPER_RIGHT_PIVOT = { x: VW/2 + 40, y: VH - 30 };
+
+// Particles
+let particles = [];
+
+// Animation
+let animTime = 0;
+let fallingBalls = [];
+let newBallQueue = [];
+
+function getGridPos(r, c) {
+    return { x: GRID_X + BALL_R * 2 * c + BALL_R, y: GRID_Y + BALL_R * 2 * r + BALL_R };
+}
+
+function launchBall() {
+    if (!ball.active && shotsLeft > 0) {
+        ball.vy = -14;
+        ball.vx = (Math.random() - 0.5) * 3;
+        ball.active = true;
+        collecting = true;
+        collectedColors = [];
+        shotsLeft--;
+    }
+}
+
+function selectColor(dir) {
+    ball.color = (ball.color + dir + COLORS.length) % COLORS.length;
+}
+
+// Input
+let keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'START' && e.code === 'Space') {
+        startGame();
+    } else if (gameState === 'GAMEOVER' && e.code === 'KeyR') {
+        startGame();
+    } else if (gameState === 'PLAYING') {
+        if (e.code === 'Space') launchBall();
+        if (e.code === 'ArrowLeft' || e.code === 'KeyA') leftFlipper.active = true;
+        if (e.code === 'ArrowRight' || e.code === 'KeyD') rightFlipper.active = true;
+        if (e.code === 'Digit1') ball.color = 0;
+        if (e.code === 'Digit2') ball.color = 1;
+        if (e.code === 'Digit3') ball.color = 2;
+        if (e.code === 'Digit4') ball.color = 3;
+        if (e.code === 'Digit5') ball.color = 4;
+        if (e.code === 'Digit6') ball.color = 5;
+    }
+});
+window.addEventListener('keyup', e => {
+    keys[e.code] = false;
+    if (e.code === 'ArrowLeft' || e.code === 'KeyA') leftFlipper.active = false;
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') rightFlipper.active = false;
+});
+
+function startGame() {
+    gameState = 'PLAYING';
+    score = 0;
+    shotsLeft = 20;
+    initGrid();
+    ball.x = VW/2;
+    ball.y = VH - 55;
+    ball.vx = 0;
+    ball.vy = 0;
+    ball.active = false;
+    ball.color = Math.floor(Math.random() * COLORS.length);
+    particles = [];
+    fallingBalls = [];
+}
+
+function addParticles(x, y, color) {
+    for (let i = 0; i < 8; i++) {
+        const angle = (i / 8) * Math.PI * 2;
+        particles.push({
+            x: x, y: y,
+            vx: Math.cos(angle) * (2 + Math.random() * 3),
+            vy: Math.sin(angle) * (2 + Math.random() * 3),
+            life: 1,
+            color: color
+        });
+    }
+}
+
+function checkMatchAndPop() {
+    if (!collecting) return;
+    const counts = {};
+    for (let c of collectedColors) {
+        counts[c] = (counts[c] || 0) + 1;
+    }
+    for (let c in counts) {
+        if (counts[c] >= 3) {
+            const pts = counts[c] === 3 ? 100 : counts[c] === 4 ? 300 : 600;
+            score += pts;
+            // Pop from grid - remove collected positions
+            for (let i = collectedColors.length - 1; i >= 0; i--) {
+                const item = collectedColors[i];
+                if (item.color === c) {
+                    const pos = getGridPos(item.r, item.c);
+                    addParticles(pos.x, pos.y, COLORS[c]);
+                    grid[item.r][item.c] = -1; // mark empty
+                }
+            }
+            collectedColors = [];
+            applyGravity();
+        }
+    }
+}
+
+function applyGravity() {
+    for (let c = 0; c < GRID_COLS; c++) {
+        let writeRow = GRID_ROWS - 1;
+        for (let r = GRID_ROWS - 1; r >= 0; r--) {
+            if (grid[r][c] !== -1) {
+                grid[writeRow][c] = grid[r][c];
+                if (writeRow !== r) grid[r][c] = -1;
+                writeRow--;
+            }
+        }
+        // Fill top with new balls
+        for (let r = writeRow; r >= 0; r--) {
+            grid[r][c] = Math.floor(Math.random() * COLORS.length);
+        }
+    }
+}
+
+function updatePhysics(dt) {
+    if (!ball.active) {
+        // Ball rests at bottom
+        ball.x += (VW/2 - ball.x) * 0.1;
+        ball.y = VH - 55;
+        return;
+    }
+
+    ball.vy += 0.35; // gravity
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+
+    // Wall bounces (pinball area walls)
+    const leftWall = GRID_X - 10;
+    const rightWall = GRID_X + GRID_W + 10;
+    if (ball.x - BALL_R < leftWall) { ball.x = leftWall + BALL_R; ball.vx = Math.abs(ball.vx); }
+    if (ball.x + BALL_R > rightWall) { ball.x = rightWall - BALL_R; ball.vx = -Math.abs(ball.vx); }
+
+    // Top wall
+    if (ball.y - BALL_R < 10) { ball.y = 10 + BALL_R; ball.vy = Math.abs(ball.vy) * 0.8; }
+
+    // Flipper collisions
+    if (!ball.active) return;
+
+    // Left flipper
+    const lfAngle = leftFlipper.active ? -0.3 : 0.6;
+    const lfEndX = FLIPPER_LEFT_PIVOT.x + Math.cos(lfAngle + Math.PI/2) * FLIPPER_LEN;
+    const lfEndY = FLIPPER_LEFT_PIVOT.y + Math.sin(lfAngle + Math.PI/2) * FLIPPER_LEN;
+    if (ball.y > PINBALL_TOP && ball.x < VW/2) {
+        // Simple: if ball is near left flipper line, bounce it up
+        const dx = lfEndX - FLIPPER_LEFT_PIVOT.x;
+        const dy = lfEndY - FLIPPER_LEFT_PIVOT.y;
+        const t = ((ball.x - FLIPPER_LEFT_PIVOT.x) * dx + (ball.y - FLIPPER_LEFT_PIVOT.y) * dy) / (dx*dx+dy*dy);
+        if (t > 0 && t < 1) {
+            const projX = FLIPPER_LEFT_PIVOT.x + t * dx;
+            const projY = FLIPPER_LEFT_PIVOT.y + t * dy;
+            const dist = Math.hypot(ball.x - projX, ball.y - projY);
+            if (dist < BALL_R + 5) {
+                ball.vy = -Math.abs(ball.vy) * 0.9 - 3;
+                ball.vx += 2;
+            }
+        }
+    }
+
+    // Right flipper
+    const rfAngle = rightFlipper.active ? 0.3 : -0.6;
+    const rfEndX = FLIPPER_RIGHT_PIVOT.x + Math.cos(rfAngle - Math.PI/2) * FLIPPER_LEN;
+    const rfEndY = FLIPPER_RIGHT_PIVOT.y + Math.sin(rfAngle - Math.PI/2) * FLIPPER_LEN;
+    if (ball.y > PINBALL_TOP && ball.x >= VW/2) {
+        const dx = rfEndX - FLIPPER_RIGHT_PIVOT.x;
+        const dy = rfEndY - FLIPPER_RIGHT_PIVOT.y;
+        const t = ((ball.x - FLIPPER_RIGHT_PIVOT.x) * dx + (ball.y - FLIPPER_RIGHT_PIVOT.y) * dy) / (dx*dx+dy*dy);
+        if (t > 0 && t < 1) {
+            const projX = FLIPPER_RIGHT_PIVOT.x + t * dx;
+            const projY = FLIPPER_RIGHT_PIVOT.y + t * dy;
+            const dist = Math.hypot(ball.x - projX, ball.y - projY);
+            if (dist < BALL_R + 5) {
+                ball.vy = -Math.abs(ball.vy) * 0.9 - 3;
+                ball.vx -= 2;
+            }
+        }
+    }
+
+    // Grid ball collisions and collection
+    if (ball.y > GRID_Y && ball.y < PINBALL_TOP) {
+        for (let r = 0; r < GRID_ROWS; r++) {
+            for (let c = 0; c < GRID_COLS; c++) {
+                if (grid[r][c] === -1) continue;
+                const pos = getGridPos(r, c);
+                const dx = ball.x - pos.x;
+                const dy = ball.y - pos.y;
+                const dist = Math.hypot(dx, dy);
+                if (dist < BALL_R * 2) {
+                    // Bounce off
+                    const nx = dx / (dist || 1);
+                    const ny = dy / (dist || 1);
+                    ball.vx += nx * 4;
+                    ball.vy += ny * 4;
+
+                    // Collect if same color
+                    if (grid[r][c] === ball.color) {
+                        collectedColors.push({ r, c, color: grid[r][c] });
+                        addParticles(pos.x, pos.y, COLORS[ball.color]);
+                        grid[r][c] = -1;
+                        checkMatchAndPop();
+                    }
+                }
+            }
+        }
+    }
+
+    // Ball falls back to pinball area
+    if (ball.y > VH - 40 && ball.vy > 0) {
+        ball.active = false;
+        collecting = false;
+        checkMatchAndPop();
+        collectedColors = [];
+    }
+
+    // Check game over
+    if (shotsLeft <= 0 && !ball.active) {
+        gameState = 'GAMEOVER';
+        if (score > bestScore) {
+            bestScore = score;
+            try { localStorage.setItem('pinballMatch3Best', bestScore.toString()); } catch(e) {}
+        }
+    }
+
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        particles[i].x += particles[i].vx;
+        particles[i].y += particles[i].vy;
+        particles[i].life -= 0.03;
+        if (particles[i].life <= 0) particles.splice(i, 1);
+    }
+}
+
+function draw() {
+    ctx.save();
+    ctx.scale(scale, scale);
+
+    // Background
+    const bg = ctx.createLinearGradient(0, 0, 0, VH);
+    bg.addColorStop(0, '#1a1a3e');
+    bg.addColorStop(1, '#16213e');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, VW, VH);
+
+    if (gameState === 'START') {
+        drawStartScreen();
+        ctx.restore();
+        return;
+    }
+
+    // Grid area background
+    ctx.fillStyle = 'rgba(255,255,255,0.03)';
+    ctx.fillRect(GRID_X - 5, GRID_Y - 5, GRID_W + 10, GRID_H + 10);
+
+    // Grid border
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(GRID_X - 5, GRID_Y - 5, GRID_W + 10, GRID_H + 10);
+
+    // Draw grid balls
+    for (let r = 0; r < GRID_ROWS; r++) {
+        for (let c = 0; c < GRID_COLS; c++) {
+            if (grid[r][c] === -1) continue;
+            const pos = getGridPos(r, c);
+            drawBall(pos.x, pos.y, BALL_R - 2, COLORS[grid[r][c]]);
+        }
+    }
+
+    // Draw pinball area walls
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(GRID_X - 10, PINBALL_TOP);
+    ctx.lineTo(GRID_X - 10, VH);
+    ctx.lineTo(VW/2 - 60, VH);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(GRID_X + GRID_W + 10, PINBALL_TOP);
+    ctx.lineTo(GRID_X + GRID_W + 10, VH);
+    ctx.lineTo(VW/2 + 60, VH);
+    ctx.stroke();
+
+    // Draw flippers
+    const lfAngle = leftFlipper.active ? -0.3 : 0.6;
+    const rfAngle = rightFlipper.active ? 0.3 : -0.6;
+
+    ctx.strokeStyle = '#ffcc44';
+    ctx.lineWidth = 8;
+    ctx.lineCap = 'round';
+    // Left flipper
+    ctx.beginPath();
+    ctx.moveTo(FLIPPER_LEFT_PIVOT.x, FLIPPER_LEFT_PIVOT.y);
+    const lfEx = FLIPPER_LEFT_PIVOT.x + Math.cos(lfAngle) * FLIPPER_LEN;
+    const lfEy = FLIPPER_LEFT_PIVOT.y - Math.sin(lfAngle) * FLIPPER_LEN;
+    ctx.lineTo(lfEx, lfEy);
+    ctx.stroke();
+
+    // Right flipper
+    ctx.beginPath();
+    ctx.moveTo(FLIPPER_RIGHT_PIVOT.x, FLIPPER_RIGHT_PIVOT.y);
+    const rfEx = FLIPPER_RIGHT_PIVOT.x - Math.cos(rfAngle) * FLIPPER_LEN;
+    const rfEy = FLIPPER_RIGHT_PIVOT.y - Math.sin(rfAngle) * FLIPPER_LEN;
+    ctx.lineTo(rfEx, rfEy);
+    ctx.stroke();
+
+    // Draw launcher ball
+    drawBall(ball.x, ball.y, BALL_R, COLORS[ball.color]);
+    // Glow effect for active ball
+    if (ball.active) {
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, BALL_R + 4, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+    }
+
+    // Draw particles
+    for (let p of particles) {
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 4 * p.life, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // UI
+    drawHUD();
+
+    if (gameState === 'GAMEOVER') {
+        drawGameOver();
+    }
+
+    ctx.restore();
+}
+
+function drawBall(x, y, r, color) {
+    const grad = ctx.createRadialGradient(x - r*0.3, y - r*0.3, 0, x, y, r);
+    grad.addColorStop(0, lighten(color, 40));
+    grad.addColorStop(1, color);
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+}
+
+function lighten(color, amt) {
+    let r = parseInt(color.slice(1,3),16), g = parseInt(color.slice(3,5),16), b = parseInt(color.slice(5,7),16);
+    r = Math.min(255, r + amt); g = Math.min(255, g + amt); b = Math.min(255, b + amt);
+    return `rgb(${r},${g},${b})`;
+}
+
+function drawHUD() {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, VW, 40);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 16px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Score: ${score}`, 15, 26);
+    ctx.textAlign = 'center';
+    ctx.fillText(`Shots: ${shotsLeft}`, VW/2, 26);
+
+    // Color indicator
+    ctx.fillStyle = COLORS[ball.color];
+    ctx.beginPath();
+    ctx.arc(VW - 30, 20, 10, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(`[${ball.color+1}]`, VW - 15, 38);
+
+    // Collected this shot
+    if (collecting && collectedColors.length > 0) {
+        ctx.fillStyle = '#fff';
+        ctx.font = '12px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(`Collected: ${collectedColors.length} (need 3+)`, VW/2, 55);
+    }
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 36px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('PINBALL', VW/2, 180);
+    ctx.fillText('MATCH-3', VW/2, 225);
+
+    ctx.font = '14px monospace';
+    ctx.fillStyle = '#aaa';
+    const lines = [
+        'Launch colored balls into the grid!',
+        'Collect 3+ matching colors to POP them.',
+        '',
+        'Controls:',
+        '  SPACE - Launch ball',
+        '  A/Left - Left flipper',
+        '  D/Right - Right flipper',
+        '  1-6 - Choose ball color',
+        '',
+        'You have 20 shots. Score big!'
+    ];
+    lines.forEach((l, i) => ctx.fillText(l, VW/2, 280 + i * 24));
+
+    ctx.fillStyle = '#ffcc44';
+    ctx.font = '16px monospace';
+    ctx.fillText('Press SPACE to Start', VW/2, 560);
+
+    if (bestScore > 0) {
+        ctx.fillStyle = '#888';
+        ctx.font = '13px monospace';
+        ctx.fillText(`Best: ${bestScore}`, VW/2, 600);
+    }
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, VW, VH);
+
+    ctx.fillStyle = '#ff4444';
+    ctx.font = 'bold 32px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', VW/2, 250);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = '20px monospace';
+    ctx.fillText(`Final Score: ${score}`, VW/2, 310);
+    ctx.fillText(`Best: ${bestScore}`, VW/2, 345);
+
+    ctx.fillStyle = '#ffcc44';
+    ctx.font = '16px monospace';
+    ctx.fillText('Press R to Restart', VW/2, 420);
+}
+
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = Math.min((time - lastTime) / 16.67, 3);
+    lastTime = time;
+    animTime += dt;
+
+    if (gameState === 'PLAYING') {
+        updatePhysics(dt);
+    }
+
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
