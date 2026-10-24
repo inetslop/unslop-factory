@@ -1,0 +1,494 @@
+<think>
+The user wants an "endless" Snake game - a single-file HTML5 game. Key requirements:
+- One HTML file, inline CSS/JS only
+- Web Audio API for sound (starts after first input)
+- Fills window, rescales on resize, no scrollbars
+- Start screen with name and controls
+- Restart without reloading
+- Listen for keys on window
+- No alert/confirm/prompt
+- Wrap localStorage in try/catch
+- Game name in <title>
+
+"Endless Snake" - I'll make a snake game where the board is infinite/scrolling. The snake moves continuously and the camera follows it. Food spawns ahead. Walls? Since it's endless, maybe no walls but obstacles spawn. Or wrap-around? Let me think about what makes "endless" distinct:
+
+Option 1: Camera-based - the grid scrolls with the snake. Obstacles appear. Score based on food eaten.
+Option 2: The snake grows longer and longer with increasing difficulty (speed, obstacles).
+
+I'll go with a camera-following approach where the world is effectively infinite. The snake moves in a direction, camera follows. Food spawns ahead in a pattern. Obstacles (rocks/blocks) appear to make it challenging. If you hit an obstacle or yourself, game over.
+
+Let me design:
+- Grid-based movement on a large virtual grid
+- Camera centers on the snake's head
+- Food items spawn in a radius ahead of the snake
+- Obstacles are scattered blocks that increase with score
+- Speed increases gradually
+- Score = food eaten
+- High score saved to localStorage
+
+Controls: Arrow keys or WASD. Space to start/restart.
+
+Let me code this up properly with canvas rendering, smooth interpolation between grid cells for visual appeal.
+
+Actually, for a cleaner implementation: I'll use a tile-based approach where the snake moves tile by tile, but I'll interpolate visually. The world is conceptually infinite - I'll track positions in absolute coordinates and only render what's visible.
+
+Let me structure:
+- Game state: grid of obstacles (sparse - use a Set or Map), food positions, snake segments
+- Snake head position in absolute coords
+- Camera follows head
+- Each tick, snake moves one cell in current direction
+- Food spawns periodically ahead
+- Obstacles spawn as score increases
+- Collision: hit obstacle or self = game over
+
+For rendering, I'll use a canvas that fills the window. Grid size adapts to screen.
+
+Let me write this out carefully.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Endless Snake</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; font-family: 'Courier New', monospace; }
+canvas { display: block; width: 100%; height: 100%; }
+#ui { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.screen { display: flex; flex-direction: column; align-items: center; gap: 20px; text-align: center; color: #e0e0ff; }
+.screen h1 { font-size: clamp(2rem, 5vw, 4rem); color: #7fff7f; text-shadow: 0 0 20px #3a3, 0 0 40px #3a3; letter-spacing: 4px; }
+.screen p { font-size: clamp(0.9rem, 2vw, 1.2rem); color: #aaa; line-height: 1.8; }
+.screen .score-display { font-size: clamp(1.5rem, 3vw, 2.5rem); color: #fff; }
+.screen .hi-score { font-size: clamp(1rem, 2vw, 1.4rem); color: #ffd700; }
+.screen .restart-hint { font-size: clamp(1rem, 2vw, 1.3rem); color: #88f; animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100%{opacity:0.5} 50%{opacity:1} }
+.hidden { display: none !important; }
+#hud { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); color: #fff; font-size: clamp(1rem, 2vw, 1.4rem); text-align: center; pointer-events: none; text-shadow: 0 0 10px rgba(0,255,255,0.5); }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud" class="hidden"><span id="score">0</span> | <span id="speed">1x</span></div>
+<div id="ui">
+  <div id="startScreen" class="screen">
+    <h1>ENDLESS SNAKE</h1>
+    <p>Avoid obstacles. Eat food. Don't stop.<br>The world is infinite — how far can you go?</p>
+    <p>↑ ← ↓ → or WASD to steer<br>SPACE / ENTER to start</p>
+  </div>
+  <div id="gameOverScreen" class="screen hidden">
+    <h1 style="color:#f55;">GAME OVER</h1>
+    <div class="score-display">Score: <span id="finalScore">0</span></div>
+    <div class="hi-score">Best: <span id="hiScore">0</span></div>
+    <p class="restart-hint">Press SPACE to restart</p>
+  </div>
+</div>
+<script>
+(function(){
+"use strict";
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const hud = document.getElementById('hud');
+const scoreEl = document.getElementById('score');
+const speedEl = document.getElementById('speed');
+const startScreen = document.getElementById('startScreen');
+const gameOverScreen = document.getElementById('gameOverScreen');
+const finalScoreEl = document.getElementById('finalScore');
+const hiScoreEl = document.getElementById('hiScore');
+
+let W, H, tileSize;
+function resize(){
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W; canvas.height = H;
+  tileSize = Math.max(20, Math.min(W, H) / 24);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio(){
+  if(!audioCtx){
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
+  }
+}
+function playTone(freq, dur, type, vol){
+  if(!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || 'square';
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(vol||0.1, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + dur);
+}
+function sfxEat(){ playTone(880,0.1,'square',0.08); playTone(1320,0.15,'square',0.06); }
+function sfxDie(){ playTone(120,0.5,'sawtooth',0.15); playTone(80,0.7,'sawtooth',0.1); }
+function sfxMove(){ if(Math.random()<0.3) playTone(220,0.03,'triangle',0.02); }
+
+// Game state
+let state = 'start'; // start, playing, over
+let snake = [];
+let dir = {x:1,y:0};
+let nextDir = {x:1,y:0};
+let food = [];
+let obstacles = new Map();
+let score = 0;
+let speed = 0;
+let tickTimer = 0;
+let lastTime = 0;
+let cameraX = 0, cameraY = 0;
+let hiScore = 0;
+let particles = [];
+let gridOffsetX = 0, gridOffsetY = 0;
+
+function loadHi(){ try { hiScore = parseInt(localStorage.getItem('endlessSnakeHi')||'0',10)||0; } catch(e){ hiScore=0; } }
+function saveHi(){ try { localStorage.setItem('endlessSnakeHi', String(hiScore)); } catch(e){} }
+
+function resetGame(){
+  const cx = Math.floor(W / tileSize);
+  const cy = Math.floor(H / tileSize);
+  snake = [{x:cx,y:cy},{x:cx-1,y:cy},{x:cx-2,y:cy}];
+  dir = {x:1,y:0};
+  nextDir = {x:1,y:0};
+  score = 0;
+  speed = 8;
+  tickTimer = 0;
+  food = [];
+  obstacles.clear();
+  particles = [];
+  // Initial food
+  for(let i=0;i<5;i++) spawnFood();
+  // Initial obstacles (sparse, not near snake)
+  for(let i=0;i<8;i++) spawnObstacle(4);
+}
+
+function spawnFood(){
+  const head = snake[0];
+  const angle = Math.random()*Math.PI*2;
+  const dist = 6 + Math.floor(Math.random()*10);
+  let fx = head.x + Math.round(Math.cos(angle)*dist);
+  let fy = head.y + Math.round(Math.sin(angle)*dist);
+  // Don't spawn on obstacle or snake
+  if(obstacles.has(fx+','+fy)) { fx += 2; }
+  for(let s of snake) if(s.x===fx && s.y===fy){ fx+=3; break; }
+  food.push({x:fx, y:fy, pulse: Math.random()*Math.PI*2});
+}
+
+function spawnObstacle(minDist){
+  const head = snake[0];
+  for(let attempt=0; attempt<20; attempt++){
+    const angle = Math.random()*Math.PI*2;
+    const dist = minDist + Math.floor(Math.random()*15);
+    let ox = head.x + Math.round(Math.cos(angle)*dist);
+    let oy = head.y + Math.round(Math.sin(angle)*dist);
+    const key = ox+','+oy;
+    if(obstacles.has(key)) continue;
+    // Check not on snake or food
+    let valid = true;
+    for(let s of snake) if(s.x===ox&&s.y===oy){valid=false;break;}
+    if(valid) for(let f of food) if(f.x===ox&&f.y===oy){valid=false;break;}
+    if(valid) obstacles.set(key, {x:ox, y:oy, type: Math.random()<0.2?'spike':'block'});
+  }
+}
+
+function tick(){
+  const head = snake[0];
+  const nx = head.x + dir.x;
+  const ny = head.y + dir.y;
+  // Check collision with obstacles
+  const key = nx+','+ny;
+  if(obstacles.has(key)) { die(); return; }
+  // Check self-collision (skip last segment since it'll move)
+  for(let i=0;i<snake.length-1;i++){
+    if(snake[i].x===nx && snake[i].y===ny){ die(); return; }
+  }
+  // Move
+  snake.unshift({x:nx, y:ny});
+  // Check food
+  let ate = false;
+  for(let i=food.length-1;i>=0;i--){
+    if(food[i].x===nx && food[i].y===ny){
+      score++;
+      ate = true;
+      sfxEat();
+      spawnParticles(nx, ny);
+      food.splice(i,1);
+      // Speed up slightly
+      speed = Math.min(20, 8 + Math.floor(score/5));
+    }
+  }
+  if(!ate) snake.pop();
+
+  // Spawn new food if low
+  while(food.length < 4) spawnFood();
+
+  // Spawn obstacles as score increases
+  if(score % 3 === 0 && score > 0){
+    const count = Math.min(4, 1 + Math.floor(score/15));
+    for(let i=0;i<count;i++) spawnObstacle(5);
+  }
+
+  sfxMove();
+}
+
+function die(){
+  state = 'over';
+  sfxDie();
+  if(score > hiScore){ hiScore = score; saveHi(); }
+  finalScoreEl.textContent = score;
+  hiScoreEl.textContent = hiScore;
+  startScreen.classList.add('hidden');
+  gameOverScreen.classList.remove('hidden');
+  hud.classList.add('hidden');
+}
+
+function spawnParticles(gx, gy){
+  const px = gx * tileSize + tileSize/2 - cameraX;
+  const py = gy * tileSize + tileSize/2 - cameraY;
+  for(let i=0;i<8;i++){
+    const a = Math.random()*Math.PI*2;
+    const sp = 1+Math.random()*3;
+    particles.push({x:px, y:py, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp, life:1, color:`hsl(${120+Math.random()*60},100%,60%)`});
+  }
+}
+
+function update(dt){
+  if(state !== 'playing') return;
+  tickTimer += dt;
+  const interval = 1.0 / speed;
+  while(tickTimer >= interval && state==='playing'){
+    tick();
+    tickTimer -= interval;
+  }
+  // Update particles
+  for(let i=particles.length-1;i>=0;i--){
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.life -= dt*2;
+    if(p.life<=0) particles.splice(i,1);
+  }
+  // Camera follows head smoothly
+  const head = snake[0];
+  const targetX = head.x * tileSize - W/2 + tileSize/2;
+  const targetY = head.y * tileSize - H/2 + tileSize/2;
+  cameraX += (targetX - cameraX) * Math.min(1, dt*8);
+  cameraY += (targetY - cameraY) * Math.min(1, dt*8);
+
+  // Update HUD
+  scoreEl.textContent = score;
+  speedEl.textContent = Math.round(speed/8*10)/10 + 'x';
+}
+
+function render(){
+  ctx.fillStyle = '#0a0a1a';
+  ctx.fillRect(0,0,W,H);
+
+  if(state === 'start'){
+    drawGrid(cameraX, cameraY);
+    return;
+  }
+
+  // Draw grid
+  drawGrid(cameraX, cameraY);
+
+  // Draw obstacles
+  for(let [key, obs] of obstacles){
+    const sx = obs.x * tileSize - cameraX;
+    const sy = obs.y * tileSize - cameraY;
+    if(sx < -tileSize || sx > W+tileSize || sy < -tileSize || sy > H+tileSize) continue;
+    ctx.fillStyle = obs.type === 'spike' ? '#ff4444' : '#886633';
+    const pad = 2;
+    if(obs.type === 'block'){
+      roundRect(sx+pad, sy+pad, tileSize-pad*2, tileSize-pad*2, 3);
+      ctx.fill();
+      ctx.fillStyle = '#664411';
+      roundRect(sx+pad+2, sy+pad+2, tileSize-pad*2-4, (tileSize-pad*2)/3, 2);
+      ctx.fill();
+    } else {
+      // Spike - diamond shape
+      const cx = sx+tileSize/2, cy = sy+tileSize/2;
+      const r = tileSize*0.4;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy-r);
+      ctx.lineTo(cx+r, cy);
+      ctx.lineTo(cx, cy+r);
+      ctx.lineTo(cx-r, cy);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  // Draw food
+  const time = performance.now()/1000;
+  for(let f of food){
+    const sx = f.x * tileSize - cameraX + tileSize/2;
+    const sy = f.y * tileSize - cameraY + tileSize/2;
+    if(sx < -tileSize || sx > W+tileSize || sy < -tileSize || sy > H+tileSize) continue;
+    const pulse = 1 + Math.sin(time*4 + f.pulse)*0.15;
+    ctx.fillStyle = '#ff6699';
+    ctx.beginPath();
+    ctx.arc(sx, sy, tileSize*0.3*pulse, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = '#ffaacc';
+    ctx.beginPath();
+    ctx.arc(sx-2, sy-2, tileSize*0.12*pulse, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // Draw snake
+  for(let i=snake.length-1;i>=0;i--){
+    const s = snake[i];
+    const sx = s.x * tileSize - cameraX;
+    const sy = s.y * tileSize - cameraY;
+    if(sx < -tileSize*2 || sx > W+tileSize*2 || sy < -tileSize*2 || sy > H+tileSize*2) continue;
+    const t = i / snake.length;
+    const hue = 120 - t*40;
+    const light = 55 - t*15;
+    ctx.fillStyle = `hsl(${hue},70%,${light}%)`;
+    if(i===0){
+      // Head
+      roundRect(sx+1, sy+1, tileSize-2, tileSize-2, 6);
+      ctx.fill();
+      // Eyes
+      const ex = sx + tileSize/2 + dir.x*tileSize*0.2;
+      const ey = sy + tileSize/2 + dir.y*tileSize*0.2;
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(ex-3,ey-1, 3, 0,Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(ex+3,ey-1, 3, 0,Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.arc(ex-3,ey-1, 1.5, 0,Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(ex+3,ey-1, 1.5, 0,Math.PI*2); ctx.fill();
+    } else {
+      roundRect(sx+2, sy+2, tileSize-4, tileSize-4, 4);
+      ctx.fill();
+    }
+  }
+
+  // Particles
+  for(let p of particles){
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 3*p.life, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // Vignette
+  const grad = ctx.createRadialGradient(W/2,H/2, W*0.3, W/2,H/2, W*0.7);
+  grad.addColorStop(0,'rgba(0,0,0,0)');
+  grad.addColorStop(1,'rgba(0,0,0,0.4)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0,0,W,H);
+}
+
+function drawGrid(cx, cy){
+  const startX = -Math.ceil(-cx/tileSize);
+  const startY = -Math.ceil(-cy/tileSize);
+  const endX = Math.ceil((W-cx)/tileSize);
+  const endY = Math.ceil((H-cy)/tileSize);
+  ctx.strokeStyle = 'rgba(40,60,80,0.3)';
+  ctx.lineWidth = 1;
+  for(let x=startX;x<=endX;x++){
+    const sx = x*tileSize - cx;
+    ctx.beginPath(); ctx.moveTo(sx,0); ctx.lineTo(sx,H); ctx.stroke();
+  }
+  for(let y=startY;y<=endY;y++){
+    const sy = y*tileSize - cy;
+    ctx.beginPath(); ctx.moveTo(0,sy); ctx.lineTo(W,sy); ctx.stroke();
+  }
+}
+
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.lineTo(x+w-r,y);
+  ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+  ctx.lineTo(x+w,y+h-r);
+  ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+  ctx.lineTo(x+r,y+h);
+  ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+  ctx.lineTo(x,y+r);
+  ctx.quadraticCurveTo(x,y,x+r,y);
+  ctx.closePath();
+}
+
+function gameLoop(ts){
+  const dt = Math.min((ts - lastTime)/1000, 0.1);
+  lastTime = ts;
+  update(dt);
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+// Input
+window.addEventListener('keydown', function(e){
+  if(!audioCtx) initAudio();
+  if(audioCtx && audioCtx.state==='suspended') audioCtx.resume();
+
+  if(state === 'start' || state === 'over'){
+    if(e.code==='Space'||e.code==='Enter'){
+      e.preventDefault();
+      startGame();
+      return;
+    }
+  }
+  if(state !== 'playing') return;
+  e.preventDefault();
+  // Prevent reversing into self
+  if(dir.x===1 && e.key==='ArrowLeft' || e.key==='a'||e.key==='A') return;
+  if(dir.x===-1 && e.key==='ArrowRight'||e.key==='d'||e.key==='D') return;
+  if(dir.y===1 && e.key==='ArrowUp'||e.key==='w'||e.key==='W') return;
+  if(dir.y===-1 && e.key==='ArrowDown'||e.key==='s'||e.key==='S') return;
+
+  switch(e.key){
+    case 'ArrowUp': case 'w': case 'W': nextDir={x:0,y:-1}; break;
+    case 'ArrowDown': case 's': case 'S': nextDir={x:0,y:1}; break;
+    case 'ArrowLeft': case 'a': case 'A': nextDir={x:-1,y:0}; break;
+    case 'ArrowRight': case 'd': case 'D': nextDir={x:1,y:0}; break;
+  }
+});
+
+// Touch / swipe support
+let touchStartX=0, touchStartY=0;
+canvas.addEventListener('touchstart', function(e){
+  initAudio(); if(audioCtx&&audioCtx.state==='suspended') audioCtx.resume();
+  touchStartX = e.touches[0].clientX;
+  touchStartY = e.touches[0].clientY;
+});
+canvas.addEventListener('touchend', function(e){
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  const dy = e.changedTouches[0].clientY - touchStartY;
+  if(state==='start'||state==='over'){ startGame(); return; }
+  if(Math.abs(dx)>Math.abs(dy)){
+    if(Math.abs(dx)>20){ nextDir = dx>0?{x:1,y:0}:{x:-1,y:0}; }
+  } else {
+    if(Math.abs(dy)>20){ nextDir = dy>0?{x:0,y:1}:{x:0,y:-1}; }
+  }
+});
+
+function startGame(){
+  resetGame();
+  state = 'playing';
+  startScreen.classList.add('hidden');
+  gameOverScreen.classList.add('hidden');
+  hud.classList.remove('hidden');
+  scoreEl.textContent='0';
+  speedEl.textContent='1x';
+}
+
+// Init
+loadHi();
+hiScoreEl.textContent = hiScore;
+resetGame(); // For background grid animation
+state = 'start';
+lastTime = performance.now();
+requestAnimationFrame(gameLoop);
+})();
+</script>
+</body>
+</html>
+```
