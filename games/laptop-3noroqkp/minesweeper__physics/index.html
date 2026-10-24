@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Physics Minesweeper</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #1a1a2e; display: flex; justify-content: center; align-items: center; height: 100vh; width: 100vw; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, cellSize, gridW, gridH, offsetX, offsetY;
+let gameState = 'start'; // start, playing, won, lost
+let grid = [];
+let ball = { x: 0, y: 0, vx: 0, vy: 0, radius: 12 };
+let keys = {};
+let friction = 0.985;
+let accel = 0.4;
+let maxSpeed = 6;
+let revealedCount = 0;
+let totalSafe = 0;
+let mineCount = 18;
+let animFrame = 0;
+let particles = [];
+let audioCtx = null;
+
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    gridW = Math.min(9, Math.floor((W - 40) / 60));
+    gridH = Math.min(9, Math.floor((H - 120) / 60));
+    cellSize = Math.min(Math.floor((W - 60) / gridW), Math.floor((H - 140) / gridH), 70);
+    offsetX = Math.floor((W - gridW * cellSize) / 2);
+    offsetY = Math.floor((H - gridH * cellSize) / 2) + 30;
+}
+
+window.addEventListener('resize', resize);
+resize();
+
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    
+    if (type === 'reveal') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(400 + Math.random() * 200, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.1);
+    } else if (type === 'explosion') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(80, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(30, audioCtx.currentTime + 0.5);
+        gain.gain.setValueAtTime(0.4, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.5);
+    } else if (type === 'win') {
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(523, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.8);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.8);
+    } else if (type === 'bounce') {
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.05);
+        osc.start(audioCtx.currentTime);
+        osc.stop(audioCtx.currentTime + 0.05);
+    }
+}
+
+function generateGrid() {
+    grid = [];
+    for (let y = 0; y < gridH; y++) {
+        grid[y] = [];
+        for (let x = 0; x < gridW; x++) {
+            grid[y][x] = { mine: false, revealed: false, number: 0 };
+        }
+    }
+    
+    // Place mines (avoid starting area)
+    let placed = 0;
+    while (placed < mineCount) {
+        let mx = Math.floor(Math.random() * gridW);
+        let my = Math.floor(Math.random() * gridH);
+        if (!grid[my][mx].mine) {
+            // Keep starting area clear (top-left 2x2)
+            if (mx < 2 && my < 2) continue;
+            grid[my][mx].mine = true;
+            placed++;
+        }
+    }
+    
+    // Calculate numbers
+    for (let y = 0; y < gridH; y++) {
+        for (let x = 0; x < gridW; x++) {
+            if (!grid[y][x].mine) {
+                let n = 0;
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        let ny = y + dy, nx = x + dx;
+                        if (ny >= 0 && ny < gridH && nx >= 0 && nx < gridW && grid[ny][nx].mine) n++;
+                    }
+                }
+                grid[y][x].number = n;
+            }
+        }
+    }
+    
+    totalSafe = gridW * gridH - mineCount;
+}
+
+function startGame() {
+    gameState = 'playing';
+    generateGrid();
+    revealedCount = 0;
+    ball.x = offsetX + cellSize * 1.5;
+    ball.y = offsetY + cellSize * 1.5;
+    ball.vx = 0;
+    ball.vy = 0;
+    particles = [];
+}
+
+function getCellAt(px, py) {
+    let cx = Math.floor((px - offsetX) / cellSize);
+    let cy = Math.floor((py - offsetY) / cellSize);
+    if (cx >= 0 && cx < gridW && cy >= 0 && cy < gridH) return { x: cx, y: cy };
+    return null;
+}
+
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        let angle = Math.random() * Math.PI * 2;
+        let speed = 1 + Math.random() * 4;
+        particles.push({
+            x: x, y: y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            life: 1,
+            color: color,
+            size: 2 + Math.random() * 4
+        });
+    }
+}
+
+function update() {
+    if (gameState !== 'playing') return;
+    
+    // Apply input force
+    if (keys['ArrowUp'] || keys['w'] || keys['W']) ball.vy -= accel;
+    if (keys['ArrowDown'] || keys['s'] || keys['S']) ball.vy += accel;
+    if (keys['ArrowLeft'] || keys['a'] || keys['A']) ball.vx -= accel;
+    if (keys['ArrowRight'] || keys['d'] || keys['D']) ball.vx += accel;
+    
+    // Friction
+    ball.vx *= friction;
+    ball.vy *= friction;
+    
+    // Clamp speed
+    let speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+    if (speed > maxSpeed) {
+        ball.vx = (ball.vx / speed) * maxSpeed;
+        ball.vy = (ball.vy / speed) * maxSpeed;
+    }
+    
+    // Move
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+    
+    // Wall bounce
+    let minX = offsetX + ball.radius;
+    let maxX = offsetX + gridW * cellSize - ball.radius;
+    let minY = offsetY + ball.radius;
+    let maxY = offsetY + gridH * cellSize - ball.radius;
+    
+    if (ball.x < minX) { ball.x = minX; ball.vx = Math.abs(ball.vx) * 0.8; playSound('bounce'); }
+    if (ball.x > maxX) { ball.x = maxX; ball.vx = -Math.abs(ball.vx) * 0.8; playSound('bounce'); }
+    if (ball.y < minY) { ball.y = minY; ball.vy = Math.abs(ball.vy) * 0.8; playSound('bounce'); }
+    if (ball.y > maxY) { ball.y = maxY; ball.vy = -Math.abs(ball.vy) * 0.8; playSound('bounce'); }
+    
+    // Reveal cell
+    let cell = getCellAt(ball.x, ball.y);
+    if (cell) {
+        if (!grid[cell.y][cell.x].revealed) {
+            grid[cell.y][cell.x].revealed = true;
+            
+            if (grid[cell.y][cell.x].mine) {
+                gameState = 'lost';
+                playSound('explosion');
+                spawnParticles(ball.x, ball.y, '#ff4444', 30);
+                spawnParticles(ball.x, ball.y, '#ffaa00', 20);
+            } else {
+                revealedCount++;
+                playSound('reveal');
+                spawnParticles(ball.x, ball.y, '#44ff88', 5);
+                
+                if (revealedCount >= totalSafe) {
+                    gameState = 'won';
+                    playSound('win');
+                }
+            }
+        }
+    }
+    
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        let p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.1;
+        p.life -= 0.02;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function drawGrid() {
+    for (let y = 0; y < gridH; y++) {
+        for (let x = 0; x < gridW; x++) {
+            let px = offsetX + x * cellSize;
+            let py = offsetY + y * cellSize;
+            
+            if (grid[y][x].revealed) {
+                if (grid[y][x].mine) {
+                    ctx.fillStyle = '#cc2222';
+                    ctx.fillRect(px, py, cellSize, cellSize);
+                    // Draw mine icon
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = `${cellSize * 0.5}px monospace`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText('✕', px + cellSize/2, py + cellSize/2);
+                } else {
+                    ctx.fillStyle = (x + y) % 2 === 0 ? '#2a3a4a' : '#253545';
+                    ctx.fillRect(px, py, cellSize, cellSize);
+                    
+                    if (grid[y][x].number > 0) {
+                        let colors = ['#ffffff', '#66ccff', '#66ff99', '#ffcc66', '#ff9966', '#ff66cc'];
+                        ctx.fillStyle = colors[grid[y][x].number - 1] || '#ffffff';
+                        ctx.font = `bold ${cellSize * 0.45}px monospace`;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText(grid[y][x].number.toString(), px + cellSize/2, py + cellSize/2);
+                    }
+                }
+            } else {
+                // Hidden cell - show mine possibility
+                let isMine = grid[y][x].mine;
+                if (gameState === 'lost' && isMine) {
+                    ctx.fillStyle = '#cc2222';
+                    ctx.fillRect(px, py, cellSize, cellSize);
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = `${cellSize * 0.5}px monospace`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText('✕', px + cellSize/2, py + cellSize/2);
+                } else {
+                    let pulse = Math.sin(animFrame * 0.05 + x * 0.5 + y * 0.3) * 10;
+                    let baseR = isMine ? 60 : 40;
+                    let baseG = isMine ? 40 : 70;
+                    let baseB = isMine ? 40 : 100;
+                    ctx.fillStyle = `rgb(${baseR + pulse},${baseG + pulse},${baseB + pulse})`;
+                    ctx.fillRect(px, py, cellSize, cellSize);
+                    
+                    // Subtle dot for hidden cells
+                    ctx.fillStyle = 'rgba(255,255,255,0.1)';
+                    ctx.beginPath();
+                    ctx.arc(px + cellSize/2, py + cellSize/2, 3, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+            
+            // Cell border
+            ctx.strokeStyle = 'rgba(100,150,200,0.2)';
+            ctx.strokeRect(px, py, cellSize, cellSize);
+        }
+    }
+}
+
+function drawBall() {
+    // Glow
+    let glow = ctx.createRadialGradient(ball.x, ball.y, 0, ball.x, ball.y, ball.radius * 2);
+    glow.addColorStop(0, 'rgba(100,255,200,0.4)');
+    glow.addColorStop(1, 'rgba(100,255,200,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.radius * 2, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Ball body
+    let grad = ctx.createRadialGradient(ball.x - 3, ball.y - 3, 0, ball.x, ball.y, ball.radius);
+    grad.addColorStop(0, '#aaffee');
+    grad.addColorStop(1, '#44aaaa');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, ball.radius, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Highlight
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.beginPath();
+    ctx.arc(ball.x - ball.radius * 0.3, ball.y - ball.radius * 0.3, ball.radius * 0.3, 0, Math.PI * 2);
+    ctx.fill();
+}
+
+function drawParticles() {
+    for (let p of particles) {
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+    // Title
+    ctx.fillStyle = '#aaddff';
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`PHYSICS MINESWEEPER`, offsetX, offsetY - 40);
+    
+    // Progress
+    let pct = totalSafe > 0 ? Math.floor((revealedCount / totalSafe) * 100) : 0;
+    ctx.fillStyle = '#8899aa';
+    ctx.font = '14px monospace';
+    ctx.fillText(`Safe: ${revealedCount}/${totalSafe} (${pct}%)`, offsetX, offsetY - 20);
+    
+    // Speed indicator
+    let speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy);
+    ctx.fillStyle = '#667788';
+    ctx.fillText(`Speed: ${speed.toFixed(1)}`, offsetX + 250, offsetY - 20);
+    
+    // Controls hint
+    ctx.fillStyle = 'rgba(150,180,220,0.6)';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('WASD / Arrow Keys to move • R to restart', W/2, H - 20);
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Title with glow
+    let titleY = H / 2 - 60;
+    ctx.shadowColor = '#44ffaa';
+    ctx.shadowBlur = 20;
+    ctx.fillStyle = '#aaffee';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('PHYSICS', W/2, titleY);
+    ctx.fillText('MINESWEEPER', W/2, titleY + 55);
+    ctx.shadowBlur = 0;
+    
+    // Description
+    ctx.fillStyle = '#8899bb';
+    ctx.font = '16px monospace';
+    ctx.fillText('Navigate a ball through a minefield using physics!', W/2, H/2 + 30);
+    ctx.fillText('Reveal all safe cells without hitting a mine.', W/2, H/2 + 55);
+    
+    // Controls
+    ctx.fillStyle = '#667799';
+    ctx.font = '14px monospace';
+    ctx.fillText('WASD / Arrow Keys — Apply force', W/2, H/2 + 100);
+    ctx.fillText('Ball has momentum & friction', W/2, H/2 + 125);
+    ctx.fillText('Bounces off walls • Numbers show adjacent mines', W/2, H/2 + 150);
+    
+    // Start prompt
+    let alpha = (Math.sin(animFrame * 0.05) + 1) / 2;
+    ctx.fillStyle = `rgba(100,255,200,${alpha})`;
+    ctx.font = '20px monospace';
+    ctx.fillText('Press SPACE or ENTER to start', W/2, H/2 + 210);
+    
+    // Decorative grid
+    let gs = 40;
+    for (let i = 0; i < Math.floor(W/gs); i++) {
+        for (let j = 0; j < Math.floor(H/gs); j++) {
+            ctx.fillStyle = `rgba(100,150,200,${0.03 + Math.sin(i*0.3+j*0.2+animFrame*0.02)*0.02})`;
+            ctx.fillRect(i*gs, j*gs, gs-2, gs-2);
+        }
+    }
+}
+
+function drawEndScreen(won) {
+    let alpha = Math.min(1, (animFrame % 999) * 0.01 + 0.3);
+    ctx.fillStyle = `rgba(0,0,0,${alpha * 0.5})`;
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.textAlign = 'center';
+    if (won) {
+        ctx.shadowColor = '#44ffaa';
+        ctx.shadowBlur = 15;
+        ctx.fillStyle = '#aaffee';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText('YOU SURVIVED!', W/2, H/2 - 20);
+        ctx.shadowBlur = 0;
+    } else {
+        ctx.shadowColor = '#ff4444';
+        ctx.shadowBlur = 15;
+        ctx.fillStyle = '#ff6666';
+        ctx.font = 'bold 42px monospace';
+        ctx.fillText('BOOM!', W/2, H/2 - 20);
+        ctx.shadowBlur = 0;
+    }
+    
+    ctx.fillStyle = '#8899bb';
+    ctx.font = '16px monospace';
+    ctx.fillText(`Safe cells revealed: ${revealedCount}/${totalSafe}`, W/2, H/2 + 30);
+    
+    let alpha2 = (Math.sin(animFrame * 0.05) + 1) / 2;
+    ctx.fillStyle = `rgba(150,200,255,${alpha2})`;
+    ctx.font = '18px monospace';
+    ctx.fillText('Press R or SPACE to play again', W/2, H/2 + 80);
+}
+
+function draw() {
+    animFrame++;
+    
+    if (gameState === 'start') {
+        drawStartScreen();
+        return;
+    }
+    
+    // Clear
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+    
+    drawGrid();
+    drawBall();
+    drawParticles();
+    drawHUD();
+    
+    if (gameState === 'won') drawEndScreen(true);
+    if (gameState === 'lost') drawEndScreen(false);
+}
+
+function gameLoop() {
+    update();
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+// Input
+window.addEventListener('keydown', (e) => {
+    keys[e.key] = true;
+    
+    if (!audioCtx && (gameState === 'start' || gameState === 'playing')) {
+        initAudio();
+    }
+    
+    if (gameState === 'start') {
+        if (e.key === ' ' || e.key === 'Enter') startGame();
+    } else if (gameState === 'won' || gameState === 'lost') {
+        if (e.key === ' ' || e.key === 'Enter' || e.key === 'r' || e.key === 'R') startGame();
+    } else if (gameState === 'playing') {
+        if (e.key === 'r' || e.key === 'R') startGame();
+    }
+    
+    // Prevent scrolling
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) {
+        e.preventDefault();
+    }
+});
+
+window.addEventListener('keyup', (e) => {
+    keys[e.key] = false;
+});
+
+// Click to start too
+canvas.addEventListener('click', () => {
+    if (!audioCtx && gameState !== 'start') initAudio();
+    if (gameState === 'start') startGame();
+    else if (gameState === 'won' || gameState === 'lost') startGame();
+});
+
+// Start
+generateGrid();
+animFrame = 0;
+gameLoop();
+</script>
+</body>
+</html>
