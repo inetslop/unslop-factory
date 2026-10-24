@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Golf Space Invaders</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.15, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+
+// Game state
+let state = 'START'; // START, PLAYING, CHARGING, BALL_FLYING, WAVE_CLEAR, GAME_OVER
+let score = 0;
+let highScore = 0;
+try { highScore = parseInt(localStorage.getItem('golfSI_high') || '0'); } catch(e) {}
+
+// Stars background
+let stars = [];
+function genStars() {
+    stars = [];
+    for (let i = 0; i < 150; i++) {
+        stars.push({ x: Math.random() * W, y: Math.random() * H, s: Math.random() * 2 + 0.5, sp: Math.random() * 0.3 + 0.1 });
+    }
+}
+genStars();
+
+// Player
+let player = { x: 0, y: 0, angle: -Math.PI/2, power: 0 };
+function resetPlayer() {
+    player.x = W / 2;
+    player.y = H - 40;
+    player.angle = -Math.PI / 2;
+    player.power = 0;
+}
+
+// Ball
+let ball = { x: 0, y: 0, vx: 0, vy: 0, active: false, trail: [] };
+
+// Aliens
+let aliens = [];
+let alienDir = 1;
+let alienSpeed = 1;
+let wave = 1;
+let waveClearTimer = 0;
+
+const ALIEN_TYPES = [
+    { color: '#ff4444', rows: [1,2,3], hp: 1, points: 10 },
+    { color: '#44ff44', rows: [4,5,6], hp: 1, points: 20 },
+    { color: '#ffff44', rows: [7,8,9], hp: 1, points: 30 },
+    { color: '#ff44ff', rows: [10,11,12], hp: 1, points: 50 }
+];
+
+function spawnWave(w) {
+    aliens = [];
+    alienDir = 1;
+    alienSpeed = 0.5 + w * 0.3;
+    const cols = Math.min(8 + w, 12);
+    const rows = Math.min(5 + Math.floor(w/2), 7);
+    const cellW = Math.min(50, (W - 100) / cols);
+    const startX = (W - cols * cellW) / 2;
+    const startY = 80;
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            if (Math.random() < 0.15 && w > 2) continue; // gaps in higher waves
+            const typeIdx = Math.min(Math.floor(r / 3), ALIEN_TYPES.length - 1);
+            aliens.push({
+                x: startX + c * cellW,
+                y: startY + r * (cellW * 0.8),
+                w: cellW * 0.7,
+                h: cellW * 0.6,
+                type: typeIdx,
+                hp: 1,
+                alive: true
+            });
+        }
+    }
+}
+
+// Particles
+let particles = [];
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const sp = Math.random() * 4 + 1;
+        particles.push({ x, y, vx: Math.cos(a)*sp, vy: Math.sin(a)*sp, life: 30 + Math.random()*20, color, size: Math.random()*4+2 });
+    }
+}
+
+// Input
+let mouseX = W/2, mouseY = H/2;
+let mouseDown = false;
+let charging = false;
+let chargeStart = 0;
+
+window.addEventListener('mousemove', e => {
+    mouseX = e.clientX;
+    mouseY = e.clientY;
+});
+window.addEventListener('mousedown', e => {
+    initAudio();
+    if (state === 'START') { startGame(); return; }
+    if (state === 'GAME_OVER') { restartGame(); return; }
+    if (state === 'PLAYING' && !ball.active) {
+        charging = true;
+        chargeStart = performance.now();
+        playSound(200, 0.1, 'sine', 0.05);
+    }
+});
+window.addEventListener('mouseup', e => {
+    if (charging && state === 'PLAYING') {
+        fireBall();
+    }
+    charging = false;
+});
+
+window.addEventListener('keydown', e => {
+    initAudio();
+    if (e.code === 'KeyR') { restartGame(); }
+    if (state === 'START' && (e.code === 'Space' || e.code === 'Enter')) startGame();
+    if (state === 'GAME_OVER' && (e.code === 'Space' || e.code === 'Enter')) restartGame();
+});
+
+function startGame() {
+    state = 'PLAYING';
+    score = 0;
+    wave = 1;
+    resetPlayer();
+    spawnWave(wave);
+    ball.active = false;
+}
+
+function restartGame() {
+    state = 'START';
+}
+
+function fireBall() {
+    const power = Math.min(player.power, 25);
+    const dx = mouseX - player.x;
+    const dy = mouseY - player.y;
+    const angle = Math.atan2(dy, dx);
+    ball.x = player.x;
+    ball.y = player.y - 20;
+    ball.vx = Math.cos(angle) * power;
+    ball.vy = Math.sin(angle) * power;
+    ball.active = true;
+    ball.trail = [];
+    state = 'BALL_FLYING';
+    playSound(400, 0.15, 'square', 0.2);
+    playSound(600, 0.1, 'sine', 0.1);
+}
+
+function updateBall() {
+    if (!ball.active) return;
+    ball.vy += 0.35; // gravity
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+    
+    ball.trail.push({x: ball.x, y: ball.y});
+    if (ball.trail.length > 20) ball.trail.shift();
+
+    // Bounce off walls
+    if (ball.x < 5) { ball.x = 5; ball.vx *= -0.8; }
+    if (ball.x > W - 5) { ball.x = W - 5; ball.vx *= -0.8; }
+    if (ball.y < 5) { ball.y = 5; ball.vy *= -0.8; }
+
+    // Hit aliens
+    for (let a of aliens) {
+        if (!a.alive) continue;
+        if (ball.x > a.x && ball.x < a.x + a.w && ball.y > a.y && ball.y < a.y + a.h) {
+            a.alive = false;
+            const type = ALIEN_TYPES[a.type];
+            score += type.points * wave;
+            spawnParticles(a.x + a.w/2, a.y + a.h/2, type.color, 15);
+            playSound(300 + Math.random()*200, 0.2, 'square', 0.2);
+            ball.vx *= -0.7;
+            ball.vy *= -0.7;
+            break;
+        }
+    }
+
+    // Ball out of bounds
+    if (ball.y > H + 50 || ball.x < -50 || ball.x > W + 50) {
+        ball.active = false;
+        state = 'PLAYING';
+    }
+}
+
+function updateAliens() {
+    let aliveCount = 0;
+    for (let a of aliens) if (a.alive) aliveCount++;
+    
+    if (aliveCount === 0 && state !== 'WAVE_CLEAR' && state !== 'GAME_OVER') {
+        state = 'WAVE_CLEAR';
+        waveClearTimer = 120;
+        playSound(800, 0.3, 'sine', 0.2);
+        playSound(1000, 0.3, 'sine', 0.15);
+    }
+
+    // Move aliens
+    let dx = alienDir * alienSpeed * (1 + wave * 0.1);
+    let hitEdge = false;
+    for (let a of aliens) {
+        if (!a.alive) continue;
+        if ((a.x < 20 && alienDir < 0) || (a.x + a.w > W - 20 && alienDir > 0)) {
+            hitEdge = true;
+            break;
+        }
+    }
+    if (hitEdge) {
+        alienDir *= -1;
+        for (let a of aliens) {
+            if (a.alive) a.y += 20;
+        }
+    }
+    for (let a of aliens) {
+        if (!a.alive) continue;
+        a.x += dx;
+    }
+
+    // Check if aliens reached player
+    for (let a of aliens) {
+        if (a.alive && a.y + a.h > H - 60) {
+            state = 'GAME_OVER';
+            try { localStorage.setItem('golfSI_high', String(highScore)); } catch(e) {}
+            highScore = Math.max(highScore, score);
+            playSound(150, 0.5, 'sawtooth', 0.3);
+        }
+    }
+}
+
+function updateParticles() {
+    for (let p of particles) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.1;
+        p.life--;
+    }
+    particles = particles.filter(p => p.life > 0);
+}
+
+function drawStars() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+    for (let s of stars) {
+        s.y += s.sp;
+        if (s.y > H) { s.y = 0; s.x = Math.random() * W; }
+        const alpha = 0.3 + Math.sin(Date.now() * 0.001 + s.x) * 0.3;
+        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+        ctx.fillRect(s.x, s.y, s.s, s.s);
+    }
+}
+
+function drawAlien(a) {
+    if (!a.alive) return;
+    const type = ALIEN_TYPES[a.type];
+    const t = Date.now() * 0.003 + a.x * 0.1;
+    const bob = Math.sin(t) * 2;
+    
+    ctx.fillStyle = type.color;
+    const cx = a.x + a.w/2;
+    const cy = a.y + a.h/2 + bob;
+    const s = a.w * 0.4;
+    
+    // Body
+    ctx.beginPath();
+    ctx.ellipse(cx, cy + s*0.1, s*0.6, s*0.5, 0, 0, Math.PI*2);
+    ctx.fill();
+    
+    // Eyes
+    ctx.fillStyle = '#fff';
+    const eyeOff = s * 0.2;
+    ctx.beginPath();
+    ctx.arc(cx - eyeOff, cy - s*0.15, s*0.15, 0, Math.PI*2);
+    ctx.arc(cx + eyeOff, cy - s*0.15, s*0.15, 0, Math.PI*2);
+    ctx.fill();
+    
+    // Pupils
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(cx - eyeOff, cy - s*0.15, s*0.07, 0, Math.PI*2);
+    ctx.arc(cx + eyeOff, cy - s*0.15, s*0.07, 0, Math.PI*2);
+    ctx.fill();
+    
+    // Antennae
+    ctx.strokeStyle = type.color;
+    ctx.lineWidth = 2;
+    const antWiggle = Math.sin(t * 2) * 3;
+    ctx.beginPath();
+    ctx.moveTo(cx - s*0.3, cy - s*0.4);
+    ctx.lineTo(cx - s*0.4 + antWiggle, cy - s*0.8);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx + s*0.3, cy - s*0.4);
+    ctx.lineTo(cx + s*0.4 - antWiggle, cy - s*0.8);
+    ctx.stroke();
+    
+    // Legs
+    const legAnim = Math.sin(t * 2) * s * 0.15;
+    ctx.beginPath();
+    ctx.moveTo(cx - s*0.3, cy + s*0.4);
+    ctx.lineTo(cx - s*0.4 - legAnim, cy + s*0.7);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx + s*0.3, cy + s*0.4);
+    ctx.lineTo(cx + s*0.4 + legAnim, cy + s*0.7);
+    ctx.stroke();
+}
+
+function drawPlayer() {
+    const px = player.x;
+    const py = player.y;
+    
+    // Aim line
+    const aimLen = 60;
+    const angle = Math.atan2(mouseY - py, mouseX - px);
+    ctx.strokeStyle = 'rgba(255,255,100,0.4)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 5]);
+    ctx.beginPath();
+    ctx.moveTo(px, py - 20);
+    ctx.lineTo(px + Math.cos(angle) * aimLen, py - 20 + Math.sin(angle) * aimLen);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    
+    // Golfer body
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(px, py - 15, 10, 0, Math.PI*2); // head
+    ctx.fill();
+    
+    // Hat
+    ctx.fillStyle = '#4488ff';
+    ctx.fillRect(px - 12, py - 27, 24, 5);
+    ctx.fillRect(px - 6, py - 32, 12, 6);
+    
+    // Body
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(px - 8, py - 5, 16, 20);
+    
+    // Club (aiming direction)
+    const clubAngle = angle;
+    ctx.strokeStyle = '#ffcc00';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(px, py - 10);
+    ctx.lineTo(px + Math.cos(clubAngle) * 25, py - 10 + Math.sin(clubAngle) * 25);
+    ctx.stroke();
+    
+    // Power bar when charging
+    if (charging) {
+        const pw = player.power / 25;
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(px - 30, py + 10, 60, 8);
+        ctx.fillStyle = pw > 0.8 ? '#ff4444' : pw > 0.5 ? '#ffcc00' : '#44ff44';
+        ctx.fillRect(px - 28, py + 12, 56 * pw, 4);
+    }
+}
+
+function drawBall() {
+    if (!ball.active) return;
+    
+    // Trail
+    for (let i = 0; i < ball.trail.length; i++) {
+        const t = ball.trail[i];
+        const alpha = (i / ball.trail.length) * 0.5;
+        const size = (i / ball.trail.length) * 6;
+        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+        ctx.beginPath();
+        ctx.arc(t.x, t.y, size, 0, Math.PI*2);
+        ctx.fill();
+    }
+    
+    // Ball
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(ball.x, ball.y, 7, 0, Math.PI*2);
+    ctx.fill();
+    // Dimple pattern hint
+    ctx.fillStyle = 'rgba(200,200,200,0.5)';
+    ctx.beginPath();
+    ctx.arc(ball.x - 2, ball.y - 2, 3, 0, Math.PI*2);
+    ctx.fill();
+}
+
+function drawParticles() {
+    for (let p of particles) {
+        const alpha = p.life / 50;
+        ctx.fillStyle = p.color.replace(')', `,${alpha})`).replace('#', 'rgba(').replace(/rgba\((\d+),(\d+),(\d+)\)/, (m,r,g,b) => `rgba(${r},${g},${b},${alpha})`);
+        // Simpler approach
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+        ctx.globalAlpha = 1;
+    }
+}
+
+function drawHUD() {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE: ${score}`, 20, 30);
+    ctx.fillText(`WAVE: ${wave}`, 20, 55);
+    
+    const aliveCount = aliens.filter(a => a.alive).length;
+    ctx.fillText(`ALIENS: ${aliveCount}`, 20, 80);
+    
+    if (highScore > 0) {
+        ctx.textAlign = 'right';
+        ctx.fillText(`HI: ${highScore}`, W - 20, 30);
+    }
+}
+
+function drawStartScreen() {
+    drawStars();
+    
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.min(60, W/12)}px monospace`;
+    ctx.fillText('GOLF', W/2, H*0.3);
+    ctx.fillStyle = '#44ff44';
+    ctx.fillText('SPACE INVADERS', W/2, H*0.3 + Math.min(60, W/12));
+    
+    ctx.font = '18px monospace';
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('Aim with mouse | Hold click to charge power', W/2, H*0.5);
+    ctx.fillText('Release to launch golf ball at aliens!', W/2, H*0.5 + 30);
+    ctx.fillText('R to restart', W/2, H*0.5 + 60);
+    
+    if (highScore > 0) {
+        ctx.fillStyle = '#ffcc00';
+        ctx.fillText(`High Score: ${highScore}`, W/2, H*0.65);
+    }
+    
+    const pulse = Math.sin(Date.now() * 0.005) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(255,255,255,${pulse})`;
+    ctx.font = 'bold 24px monospace';
+    ctx.fillText('CLICK TO START', W/2, H*0.78);
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff4444';
+    ctx.font = `bold ${Math.min(50, W/10)}px monospace`;
+    ctx.fillText('GAME OVER', W/2, H*0.35);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = '24px monospace';
+    ctx.fillText(`Final Score: ${score}`, W/2, H*0.45);
+    ctx.fillText(`Wave Reached: ${wave}`, W/2, H*0.5);
+    
+    if (highScore > 0) {
+        ctx.fillStyle = '#ffcc00';
+        ctx.fillText(`High Score: ${highScore}`, W/2, H*0.6);
+    }
+    
+    const pulse = Math.sin(Date.now() * 0.005) * 0.3 + 0.7;
+    ctx.fillStyle = `rgba(255,255,255,${pulse})`;
+    ctx.font = '20px monospace';
+    ctx.fillText('Click or press Space to restart', W/2, H*0.75);
+}
+
+function drawWaveClear() {
+    const alpha = Math.min(1, waveClearTimer / 30);
+    ctx.fillStyle = `rgba(68,255,68,${alpha * 0.3})`;
+    ctx.fillRect(0, H*0.4, W, H*0.2);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = `rgba(68,255,68,${alpha})`;
+    ctx.font = `bold ${Math.min(40, W/15)}px monospace`;
+    ctx.fillText(`WAVE ${wave} CLEAR!`, W/2, H*0.5);
+}
+
+function update() {
+    if (state === 'PLAYING' || state === 'BALL_FLYING') {
+        if (charging) {
+            const elapsed = (performance.now() - chargeStart) / 1000;
+            player.power = Math.min(25, elapsed * 25);
+            // Oscillate slightly for feel
+            player.power = Math.min(25, 10 + Math.sin(elapsed * 3) * 8 + elapsed * 5);
+        }
+        
+        if (state === 'BALL_FLYING') {
+            updateBall();
+        }
+        updateAliens();
+    }
+    
+    if (state === 'WAVE_CLEAR') {
+        waveClearTimer--;
+        if (waveClearTimer <= 0) {
+            wave++;
+            spawnWave(wave);
+            resetPlayer();
+            state = 'PLAYING';
+        }
+    }
+    
+    updateParticles();
+}
+
+function draw() {
+    if (state === 'START') {
+        drawStartScreen();
+        return;
+    }
+    
+    drawStars();
+    
+    // Draw aliens
+    for (let a of aliens) drawAlien(a);
+    
+    drawPlayer();
+    drawBall();
+    drawParticles();
+    drawHUD();
+    
+    if (state === 'WAVE_CLEAR') drawWaveClear();
+    if (state === 'GAME_OVER') drawGameOver();
+}
+
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = time - lastTime;
+    lastTime = time;
+    
+    update();
+    draw();
+    
+    requestAnimationFrame(gameLoop);
+}
+
+resetPlayer();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
