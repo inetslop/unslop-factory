@@ -1,0 +1,514 @@
+<think>
+The user wants a "bullet-hell maze game" - this is a combination of:
+1. Bullet hell (danmaku) - dodging lots of bullets
+2. Maze - navigating through walls/paths
+
+I need to create a complete HTML5 game that combines these elements. Let me think about the design:
+
+- A maze-like environment where the player navigates
+- Bullets rain down from various directions (bullet hell pattern)
+- The player must dodge bullets while moving through the maze
+- Start screen with name and controls
+- Restart functionality
+- Web Audio API for sound effects
+- No external resources
+
+Game Design:
+- Player moves with WASD or arrow keys
+- Bullets spawn from edges in patterns (spreads, spirals, aimed shots)
+- Maze walls are static obstacles
+- Score increases over time
+- One hit = game over (or health system)
+- Difficulty ramps up over time
+
+Let me design a good maze layout that's interesting but navigable. I'll use a grid-based approach for the maze and free movement for the player.
+
+Controls:
+- WASD/Arrow keys to move
+- Space to dash/dodge (brief invulnerability)
+
+Let me build this out as a complete, polished game.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Bullet Hell Maze</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #0a0a1a; width: 100vw; height: 100vh; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    scale = Math.min(W, H) / 800;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+function playSound(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+function sfxShoot() { playSound(880, 0.08, 'square', 0.05); }
+function sfxHit() { playSound(200, 0.3, 'sawtooth', 0.15); }
+function sfxDash() { playSound(440, 0.15, 'sine', 0.08); }
+function sfxScore() { playSound(1200, 0.1, 'sine', 0.06); }
+
+// Game state
+let gameState = 'start'; // start, playing, gameover
+let score = 0;
+let highScore = 0;
+try { highScore = parseInt(localStorage.getItem('bhm_high') || '0'); } catch(e) {}
+let time = 0;
+let shakeTime = 0;
+
+// Player
+let player = { x: 0, y: 0, vx: 0, vy: 0, r: 8, dashing: false, dashTimer: 0, invuln: 0 };
+const PLAYER_SPEED = 4.5;
+const DASH_DURATION = 12;
+const DASH_COOLDOWN = 45;
+let dashCooldown = 0;
+
+// Bullets
+let bullets = [];
+let particles = [];
+let mazeWalls = [];
+
+// Maze generation
+function generateMaze() {
+    mazeWalls = [];
+    const cols = 8, rows = 6;
+    const cw = W / cols, ch = H / rows;
+    // Random walls with gaps
+    for (let r = 0; r < rows - 1; r++) {
+        for (let c = 0; c < cols; c++) {
+            if (Math.random() < 0.4) {
+                let wallW = cw * (0.5 + Math.random() * 0.3);
+                let gap = 40 + Math.random() * 20;
+                let gapStart = Math.random() < 0.5 ? 10 : cw - wallW - 10;
+                mazeWalls.push({ x: c * cw + gapStart, y: r * ch + ch * 0.3, w: wallW, h: 12 });
+            }
+        }
+    }
+    for (let c = 0; c < cols - 1; c++) {
+        for (let r = 0; r < rows; r++) {
+            if (Math.random() < 0.3) {
+                let wallH = ch * (0.4 + Math.random() * 0.3);
+                mazeWalls.push({ x: c * cw + cw * 0.6, y: r * ch + 10, w: 12, h: wallH });
+            }
+        }
+    }
+}
+
+function resetGame() {
+    player.x = W / 2;
+    player.y = H - 80;
+    player.vx = 0;
+    player.vy = 0;
+    player.dashing = false;
+    player.dashTimer = 0;
+    player.invuln = 60;
+    dashCooldown = 0;
+    bullets = [];
+    particles = [];
+    score = 0;
+    time = 0;
+    generateMaze();
+}
+
+// Input
+let keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === 'start' && (e.code === 'Space' || e.code === 'Enter')) {
+        initAudio();
+        resetGame();
+        gameState = 'playing';
+    } else if (gameState === 'gameover' && (e.code === 'KeyR' || e.code === 'Enter')) {
+        resetGame();
+        gameState = 'playing';
+    }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Bullet patterns
+function spawnBullet(x, y, vx, vy, r, color) {
+    bullets.push({ x, y, vx, vy, r: r || 5, color: color || '#ff4444', life: 600 });
+}
+
+let patternTimer = 0;
+function updateBullets() {
+    time++;
+    const difficulty = Math.min(1 + score / 200, 3);
+    patternTimer++;
+    
+    if (patternTimer % Math.max(20 - Math.floor(score / 50), 8) === 0) {
+        sfxShoot();
+        let pattern = Math.floor(Math.random() * 5);
+        if (pattern === 0) {
+            // Spread from top
+            const cx = Math.random() * W;
+            for (let i = -3; i <= 3; i++) {
+                const angle = Math.PI / 2 + i * 0.25;
+                spawnBullet(cx, -10, Math.cos(angle) * 3 * difficulty, Math.sin(angle) * 3 * difficulty, 5, '#ff6644');
+            }
+        } else if (pattern === 1) {
+            // Aimed shot
+            const angle = Math.atan2(player.y - 0, player.x - W / 2);
+            for (let i = -1; i <= 1; i++) {
+                spawnBullet(W / 2, -10, Math.cos(angle + i * 0.3) * 3.5 * difficulty, Math.sin(angle + i * 0.3) * 3.5 * difficulty, 6, '#ff44aa');
+            }
+        } else if (pattern === 2) {
+            // Side burst
+            const side = Math.random() < 0.5 ? -10 : W + 10;
+            const sy = Math.random() * H;
+            for (let i = -2; i <= 2; i++) {
+                const angle = (side < 0 ? 0 : Math.PI) + i * 0.3;
+                spawnBullet(side, sy, Math.cos(angle) * 2.5 * difficulty, Math.sin(angle) * 2.5 * difficulty, 4, '#44ff88');
+            }
+        } else if (pattern === 3) {
+            // Ring from random point
+            const cx = Math.random() * W;
+            const cy = -20;
+            const n = 6 + Math.floor(score / 100);
+            for (let i = 0; i < n; i++) {
+                const a = (i / n) * Math.PI * 2;
+                spawnBullet(cx, cy, Math.cos(a) * 2.8 * difficulty, Math.sin(a) * 2.8 * difficulty, 4, '#ffdd44');
+            }
+        } else {
+            // Spiral stream
+            const cx = W / 2 + (Math.random() - 0.5) * W * 0.6;
+            for (let i = 0; i < 3; i++) {
+                const a = time * 0.1 + i * 2.1;
+                spawnBullet(cx, -10, Math.cos(a) * 2 * difficulty, Math.sin(a) * 2 * difficulty + 1, 5, '#aa44ff');
+            }
+        }
+    }
+    
+    // Update bullets
+    for (let i = bullets.length - 1; i >= 0; i--) {
+        const b = bullets[i];
+        b.x += b.vx;
+        b.y += b.vy;
+        b.life--;
+        if (b.x < -50 || b.x > W + 50 || b.y < -50 || b.y > H + 50 || b.life <= 0) {
+            bullets.splice(i, 1);
+        }
+    }
+}
+
+function updatePlayer() {
+    let mx = 0, my = 0;
+    if (keys['KeyA'] || keys['ArrowLeft']) mx -= 1;
+    if (keys['KeyD'] || keys['ArrowRight']) mx += 1;
+    if (keys['KeyW'] || keys['ArrowUp']) my -= 1;
+    if (keys['KeyS'] || keys['ArrowDown']) my += 1;
+    
+    if (mx || my) {
+        const len = Math.sqrt(mx * mx + my * my);
+        mx /= len; my /= len;
+    }
+    
+    player.vx = mx * PLAYER_SPEED;
+    player.vy = my * PLAYER_SPEED;
+    
+    if ((keys['Space'] || keys['ShiftLeft']) && dashCooldown <= 0) {
+        player.dashing = true;
+        player.dashTimer = DASH_DURATION;
+        dashCooldown = DASH_COOLDOWN;
+        sfxDash();
+    }
+    
+    if (player.dashing) {
+        player.dashTimer--;
+        player.invuln = Math.max(player.invuln, 1);
+        if (player.dashTimer <= 0) player.dashing = false;
+    }
+    
+    if (dashCooldown > 0) dashCooldown--;
+    if (player.invuln > 0 && !player.dashing) player.invuln--;
+    
+    let nx = player.x + player.vx;
+    let ny = player.y + player.vy;
+    
+    // Wall collision
+    for (const wall of mazeWalls) {
+        if (nx + player.r > wall.x && nx - player.r < wall.x + wall.w &&
+            ny + player.r > wall.y && ny - player.r < wall.y + wall.h) {
+            // Push out
+            const overlapX = Math.min(nx + player.r - wall.x, wall.x + wall.w - (nx - player.r));
+            const overlapY = Math.min(ny + player.r - wall.y, wall.y + wall.h - (ny - player.r));
+            if (overlapX < overlapY) { nx = nx < wall.x ? wall.x - player.r : wall.x + wall.w + player.r; }
+            else { ny = ny < wall.y ? wall.y - player.r : wall.y + wall.h + player.r; }
+        }
+    }
+    
+    // Bounds
+    nx = Math.max(player.r, Math.min(W - player.r, nx));
+    ny = Math.max(player.r, Math.min(H - player.r, ny));
+    
+    player.x = nx;
+    player.y = ny;
+    
+    // Bullet collision
+    if (player.invuln <= 0) {
+        for (const b of bullets) {
+            const dx = player.x - b.x;
+            const dy = player.y - b.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist < player.r + b.r - 2) {
+                sfxHit();
+                shakeTime = 15;
+                spawnExplosion(player.x, player.y);
+                gameState = 'gameover';
+                try { localStorage.setItem('bhm_high', String(highScore)); } catch(e) {}
+                return;
+            }
+        }
+    }
+    
+    score++;
+    if (score % 10 === 0) sfxScore();
+}
+
+function spawnExplosion(x, y) {
+    for (let i = 0; i < 30; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const sp = 2 + Math.random() * 5;
+        particles.push({ x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 40 + Math.random() * 30, r: 3 + Math.random() * 4 });
+    }
+}
+
+function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vx *= 0.95;
+        p.vy *= 0.95;
+        p.life--;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+// Rendering
+function drawMaze() {
+    ctx.fillStyle = '#1a1a3a';
+    for (const wall of mazeWalls) {
+        ctx.fillRect(wall.x, wall.y, wall.w, wall.h);
+        ctx.strokeStyle = '#4a4a8a';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(wall.x, wall.y, wall.w, wall.h);
+    }
+}
+
+function drawPlayer() {
+    const px = player.x, py = player.y;
+    if (player.invuln > 0 && Math.floor(time / 3) % 2 === 0 && !player.dashing) return;
+    
+    ctx.save();
+    ctx.translate(px, py);
+    if (player.dashing) {
+        ctx.globalAlpha = 0.6;
+        ctx.shadowColor = '#00ffff';
+        ctx.shadowBlur = 15;
+    }
+    // Ship shape
+    ctx.fillStyle = player.dashing ? '#00ffff' : '#ffffff';
+    ctx.beginPath();
+    ctx.moveTo(0, -player.r);
+    ctx.lineTo(-player.r * 0.7, player.r);
+    ctx.lineTo(0, player.r * 0.4);
+    ctx.lineTo(player.r * 0.7, player.r);
+    ctx.closePath();
+    ctx.fill();
+    ctx.strokeStyle = player.dashing ? '#88ffff' : '#aaddff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.restore();
+}
+
+function drawBullets() {
+    for (const b of bullets) {
+        ctx.fillStyle = b.color;
+        ctx.shadowColor = b.color;
+        ctx.shadowBlur = 6;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+}
+
+function drawParticles() {
+    for (const p of particles) {
+        const alpha = p.life / 60;
+        ctx.fillStyle = `rgba(255, 150, 50, ${alpha})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * (p.life / 40), 0, Math.PI * 2);
+        ctx.fill();
+    }
+}
+
+function drawHUD() {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`SCORE: ${score}`, 20, 30);
+    ctx.textAlign = 'right';
+    const hs = Math.max(score, highScore);
+    ctx.fillText(`HI: ${hs}`, W - 20, 30);
+    
+    // Dash cooldown bar
+    const barW = 80;
+    const barH = 6;
+    const bx = W / 2 - barW / 2;
+    const by = H - 25;
+    ctx.fillStyle = '#333';
+    ctx.fillRect(bx, by, barW, barH);
+    const fill = dashCooldown > 0 ? (1 - dashCooldown / DASH_COOLDOWN) : 1;
+    ctx.fillStyle = fill >= 1 ? '#00ffcc' : '#0066aa';
+    ctx.fillRect(bx, by, barW * fill, barH);
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+    
+    // Animated background bullets
+    for (let i = 0; i < 40; i++) {
+        const x = ((i * 137 + time * 0.5) % (W + 20)) - 10;
+        const y = ((i * 211 + time * 0.3) % (H + 20)) - 10;
+        ctx.fillStyle = `hsl(${(i * 30 + time) % 360}, 70%, 50%)`;
+        ctx.beginPath();
+        ctx.arc(x, y, 3, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.min(48, W / 15)}px monospace`;
+    ctx.fillText('BULLET HELL MAZE', W / 2, H / 3);
+    
+    ctx.font = `${Math.min(16, W / 30)}px monospace`;
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('Navigate the maze. Dodge the bullets.', W / 2, H / 3 + 50);
+    ctx.fillText('WASD / Arrows — Move', W / 2, H / 3 + 90);
+    ctx.fillText('SPACE / SHIFT — Dash (i-frames)', W / 2, H / 3 + 115);
+    ctx.fillText(`High Score: ${highScore}`, W / 2, H / 3 + 155);
+    
+    if (Math.floor(time / 30) % 2 === 0) {
+        ctx.fillStyle = '#0ff';
+        ctx.font = `bold ${Math.min(20, W / 25)}px monospace`;
+        ctx.fillText('PRESS SPACE TO START', W / 2, H * 0.7);
+    }
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ff4444';
+    ctx.font = `bold ${Math.min(42, W / 15)}px monospace`;
+    ctx.fillText('GAME OVER', W / 2, H / 3);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.min(20, W / 25)}px monospace`;
+    ctx.fillText(`Score: ${score}`, W / 2, H / 3 + 50);
+    
+    if (score > highScore) {
+        ctx.fillStyle = '#ffdd44';
+        ctx.fillText('NEW HIGH SCORE!', W / 2, H / 3 + 85);
+        highScore = score;
+        try { localStorage.setItem('bhm_high', String(highScore)); } catch(e) {}
+    }
+    
+    if (Math.floor(time / 30) % 2 === 0) {
+        ctx.fillStyle = '#0ff';
+        ctx.font = `bold ${Math.min(18, W / 30)}px monospace`;
+        ctx.fillText('PRESS R TO RESTART', W / 2, H * 0.65);
+    }
+}
+
+function render() {
+    ctx.save();
+    if (shakeTime > 0) {
+        shakeTime--;
+        const sx = (Math.random() - 0.5) * 8;
+        const sy = (Math.random() - 0.5) * 8;
+        ctx.translate(sx, sy);
+    }
+    
+    if (gameState === 'start') {
+        drawStartScreen();
+    } else {
+        // Background
+        ctx.fillStyle = '#0a0a1a';
+        ctx.fillRect(0, 0, W, H);
+        
+        // Grid lines
+        ctx.strokeStyle = 'rgba(40, 40, 80, 0.3)';
+        ctx.lineWidth = 1;
+        for (let x = 0; x < W; x += 50) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+        for (let y = 0; y < H; y += 50) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+        
+        drawMaze();
+        drawBullets();
+        drawParticles();
+        if (gameState === 'playing') drawPlayer();
+        drawHUD();
+        
+        if (gameState === 'gameover') drawGameOver();
+    }
+    
+    ctx.restore();
+}
+
+function gameLoop() {
+    time++;
+    if (gameState === 'playing') {
+        updateBullets();
+        updatePlayer();
+    }
+    if (gameState === 'gameover' || gameState === 'start') {
+        updateParticles();
+    }
+    render();
+    requestAnimationFrame(gameLoop);
+}
+
+generateMaze();
+gameLoop();
+</script>
+</body>
+</html>
+```
