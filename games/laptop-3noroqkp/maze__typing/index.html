@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Type Maze</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0f0f1a; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; width: 100vw; font-family: 'Courier New', monospace; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width = W;
+  canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playTone(freq, dur, type, vol) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || 'square';
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + dur);
+}
+function sfxMove() { playTone(220, 0.05, 'square', 0.05); }
+function sfxType(c) { playTone(c ? 440 : 150, 0.08, 'square', c ? 0.08 : 0.12); }
+function sfxWin() { for (let i = 0; i < 5; i++) setTimeout(() => playTone(330 + i * 80, 0.2, 'square', 0.1), i * 100); }
+function sfxLose() { playTone(100, 0.4, 'sawtooth', 0.15); }
+function sfxGate() { playTone(600, 0.15, 'sine', 0.1); }
+
+// Game state
+let state = 'start'; // start, playing, typing, win, gameover
+let maze = [];
+let mazeW = 21, mazeH = 15;
+let playerX = 0, playerY = 0;
+let exitX = 0, exitY = 0;
+let cellSize = 40;
+let offsetX = 0, offsetY = 0;
+let lives = 3;
+let score = 0;
+let level = 1;
+let gates = []; // {x, y, word, typed: '', timeLeft, maxTime}
+let activeGate = null;
+let gateTimer = 0;
+let particles = [];
+let shakeTime = 0;
+let animFrame = 0;
+
+const words = [
+  ['Maze', 'Type', 'Word', 'Path', 'Goal'],
+  ['Labyrinth', 'Keyboard', 'Navigate', 'Puzzle', 'Circuit'],
+  ['Algorithm', 'Typography', 'Momentum', 'Quantum', 'Horizon']
+];
+
+function generateMaze(w, h) {
+  // Recursive backtracker
+  let grid = [];
+  for (let y = 0; y < h; y++) {
+    grid[y] = [];
+    for (let x = 0; x < w; x++) grid[y][x] = 1; // 1 = wall, 0 = path
+  }
+  
+  let stack = [{x: 0, y: 0}];
+  grid[0][0] = 0;
+  
+  const dirs = [[0,-1],[1,0],[0,1],[-1,0]];
+  
+  while (stack.length > 0) {
+    let cur = stack[stack.length - 1];
+    let neighbors = [];
+    for (let d of dirs) {
+      let nx = cur.x + d[0], ny = cur.y + d[1];
+      if (nx >= 0 && nx < w && ny >= 0 && ny < h && grid[ny][nx] === 1) {
+        neighbors.push({x: nx, y: ny, dx: d[0], dy: d[1]});
+      }
+    }
+    if (neighbors.length === 0) {
+      stack.pop();
+    } else {
+      let next = neighbors[Math.floor(Math.random() * neighbors.length)];
+      // Remove wall between current and next
+      grid[cur.y][cur.x + next.dx] = 0;
+      grid[next.y][next.x] = 0;
+      stack.push({x: next.x, y: next.y});
+    }
+  }
+  
+  return grid;
+}
+
+function solveMaze(grid) {
+  // BFS to find path from (0,0) to (w-1,h-1)
+  let w = mazeW, h = mazeH;
+  let visited = Array.from({length: h}, () => Array(w).fill(false));
+  let queue = [[0, 0]];
+  visited[0][0] = true;
+  let parent = {};
+  
+  while (queue.length > 0) {
+    let [cx, cy] = queue.shift();
+    if (cx === w - 1 && cy === h - 1) break;
+    
+    let dirs = [[0,-1],[1,0],[0,1],[-1,0]];
+    for (let d of dirs) {
+      let nx = cx + d[0], ny = cy + d[1];
+      if (nx >= 0 && nx < w && ny >= 0 && ny < h && !visited[ny][nx] && grid[ny][nx] === 0) {
+        visited[ny][nx] = true;
+        parent[nx + ',' + ny] = [cx, cy];
+        queue.push([nx, ny]);
+      }
+    }
+  }
+  
+  // Reconstruct path
+  let path = [];
+  let cur = [w - 1, h - 1];
+  while (cur[0] !== 0 || cur[1] !== 0) {
+    path.unshift(cur);
+    cur = parent[cur[0] + ',' + cur[1]];
+    if (!cur) break;
+  }
+  path.unshift([0, 0]);
+  return path;
+}
+
+function startGame() {
+  state = 'playing';
+  level = 1;
+  lives = 3;
+  score = 0;
+  startLevel();
+}
+
+function startLevel() {
+  maze = generateMaze(mazeW, mazeH);
+  playerX = 0;
+  playerY = 0;
+  exitX = mazeW - 1;
+  exitY = mazeH - 1;
+  activeGate = null;
+  
+  // Find solution path and place gates
+  let path = solveMaze(maze);
+  // Remove first and last from path for gate placement
+  path = path.slice(1, -1);
+  
+  let gateCount = Math.min(words[level - 1].length, Math.floor(path.length / (level + 2)));
+  gates = [];
+  
+  if (path.length > 5) {
+    let step = Math.floor(path.length / (gateCount + 1));
+    for (let i = 0; i < gateCount; i++) {
+      let idx = (i + 1) * step;
+      if (idx < path.length) {
+        gates.push({
+          x: path[idx][0],
+          y: path[idx][1],
+          word: words[level - 1][i % words[level - 1].length],
+          typed: '',
+          timeLeft: 0,
+          maxTime: Math.max(4, 8 - level),
+          active: false
+        });
+      }
+    }
+  }
+  
+  calculateLayout();
+}
+
+function calculateLayout() {
+  cellSize = Math.min(Math.floor((W * 0.7) / mazeW), Math.floor((H * 0.65) / mazeH));
+  offsetX = Math.floor((W - mazeW * cellSize) / 2);
+  offsetY = Math.floor((H - mazeH * cellSize) / 2) + 30;
+}
+
+function drawMaze() {
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0, 0, W, H);
+  
+  // Draw maze cells
+  for (let y = 0; y < mazeH; y++) {
+    for (let x = 0; x < mazeW; x++) {
+      let px = offsetX + x * cellSize;
+      let py = offsetY + y * cellSize;
+      
+      if (maze[y][x] === 1) {
+        ctx.fillStyle = '#2a2a4a';
+        ctx.fillRect(px, py, cellSize, cellSize);
+      } else {
+        ctx.fillStyle = '#0f0f1a';
+        ctx.fillRect(px, py, cellSize, cellSize);
+      }
+      
+      // Grid lines
+      ctx.strokeStyle = '#2a2a4a';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(px, py, cellSize, cellSize);
+    }
+  }
+  
+  // Draw gates
+  for (let g of gates) {
+    let px = offsetX + g.x * cellSize;
+    let py = offsetY + g.y * cellSize;
+    if (!g.cleared) {
+      ctx.fillStyle = 'rgba(255, 100, 200, ' + (0.4 + 0.3 * Math.sin(animFrame * 0.05)) + ')';
+      ctx.fillRect(px + 2, py + 2, cellSize - 4, cellSize - 4);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold ' + Math.min(cellSize * 0.6, 18) + 'px Courier New';
+      ctx.textAlign = 'center';
+      ctx.fillText('?', px + cellSize/2, py + cellSize/2 + 5);
+    } else {
+      ctx.fillStyle = 'rgba(100, 255, 150, 0.1)';
+      ctx.fillRect(px + 2, py + 2, cellSize - 4, cellSize - 4);
+    }
+  }
+  
+  // Draw exit
+  let ex = offsetX + exitX * cellSize;
+  let ey = offsetY + exitY * cellSize;
+  ctx.fillStyle = 'rgba(100, 255, 100, ' + (0.3 + 0.2 * Math.sin(animFrame * 0.08)) + ')';
+  ctx.fillRect(ex + 2, ey + 2, cellSize - 4, cellSize - 4);
+  ctx.fillStyle = '#0f0';
+  ctx.font = 'bold ' + Math.min(cellSize * 0.5, 14) + 'px Courier New';
+  ctx.textAlign = 'center';
+  ctx.fillText('EXIT', ex + cellSize/2, ey + cellSize/2 + 5);
+  
+  // Draw player
+  let ppx = offsetX + playerX * cellSize;
+  let ppy = offsetY + playerY * cellSize;
+  ctx.fillStyle = '#4fc3f7';
+  ctx.shadowColor = '#4fc3f7';
+  ctx.shadowBlur = 10;
+  ctx.fillRect(ppx + 4, ppy + 4, cellSize - 8, cellSize - 8);
+  ctx.shadowBlur = 0;
+}
+
+function drawHUD() {
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 16px Courier New';
+  ctx.textAlign = 'left';
+  ctx.fillText('LIVES: ' + '♥'.repeat(lives), 20, 30);
+  ctx.fillText('SCORE: ' + score, 150, 30);
+  ctx.fillText('LEVEL: ' + level, 300, 30);
+  
+  if (activeGate) {
+    let g = activeGate;
+    let barW = Math.min(W * 0.5, 400);
+    let barX = (W - barW) / 2;
+    let barY = H - 120;
+    
+    // Background
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.fillRect(barX - 20, barY - 40, barW + 40, 90);
+    
+    // Word to type
+    let wordUpper = g.word.toUpperCase();
+    let typedUpper = g.typed.toUpperCase();
+    
+    ctx.font = 'bold 28px Courier New';
+    ctx.textAlign = 'center';
+    
+    for (let i = 0; i < wordUpper.length; i++) {
+      let chX = barX + barW / 2 - (wordUpper.length * 16) / 2 + i * 16 + 8;
+      if (i < typedUpper.length && typedUpper[i] === wordUpper[i]) {
+        ctx.fillStyle = '#4fc3f7';
+      } else if (i < typedUpper.length) {
+        ctx.fillStyle = '#f44';
+      } else {
+        ctx.fillStyle = '#fff';
+      }
+      ctx.fillText(wordUpper[i], chX, barY);
+    }
+    
+    // Timer bar
+    let ratio = g.timeLeft / g.maxTime;
+    ctx.fillStyle = '#333';
+    ctx.fillRect(barX, barY + 20, barW, 12);
+    ctx.fillStyle = ratio > 0.3 ? '#4fc3f7' : '#f44';
+    ctx.fillRect(barX, barY + 20, barW * ratio, 12);
+    
+    // Instruction
+    ctx.font = '14px Courier New';
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('TYPE THE WORD TO PASS', barX + barW/2, barY + 50);
+  }
+}
+
+function drawParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    let p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.life -= 0.02;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    ctx.fillStyle = p.color + Math.floor(p.life * 255).toString(16).padStart(2,'0');
+    ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+  }
+}
+
+function spawnParticles(x, y, color) {
+  for (let i = 0; i < 8; i++) {
+    particles.push({
+      x: x, y: y,
+      vx: (Math.random() - 0.5) * 4,
+      vy: (Math.random() - 0.5) * 4,
+      life: 1,
+      size: Math.random() * 6 + 2,
+      color: color
+    });
+  }
+}
+
+function drawStartScreen() {
+  ctx.fillStyle = '#0f0f1a';
+  ctx.fillRect(0, 0, W, H);
+  
+  // Title
+  ctx.fillStyle = '#4fc3f7';
+  ctx.font = 'bold 60px Courier New';
+  ctx.textAlign = 'center';
+  ctx.shadowColor = '#4fc3f7';
+  ctx.shadowBlur = 20;
+  ctx.fillText('TYPE MAZE', W/2, H/2 - 80);
+  ctx.shadowBlur = 0;
+  
+  // Instructions
+  ctx.fillStyle = '#aaa';
+  ctx.font = '18px Courier New';
+  let lines = [
+    'Navigate the maze to reach the EXIT.',
+    '',
+    'WASD / Arrow Keys - Move',
+    'Type words to clear gates blocking your path!',
+    '',
+    'You have 3 lives. Don\'t run out of time!',
+    '',
+    'Score: +100 per gate, +500 for completing a level'
+  ];
+  lines.forEach((line, i) => {
+    ctx.fillText(line, W/2, H/2 - 20 + i * 28);
+  });
+  
+  // Blinking prompt
+  if (Math.floor(animFrame / 30) % 2 === 0) {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 22px Courier New';
+    ctx.fillText('Press ENTER to Start', W/2, H/2 + 240);
+  }
+}
+
+function drawWinScreen() {
+  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  ctx.fillRect(0, 0, W, H);
+  
+  ctx.fillStyle = '#4fc3f7';
+  ctx.font = 'bold 48px Courier New';
+  ctx.textAlign = 'center';
+  ctx.shadowColor = '#4fc3f7';
+  ctx.shadowBlur = 15;
+  
+  if (state === 'win') {
+    ctx.fillText('LEVEL COMPLETE!', W/2, H/2 - 40);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fff';
+    ctx.font = '22px Courier New';
+    ctx.fillText('Score: ' + score, W/2, H/2 + 10);
+    ctx.fillText('Press ENTER for next level', W/2, H/2 + 60);
+  } else if (state === 'gameover') {
+    ctx.fillStyle = '#f44';
+    ctx.shadowColor = '#f44';
+    ctx.shadowBlur = 15;
+    ctx.fillText('GAME OVER', W/2, H/2 - 40);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fff';
+    ctx.font = '22px Courier New';
+    ctx.fillText('Final Score: ' + score, W/2, H/2 + 10);
+    ctx.fillText('Press ENTER to restart', W/2, H/2 + 60);
+  }
+}
+
+function drawAll() {
+  if (state === 'start') {
+    drawStartScreen();
+  } else if (state === 'win' || state === 'gameover') {
+    drawMaze();
+    drawHUD();
+    drawParticles();
+    drawWinScreen();
+  } else {
+    // Screen shake
+    ctx.save();
+    if (shakeTime > 0) {
+      ctx.translate((Math.random()-0.5)*6, (Math.random()-0.5)*6);
+      shakeTime -= 0.1;
+    }
+    drawMaze();
+    drawHUD();
+    drawParticles();
+    ctx.restore();
+  }
+}
+
+function update() {
+  if (state === 'typing' && activeGate) {
+    gateTimer -= 1/60;
+    if (gateTimer <= 0) {
+      // Time's up!
+      loseLife();
+    }
+  }
+  
+  animFrame++;
+}
+
+function loseLife() {
+  lives--;
+  sfxLose();
+  shakeTime = 1;
+  activeGate = null;
+  state = 'playing';
+  
+  if (lives <= 0) {
+    state = 'gameover';
+  }
+}
+
+function movePlayer(dx, dy) {
+  let nx = playerX + dx, ny = playerY + dy;
+  if (nx < 0 || nx >= mazeW || ny < 0 || ny >= mazeH) return;
+  if (maze[ny][nx] === 1) return;
+  
+  // Check for gates
+  let gate = gates.find(g => g.x === nx && g.y === ny && !g.cleared);
+  if (gate) {
+    activeGate = gate;
+    gate.typed = '';
+    gate.timeLeft = gate.maxTime;
+    state = 'typing';
+    sfxGate();
+    return;
+  }
+  
+  playerX = nx;
+  playerY = ny;
+  sfxMove();
+  
+  // Check exit
+  if (nx === exitX && ny === exitY) {
+    score += 500;
+    sfxWin();
+    spawnParticles(offsetX + nx * cellSize + cellSize/2, offsetY + ny * cellSize + cellSize/2, '#4f');
+    
+    if (level >= 3) {
+      state = 'win';
+    } else {
+      level++;
+      startLevel();
+      state = 'playing';
+    }
+  }
+}
+
+function handleKeyDown(e) {
+  initAudio();
+  
+  if (state === 'start') {
+    if (e.key === 'Enter' || e.key === ' ') startGame();
+    return;
+  }
+  
+  if (state === 'win') {
+    if (e.key === 'Enter' || e.key === ' ') {
+      level++;
+      startLevel();
+      state = 'playing';
+    }
+    return;
+  }
+  
+  if (state === 'gameover') {
+    if (e.key === 'Enter' || e.key === ' ') startGame();
+    return;
+  }
+  
+  if (state === 'typing') {
+    if (activeGate) {
+      let key = e.key.toLowerCase();
+      let wordLower = activeGate.word.toLowerCase();
+      
+      if (key === 'backspace') {
+        activeGate.typed = activeGate.typed.slice(0, -1);
+        sfxType(false);
+        return;
+      }
+      
+      if (key.length === 1 && /[a-zA-Z]/.test(key)) {
+        activeGate.typed += key;
+        let expected = wordLower[activeGate.typed.length - 1];
+        let typed = activeGate.typed[activeGate.typed.length - 1].toLowerCase();
+        sfxType(typed === expected);
+        
+        if (typed !== expected) {
+          shakeTime = 0.3;
+        }
+        
+        if (activeGate.typed.toLowerCase() === wordLower) {
+          // Success!
+          activeGate.cleared = true;
+          score += 100;
+          sfxWin();
+          spawnParticles(
+            offsetX + activeGate.x * cellSize + cellSize/2,
+            offsetY + activeGate.y * cellSize + cellSize/2,
+            '#4f'
+          );
+          playerX = activeGate.x;
+          playerY = activeGate.y;
+          activeGate = null;
+          state = 'playing';
+        }
+      }
+    }
+    return;
+  }
+  
+  if (state === 'playing') {
+    let dx = 0, dy = 0;
+    switch(e.key) {
+      case 'w': case 'W': dy = -1; break;
+      case 'a': case 'A': dx = -1; break;
+      case 's': case 'S': dy = 1; break;
+      case 'd': case 'D': dx = 1; break;
+      case 'ArrowUp': dy = -1; break;
+      case 'ArrowDown': dy = 1; break;
+      case 'ArrowLeft': dx = -1; break;
+      case 'ArrowRight': dx = 1; break;
+    }
+    if (dx !== 0 || dy !== 0) {
+      e.preventDefault();
+      movePlayer(dx, dy);
+    }
+  }
+}
+
+window.addEventListener('keydown', handleKeyDown);
+
+function gameLoop() {
+  update();
+  drawAll();
+  requestAnimationFrame(gameLoop);
+}
+
+calculateLayout();
+gameLoop();
+</script>
+</body>
+</html>
