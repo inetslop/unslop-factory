@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Crystal Drop - Physics Match 3</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { 
+  background: #1a1a2e; 
+  overflow: hidden; 
+  display: flex; 
+  justify-content: center; 
+  alignways: center; 
+  height: 100vh;
+  font-family: 'Segoe UI', sans-serif;
+}
+canvas { 
+  display: block; 
+  max-width: 100vw; 
+  max-height: 100vh; 
+}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, CELL, GRID_X, GRID_Y, GRID_SIZE = 8;
+let tiles = [];
+let score = 0;
+let combo = 0;
+let state = 'start'; // start, playing, animating
+let selected = null;
+let particles = [];
+let shakeTime = 0;
+let shakeIntensity = 0;
+let audioCtx = null;
+
+const COLORS = [
+  { fill: '#ff4757', glow: '#ff6b81' },
+  { fill: '#2ed573', glow: '#5eea9e' },
+  { fill: '#1e90ff', glow: '#5bb8ff' },
+  { fill: '#ffa502', glow: '#ffc454' },
+  { fill: '#e040fb', glow: '#f07fff' }
+];
+
+const SHAPES = ['diamond', 'circle', 'hex', 'triangle', 'star'];
+
+function initAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+}
+
+function playSound(freq, duration, type = 'sine', vol = 0.3) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+function playMatchSound(comboLevel) {
+  const base = 400 + comboLevel * 100;
+  playSound(base, 0.2, 'sine', 0.25);
+  setTimeout(() => playSound(base * 1.5, 0.15, 'sine', 0.2), 50);
+}
+
+function playSwapSound() {
+  playSound(300, 0.1, 'triangle', 0.15);
+}
+
+function playDropSound() {
+  playSound(200, 0.08, 'sine', 0.08);
+}
+
+function resize() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  canvas.width = w;
+  canvas.height = h;
+  W = w; H = h;
+  CELL = Math.min(Math.floor((W - 40) / GRID_SIZE), Math.floor((H - 120) / GRID_SIZE));
+  GRID_X = (W - CELL * GRID_SIZE) / 2;
+  GRID_Y = (H - CELL * GRID_SIZE) / 2 + 30;
+}
+
+window.addEventListener('resize', resize);
+resize();
+
+function createTile(row, col, colorIdx, fromTop = false) {
+  return {
+    row: row, col: col,
+    x: GRID_X + col * CELL + CELL / 2,
+    y: fromTop ? GRID_Y - (GRID_SIZE - row) * CELL : GRID_Y + row * CELL + CELL / 2,
+    vy: 0,
+    color: colorIdx,
+    scale: 1,
+    rotation: 0,
+    alive: true,
+    settling: false,
+    targetY: GRID_Y + row * CELL + CELL / 2,
+    bounce: 0
+  };
+}
+
+function initGrid() {
+  tiles = [];
+  particles = [];
+  score = 0;
+  combo = 0;
+  selected = null;
+  
+  for (let r = 0; r < GRID_SIZE; r++) {
+    for (let c = 0; c < GRID_SIZE; c++) {
+      let color;
+      do { color = Math.floor(Math.random() * COLORS.length); } 
+      while (wouldMatch(r, c, color));
+      tiles.push(createTile(r, c, color));
+    }
+  }
+}
+
+function getTileAt(row, col) {
+  return tiles.find(t => t.row === row && t.col === col && t.alive);
+}
+
+function wouldMatch(row, col, color) {
+  for (let i = 1; i <= 2; i++) {
+    const tl = getTileAt(row, col - i);
+    if (tl && tl.color === color) return true;
+    const tt = getTileAt(row - i, col);
+    if (tt && tt.color === color) return true;
+  }
+  return false;
+}
+
+function findMatches() {
+  let matches = new Set();
+  
+  // Horizontal
+  for (let r = 0; r < GRID_SIZE; r++) {
+    for (let c = 0; c < GRID_SIZE - 2; c++) {
+      const t1 = getTileAt(r, c);
+      if (!t1) continue;
+      const t2 = getTileAt(r, c + 1);
+      const t3 = getTileAt(r, c + 2);
+      if (t1 && t2 && t3 && t1.color === t2.color && t2.color === t3.color) {
+        matches.add(t1); matches.add(t2); matches.add(t3);
+        let cc = c + 3;
+        while (cc < GRID_SIZE) {
+          const tn = getTileAt(r, cc);
+          if (tn && tn.color === t1.color) { matches.add(tn); cc++; }
+          else break;
+        }
+      }
+    }
+  }
+  
+  // Vertical
+  for (let c = 0; c < GRID_SIZE; c++) {
+    for (let r = 0; r < GRID_SIZE - 2; r++) {
+      const t1 = getTileAt(r, c);
+      if (!t1) continue;
+      const t2 = getTileAt(r + 1, c);
+      const t3 = getTileAt(r + 2, c);
+      if (t1 && t2 && t3 && t1.color === t2.color && t2.color === t3.color) {
+        matches.add(t1); matches.add(t2); matches.add(t3);
+        let rr = r + 3;
+        while (rr < GRID_SIZE) {
+          const tn = getTileAt(rr, c);
+          if (tn && tn.color === t1.color) { matches.add(tn); rr++; }
+          else break;
+        }
+      }
+    }
+  }
+  
+  return [...matches];
+}
+
+function removeMatches(matches) {
+  combo++;
+  const points = matches.length * 10 * combo;
+  score += points;
+  
+  playMatchSound(combo);
+  if (combo > 1) {
+    shakeTime = 0.2;
+    shakeIntensity = 3 + combo;
+  }
+  
+  for (const t of matches) {
+    t.alive = false;
+    spawnParticles(t.x, t.y, t.color);
+  }
+  
+  tiles = tiles.filter(t => t.alive);
+}
+
+function applyGravity() {
+  let anyMoved = false;
+  
+  for (let c = 0; c < GRID_SIZE; c++) {
+    let writeRow = GRID_SIZE - 1;
+    for (let r = GRID_SIZE - 1; r >= 0; r--) {
+      const t = getTileAt(r, c);
+      if (t) {
+        if (r !== writeRow) {
+          t.row = writeRow;
+          t.targetY = GRID_Y + writeRow * CELL + CELL / 2;
+          t.settling = true;
+          anyMoved = true;
+        }
+        writeRow--;
+      }
+    }
+  }
+  
+  // Spawn new tiles from top
+  for (let c = 0; c < GRID_SIZE; c++) {
+    let emptyCount = 0;
+    for (let r = 0; r < GRID_SIZE; r++) {
+      if (!getTileAt(r, c)) emptyCount++;
+    }
+    for (let i = 0; i < emptyCount; i++) {
+      const row = emptyCount - 1 - i;
+      const color = Math.floor(Math.random() * COLORS.length);
+      const t = createTile(row, c, color, true);
+      t.y = GRID_Y - (emptyCount - i) * CELL;
+      t.settling = true;
+      tiles.push(t);
+      anyMoved = true;
+    }
+  }
+  
+  return anyMoved;
+}
+
+function spawnParticles(x, y, colorIdx) {
+  const col = COLORS[colorIdx];
+  for (let i = 0; i < 8; i++) {
+    const angle = (Math.PI * 2 * i) / 8 + Math.random() * 0.5;
+    const speed = 2 + Math.random() * 4;
+    particles.push({
+      x: x, y: y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 2,
+      life: 1,
+      color: col.fill,
+      size: 3 + Math.random() * 4
+    });
+  }
+}
+
+function update(dt) {
+  if (state !== 'playing' && state !== 'animating') return;
+  
+  // Physics for settling tiles
+  let allSettled = true;
+  for (const t of tiles) {
+    if (!t.alive) continue;
+    if (t.settling) {
+      allSettled = false;
+      t.vy += 1500 * dt; // gravity
+      t.y += t.vy * dt;
+      
+      if (t.y >= t.targetY) {
+        t.y = t.targetY;
+        if (Math.abs(t.vy) > 200) {
+          t.bounce = Math.min(t.vy * 0.3, 100);
+          t.vy = -t.bounce * 0.4;
+        } else {
+          t.vy = 0;
+          t.settling = false;
+          playDropSound();
+        }
+      }
+    }
+  }
+  
+  // Update particles
+  for (const p of particles) {
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 5 * dt;
+    p.life -= dt * 2;
+  }
+  particles = particles.filter(p => p.life > 0);
+  
+  // Shake
+  if (shakeTime > 0) {
+    shakeTime -= dt;
+  }
+  
+  // Check for matches when settled
+  if (!allSettled) return;
+  
+  const matches = findMatches();
+  if (matches.length > 0) {
+    state = 'animating';
+    removeMatches(matches);
+    
+    // After a delay, apply gravity and check again
+    setTimeout(() => {
+      applyGravity();
+      state = 'playing';
+    }, 200);
+  } else {
+    combo = 0;
+    state = 'playing';
+  }
+}
+
+function drawGem(x, y, colorIdx, scale, rotation) {
+  const col = COLORS[colorIdx];
+  const size = (CELL * 0.35) * scale;
+  
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(rotation);
+  
+  // Glow
+  ctx.shadowColor = col.glow;
+  ctx.shadowBlur = 8;
+  
+  ctx.fillStyle = col.fill;
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  
+  const shape = SHAPES[colorIdx];
+  
+  if (shape === 'diamond') {
+    ctx.beginPath();
+    ctx.moveTo(0, -size);
+    ctx.lineTo(size * 0.7, 0);
+    ctx.lineTo(0, size);
+    ctx.lineTo(-size * 0.7, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  } else if (shape === 'circle') {
+    ctx.beginPath();
+    ctx.arc(0, 0, size * 0.8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  } else if (shape === 'hex') {
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+      const a = (Math.PI / 3) * i - Math.PI / 2;
+      const px = Math.cos(a) * size;
+      const py = Math.sin(a) * size;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  } else if (shape === 'triangle') {
+    ctx.beginPath();
+    for (let i = 0; i < 3; i++) {
+      const a = (Math.PI * 2 / 3) * i - Math.PI / 2;
+      const px = Math.cos(a) * size;
+      const py = Math.sin(a) * size;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  } else if (shape === 'star') {
+    ctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const a = (Math.PI / 5) * i - Math.PI / 2;
+      const r = i % 2 === 0 ? size : size * 0.5;
+      const px = Math.cos(a) * r;
+      const py = Math.sin(a) * r;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  }
+  
+  // Highlight
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.beginPath();
+  ctx.arc(-size * 0.25, -size * 0.25, size * 0.25, 0, Math.PI * 2);
+  ctx.fill();
+  
+  ctx.restore();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  
+  // Background gradient
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#16213e');
+  bg.addColorStop(1, '#0f3460');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+  
+  if (state === 'start') {
+    drawStartScreen();
+    return;
+  }
+  
+  // Screen shake
+  ctx.save();
+  if (shakeTime > 0) {
+    const sx = (Math.random() - 0.5) * shakeIntensity;
+    const sy = (Math.random() - 0.5) * shakeIntensity;
+    ctx.translate(sx, sy);
+  }
+  
+  // Grid background
+  ctx.fillStyle = 'rgba(255,255,255,0.03)';
+  ctx.fillRect(GRID_X - 5, GRID_Y - 5, CELL * GRID_SIZE + 10, CELL * GRID_SIZE + 10);
+  
+  // Grid cells
+  for (let r = 0; r < GRID_SIZE; r++) {
+    for (let c = 0; c < GRID_SIZE; c++) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(GRID_X + c * CELL, GRID_Y + r * CELL, CELL, CELL);
+    }
+  }
+  
+  // Selection highlight
+  if (selected) {
+    const sx = GRID_X + selected.col * CELL;
+    const sy = GRID_Y + selected.row * CELL;
+    ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(sx + 2, sy + 2, CELL - 4, CELL - 4);
+  }
+  
+  // Draw tiles
+  for (const t of tiles) {
+    if (!t.alive) continue;
+    drawGem(t.x, t.y, t.color, t.scale, t.rotation);
+  }
+  
+  // Particles
+  for (const p of particles) {
+    ctx.globalAlpha = p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  
+  ctx.restore();
+  
+  // Score
+  ctx.fillStyle = '#fff';
+  ctx.font = `bold ${Math.min(36, CELL * 0.5)}px 'Segoe UI', sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText(`Score: ${score}`, W / 2, GRID_Y - 15);
+  
+  if (combo > 1) {
+    ctx.fillStyle = '#ffa502';
+    ctx.font = `bold ${Math.min(24, CELL * 0.35)}px 'Segoe UI', sans-serif`;
+    ctx.fillText(`COMBO x${combo}!`, W / 2, GRID_Y + CELL * GRID_SIZE + 30);
+  }
+  
+  // Restart button
+  const btnY = H - 40;
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  ctx.fillRect(W / 2 - 60, btnY - 15, 120, 30);
+  ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+  ctx.strokeRect(W / 2 - 60, btnY - 15, 120, 30);
+  ctx.fillStyle = '#fff';
+  ctx.font = '14px "Segoe UI", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('Restart [R]', W / 2, btnY + 5);
+}
+
+function drawStartScreen() {
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  
+  const titleSize = Math.min(48, W * 0.06);
+  ctx.font = `bold ${titleSize}px 'Segoe UI', sans-serif`;
+  ctx.fillText('CRYSTAL DROP', W / 2, H * 0.25);
+  
+  ctx.font = `${Math.min(18, W * 0.03)}px 'Segoe UI', sans-serif`;
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.fillText('A Physics-Based Match-3 Game', W / 2, H * 0.35);
+  
+  ctx.font = `${Math.min(16, W * 0.025)}px 'Segoe UI', sans-serif`;
+  ctx.fillStyle = 'rgba(255,255,255,0.8)';
+  ctx.fillText('Click a gem, then click an adjacent gem to swap.', W / 2, H * 0.48);
+  ctx.fillText('Match 3 or more in a row or column to clear them.', W / 2, H * 0.53);
+  ctx.fillText('Gems fall with gravity and bounce into place!', W / 2, H * 0.58);
+  
+  // Animated gems
+  const time = Date.now() / 1000;
+  for (let i = 0; i < 5; i++) {
+    const x = W / 2 + (i - 2) * CELL * 0.8;
+    const y = H * 0.7 + Math.sin(time * 2 + i) * 10;
+    drawGem(x, y, i, 1, Math.sin(time + i) * 0.2);
+  }
+  
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.font = `bold ${Math.min(20, W * 0.03)}px 'Segoe UI', sans-serif`;
+  const pulse = 0.7 + Math.sin(time * 3) * 0.3;
+  ctx.globalAlpha = pulse;
+  ctx.fillText('Press SPACE or Click to Start', W / 2, H * 0.85);
+  ctx.globalAlpha = 1;
+}
+
+function handleClick(x, y) {
+  if (state === 'start') {
+    initAudio();
+    state = 'playing';
+    initGrid();
+    return;
+  }
+  
+  // Restart button check
+  const btnY = H - 40;
+  if (y > btnY - 15 && y < btnY + 15 && x > W / 2 - 60 && x < W / 2 + 60) {
+    initGrid();
+    state = 'playing';
+    return;
+  }
+  
+  if (state !== 'playing') return;
+  
+  const col = Math.floor((x - GRID_X) / CELL);
+  const row = Math.floor((y - GRID_Y) / CELL);
+  
+  if (row < 0 || row >= GRID_SIZE || col < 0 || col >= GRID_SIZE) return;
+  
+  const clickedTile = getTileAt(row, col);
+  if (!clickedTile) return;
+  
+  if (!selected) {
+    selected = { row, col };
+  } else {
+    // Check if adjacent
+    const dr = Math.abs(selected.row - row);
+    const dc = Math.abs(selected.col - col);
+    
+    if ((dr === 1 && dc === 0) || (dr === 0 && dc === 1)) {
+      // Swap
+      const t1 = getTileAt(selected.row, selected.col);
+      const t2 = getTileAt(row, col);
+      if (t1 && t2) {
+        const tr = t1.row, tc = t1.col;
+        t1.row = row; t1.col = col;
+        t2.row = tr; t2.col = tc;
+        t1.x = GRID_X + t1.col * CELL + CELL / 2;
+        t1.y = GRID_Y + t1.row * CELL + CELL / 2;
+        t2.x = GRID_X + t2.col * CELL + CELL / 2;
+        t2.y = GRID_Y + t2.row * CELL + CELL / 2;
+        
+        playSwapSound();
+        
+        // Check if swap creates a match
+        const matches = findMatches();
+        if (matches.length > 0) {
+          state = 'animating';
+          setTimeout(() => {
+            removeMatches(matches);
+            applyGravity();
+            combo = 0;
+            state = 'playing';
+          }, 150);
+        } else {
+          // Swap back
+          t1.row = tr; t1.col = tc;
+          t2.row = row; t2.col = col;
+          t1.x = GRID_X + t1.col * CELL + CELL / 2;
+          t1.y = GRID_Y + t1.row * CELL + CELL / 2;
+          t2.x = GRID_X + t2.col * CELL + CELL / 2;
+          t2.y = GRID_Y + t2.row * CELL + CELL / 2;
+        }
+      }
+    }
+    selected = null;
+  }
+}
+
+let lastTime = 0;
+function gameLoop(timestamp) {
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+  lastTime = timestamp;
+  
+  update(dt);
+  draw();
+  
+  requestAnimationFrame(gameLoop);
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    initAudio();
+    if (state === 'start') {
+      state = 'playing';
+      initGrid();
+    }
+  }
+  if (e.code === 'KeyR') {
+    initGrid();
+    state = 'playing';
+  }
+});
+
+canvas.addEventListener('click', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  handleClick(x, y);
+});
+
+canvas.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  const touch = e.touches[0];
+  const rect = canvas.getBoundingClientRect();
+  const x = touch.clientX - rect.left;
+  const y = touch.clientY - rect.top;
+  handleClick(x, y);
+});
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
