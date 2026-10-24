@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Minesweeper Breakout</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; overflow: hidden; display: flex; align-items: center; justify-content: center; height: 100vh; width: 100vw; font-family: 'Courier New', monospace; }
+canvas { display: block; }
+#overlay {
+position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+display: flex; flex-direction: column; align-items: center; justify-content: center;
+background: rgba(26, 26, 46, 0.95); color: #e0e0e0; z-index: 10;
+}
+#overlay.hidden { display: none; }
+h1 { font-size: 2.5em; color: #ff4444; text-shadow: 0 0 20px #ff4444; margin-bottom: 10px; }
+.subtitle { font-size: 1.1em; color: #aaa; margin-bottom: 30px; }
+.controls { text-align: center; line-height: 1.8; color: #ccc; margin-bottom: 30px; }
+.controls span { color: #ffdd44; }
+#startBtn, #restartBtn {
+padding: 12px 40px; font-size: 1.2em; background: #ff4444; color: #fff;
+border: none; cursor: pointer; font-family: 'Courier New', monospace;
+font-weight: bold; box-shadow: 0 0 15px rgba(255,68,68,0.5);
+transition: all 0.2s;
+}
+#startBtn:hover, #restartBtn:hover { background: #ff6666; transform: scale(1.05); }
+.mini-demo { display: flex; gap: 4px; margin-bottom: 20px; }
+.mini-cell { width: 30px; height: 30px; background: #c0c0c0; border: 2px outset #fff; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 14px; color: #0000ff; }
+.mini-cell.mine { color: #ff0000; background: #c0c0c0; }
+#gameOver { display: none; text-align: center; }
+#gameOver h2 { font-size: 2em; margin-bottom: 15px; }
+#finalScore { font-size: 1.3em; color: #ffdd44; margin-bottom: 20px; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<div id="overlay">
+<h1>⛏ MINESWEEPER BREAKOUT ⛏</h1>
+<div class="mini-demo">
+<div class="mini-cell">1</div><div class="mini-cell mine">💣</div><div class="mini-cell">3</div><div class="mini-cell">2</div><div class="mini-cell">💥</div>
+</div>
+<p class="subtitle">Break the numbered bricks. Watch out for hidden mines!</p>
+<div class="controls">
+<span>← → or A/D</span> — Move paddle<br>
+<span>M</span> — Launch ball / Pause<br>
+<span>Mouse</span> — Also moves paddle<br><br>
+Bricks with numbers need that many hits to break.<br>
+Hidden mines 💣 explode and blast nearby bricks!<br>
+Clear all bricks to win. Don't lose the ball!
+</div>
+<button id="startBtn">START GAME</button>
+<div id="gameOver" style="display:none;">
+<h2 id="resultText"></h2>
+<p id="finalScore"></p>
+<button id="restartBtn">PLAY AGAIN</button>
+</div>
+</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const startBtn = document.getElementById('startBtn');
+const restartBtn = document.getElementById('restartBtn');
+const gameOverDiv = document.getElementById('gameOver');
+
+let W, H;
+let gameState = 'menu'; // menu, playing, paused, won, lost
+let score = 0;
+let lives = 3;
+let level = 1;
+let particles = [];
+let shockwaves = [];
+let shakeTimer = 0;
+let shakeIntensity = 0;
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+if (!audioCtx) {
+audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+}
+function playSound(freq, duration, type, volume) {
+if (!audioCtx) return;
+const osc = audioCtx.createOscillator();
+const gain = audioCtx.createGain();
+osc.type = type || 'square';
+osc.frequency.value = freq;
+gain.gain.setValueAtTime(volume || 0.1, audioCtx.currentTime);
+gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+osc.connect(gain);
+gain.connect(audioCtx.destination);
+osc.start();
+osc.stop(audioCtx.currentTime + duration);
+}
+function playBrickHit() { playSound(400 + Math.random()*200, 0.1, 'square', 0.08); }
+function playBrickBreak() { playSound(600, 0.15, 'square', 0.12); playSound(900, 0.1, 'triangle', 0.08); }
+function playExplosion() { playSound(80, 0.4, 'sawtooth', 0.3); playSound(60, 0.5, 'square', 0.2); }
+function playPaddleHit() { playSound(250, 0.08, 'square', 0.1); }
+function playWallHit() { playSound(300, 0.05, 'sine', 0.06); }
+function playLifeLost() { playSound(200, 0.3, 'sawtooth', 0.15); }
+function playWin() { [523,659,784,1047].forEach((f,i) => setTimeout(() => playSound(f, 0.3, 'square', 0.1), i*150)); }
+
+// Paddle
+let paddle = { x: 0, y: 0, w: 120, h: 18 };
+// Ball
+let ball = { x: 0, y: 0, vx: 0, vy: 0, r: 8, active: false, speed: 5 };
+
+// Bricks
+const COLS = 10;
+const ROWS = 6;
+let bricks = [];
+let brickW, brickH, brickPadX, brickPadY;
+
+function resize() {
+W = window.innerWidth;
+H = window.innerHeight;
+canvas.width = W;
+canvas.height = H;
+paddle.y = H - 50;
+brickW = Math.min(70, (W - 60) / COLS);
+brickH = 32;
+brickPadX = (W - COLS * brickW) / 2;
+brickPadY = 40;
+if (bricks.length === 0) initBricks();
+}
+
+function initBricks() {
+bricks = [];
+for (let r = 0; r < ROWS; r++) {
+for (let c = 0; c < COLS; c++) {
+let isMine = Math.random() < 0.12 && r >= 3;
+let num = Math.floor(Math.random() * 4) + 1;
+if (!isMine && num === 1 && r < 2) num = 1;
+bricks.push({
+col: c, row: r,
+x: brickPadX + c * brickW,
+y: brickPadY + r * brickH,
+w: brickW - 4, h: brickH - 4,
+hp: isMine ? 1 : num,
+maxHp: isMine ? 1 : num,
+isMine: isMine,
+revealed: false,
+alive: true,
+num: num,
+color: getBrickColor(num)
+});
+}
+}
+}
+
+function getBrickColor(n) {
+const colors = ['#0000ff','#008000','#ff0000','#000080','#800000','#004040','#800080'];
+return colors[n-1] || '#000000';
+}
+
+function resetBall() {
+ball.x = W / 2;
+ball.y = paddle.y - 20;
+ball.vx = 0;
+ball.vy = 0;
+ball.active = false;
+paddle.x = W / 2 - paddle.w / 2;
+}
+
+function launchBall() {
+if (!ball.active) {
+ball.active = true;
+let angle = -Math.PI/4 + (Math.random()-0.5)*0.5;
+ball.vx = Math.cos(angle) * ball.speed;
+ball.vy = Math.sin(angle) * ball.speed;
+playSound(350, 0.1, 'sine', 0.1);
+}
+}
+
+function startGame() {
+initAudio();
+score = 0;
+lives = 3;
+level = 1;
+particles = [];
+shockwaves = [];
+initBricks();
+paddle.x = W/2 - paddle.w/2;
+resetBall();
+gameState = 'playing';
+overlay.classList.add('hidden');
+}
+
+function showEnd(won) {
+gameState = won ? 'won' : 'lost';
+gameOverDiv.style.display = 'block';
+document.getElementById('resultText').textContent = won ? '🎉 CLEARED! 🎉' : '💥 BOOMED! 💥';
+document.getElementById('resultText').style.color = won ? '#44ff44' : '#ff4444';
+document.getElementById('finalScore').textContent = `Score: ${score}  |  Level: ${level}`;
+startBtn.style.display = 'none';
+if (won) playWin();
+else playLifeLost();
+}
+
+function nextLevel() {
+level++;
+ball.speed += 0.5;
+initBricks();
+resetBall();
+gameState = 'playing';
+}
+
+// Particles
+function spawnParticles(x, y, color, count) {
+for (let i = 0; i < count; i++) {
+let angle = Math.random() * Math.PI * 2;
+let speed = 1 + Math.random() * 4;
+particles.push({
+x, y, vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed - 1,
+life: 1, decay: 0.02 + Math.random()*0.03,
+size: 2 + Math.random()*4, color
+});
+}
+}
+
+function spawnShockwave(x, y) {
+shockwaves.push({ x, y, r: 0, maxR: 80, life: 1 });
+}
+
+// Input
+let keys = {};
+let mouseX = null;
+
+window.addEventListener('keydown', e => {
+keys[e.key] = true;
+if ((e.key === 'm' || e.key === 'M') && gameState === 'playing') {
+if (!ball.active) launchBall();
+}
+});
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+window.addEventListener('mousemove', e => { mouseX = e.clientX; });
+
+startBtn.addEventListener('click', startGame);
+restartBtn.addEventListener('click', () => {
+gameOverDiv.style.display = 'none';
+startBtn.style.display = '';
+startGame();
+});
+
+// Game loop
+let lastTime = 0;
+function gameLoop(time) {
+let dt = Math.min((time - lastTime) / 16.67, 3);
+lastTime = time;
+if (gameState === 'playing') update(dt);
+render();
+requestAnimationFrame(gameLoop);
+}
+
+function update(dt) {
+// Paddle movement
+let pSpeed = 8 * dt;
+if (keys['ArrowLeft'] || keys['a'] || keys['A']) paddle.x -= pSpeed;
+if (keys['ArrowRight'] || keys['d'] || keys['D']) paddle.x += pSpeed;
+if (mouseX !== null) {
+paddle.x += (mouseX - paddle.w/2 - paddle.x) * 0.15 * dt;
+}
+paddle.x = Math.max(0, Math.min(W - paddle.w, paddle.x));
+
+if (!ball.active) return;
+
+// Ball movement
+ball.x += ball.vx * dt;
+ball.y += ball.vy * dt;
+
+// Wall collisions
+if (ball.x - ball.r < 0) { ball.x = ball.r; ball.vx = Math.abs(ball.vx); playWallHit(); }
+if (ball.x + ball.r > W) { ball.x = W - ball.r; ball.vx = -Math.abs(ball.vx); playWallHit(); }
+if (ball.y - ball.r < 0) { ball.y = ball.r; ball.vy = Math.abs(ball.vy); playWallHit(); }
+
+// Paddle collision
+if (ball.vy > 0 && ball.y + ball.r >= paddle.y && ball.y + ball.r <= paddle.y + paddle.h + 5 &&
+ball.x >= paddle.x && ball.x <= paddle.x + paddle.w) {
+let hitPos = (ball.x - paddle.x) / paddle.w;
+let angle = (hitPos - 0.5) * Math.PI * 0.7;
+ball.vx = Math.sin(angle) * ball.speed;
+ball.vy = -Math.cos(angle) * ball.speed;
+ball.y = paddle.y - ball.r;
+playPaddleHit();
+}
+
+// Ball lost
+if (ball.y - ball.r > H) {
+lives--;
+playLifeLost();
+shakeTimer = 10;
+shakeIntensity = 5;
+if (lives <= 0) { showEnd(false); return; }
+resetBall();
+return;
+}
+
+// Brick collisions
+for (let b of bricks) {
+if (!b.alive) continue;
+if (ball.x + ball.r > b.x && ball.x - ball.r < b.x + b.w &&
+ball.y + ball.r > b.y && ball.y - ball.r < b.y + b.h) {
+
+// Determine bounce direction
+let overlapL = ball.x + ball.r - b.x;
+let overlapR = b.x + b.w - (ball.x - ball.r);
+let overlapT = ball.y + ball.r - b.y;
+let overlapB = b.y + b.h - (ball.y - ball.r);
+let minOverlap = Math.min(overlapL, overlapR, overlapT, overlapB);
+
+if (minOverlap === overlapL || minOverlap === overlapR) {
+ball.vx = -ball.vx;
+} else {
+ball.vy = -ball.vy;
+}
+
+// Hit brick
+b.hp--;
+playBrickHit();
+
+if (b.isMine && b.hp <= 0) {
+// MINE EXPLOSION!
+explodeBrick(b);
+} else if (b.hp <= 0) {
+b.alive = false;
+score += b.num * 10;
+spawnParticles(ball.x, ball.y, b.color, 8);
+playBrickBreak();
+}
+
+break;
+}
+}
+
+// Check win
+let remaining = bricks.filter(b => b.alive).length;
+if (remaining === 0) {
+showEnd(true);
+}
+
+// Update particles
+for (let i = particles.length - 1; i >= 0; i--) {
+let p = particles[i];
+p.x += p.vx * dt;
+p.y += p.vy * dt;
+p.vy += 0.15 * dt;
+p.life -= p.decay * dt;
+if (p.life <= 0) particles.splice(i, 1);
+}
+
+// Update shockwaves
+for (let i = shockwaves.length - 1; i >= 0; i--) {
+let s = shockwaves[i];
+s.r += 4 * dt;
+s.life -= 0.03 * dt;
+if (s.life <= 0) shockwaves.splice(i, 1);
+}
+
+// Screen shake
+if (shakeTimer > 0) shakeTimer -= dt;
+}
+
+function explodeBrick(b) {
+b.alive = false;
+score += 50;
+let cx = b.x + b.w/2;
+let cy = b.y + b.h/2;
+spawnParticles(cx, cy, '#ff4400', 20);
+spawnParticles(cx, cy, '#ffaa00', 15);
+spawnShockwave(cx, cy);
+playExplosion();
+shakeTimer = 15;
+shakeIntensity = 8;
+
+// Destroy neighbors in radius
+let blastRadius = 2.5;
+for (let other of bricks) {
+if (!other.alive || other === b) continue;
+let dc = Math.abs(other.col - b.col);
+let dr = Math.abs(other.row - b.row);
+let dist = Math.sqrt(dc*dc + dr*dr);
+if (dist <= blastRadius) {
+other.alive = false;
+score += 15;
+spawnParticles(other.x + other.w/2, other.y + other.h/2, '#ff6600', 5);
+}
+}
+}
+
+function render() {
+ctx.save();
+// Screen shake
+if (shakeTimer > 0) {
+let sx = (Math.random()-0.5) * shakeIntensity;
+let sy = (Math.random()-0.5) * shakeIntensity;
+ctx.translate(sx, sy);
+}
+
+// Background
+ctx.fillStyle = '#1a1a2e';
+ctx.fillRect(-10, -10, W+20, H+20);
+
+// Grid lines (subtle)
+ctx.strokeStyle = 'rgba(100,100,140,0.1)';
+ctx.lineWidth = 1;
+for (let x = 0; x < W; x += 40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+for (let y = 0; y < H; y += 40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+
+// Bricks
+for (let b of bricks) {
+if (!b.alive) continue;
+drawBrick(b);
+}
+
+// Shockwaves
+for (let s of shockwaves) {
+ctx.beginPath();
+ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
+ctx.strokeStyle = `rgba(255,150,0,${s.life * 0.6})`;
+ctx.lineWidth = 3;
+ctx.stroke();
+}
+
+// Particles
+for (let p of particles) {
+ctx.globalAlpha = p.life;
+ctx.fillStyle = p.color;
+ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+}
+ctx.globalAlpha = 1;
+
+// Ball
+if (ball.active || gameState === 'playing') {
+ctx.beginPath();
+ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI*2);
+let grad = ctx.createRadialGradient(ball.x-2, ball.y-2, 0, ball.x, ball.y, ball.r);
+grad.addColorStop(0, '#fff');
+grad.addColorStop(0.5, '#ccc');
+grad.addColorStop(1, '#888');
+ctx.fillStyle = grad;
+ctx.fill();
+ctx.strokeStyle = '#444';
+ctx.lineWidth = 1;
+ctx.stroke();
+
+// Ball trail
+if (ball.active) {
+for (let i = 1; i <= 5; i++) {
+ctx.beginPath();
+ctx.arc(ball.x - ball.vx*i*1.5, ball.y - ball.vy*i*1.5, ball.r * (1 - i*0.15), 0, Math.PI*2);
+ctx.fillStyle = `rgba(200,200,255,${0.3 - i*0.05})`;
+ctx.fill();
+}
+}
+}
+
+// Paddle
+drawPaddle();
+
+// HUD
+drawHUD();
+
+ctx.restore();
+}
+
+function drawBrick(b) {
+let x = b.x, y = b.y, w = b.w, h = b.h;
+
+// Cell background (minesweeper style beveled)
+ctx.fillStyle = '#c0c0c0';
+ctx.fillRect(x, y, w, h);
+
+// Bevel effect
+ctx.strokeStyle = '#fff';
+ctx.lineWidth = 2;
+ctx.beginPath();
+ctx.moveTo(x, y+h); ctx.lineTo(x, y); ctx.lineTo(x+w, y);
+ctx.stroke();
+ctx.strokeStyle = '#808080';
+ctx.beginPath();
+ctx.moveTo(x+w, y+h); ctx.lineTo(x+w, y); ctx.lineTo(x, y+h);
+ctx.stroke();
+
+// Number or mine indicator
+if (b.isMine && b.revealed) {
+ctx.font = 'bold 16px monospace';
+ctx.fillStyle = '#ff0000';
+ctx.textAlign = 'center';
+ctx.textBaseline = 'middle';
+ctx.fillText('💣', x+w/2, y+h/2);
+} else if (!b.isMine) {
+// Show number with color
+let displayNum = b.hp < b.maxHp ? b.hp : b.num;
+if (b.hp !== b.maxHp) {
+// Show damage
+ctx.fillStyle = 'rgba(0,0,0,0.1)';
+ctx.fillRect(x, y, w * (1 - b.hp/b.maxHp), h);
+}
+ctx.font = 'bold 16px monospace';
+ctx.fillStyle = b.color;
+ctx.textAlign = 'center';
+ctx.textBaseline = 'middle';
+ctx.fillText(displayNum.toString(), x+w/2, y+h/2+1);
+
+// HP bar
+if (b.hp < b.maxHp) {
+let barW = w * (b.hp / b.maxHp);
+ctx.fillStyle = 'rgba(0,255,0,0.3)';
+ctx.fillRect(x + 2, y + h - 4, barW, 2);
+}
+} else {
+// Mine looks like regular until hit - show a number to disguise
+let fakeNum = Math.floor(Math.random()*3)+1; // stable per frame is bad, use col+row
+fakeNum = (b.col + b.row * 3) % 5 + 1;
+ctx.font = 'bold 16px monospace';
+ctx.fillStyle = getBrickColor(fakeNum);
+ctx.textAlign = 'center';
+ctx.textBaseline = 'middle';
+ctx.fillText(fakeNum.toString(), x+w/2, y+h/2+1);
+}
+}
+
+function drawPaddle() {
+let px = paddle.x, py = paddle.y, pw = paddle.w, ph = paddle.h;
+// Minesweeper flag themed paddle
+ctx.fillStyle = '#4a4a6a';
+ctx.fillRect(px, py, pw, ph);
+ctx.strokeStyle = '#8888cc';
+ctx.lineWidth = 1;
+ctx.strokeRect(px, py, pw, ph);
+
+// Flag icon in center
+let cx = px + pw/2, cy = py + ph/2;
+ctx.fillStyle = '#ff4444';
+ctx.beginPath();
+ctx.moveTo(cx-5, cy+6); ctx.lineTo(cx-5, cy-8); ctx.lineTo(cx+7, cy-4); ctx.lineTo(cx-5, cy);
+ctx.fill();
+ctx.strokeStyle = '#fff';
+ctx.lineWidth = 1;
+ctx.beginPath();
+ctx.moveTo(cx-5, cy+6); ctx.lineTo(cx-5, cy-8);
+ctx.stroke();
+
+// Glow
+ctx.shadowBlur = 0;
+}
+
+function drawHUD() {
+// Score
+ctx.font = 'bold 18px monospace';
+ctx.fillStyle = '#ffdd44';
+ctx.textAlign = 'left';
+ctx.fillText(`SCORE: ${score}`, 20, 25);
+
+// Lives
+ctx.fillStyle = '#fff';
+ctx.textAlign = 'right';
+let lifeStr = '';
+for (let i = 0; i < lives; i++) lifeStr += '● ';
+ctx.fillText(lifeStr.trim(), W - 20, 25);
+
+// Level
+ctx.textAlign = 'center';
+ctx.fillStyle = '#aaa';
+ctx.fillText(`LEVEL ${level}`, W/2, 25);
+
+// Remaining bricks
+let remaining = bricks.filter(b => b.alive).length;
+ctx.font = '14px monospace';
+ctx.fillStyle = '#888';
+ctx.textAlign = 'left';
+ctx.fillText(`Bricks: ${remaining}`, 20, 45);
+
+// Hint
+if (!ball.active && gameState === 'playing') {
+ctx.font = '16px monospace';
+ctx.fillStyle = `rgba(255,255,255,${0.5 + Math.sin(Date.now()*0.005)*0.3})`;
+ctx.textAlign = 'center';
+ctx.fillText('Press M or click to launch', W/2, H - 80);
+}
+}
+
+// Click to launch
+canvas.addEventListener('click', () => {
+if (gameState === 'playing' && !ball.active) launchBall();
+});
+
+window.addEventListener('resize', resize);
+resize();
+initBricks();
+resetBall();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
