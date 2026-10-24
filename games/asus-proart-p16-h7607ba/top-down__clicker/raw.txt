@@ -1,0 +1,566 @@
+<think>
+The user wants a top-down clicker game. Let me make something fun: for example "Gem Rush" — gems fall from above (top-down view), and the player clicks to collect them, avoiding bombs. Score, combos, lives, timer. Start screen, restart button, Web Audio sound on click.
+
+Let's design it: a fullscreen canvas. Gems spawn at random x positions from the top edge and fall down. The player clicks/taps gems to collect them (click = point). Missed gems that reach the bottom just disappear; bombs cost you one life. Combo for rapid clicks. 3 lives, game over screen with restart button + R key. Difficulty ramps up over time.
+
+Implementation: a single HTML file, resize-aware canvas, requestAnimationFrame loop, click detection via canvas coordinates (accounting for devicePixelRatio scaling). Particles on collection. Sounds: collect (pitch rises with combo), bomb explosion sound, game over.
+
+Keep the code clean and complete.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Gem Rush — Top-Down Clicker</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0b0e1a; font-family: 'Segoe UI', Arial, sans-serif; }
+  #wrap { position: fixed; inset: 0; }
+  canvas { display: block; width: 100%; height: 100%; cursor: crosshair; touch-action: none; }
+  .overlay {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    background: rgba(8, 10, 24, 0.82); color: #fff; z-index: 5; padding: 20px;
+  }
+  .overlay.hidden { display: none; }
+  h1 {
+    font-size: clamp(36px, 8vw, 72px); letter-spacing: 4px; margin-bottom: 8px;
+    background: linear-gradient(90deg, #5eead4, #a78bfa, #f472b6);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .sub { font-size: clamp(14px, 2.4vw, 20px); color: #94a3b8; margin-bottom: 26px; }
+  .panel {
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 14px; padding: 18px 26px; margin-bottom: 28px; max-width: 460px;
+    line-height: 1.9; font-size: clamp(13px, 2vw, 16px); color: #cbd5e1;
+  }
+  .panel b { color: #fff; }
+  .key {
+    display: inline-block; background: rgba(255,255,255,0.12); border-radius: 6px;
+    padding: 1px 8px; margin: 0 3px; font-family: monospace; color: #e2e8f0;
+    border: 1px solid rgba(255,255,255,0.2);
+  }
+  button {
+    font-size: clamp(16px, 2.6vw, 22px); font-weight: bold; letter-spacing: 2px;
+    padding: 14px 46px; border: none; border-radius: 999px; cursor: pointer;
+    color: #0b0e1a; background: linear-gradient(90deg, #5eead4, #a78bfa);
+    box-shadow: 0 0 26px rgba(167,139,250,0.55); transition: transform .12s ease, box-shadow .12s ease;
+  }
+  button:hover { transform: scale(1.06); box-shadow: 0 0 40px rgba(94,234,212,0.7); }
+  #finalScore { font-size: clamp(28px, 6vw, 52px); color: #fbbf24; margin-bottom: 6px; font-weight: bold; }
+  #bestScore { color: #94a3b8; margin-bottom: 24px; font-size: clamp(14px, 2.4vw, 18px); }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+
+  <div class="overlay" id="startScreen">
+    <h1>GEM RUSH</h1>
+    <div class="sub">A top-down clicker — gems are raining, catch 'em!</div>
+    <div class="panel">
+      <b>Click / tap</b> falling gems before they hit the ground.<br>
+      Chain fast clicks to build a <b style="color:#5eead4">COMBO</b> multiplier.<br>
+      <b style="color:#f87171">Bombs</b> cost you a life — don't click them!<br>
+      Missed gems lower your combo. You have <b>3 lives</b>.<br><br>
+      Keys: <span class="key">R</span> restart &nbsp; <span class="key">M</span> mute
+    </div>
+    <button id="startBtn">START</button>
+  </div>
+
+  <div class="overlay hidden" id="overScreen">
+    <h1 style="font-size:clamp(28px,6vw,54px)">GAME OVER</h1>
+    <div id="finalScore">0</div>
+    <div id="bestScore">Best: 0</div>
+    <button id="restartBtn">PLAY AGAIN</button>
+    <div class="sub" style="margin-top:18px; margin-bottom:0">or press <span class="key">R</span></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var startScreen = document.getElementById('startScreen');
+  var overScreen = document.getElementById('overScreen');
+  var finalScoreEl = document.getElementById('finalScore');
+  var bestScoreEl = document.getElementById('bestScore');
+
+  var W = 0, H = 0, DPR = 1;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- Audio ----------
+  var audioCtx = null, muted = false;
+  function ensureAudio() {
+    if (!audioCtx) {
+      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  }
+  function beep(freq, dur, type, vol, slideTo) {
+    if (!audioCtx || muted) return;
+    var t = audioCtx.currentTime;
+    var o = audioCtx.createOscillator();
+    var g = audioCtx.createGain();
+    o.type = type || 'sine';
+    o.frequency.setValueAtTime(freq, t);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+    g.gain.setValueAtTime(vol || 0.15, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(t); o.stop(t + dur + 0.02);
+  }
+  function sfxCollect(combo) {
+    var base = 440 * Math.pow(1.06, Math.min(combo, 24));
+    beep(base, 0.12, 'triangle', 0.18);
+    beep(base * 1.5, 0.18, 'sine', 0.10);
+  }
+  function sfxBomb() {
+    if (!audioCtx || muted) return;
+    var t = audioCtx.currentTime;
+    // noise burst
+    var len = Math.floor(audioCtx.sampleRate * 0.35);
+    var buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
+    var d = buf.getChannelData(0);
+    for (var i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2);
+    var src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    var g = audioCtx.createGain();
+    g.gain.setValueAtTime(0.35, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+    src.connect(g); g.connect(audioCtx.destination);
+    src.start(t);
+    beep(90, 0.4, 'sawtooth', 0.25, 40);
+  }
+  function sfxMiss() { beep(180, 0.15, 'square', 0.06, 120); }
+  function sfxGameOver() {
+    beep(392, 0.25, 'triangle', 0.18);
+    setTimeout(function(){ beep(311, 0.25, 'triangle', 0.18); }, 200);
+    setTimeout(function(){ beep(233, 0.5, 'triangle', 0.2); }, 400);
+  }
+
+  // ---------- Game state ----------
+  var GEMS = [
+    { color: '#5eead4', glow: 'rgba(94,234,212,0.6)', pts: 10 },   // teal diamond
+    { color: '#a78bfa', glow: 'rgba(167,139,250,0.6)', pts: 20 },  // purple
+    { color: '#f472b6', glow: 'rgba(244,114,182,0.6)', pts: 30 },  // pink
+    { color: '#fbbf24', glow: 'rgba(251,191,36,0.7)', pts: 50 }    // gold star
+  ];
+
+  var state = 'menu'; // menu | play | over
+  var objects = [], particles = [], floaters = [];
+  var score = 0, lives = 3, combo = 0, bestCombo = 0;
+  var lastCollectTime = -9999;
+  var spawnTimer = 0, elapsed = 0, shake = 0;
+  var best = 0;
+  try { best = parseInt(localStorage.getItem('gemRushBest') || '0', 10) || 0; } catch (e) {}
+
+  function difficulty() { return Math.min(elapsed / 60, 1); } // ramps over 60s
+
+  function spawnObject() {
+    var r = Math.random();
+    var isBomb = r < 0.12 + difficulty() * 0.14;
+    var isStar = !isBomb && Math.random() < 0.07;
+    var def = isStar ? GEMS[3] : GEMS[Math.floor(Math.random() * 3)];
+    var size = isBomb ? 26 : (isStar ? 18 : 15 + Math.random() * 9);
+    objects.push({
+      x: size + Math.random() * (W - size * 2),
+      y: -size * 2,
+      vy: (60 + Math.random() * 70) * (1 + difficulty() * 1.1),
+      vx: (Math.random() - 0.5) * 50,
+      r: size,
+      rot: Math.random() * Math.PI * 2,
+      rotV: (Math.random() - 0.5) * 4,
+      bomb: isBomb,
+      def: isBomb ? null : def,
+      wobble: Math.random() * Math.PI * 2
+    });
+  }
+
+  function burst(x, y, color, n, speed) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2;
+      var s = speed * (0.4 + Math.random());
+      particles.push({
+        x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 60,
+        life: 0.5 + Math.random() * 0.4, maxLife: 0.9,
+        color: color, size: 2 + Math.random() * 3.5
+      });
+    }
+  }
+
+  function addFloater(x, y, text, color) {
+    floaters.push({ x: x, y: y, text: text, color: color, life: 1 });
+  }
+
+  function resetGame() {
+    objects = []; particles = []; floaters = [];
+    score = 0; lives = 3; combo = 0; bestCombo = 0;
+    lastCollectTime = -9999; spawnTimer = 0.4; elapsed = 0; shake = 0;
+  }
+
+  function startGame() {
+    ensureAudio();
+    resetGame();
+    state = 'play';
+    startScreen.classList.add('hidden');
+    overScreen.classList.add('hidden');
+  }
+
+  function endGame() {
+    state = 'over';
+    sfxGameOver();
+    finalScoreEl.textContent = score + ' pts';
+    var newBest = false;
+    if (score > best) {
+      best = score; newBest = true;
+      try { localStorage.setItem('gemRushBest', String(best)); } catch (e) {}
+    }
+    bestScoreEl.textContent = 'Best: ' + best + (newBest ? '  — NEW RECORD!' : '') + '   ·   Max combo ×' + Math.max(1, bestCombo);
+    overScreen.classList.remove('hidden');
+  }
+
+  // ---------- Input ----------
+  function pointAt(e) {
+    var rect = canvas.getBoundingClientRect();
+    var cx = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+    var cy = (e.touches ? e.touches[0].clientY : e.clientY) - rect.top;
+    return { x: cx, y: cy };
+  }
+
+  function handleTap(e) {
+    if (state !== 'play') return;
+    ensureAudio();
+    var p = pointAt(e);
+    // find topmost object under pointer
+    for (var i = objects.length - 1; i >= 0; i--) {
+      var o = objects[i];
+      var dx = p.x - o.x, dy = p.y - o.y;
+      if (dx * dx + dy * dy <= (o.r + 12) * (o.r + 12)) {
+        if (o.bomb) {
+          objects.splice(i, 1);
+          lives--;
+          combo = 0;
+          shake = 14;
+          burst(o.x, o.y, '#f87171', 34, 300);
+          burst(o.x, o.y, '#fbbf24', 20, 220);
+          addFloater(o.x, o.y, 'BOOM!', '#f87171');
+          sfxBomb();
+          if (lives <= 0) endGame();
+        } else {
+          objects.splice(i, 1);
+          var now = performance.now() / 1000;
+          if (now - lastCollectTime < 1.2) combo++; else combo = 1;
+          lastCollectTime = now;
+          bestCombo = Math.max(bestCombo, combo);
+          var mult = 1 + Math.floor((combo - 1) / 3) * 0.5; // x1, x1.5, x2...
+          var pts = Math.round(o.def.pts * mult);
+          score += pts;
+          burst(o.x, o.y, o.def.color, 16 + Math.min(combo, 14), 220);
+          addFloater(o.x, o.y - 10, '+' + pts + (mult > 1 ? ' ×' + mult : ''), o.def.color);
+          sfxCollect(combo);
+        }
+        return;
+      }
+    }
+    // clicked empty space: small ripple only
+    burst(p.x, p.y, 'rgba(148,163,184,0.5)', 4, 90);
+  }
+
+  canvas.addEventListener('mousedown', handleTap);
+  canvas.addEventListener('touchstart', function (e) { e.preventDefault(); handleTap(e); }, { passive: false });
+
+  window.addEventListener('keydown', function (e) {
+    var k = e.key.toLowerCase();
+    if (k === 'r') { startGame(); }
+    else if (k === 'm') { muted = !muted; ensureAudio(); }
+    else if ((k === ' ' || k === 'enter') && state !== 'play') { startGame(); }
+  });
+
+  document.getElementById('startBtn').addEventListener('click', startGame);
+  document.getElementById('restartBtn').addEventListener('click', startGame);
+
+  // ---------- Drawing helpers ----------
+  function drawGem(o) {
+    ctx.save();
+    ctx.translate(o.x, o.y);
+    ctx.rotate(o.rot);
+    var r = o.r;
+    if (o.def === GEMS[3]) {
+      // gold star
+      ctx.shadowColor = o.def.glow;
+      ctx.shadowBlur = 18;
+      ctx.fillStyle = o.def.color;
+      ctx.beginPath();
+      for (var i = 0; i < 10; i++) {
+        var ang = -Math.PI / 2 + i * Math.PI / 5;
+        var rr = (i % 2 === 0) ? r : r * 0.48;
+        ctx.lineTo(Math.cos(ang) * rr, Math.sin(ang) * rr);
+      }
+      ctx.closePath();
+      ctx.fill();
+    } else {
+      // diamond
+      ctx.shadowColor = o.def.glow;
+      ctx.shadowBlur = 16;
+      ctx.fillStyle = o.def.color;
+      ctx.beginPath();
+      ctx.moveTo(0, -r);
+      ctx.lineTo(r * 0.85, 0);
+      ctx.lineTo(0, r);
+      ctx.lineTo(-r * 0.85, 0);
+      ctx.closePath();
+      ctx.fill();
+      // facet highlight
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(255,255,255,0.45)';
+      ctx.beginPath();
+      ctx.moveTo(0, -r * 0.9);
+      ctx.lineTo(r * 0.35, 0);
+      ctx.lineTo(0, r * 0.15);
+      ctx.lineTo(-r * 0.35, 0);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawBomb(o) {
+    ctx.save();
+    ctx.translate(o.x, o.y);
+    var pulse = 1 + Math.sin(performance.now() / 120) * 0.06;
+    ctx.scale(pulse, pulse);
+    // fuse spark
+    ctx.strokeStyle = '#94a3b8';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(o.r * 0.45, -o.r * 0.75);
+    ctx.quadraticCurveTo(o.r * 0.9, -o.r * 1.25, o.r * 1.15, -o.r * 1.05);
+    ctx.stroke();
+    var spark = Math.random() < 0.3;
+    if (spark) {
+      ctx.fillStyle = '#fbbf24';
+      ctx.beginPath();
+      ctx.arc(o.r * 1.15, -o.r * 1.05, 4 + Math.random() * 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // body
+    ctx.shadowColor = 'rgba(248,113,113,0.7)';
+    ctx.shadowBlur = 16;
+    ctx.fillStyle = '#1f2937';
+    ctx.beginPath();
+    ctx.arc(0, 0, o.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = '#4b5563';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // highlight
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.beginPath();
+    ctx.arc(-o.r * 0.3, -o.r * 0.35, o.r * 0.35, 0, Math.PI * 2);
+    ctx.fill();
+    // skull-ish cross
+    ctx.fillStyle = '#f87171';
+    ctx.font = 'bold ' + Math.round(o.r) + 'px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('✕', 0, 2);
+    ctx.restore();
+  }
+
+  function drawHUD() {
+    ctx.save();
+    // top-left score
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold ' + Math.max(20, Math.min(30, W * 0.04)) + 'px "Segoe UI", Arial, sans-serif';
+    ctx.fillText(score.toLocaleString() + ' pts', 16, 14);
+    // combo
+    if (combo >= 2 && state === 'play') {
+      var age = performance.now() / 1000 - lastCollectTime;
+      var alpha = Math.max(0.35, 1 - age / 1.2);
+      ctx.fillStyle = 'rgba(94,234,212,' + alpha.toFixed(2) + ')';
+      ctx.font = 'bold ' + Math.max(15, Math.min(22, W * 0.028)) + 'px "Segoe UI", Arial, sans-serif';
+      var mult = 1 + Math.floor((combo - 1) / 3) * 0.5;
+      ctx.fillText('COMBO ×' + combo + '  (×' + mult + ')', 16, 14 + Math.max(26, Math.min(36, W * 0.05)) + 4);
+    }
+    // lives top-right
+    ctx.textAlign = 'right';
+    var heartSize = Math.max(16, Math.min(24, W * 0.035));
+    ctx.font = heartSize + 'px sans-serif';
+    var hearts = '';
+    for (var i = 0; i < lives; i++) hearts += '♥ ';
+    ctx.fillStyle = '#f87171';
+    ctx.fillText(hearts.trim() || '', W - 16, 14);
+    // mute indicator
+    if (muted) {
+      ctx.textAlign = 'right';
+      ctx.fillStyle = 'rgba(148,163,184,0.7)';
+      ctx.font = '13px sans-serif';
+      ctx.fillText('MUTED (M)', W - 16, 14 + heartSize + 8);
+    }
+    // danger line at bottom
+    var dangerY = H - 8;
+    var grad = ctx.createLinearGradient(0, dangerY - 24, 0, dangerY);
+    grad.addColorStop(0, 'rgba(248,113,113,0)');
+    grad.addColorStop(1, 'rgba(248,113,113,0.35)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, dangerY - 24, W, 24);
+    ctx.restore();
+  }
+
+  function drawMenuBG(dt) {
+    // gentle ambient falling gems on the menu
+    if (Math.random() < dt * 3 && objects.length < 25) {
+      var def = GEMS[Math.floor(Math.random() * GEMS.length)];
+      objects.push({
+        x: Math.random() * W, y: -30, vy: 40 + Math.random() * 50, vx: 0,
+        r: 8 + Math.random() * 10, rot: Math.random() * 6, rotV: (Math.random() - 0.5) * 2,
+        bomb: false, def: def, ambient: true, wobble: 0
+      });
+    }
+  }
+
+  // ---------- Main loop ----------
+  var lastT = performance.now();
+  function frame(now) {
+    var dt = Math.min((now - lastT) / 1000, 0.05);
+    lastT = now;
+
+    // update
+    if (state === 'play') {
+      elapsed += dt;
+      spawnTimer -= dt;
+      var interval = Math.max(0.28, 0.9 - difficulty() * 0.55);
+      while (spawnTimer <= 0) {
+        spawnObject();
+        spawnTimer += interval * (0.6 + Math.random() * 0.8);
+      }
+    } else if (state === 'menu') {
+      drawMenuBG(dt);
+    }
+
+    for (var i = objects.length - 1; i >= 0; i--) {
+      var o = objects[i];
+      o.wobble += dt * 3;
+      o.x += (o.vx + Math.sin(o.wobble) * 20) * dt;
+      o.y += o.vy * dt;
+      o.rot += o.rotV * dt;
+      if (o.x < o.r) { o.x = o.r; o.vx = Math.abs(o.vx); }
+      if (o.x > W - o.r) { o.x = W - o.r; o.vx = -Math.abs(o.vx); }
+      if (o.y - o.r > H) {
+        objects.splice(i, 1);
+        if (state === 'play' && !o.ambient) {
+          if (!o.bomb) {
+            combo = 0;
+            sfxMiss();
+            addFloater(o.x, H - 30, 'missed', 'rgba(148,163,184,0.8)');
+          } else {
+            addFloater(o.x, H - 30, 'phew!', 'rgba(94,234,212,0.85)');
+          }
+        }
+      }
+    }
+
+    for (var j = particles.length - 1; j >= 0; j--) {
+      var p = particles[j];
+      p.life -= dt;
+      if (p.life <= 0) { particles.splice(j, 1); continue; }
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 420 * dt;
+    }
+
+    for (var f = floaters.length - 1; f >= 0; f--) {
+      var fl = floaters[f];
+      fl.life -= dt * 1.1;
+      fl.y -= 50 * dt;
+      if (fl.life <= 0) floaters.splice(f, 1);
+    }
+
+    if (shake > 0) shake = Math.max(0, shake - dt * 40);
+
+    // render
+    ctx.clearRect(0, 0, W, H);
+
+    // background gradient
+    var bg = ctx.createLinearGradient(0, 0, 0, H);
+    bg.addColorStop(0, '#131a33');
+    bg.addColorStop(0.6, '#0b0e1a');
+    bg.addColorStop(1, '#151024');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    // subtle grid
+    ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+    ctx.lineWidth = 1;
+    var grid = 64;
+    ctx.beginPath();
+    for (var gx = 0; gx <= W; gx += grid) { ctx.moveTo(gx + 0.5, 0); ctx.lineTo(gx + 0.5, H); }
+    for (var gy = 0; gy <= H; gy += grid) { ctx.moveTo(0, gy + 0.5); ctx.lineTo(W, gy + 0.5); }
+    ctx.stroke();
+
+    ctx.save();
+    if (shake > 0) {
+      ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    }
+
+    for (var k = 0; k < objects.length; k++) {
+      var ob = objects[k];
+      if (ob.bomb) drawBomb(ob); else drawGem(ob);
+    }
+
+    // particles
+    for (var q = 0; q < particles.length; q++) {
+      var pt = particles[q];
+      ctx.globalAlpha = Math.max(0, pt.life / pt.maxLife);
+      ctx.fillStyle = pt.color;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, pt.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // floaters
+    for (var m = 0; m < floaters.length; m++) {
+      var fo = floaters[m];
+      ctx.globalAlpha = Math.max(0, Math.min(1, fo.life * 1.4));
+      ctx.fillStyle = fo.color;
+      ctx.font = 'bold ' + Math.max(16, Math.min(26, W * 0.035)) + 'px "Segoe UI", Arial, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(fo.text, fo.x, fo.y);
+    }
+    ctx.globalAlpha = 1;
+
+    ctx.restore();
+
+    if (state === 'play') drawHUD();
+    else {
+      // dim menu HUD area — the overlay handles text
+    }
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+```
