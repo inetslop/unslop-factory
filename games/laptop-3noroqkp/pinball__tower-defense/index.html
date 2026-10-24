@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tower Pinball Defense</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; font-family: 'Courier New', monospace; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+function playSound(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.1, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+
+// Game state
+let gameState = 'start'; // start, playing, gameover
+let score = 0;
+let points = 100;
+let wave = 0;
+let lives = 5;
+let enemies = [];
+let towers = [];
+let projectiles = [];
+let particles = [];
+let bumpers = [];
+let ball = null;
+let flippers = {};
+let towerSpots = [];
+let shakeTime = 0;
+let shakeMag = 0;
+
+const BALL_RADIUS = 10;
+const GRAVITY = 0.35;
+const BOUNCE_DAMPING = 0.7;
+const MAX_BALL_SPEED = 18;
+
+function resetGame() {
+    score = 0;
+    points = 100;
+    wave = 0;
+    lives = 5;
+    enemies = [];
+    towers = [];
+    projectiles = [];
+    particles = [];
+    bumpers = [];
+    ball = null;
+    setupTable();
+    nextWave();
+}
+
+function setupTable() {
+    // Bumpers
+    const cx = W / 2;
+    const cy = H * 0.45;
+    bumpers = [
+        { x: cx - 80, y: cy, r: 30 },
+        { x: cx + 80, y: cy, r: 30 },
+        { x: cx, y: cy - 70, r: 25 }
+    ];
+
+    // Tower spots
+    towerSpots = [
+        { x: W * 0.15, y: H * 0.3 },
+        { x: W * 0.85, y: H * 0.3 },
+        { x: W * 0.2, y: H * 0.55 },
+        { x: W * 0.8, y: H * 0.55 },
+        { x: W * 0.15, y: H * 0.75 },
+        { x: W * 0.85, y: H * 0.75 }
+    ];
+
+    // Flippers
+    const flipperW = 90;
+    const flipperY = H * 0.88;
+    flippers = {
+        left: { x: W / 2 - flipperW, y: flipperY, len: flipperW, angle: 0.4, targetAngle: 0.4, restAngle: 0.4, activeAngle: -0.5 },
+        right: { x: W / 2 + flipperW, y: flipperY, len: flipperW, angle: -0.4, targetAngle: -0.4, restAngle: -0.4, activeAngle: 0.5 }
+    };
+}
+
+function launchBall() {
+    ball = {
+        x: W * 0.92,
+        y: H * 0.85,
+        vx: -3,
+        vy: -12,
+        active: true
+    };
+    playSound(440, 0.1, 'sine', 0.15);
+}
+
+function nextWave() {
+    wave++;
+    const count = 3 + wave * 2;
+    for (let i = 0; i < count; i++) {
+        const type = wave > 3 && Math.random() < 0.3 ? 'tank' : (wave > 5 && Math.random() < 0.2 ? 'fast' : 'normal');
+        enemies.push({
+            x: W * (0.1 + Math.random() * 0.8),
+            y: -30 - i * 40,
+            hp: type === 'tank' ? 5 : 2,
+            maxHp: type === 'tank' ? 5 : 2,
+            speed: type === 'fast' ? 1.8 : 0.8 + wave * 0.1,
+            radius: type === 'tank' ? 22 : 16,
+            type: type,
+            hitFlash: 0
+        });
+    }
+}
+
+function spawnParticle(x, y, color, count) {
+    for (let i = 0; i < (count || 8); i++) {
+        const a = Math.random() * Math.PI * 2;
+        const s = 1 + Math.random() * 3;
+        particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 30 + Math.random() * 20, color });
+    }
+}
+
+function placeTower(spotIndex) {
+    if (spotIndex < 0 || spotIndex >= towerSpots.length) return;
+    const spot = towerSpots[spotIndex];
+    if (towers.find(t => t.spotIdx === spotIndex)) return;
+    if (points < 50) return;
+    points -= 50;
+    towers.push({ x: spot.x, y: spot.y, spotIdx: spotIndex, cooldown: 0, level: 1, range: 120, damage: 1, fireRate: 40 });
+    playSound(600, 0.15, 'triangle', 0.1);
+}
+
+function upgradeTower(spotIndex) {
+    const tower = towers.find(t => t.spotIdx === spotIndex);
+    if (!tower || points < 30) return;
+    points -= 30;
+    tower.level++;
+    tower.damage++;
+    tower.range += 20;
+    playSound(800, 0.15, 'triangle', 0.1);
+}
+
+// Input
+let keys = {};
+window.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (gameState === 'start') {
+        initAudio();
+        gameState = 'playing';
+        resetGame();
+    } else if (gameState === 'gameover' && e.code === 'KeyR') {
+        gameState = 'playing';
+        resetGame();
+    } else if (gameState === 'playing') {
+        if (e.code === 'Space' && ball && !ball.active) launchBall();
+        if (e.code === 'Digit1') placeTower(0);
+        if (e.code === 'Digit2') placeTower(1);
+        if (e.code === 'Digit3') placeTower(2);
+        if (e.code === 'Digit4') placeTower(3);
+        if (e.code === 'Digit5') placeTower(4);
+        if (e.code === 'Digit6') placeTower(5);
+        if (e.code === 'KeyU') {
+            // Upgrade closest tower to center
+            for (let i = 0; i < towerSpots.length; i++) upgradeTower(i);
+        }
+    }
+});
+window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+// Click to place/upgrade towers
+canvas.addEventListener('click', (e) => {
+    initAudio();
+    if (gameState === 'start') { gameState = 'playing'; resetGame(); return; }
+    if (gameState === 'gameover') { gameState = 'playing'; resetGame(); return; }
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    
+    // Check tower spots
+    for (let i = 0; i < towerSpots.length; i++) {
+        const s = towerSpots[i];
+        if (Math.hypot(mx - s.x, my - s.y) < 25) {
+            const existing = towers.find(t => t.spotIdx === i);
+            if (existing) upgradeTower(i);
+            else placeTower(i);
+            return;
+        }
+    }
+});
+
+// Physics
+function updateBall() {
+    if (!ball || !ball.active) return;
+    
+    ball.vy += GRAVITY;
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+    
+    // Speed cap
+    const spd = Math.hypot(ball.vx, ball.vy);
+    if (spd > MAX_BALL_SPEED) {
+        ball.vx = (ball.vx / spd) * MAX_BALL_SPEED;
+        ball.vy = (ball.vy / spd) * MAX_BALL_SPEED;
+    }
+    
+    // Walls
+    const wallPad = 15;
+    if (ball.x - BALL_RADIUS < wallPad) { ball.x = wallPad + BALL_RADIUS; ball.vx = Math.abs(ball.vx) * BOUNCE_DAMPING; playSound(200, 0.05, 'square', 0.05); }
+    if (ball.x + BALL_RADIUS > W - wallPad) { ball.x = W - wallPad - BALL_RADIUS; ball.vx = -Math.abs(ball.vx) * BOUNCE_DAMPING; playSound(200, 0.05, 'square', 0.05); }
+    if (ball.y - BALL_RADIUS < wallPad) { ball.y = wallPad + BALL_RADIUS; ball.vy = Math.abs(ball.vy) * BOUNCE_DAMPING; }
+    
+    // Bumpers
+    for (const b of bumpers) {
+        const dx = ball.x - b.x;
+        const dy = ball.y - b.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < BALL_RADIUS + b.r) {
+            const nx = dx / dist;
+            const ny = dy / dist;
+            ball.x = b.x + nx * (BALL_RADIUS + b.r + 1);
+            ball.y = b.y + ny * (BALL_RADIUS + b.r + 1);
+            const dot = ball.vx * nx + ball.vy * ny;
+            ball.vx -= 2 * dot * nx;
+            ball.vy -= 2 * dot * ny;
+            // Boost
+            ball.vx += nx * 5;
+            ball.vy += ny * 5;
+            playSound(300 + Math.random() * 200, 0.1, 'sine', 0.15);
+            spawnParticle(ball.x, ball.y, '#ffff00', 4);
+        }
+    }
+    
+    // Flippers collision
+    for (const key of ['left', 'right']) {
+        const f = flippers[key];
+        const tipX = key === 'left' ? f.x + Math.cos(f.angle) * f.len : f.x - Math.cos(f.angle) * f.len;
+        const tipY = f.y + Math.sin(f.angle) * f.len;
+        
+        // Line segment collision (base to tip)
+        const bx = key === 'left' ? f.x : f.x;
+        const by = f.y;
+        const ex = tipX;
+        const ey = tipY;
+        
+        const dist = pointToLineDist(ball.x, ball.y, bx, by, ex, ey);
+        if (dist < BALL_RADIUS + 5) {
+            const nx = (ball.y - by) / (Math.hypot(ex - bx, ey - by) || 1);
+            const ny = -(ball.x - bx) / (Math.hypot(ex - bx, ey - by) || 1);
+            
+            // Push ball out
+            if (dist < BALL_RADIUS + 5) {
+                const pushDirX = nx >= 0 ? 1 : -1;
+                ball.y -= ny * (BALL_RADIUS + 6 - dist);
+                ball.x += pushDirX * (BALL_RADIUS + 6 - dist) * 0.3;
+            }
+            
+            // Add flipper velocity boost if active
+            const isFlipping = (key === 'left' && keys['ArrowLeft']) || (key === 'right' && keys['ArrowRight']);
+            const boost = isFlipping ? 8 : 2;
+            ball.vy = -boost;
+            ball.vx += (Math.random() - 0.5) * 3;
+            playSound(500, 0.08, 'sine', 0.1);
+        }
+    }
+    
+    // Enemy collision
+    for (let i = enemies.length - 1; i >= 0; i--) {
+        const e = enemies[i];
+        const dist = Math.hypot(ball.x - e.x, ball.y - e.y);
+        if (dist < BALL_RADIUS + e.radius) {
+            e.hp--;
+            e.hitFlash = 10;
+            playSound(200, 0.1, 'sawtooth', 0.15);
+            spawnParticle(e.x, e.y, '#ff4444', 6);
+            shakeTime = 5;
+            shakeMag = 3;
+            
+            // Bounce ball off enemy
+            const nx = (ball.x - e.x) / dist;
+            const ny = (ball.y - e.y) / dist;
+            ball.vx += nx * 4;
+            ball.vy -= Math.abs(ball.vy) * 0.5 + 3;
+            
+            if (e.hp <= 0) {
+                score += e.type === 'tank' ? 50 : 20;
+                points += 10;
+                spawnParticle(e.x, e.y, '#ff8800', 12);
+                enemies.splice(i, 1);
+            }
+        }
+    }
+    
+    // Ball lost
+    if (ball.y > H + 50) {
+        ball = null;
+        lives--;
+        playSound(100, 0.3, 'sawtooth', 0.2);
+        shakeTime = 10;
+        shakeMag = 5;
+        if (lives <= 0) {
+            gameState = 'gameover';
+        }
+    }
+}
+
+function pointToLineDist(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const len2 = dx * dx + dy * dy;
+    let t = ((px - x1) * dx + (py - y1) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const cx = x1 + t * dx;
+    const cy = y1 + t * dy;
+    return Math.hypot(px - cx, py - cy);
+}
+
+function updateFlippers() {
+    // Left flipper
+    if (keys['ArrowLeft']) {
+        flippers.left.angle += (flippers.left.activeAngle - flippers.left.angle) * 0.4;
+    } else {
+        flippers.left.angle += (flippers.left.restAngle - flippers.left.angle) * 0.25;
+    }
+    // Right flipper
+    if (keys['ArrowRight']) {
+        flippers.right.angle += (flippers.right.activeAngle - flippers.right.angle) * 0.4;
+    } else {
+        flippers.right.angle += (flippers.right.restAngle - flippers.right.angle) * 0.25;
+    }
+}
+
+function updateEnemies() {
+    for (let i = enemies.length - 1; i >= 0; i--) {
+        const e = enemies[i];
+        e.y += e.speed;
+        if (e.hitFlash > 0) e.hitFlash--;
+        
+        // Reached bottom
+        if (e.y > H * 0.82) {
+            spawnParticle(e.x, e.y, '#ff0000', 10);
+            enemies.splice(i, 1);
+        }
+    }
+}
+
+function updateTowers() {
+    for (const t of towers) {
+        if (t.cooldown > 0) { t.cooldown--; continue; }
+        
+        // Find nearest enemy in range
+        let best = null, bestDist = Infinity;
+        for (const e of enemies) {
+            const d = Math.hypot(e.x - t.x, e.y - t.y);
+            if (d < t.range && d < bestDist) { best = e; bestDist = d; }
+        }
+        
+        if (best) {
+            const angle = Math.atan2(best.y - t.y, best.x - t.x);
+            projectiles.push({ x: t.x, y: t.y, vx: Math.cos(angle) * 5, vy: Math.sin(angle) * 5, damage: t.damage, life: 60 });
+            t.cooldown = t.fireRate;
+            playSound(800 + Math.random() * 200, 0.05, 'square', 0.05);
+        }
+    }
+}
+
+function updateProjectiles() {
+    for (let i = projectiles.length - 1; i >= 0; i--) {
+        const p = projectiles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life--;
+        
+        if (p.life <= 0) { projectiles.splice(i, 1); continue; }
+        
+        // Hit enemy
+        for (let j = enemies.length - 1; j >= 0; j--) {
+            const e = enemies[j];
+            if (Math.hypot(p.x - e.x, p.y - e.y) < e.radius + 5) {
+                e.hp -= p.damage;
+                e.hitFlash = 8;
+                playSound(300, 0.05, 'square', 0.08);
+                spawnParticle(p.x, p.y, '#44ff88', 3);
+                
+                if (e.hp <= 0) {
+                    score += e.type === 'tank' ? 50 : 20;
+                    points += 10;
+                    spawnParticle(e.x, e.y, '#ff8800', 12);
+                    enemies.splice(j, 1);
+                }
+                projectiles.splice(i, 1);
+                break;
+            }
+        }
+    }
+}
+
+function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.1;
+        p.life--;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function checkWaveComplete() {
+    if (enemies.length === 0 && projectiles.length === 0) {
+        // Small delay then next wave
+        setTimeout(() => { if (gameState === 'playing') nextWave(); }, 1500);
+        enemies.push({ x: -999, y: -999, hp: 1, maxHp: 1, speed: 0, radius: 1, type: 'wait', hitFlash: 0 });
+    }
+}
+
+// Rendering
+function draw() {
+    ctx.save();
+    
+    // Screen shake
+    if (shakeTime > 0) {
+        shakeTime--;
+        const sx = (Math.random() - 0.5) * shakeMag;
+        const sy = (Math.random() - 0.5) * shakeMag;
+        ctx.translate(sx, sy);
+    }
+    
+    // Background
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, '#0a0a2a');
+    grad.addColorStop(1, '#1a0a1a');
+    ctx.fillStyle = grad;
+    ctx.fillRect(-10, -10, W + 20, H + 20);
+    
+    // Grid lines
+    ctx.strokeStyle = 'rgba(50, 50, 100, 0.3)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x < W; x += 40) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+    }
+    for (let y = 0; y < H; y += 40) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+    
+    if (gameState === 'start') {
+        drawStartScreen();
+        ctx.restore();
+        return;
+    }
+    
+    if (gameState === 'gameover') {
+        drawGameOver();
+        ctx.restore();
+        return;
+    }
+    
+    // Walls
+    ctx.strokeStyle = '#4488ff';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(15, 15, W - 30, H - 30);
+    
+    // Bumpers
+    for (const b of bumpers) {
+        const bg = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, b.r);
+        bg.addColorStop(0, '#ffcc00');
+        bg.addColorStop(0.7, '#ff8800');
+        bg.addColorStop(1, '#663300');
+        ctx.fillStyle = bg;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#ffee88';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+    }
+    
+    // Tower spots
+    for (let i = 0; i < towerSpots.length; i++) {
+        const s = towerSpots[i];
+        const hasTower = towers.find(t => t.spotIdx === i);
+        if (!hasTower) {
+            ctx.strokeStyle = 'rgba(100, 255, 150, 0.4)';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath();
+            ctx.arc(s.x, s.y, 20, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = 'rgba(100, 255, 150, 0.3)';
+            ctx.font = '12px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('' + (i + 1), s.x, s.y + 4);
+        }
+    }
+    
+    // Towers
+    for (const t of towers) {
+        const glow = t.cooldown > t.fireRate - 10 ? 1 : 0.5;
+        ctx.fillStyle = `rgba(80, 255, 150, ${glow})`;
+        ctx.beginPath();
+        ctx.arc(t.x, t.y, 15 + t.level * 2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#aaffcc';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        // Level indicator
+        ctx.fillStyle = '#fff';
+        ctx.font = '10px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('L' + t.level, t.x, t.y + 4);
+    }
+    
+    // Enemies
+    for (const e of enemies) {
+        if (e.type === 'wait') continue;
+        
+        let color = '#ff4466';
+        if (e.type === 'tank') color = '#cc44ff';
+        if (e.type === 'fast') color = '#ffaa00';
+        
+        if (e.hitFlash > 0) color = '#ffffff';
+        
+        const eg = ctx.createRadialGradient(e.x, e.y, 0, e.x, e.y, e.radius);
+        eg.addColorStop(0, color);
+        eg.addColorStop(1, 'rgba(0,0,0,0.3)');
+        ctx.fillStyle = eg;
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, e.radius, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // HP bar
+        const hpW = e.radius * 2;
+        ctx.fillStyle = '#333';
+        ctx.fillRect(e.x - hpW / 2, e.y - e.radius - 10, hpW, 5);
+        ctx.fillStyle = color;
+        ctx.fillRect(e.x - hpW / 2, e.y - e.radius - 10, hpW * (e.hp / e.maxHp), 5);
+    }
+    
+    // Projectiles
+    for (const p of projectiles) {
+        ctx.fillStyle = '#44ff88';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    // Flippers
+    for (const key of ['left', 'right']) {
+        const f = flippers[key];
+        const tipX = key === 'left' ? f.x + Math.cos(f.angle) * f.len : f.x - Math.cos(f.angle) * f.len;
+        const tipY = f.y + Math.sin(f.angle) * f.len;
+        
+        ctx.strokeStyle = '#ffcc44';
+        ctx.lineWidth = 8;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(f.x, f.y);
+        ctx.lineTo(tipX, tipY);
+        ctx.stroke();
+        
+        // Base circle
+        ctx.fillStyle = '#ffcc44';
+        ctx.beginPath();
+        ctx.arc(f.x, f.y, 8, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    // Ball
+    if (ball && ball.active) {
+        const bgrad = ctx.createRadialGradient(ball.x - 3, ball.y - 3, 0, ball.x, ball.y, BALL_RADIUS);
+        bgrad.addColorStop(0, '#ffffff');
+        bgrad.addColorStop(1, '#88ccff');
+        ctx.fillStyle = bgrad;
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, BALL_RADIUS, 0, Math.PI * 2);
+        ctx.fill();
+    } else if (!ball) {
+        // Launch indicator
+        ctx.fillStyle = '#88ccff';
+        ctx.font = '14px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('SPACE to launch', W * 0.92, H * 0.88);
+    }
+    
+    // Particles
+    for (const p of particles) {
+        const alpha = p.life / 50;
+        ctx.fillStyle = p.color + Math.floor(alpha * 255).toString(16).padStart(2, '0');
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    // HUD
+    drawHUD();
+    
+    ctx.restore();
+}
+
+function drawHUD() {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(0, 0, W, 40);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Score: ${score}`, 15, 25);
+    ctx.fillText(`Points: ${points}`, 130, 25);
+    ctx.fillText(`Wave: ${wave}`, 260, 25);
+    
+    // Lives as hearts
+    for (let i = 0; i < lives; i++) {
+        ctx.fillStyle = '#ff4466';
+        ctx.beginPath();
+        ctx.arc(380 + i * 22, 20, 7, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText('←→ Flippers | SPACE Launch | 1-6 Place Tower | Click spots to place/upgrade', W - 15, 25);
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('TOWER PINBALL DEFENSE', W / 2, H * 0.3);
+    
+    ctx.font = '18px monospace';
+    ctx.fillStyle = '#aaccff';
+    ctx.fillText('Bounce the ball to destroy enemy waves!', W / 2, H * 0.42);
+    ctx.fillText('Place turrets on green spots to auto-fire.', W / 2, H * 0.5);
+    
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#888';
+    ctx.fillText('← → : Flippers', W / 2, H * 0.6);
+    ctx.fillText('SPACE : Launch Ball', W / 2, H * 0.64);
+    ctx.fillText('1-6 or Click : Place Tower (50pts)', W / 2, H * 0.68);
+    ctx.fillText('Click existing tower : Upgrade (30pts)', W / 2, H * 0.72);
+    
+    ctx.fillStyle = '#ffcc44';
+    ctx.font = 'bold 24px monospace';
+    const blink = Math.sin(Date.now() / 300) > 0;
+    if (blink) ctx.fillText('Press any key to start', W / 2, H * 0.85);
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.fillStyle = '#ff4466';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', W / 2, H * 0.35);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = '24px monospace';
+    ctx.fillText(`Final Score: ${score}`, W / 2, H * 0.48);
+    ctx.fillText(`Waves Survived: ${wave}`, W / 2, H * 0.55);
+    
+    ctx.fillStyle = '#ffcc44';
+    ctx.font = '20px monospace';
+    const blink = Math.sin(Date.now() / 300) > 0;
+    if (blink) ctx.fillText('Press R or Click to Restart', W / 2, H * 0.7);
+}
+
+// Main loop
+let lastTime = 0;
+function gameLoop(timestamp) {
+    const dt = timestamp - lastTime;
+    lastTime = timestamp;
+    
+    if (gameState === 'playing') {
+        updateFlippers();
+        updateBall();
+        updateEnemies();
+        updateTowers();
+        updateProjectiles();
+        updateParticles();
+        
+        // Auto-launch ball after delay
+        if (!ball && Math.random() < 0.02) launchBall();
+    } else {
+        updateParticles();
+    }
+    
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
