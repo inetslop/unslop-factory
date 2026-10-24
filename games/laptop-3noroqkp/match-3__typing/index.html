@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>TypeMatch 3</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { 
+    background: #1a1a2e; 
+    display: flex; 
+    justify-content: center; 
+    alignways: center; 
+    height: 100vh; 
+    overflow: hidden; 
+    font-family: 'Courier New', monospace;
+}
+canvas { 
+    display: block; 
+}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+function playTone(freq, dur, type='sine', vol=0.15) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+function playCorrect() { playTone(600 + Math.random()*200, 0.1, 'sine', 0.12); }
+function playWrong() { playTone(150, 0.2, 'sawtooth', 0.1); }
+function playClear() { 
+    playTone(400, 0.3, 'sine', 0.15); 
+    setTimeout(() => playTone(600, 0.3, 'sine', 0.12), 80);
+    setTimeout(() => playTone(800, 0.4, 'sine', 0.1), 160);
+}
+function playGameOver() { playTone(200, 0.5, 'sawtooth', 0.15); }
+
+// Game State
+const GRID_SIZE = 7;
+const WORDS_EASY = ['CAT', 'DOG', 'SUN', 'MOON', 'FIRE', 'WATER', 'TREE', 'STAR', 'CLOUD', 'SKY'];
+const WORDS_MED = ['GARDEN', 'OCEAN', 'BRIDGE', 'CASTLE', 'DRAGON', 'FOREST', 'HIDDEN', 'JOURNEY'];
+const WORDS_HARD = ['MOUNTAIN', 'RAINBOW', 'THUNDER', 'WIZARD', 'CRYSTAL', 'GALAXY', 'PHANTOM', 'SPIRIT'];
+
+let state = 'start'; // start, playing, gameover
+let grid = [];
+let score = 0;
+let lives = 3;
+let level = 1;
+let currentWord = '';
+let typedProgress = 0;
+let selectedGems = [];
+let particles = [];
+let shakeTimer = 0;
+let combo = 0;
+let wordStreak = 0;
+
+const COLORS = {
+    A: '#ff6b6b', E: '#ffa502', I: '#7bed9f', O: '#4d96ff', U: '#c56cf0',
+    B: '#ff6b6b', C: '#ffa502', D: '#7bed9f', F: '#4d96ff', G: '#c56cf0',
+    H: '#ff6b6b', J: '#ffa502', K: '#7bed9f', L: '#4d96ff', M: '#c56cf0',
+    N: '#ff6b6b', P: '#ffa502', Q: '#7bed9f', R: '#4d96ff', S: '#c56cf0',
+    T: '#ff6b6b', V: '#ffa502', W: '#7bed9f', X: '#4d96ff', Y: '#c56cf0', Z: '#ff6b6b'
+};
+
+let cellSize, gridOffsetX, gridOffsetY;
+
+function calcLayout() {
+    const maxDim = Math.min(W, H) * 0.75;
+    cellSize = Math.floor(maxDim / GRID_SIZE);
+    const gridW = cellSize * GRID_SIZE;
+    gridOffsetX = (W - gridW) / 2;
+    gridOffsetY = 60 + (H - gridW) / 2 - 30;
+}
+
+function getWordPool() {
+    if (level <= 2) return WORDS_EASY;
+    if (level <= 4) return WORDS_MED;
+    return WORDS_HARD;
+}
+
+function randomLetter() {
+    const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    return letters[Math.floor(Math.random() * letters.length)];
+}
+
+function initGrid() {
+    grid = [];
+    for (let r = 0; r < GRID_SIZE; r++) {
+        grid[r] = [];
+        for (let c = 0; c < GRID_SIZE; c++) {
+            grid[r][c] = { letter: randomLetter(), color: COLORS[randomLetter()], selected: false, scale: 1, alpha: 1, falling: 0, targetRow: r };
+        }
+    }
+}
+
+function newWord() {
+    const pool = getWordPool();
+    currentWord = pool[Math.floor(Math.random() * pool.length)];
+    typedProgress = 0;
+    selectedGems = [];
+    // Ensure the grid has enough matching letters
+    ensureLetters(currentWord);
+}
+
+function ensureLetters(word) {
+    for (let i = 0; i < word.length; i++) {
+        const target = word[i];
+        let count = 0;
+        for (let r = 0; r < GRID_SIZE; r++)
+            for (let c = 0; c < GRID_SIZE; c++)
+                if (grid[r][c].letter === target && !grid[r][c].selected) count++;
+        if (count < 2) {
+            // Force some cells to have the needed letter
+            let placed = 0;
+            for (let attempt = 0; attempt < 50 && placed < 3; attempt++) {
+                const r = Math.floor(Math.random() * GRID_SIZE);
+                const c = Math.floor(Math.random() * GRID_SIZE);
+                if (grid[r][c].letter !== target) {
+                    grid[r][c].letter = target;
+                    grid[r][c].color = COLORS[target];
+                    placed++;
+                }
+            }
+        }
+    }
+}
+
+function findGem(letter, excludeSet) {
+    let best = null;
+    let bestDist = Infinity;
+    const cr = GRID_SIZE / 2, cc = GRID_SIZE / 2;
+    for (let r = 0; r < GRID_SIZE; r++) {
+        for (let c = 0; c < GRID_SIZE; c++) {
+            if (grid[r][c].letter === letter && !excludeSet.has(r * GRID_SIZE + c)) {
+                const dist = Math.abs(r - cr) + Math.abs(c - cc);
+                if (dist < bestDist) { bestDist = dist; best = { r, c }; }
+            }
+        }
+    }
+    return best;
+}
+
+function handleKey(key) {
+    if (state !== 'playing') return;
+    initAudio();
+    
+    const expected = currentWord[typedProgress].toUpperCase();
+    if (key === expected) {
+        typedProgress++;
+        playCorrect();
+        
+        // Select a gem with this letter
+        const excludeSet = new Set(selectedGems.map(s => s.r * GRID_SIZE + s.c));
+        const pos = findGem(expected, excludeSet);
+        if (pos) {
+            selectedGems.push(pos);
+            grid[pos.r][pos.c].selected = true;
+            grid[pos.r][pos.c].scale = 1.3;
+        }
+        
+        score += 10 * combo;
+        
+        if (typedProgress >= currentWord.length) {
+            // Word complete!
+            wordStreak++;
+            combo = Math.min(combo + 1, 5);
+            score += 50 * combo;
+            playClear();
+            clearSelectedGems();
+        }
+    } else {
+        // Wrong key
+        playWrong();
+        shakeTimer = 15;
+        lives--;
+        combo = 1;
+        typedProgress = 0;
+        selectedGems.forEach(s => grid[s.r][s.c].selected = false);
+        selectedGems = [];
+        
+        if (lives <= 0) {
+            state = 'gameover';
+            playGameOver();
+        }
+    }
+}
+
+function clearSelectedGems() {
+    selectedGems.forEach(s => {
+        grid[s.r][s.c].alpha = 0;
+        spawnParticles(gridOffsetX + s.c * cellSize + cellSize/2, gridOffsetY + s.r * cellSize + cellSize/2, grid[s.r][s.c].color);
+    });
+    
+    // Apply gravity
+    for (let c = 0; c < GRID_SIZE; c++) {
+        let writeRow = GRID_SIZE - 1;
+        for (let r = GRID_SIZE - 1; r >= 0; r--) {
+            if (grid[r][c].alpha > 0) {
+                const temp = grid[r][c];
+                grid[r][c] = null;
+                if (writeRow !== r) grid[writeRow][c] = temp;
+                writeRow--;
+            }
+        }
+        // Fill top with new gems
+        for (let r = writeRow; r >= 0; r--) {
+            const letter = randomLetter();
+            grid[r][c] = { letter, color: COLORS[letter], selected: false, scale: 1, alpha: 1, fallOffset: cellSize * (r + 1) };
+        }
+    }
+    
+    // Level up every 3 words
+    if (wordStreak % 3 === 0) level++;
+    
+    setTimeout(() => { newWord(); }, 400);
+}
+
+function spawnParticles(x, y, color) {
+    for (let i = 0; i < 8; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 2 + Math.random() * 4;
+        particles.push({
+            x, y, 
+            vx: Math.cos(angle) * speed, 
+            vy: Math.sin(angle) * speed - 2,
+            life: 1, 
+            color, 
+            size: 3 + Math.random() * 4
+        });
+    }
+}
+
+function updateParticles() {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.3;
+        p.life -= 0.025;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function updateScales() {
+    for (let r = 0; r < GRID_SIZE; r++) {
+        for (let c = 0; c < GRID_SIZE; c++) {
+            const g = grid[r][c];
+            if (g.scale > 1) g.scale += (1 - g.scale) * 0.2;
+            else if (g.scale < 1) g.scale += (1 - g.scale) * 0.2;
+        }
+    }
+}
+
+function startGame() {
+    state = 'playing';
+    score = 0;
+    lives = 3;
+    level = 1;
+    combo = 1;
+    wordStreak = 0;
+    particles = [];
+    initGrid();
+    newWord();
+}
+
+function draw() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+    
+    if (state === 'start') {
+        drawStartScreen();
+        return;
+    }
+    
+    calcLayout();
+    
+    // Draw word target
+    const wordX = W / 2;
+    const wordY = 35;
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.min(40, W * 0.05)}px Courier New`;
+    
+    for (let i = 0; i < currentWord.length; i++) {
+        const charW = Math.min(40, W * 0.05) * 0.7;
+        const x = wordX - (currentWord.length * charW) / 2 + i * charW + charW/2;
+        
+        if (i < typedProgress) {
+            ctx.fillStyle = '#7bed9f';
+        } else if (i === typedProgress) {
+            ctx.fillStyle = '#ffa502';
+        } else {
+            ctx.fillStyle = '#4a4a6a';
+        }
+        ctx.fillText(currentWord[i], x, wordY);
+    }
+    
+    // Draw progress bar
+    const progW = Math.min(300, W * 0.4);
+    const progX = W/2 - progW/2;
+    const progY = wordY + 15;
+    ctx.fillStyle = '#2a2a4e';
+    ctx.fillRect(progX, progY, progW, 6);
+    ctx.fillStyle = '#7bed9f';
+    ctx.fillRect(progX, progY, progW * (typedProgress / currentWord.length), 6);
+    
+    // Shake effect
+    let shakeX = 0, shakeY = 0;
+    if (shakeTimer > 0) {
+        shakeX = (Math.random() - 0.5) * shakeTimer;
+        shakeY = (Math.random() - 0.5) * shakeTimer;
+        shakeTimer--;
+    }
+    
+    // Draw grid
+    ctx.save();
+    ctx.translate(shakeX, shakeY);
+    
+    for (let r = 0; r < GRID_SIZE; r++) {
+        for (let c = 0; c < GRID_SIZE; c++) {
+            const g = grid[r][c];
+            if (!g || g.alpha <= 0) continue;
+            
+            const x = gridOffsetX + c * cellSize;
+            const y = gridOffsetY + r * cellSize;
+            const pad = 3;
+            const sz = (cellSize - pad * 2) * g.scale;
+            const cx = x + cellSize/2, cy = y + cellSize/2;
+            
+            // Gem background
+            ctx.globalAlpha = g.alpha;
+            ctx.fillStyle = g.selected ? '#fff' : 'rgba(255,255,255,0.1)';
+            if (g.selected) {
+                ctx.shadowColor = g.color;
+                ctx.shadowBlur = 15;
+            } else {
+                ctx.shadowBlur = 0;
+            }
+            
+            const bx = cx - sz/2, by = cy - sz/2;
+            ctx.beginPath();
+            roundRect(ctx, bx, by, sz, sz, 6);
+            ctx.fillStyle = g.selected ? 'rgba(255,255,255,0.3)' : g.color + '44';
+            ctx.fill();
+            
+            // Border
+            ctx.strokeStyle = g.selected ? '#fff' : g.color;
+            ctx.lineWidth = g.selected ? 3 : 1.5;
+            ctx.beginPath();
+            roundRect(ctx, bx, by, sz, sz, 6);
+            ctx.stroke();
+            
+            // Letter
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = g.selected ? '#fff' : g.color;
+            ctx.font = `bold ${cellSize * 0.5}px Courier New`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(g.letter, cx, cy + 2);
+            
+            ctx.shadowBlur = 0;
+            ctx.globalAlpha = 1;
+        }
+    }
+    
+    // Particles
+    particles.forEach(p => {
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+        ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+    
+    ctx.restore();
+    
+    // HUD
+    ctx.textAlign = 'left';
+    ctx.font = `bold ${Math.min(24, W*0.03)}px Courier New`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`SCORE: ${score}`, 15, H - 60);
+    ctx.fillText(`LEVEL: ${level}`, 15, H - 35);
+    
+    // Lives as hearts
+    for (let i = 0; i < lives; i++) {
+        ctx.fillStyle = '#ff6b6b';
+        const hx = W - 40 - i * 35;
+        const hy = H - 50;
+        drawHeart(hx, hy, 12);
+    }
+    
+    // Combo indicator
+    if (combo > 1) {
+        ctx.textAlign = 'right';
+        ctx.fillStyle = '#ffa502';
+        ctx.font = `bold ${Math.min(20, W*0.025)}px Courier New`;
+        ctx.fillText(`COMBO x${combo}`, W - 15, H - 35);
+    }
+    
+    if (state === 'gameover') {
+        drawGameOver();
+    }
+}
+
+function drawHeart(x, y, size) {
+    ctx.beginPath();
+    ctx.moveTo(x, y + size/4);
+    ctx.bezierCurveTo(x, y - size/2, x - size/2, y - size/2, x - size/2, y + size/4);
+    ctx.bezierCurveTo(x - size/2, y + size, x, y + size*0.75, x, y + size);
+    ctx.bezierCurveTo(x, y + size*0.75, x + size/2, y + size, x + size/2, y + size/4);
+    ctx.bezierCurveTo(x + size/2, y - size/2, x, y - size/2, x, y + size/4);
+    ctx.fill();
+}
+
+function drawStartScreen() {
+    ctx.textAlign = 'center';
+    
+    // Title
+    const titleSize = Math.min(60, W * 0.08);
+    ctx.font = `bold ${titleSize}px Courier New`;
+    ctx.fillStyle = '#7bed9f';
+    ctx.shadowColor = '#7bed9f';
+    ctx.shadowBlur = 20;
+    ctx.fillText('TYPE MATCH 3', W/2, H * 0.25);
+    ctx.shadowBlur = 0;
+    
+    // Instructions
+    const instrSize = Math.min(18, W * 0.025);
+    ctx.font = `${instrSize}px Courier New`;
+    ctx.fillStyle = '#ccc';
+    const lines = [
+        'Type the target word to match gems in the grid!',
+        '',
+        'Each correct letter selects a matching gem.',
+        'Complete the full word to clear all selected gems.',
+        'Wrong keys cost a life. You have 3 lives.',
+        '',
+        'Build combos by completing words without mistakes!',
+        '',
+        'Press ENTER or SPACE to start'
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, W/2, H * 0.4 + i * (instrSize * 1.5));
+    });
+    
+    // Demo gems
+    const demoSize = Math.min(40, W * 0.05);
+    const demoY = H * 0.85;
+    const letters = 'CAT';
+    for (let i = 0; i < 3; i++) {
+        const x = W/2 - demoSize + i * demoSize * 1.4;
+        ctx.fillStyle = COLORS[letters[i]] + '66';
+        ctx.beginPath();
+        roundRect(ctx, x, demoY, demoSize, demoSize, 8);
+        ctx.fill();
+        ctx.strokeStyle = COLORS[letters[i]];
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        roundRect(ctx, x, demoY, demoSize, demoSize, 8);
+        ctx.stroke();
+        ctx.fillStyle = COLORS[letters[i]];
+        ctx.font = `bold ${demoSize * 0.6}px Courier New`;
+        ctx.fillText(letters[i], x + demoSize/2, demoY + demoSize/2 + 4);
+    }
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+    
+    ctx.textAlign = 'center';
+    const gs = Math.min(50, W * 0.06);
+    ctx.font = `bold ${gs}px Courier New`;
+    ctx.fillStyle = '#ff6b6b';
+    ctx.fillText('GAME OVER', W/2, H * 0.3);
+    
+    ctx.font = `${Math.min(24, W*0.03)}px Courier New`;
+    ctx.fillStyle = '#fff';
+    ctx.fillText(`Final Score: ${score}`, W/2, H * 0.45);
+    ctx.fillText(`Level Reached: ${level}`, W/2, H * 0.52);
+    
+    ctx.fillStyle = '#7bed9f';
+    ctx.fillText('Press ENTER to play again', W/2, H * 0.65);
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+}
+
+// Input
+window.addEventListener('keydown', (e) => {
+    if (state === 'start') {
+        if (e.key === 'Enter' || e.key === ' ') {
+            initAudio();
+            startGame();
+        }
+        return;
+    }
+    
+    if (state === 'gameover') {
+        if (e.key === 'Enter' || e.key === ' ') {
+            startGame();
+        }
+        return;
+    }
+    
+    if (state === 'playing') {
+        if (/^[a-zA-Z]$/.test(e.key)) {
+            handleKey(e.key);
+        }
+    }
+});
+
+// Game loop
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = time - lastTime;
+    lastTime = time;
+    
+    updateParticles();
+    updateScales();
+    
+    if (shakeTimer > 0) shakeTimer--;
+    
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+calcLayout();
+initGrid();
+newWord();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
