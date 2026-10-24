@@ -1,0 +1,491 @@
+<think>
+The user wants a "Zombie Snake Game" — a single-file HTML5 game. Make a snake game with a zombie theme: grid-based, food is brains (or zombie survivors), obstacles are zombies? Let me think about the design:
+
+- Grid-based snake, canvas rendering
+- Food = brains (pink) / survivors to rescue
+- Zombies as moving obstacles that kill you on contact
+- Start screen with title and control instructions, restart button
+- Web Audio for sound effects after first input
+- Resize handling, no scrollbars
+- localStorage for high score (with try/catch)
+
+Implementation details:
+- Canvas filling the window, grid computed from size.
+- Snake moves each tick, speed increases over time.
+- Zombies spawn periodically and move toward the snake's head or randomly; collision with zombie = game over.
+- Eating brains grows the snake and adds to score; sometimes survivors appear for bonus points.
+- Game over screen with restart (Enter / R key or button).
+- Sound: beep on eating, thud on death, etc.
+
+Keep the code clean. Use an emoji-free canvas drawing — draw shapes: brain = pink blob, zombie = green square with eyes.
+
+Let's write it. Grid cell size roughly 24px, computed from min dimension; but simpler: fixed logical grid (e.g., 30x20 cells), scale canvas to window preserving aspect ratio? Simpler still: fill the whole window, compute cols/rows from canvas size with a fixed cell size of 28. Recompute on resize — but that would change the board during the game. Simpler: use a fixed logical grid 40x25, scale cells to fit the window (letterbox). Do that: canvas = full window, compute cellSize = floor(min(w/cols, h/rows)), center the board.
+
+Zombies: move every zombieMoveInterval ticks (e.g., every 2 moves), step toward the snake's head with some randomness; don't overlap each other or the food? Keep it simple: they can move anywhere within bounds, avoiding cells occupied by other zombies. If a zombie is on the same cell as the snake's head or body → death. Actually, if the zombie steps onto the head → game over.
+
+Spawn zombies every N seconds, up to a maximum count.
+
+Survivors: rare bonus item worth 5 points, disappears after a certain number of ticks.
+
+Audio: create AudioContext on first keydown/click. Functions: playEat (rising blip sound), playDie (descending sawtooth), playBonus.
+
+Controls: arrow keys / WASD, prevent reverse direction. Space to pause? Enter to start/restart.
+
+High score saved in localStorage.
+
+Let's write the complete HTML.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Zombie Snake</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: #0d0f0a;
+    font-family: 'Courier New', monospace;
+  }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; background: #141710; image-rendering: pixelated; }
+  .overlay {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: #cfe8b8; text-align: center; z-index: 5;
+    background: rgba(10, 12, 8, 0.88);
+  }
+  .overlay h1 {
+    font-size: clamp(34px, 7vw, 72px); margin: 0 0 6px;
+    color: #7ed957; letter-spacing: 3px;
+    text-shadow: 0 0 18px rgba(126,217,87,.6), 3px 3px 0 #1c2a12;
+  }
+  .overlay h1 span { color: #ff5d7a; text-shadow: 0 0 18px rgba(255,93,122,.6), 3px 3px 0 #2a1218; }
+  .overlay p { font-size: clamp(14px, 2vw, 20px); margin: 6px 0; color: #a9c48f; line-height: 1.5; }
+  .overlay .big { font-size: clamp(20px, 3vw, 30px); color: #ffd76e; }
+  button {
+    margin-top: 18px; padding: 12px 34px; font-family: inherit;
+    font-size: clamp(16px, 2.4vw, 22px); letter-spacing: 2px;
+    background: #2c4a1e; color: #d7ffb0; border: 2px solid #7ed957;
+    cursor: pointer; border-radius: 6px; transition: all .15s;
+  }
+  button:hover { background: #3d6b2b; box-shadow: 0 0 16px rgba(126,217,87,.5); transform: scale(1.05); }
+  .hidden { display: none !important; }
+  .hint { font-size: clamp(11px, 1.6vw, 14px); color: #6f8a5c; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+
+  <div id="startScreen" class="overlay">
+    <h1>ZOMBIE <span>SNAKE</span></h1>
+    <p>You are the last survivor's pet snake in a world of the undead.</p>
+    <p>Eat <b style="color:#ff9db8">brains</b> to grow. Rescue <b style="color:#ffd76e">survivors</b> for bonus points.</p>
+    <p>Avoid the <b style="color:#7ed957">zombies</b> — they hunt you!</p>
+    <p class="big">Controls: Arrow keys / WASD &nbsp;·&nbsp; P = pause</p>
+    <p id="startHi" class="hint"></p>
+    <button id="startBtn">START GAME</button>
+    <p class="hint">or press ENTER</p>
+  </div>
+
+  <div id="overScreen" class="overlay hidden">
+    <h1><span>YOU DIED</span></h1>
+    <p id="finalScore" class="big"></p>
+    <p id="finalHi" class="hint"></p>
+    <button id="restartBtn">PLAY AGAIN</button>
+    <p class="hint">or press ENTER / R</p>
+  </div>
+
+  <div id="pauseScreen" class="overlay hidden">
+    <h1>PAUSED</h1>
+    <p>Press P to resume</p>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---------- Canvas / board setup ----------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const COLS = 40, ROWS = 25;
+  let cell = 28, offX = 0, offY = 0;
+
+  function resize(){
+    const w = window.innerWidth, h = window.innerHeight;
+    canvas.width = w; canvas.height = h;
+    cell = Math.floor(Math.min(w / COLS, h / ROWS));
+    offX = Math.floor((w - cell * COLS) / 2);
+    offY = Math.floor((h - cell * ROWS) / 2);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- Audio (Web Audio API, after first input) ----------
+  let actx = null;
+  function initAudio(){
+    if (!actx){
+      try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
+    }
+    if (actx && actx.state === 'suspended') actx.resume();
+  }
+  function tone(freq, dur, type, vol, slideTo){
+    if (!actx) return;
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'square';
+    o.frequency.setValueAtTime(freq, actx.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, actx.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.12, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  }
+  const sfx = {
+    eat(){ tone(300, .08, 'square', .12, 600); },
+    bonus(){ tone(500,.1,'triangle',.14,900); setTimeout(()=>tone(750,.15,'triangle',.14,1200),90); },
+    zombie(){ tone(120,.25,'sawtooth',.1,60); },
+    die(){ tone(220,.5,'sawtooth',.18,40); setTimeout(()=>tone(150,.6,'square',.14,30),120); },
+    start(){ tone(400,.1,'triangle',.12,800); }
+  };
+
+  // ---------- Game state ----------
+  const DIRS = { up:{x:0,y:-1}, down:{x:0,y:1}, left:{x:-1,y:0}, right:{x:1,y:0} };
+  let snake, dir, nextDir, food, survivor, survivorsLeft, zombies;
+  let score, hiScore = 0, tickMs, tickCount, gameOver, paused, running = false;
+  let lastTime = 0, acc = 0, inputLock = 0;
+
+  try { hiScore = parseInt(localStorage.getItem('zombieSnakeHi') || '0', 10) || 0; } catch(e){}
+
+  const startScreen = document.getElementById('startScreen');
+  const overScreen  = document.getElementById('overScreen');
+  const pauseScreen = document.getElementById('pauseScreen');
+  document.getElementById('startHi').textContent = hiScore > 0 ? 'High score: ' + hiScore : '';
+
+  function randInt(n){ return Math.floor(Math.random() * n); }
+
+  function freeCell(){
+    let c, guard = 0;
+    do {
+      c = { x: randInt(COLS), y: randInt(ROWS) };
+      guard++;
+    } while (guard < 2000 && (
+      snake.some(s => s.x === c.x && s.y === c.y) ||
+      (food && food.x === c.x && food.y === c.y) ||
+      (survivor && survivor.x === c.x && survivor.y === c.y) ||
+      zombies.some(z => z.x === c.x && z.y === c.y)
+    ));
+    return c;
+  }
+
+  function reset(){
+    snake = [{x:10,y:12},{x:9,y:12},{x:8,y:12}];
+    dir = DIRS.right; nextDir = DIRS.right;
+    food = freeCell();
+    survivor = null; survivorsLeft = 0;
+    zombies = [];
+    score = 0; tickMs = 140; tickCount = 0;
+    gameOver = false; paused = false; acc = 0; inputLock = 0;
+    lastTime = performance.now();
+  }
+
+  function spawnZombie(){
+    // Spawn at edge, away from the head
+    let c, guard = 0;
+    do {
+      const side = randInt(4);
+      if (side === 0)      c = { x: randInt(COLS), y: 0 };
+      else if (side === 1) c = { x: randInt(COLS), y: ROWS-1 };
+      else if (side === 2) c = { x: 0, y: randInt(ROWS) };
+      else                 c = { x: COLS-1, y: randInt(ROWS) };
+      guard++;
+    } while (guard < 60 &&
+      Math.abs(c.x - snake[0].x) + Math.abs(c.y - snake[0].y) < 8);
+    zombies.push({ x: c.x, y: c.y, wob: Math.random() * 6.28 });
+  }
+
+  function moveZombies(){
+    const head = snake[0];
+    for (const z of zombies){
+      z.wob += 0.4;
+      let dx = 0, dy = 0;
+      // mostly chase head, sometimes wander
+      if (Math.random() < 0.82){
+        if (Math.abs(head.x - z.x) > Math.abs(head.y - z.y)) dx = Math.sign(head.x - z.x);
+        else dy = Math.sign(head.y - z.y);
+      } else {
+        const d = [DIRS.up, DIRS.down, DIRS.left, DIRS.right][randInt(4)];
+        dx = d.x; dy = d.y;
+      }
+      let nx = z.x + dx, ny = z.y + dy;
+      if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS){
+        // slide along wall instead
+        nx = z.x; ny = z.y;
+        if (Math.abs(head.x - z.x) > Math.abs(head.y - z.y)) nx += Math.sign(head.x - z.x);
+        else ny += Math.sign(head.y - z.y);
+        if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS){ nx = z.x; ny = z.y; }
+      }
+      // avoid stacking on other zombies or food cell
+      const blocked = zombies.some(o => o !== z && o.x === nx && o.y === ny) ||
+                      (food && food.x === nx && food.y === ny);
+      if (!blocked){ z.x = nx; z.y = ny; }
+    }
+  }
+
+  function step(){
+    tickCount++;
+    inputLock--;
+    dir = nextDir;
+    const head = { x: snake[0].x + dir.x, y: snake[0].y + dir.y };
+
+    // wall or self collision
+    if (head.x < 0 || head.x >= COLS || head.y < 0 || head.y >= ROWS ||
+        snake.some(s => s.x === head.x && s.y === head.y)){
+      return endGame();
+    }
+    snake.unshift(head);
+
+    // zombies: collide or move
+    if (zombies.some(z => z.x === head.x && z.y === head.y)) return endGame();
+    if (tickCount % 2 === 0) moveZombies();
+    if (zombies.some(z => z.x === head.x && z.y === head.y)) return endGame();
+
+    // spawn zombies over time
+    const maxZ = Math.min(10, 2 + Math.floor(tickCount / 90));
+    if (zombies.length < maxZ && tickCount % 45 === 0) spawnZombie();
+
+    // food
+    if (head.x === food.x && head.y === food.y){
+      score += 1;
+      sfx.eat();
+      tickMs = Math.max(70, 140 - Math.floor(score / 3) * 6);
+      food = freeCell();
+      // chance to spawn a survivor bonus
+      if (!survivor && Math.random() < 0.25){
+        survivor = freeCell();
+        survivorsLeft = 60;
+      }
+    }
+
+    // survivor bonus
+    if (survivor){
+      if (head.x === survivor.x && head.y === survivor.y){
+        score += 5;
+        sfx.bonus();
+        survivor = null;
+      } else if (--survivorsLeft <= 0){
+        survivor = null;
+      }
+    }
+
+    snake.pop();
+  }
+
+  function endGame(){
+    gameOver = true; running = false;
+    sfx.die();
+    if (score > hiScore){
+      hiScore = score;
+      try { localStorage.setItem('zombieSnakeHi', String(hiScore)); } catch(e){}
+    }
+    document.getElementById('finalScore').textContent = 'Brains eaten: ' + score;
+    document.getElementById('finalHi').textContent = (score >= hiScore && score > 0) ? '★ NEW HIGH SCORE! ★' : 'High score: ' + hiScore;
+    overScreen.classList.remove('hidden');
+  }
+
+  // ---------- Rendering ----------
+  function draw(){
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const t = performance.now() / 1000;
+
+    // board bg with subtle checker
+    ctx.fillStyle = '#141710';
+    ctx.fillRect(offX, offY, cell*COLS, cell*ROWS);
+    ctx.fillStyle = 'rgba(255,255,255,0.018)';
+    for (let y = 0; y < ROWS; y++)
+      for (let x = 0; x < COLS; x++)
+        if ((x + y) % 2 === 0) ctx.fillRect(offX + x*cell, offY + y*cell, cell, cell);
+
+    // grid border
+    ctx.strokeStyle = '#3a5c26';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(offX - 1, offY - 1, cell*COLS + 2, cell*ROWS + 2);
+
+    // food: brain (pink blob)
+    if (food){
+      const fx = offX + food.x*cell + cell/2, fy = offY + food.y*cell + cell/2;
+      const r = cell * 0.34 * (1 + 0.08 * Math.sin(t*5));
+      ctx.fillStyle = '#ff9db8';
+      ctx.beginPath(); ctx.arc(fx - r*0.4, fy, r*0.75, 0, 6.29); ctx.fill();
+      ctx.beginPath(); ctx.arc(fx + r*0.4, fy, r*0.75, 0, 6.29); ctx.fill();
+      ctx.strokeStyle = '#c75d7e'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(fx, fy - r); ctx.lineTo(fx, fy + r); ctx.stroke();
+      ctx.beginPath(); ctx.arc(fx - r*0.4, fy, r*0.35, 0, 6.29); ctx.stroke();
+    }
+
+    // survivor: little person with a light
+    if (survivor){
+      const sx = offX + survivor.x*cell + cell/2, sy = offY + survivor.y*cell + cell/2;
+      const blink = Math.sin(t*8) > -0.3;
+      ctx.fillStyle = 'rgba(255,215,110,' + (blink ? 0.25 : 0.08) + ')';
+      ctx.beginPath(); ctx.arc(sx, sy, cell*0.7, 0, 6.29); ctx.fill();
+      ctx.fillStyle = '#ffd76e';
+      ctx.beginPath(); ctx.arc(sx, sy - cell*0.15, cell*0.13, 0, 6.29); ctx.fill(); // head
+      ctx.fillRect(sx - cell*0.11, sy - cell*0.02, cell*0.22, cell*0.28);          // body
+    }
+
+    // zombies: green shamblers with eyes
+    for (const z of zombies){
+      const zx = offX + z.x*cell, zy = offY + z.y*cell;
+      const wob = Math.sin(z.wob) * cell * 0.05;
+      ctx.fillStyle = '#4f8a35';
+      roundRect(zx + cell*0.12 + wob, zy + cell*0.16, cell*0.76, cell*0.72, cell*0.18);
+      // arms out
+      ctx.fillRect(zx - cell*0.05 + wob, zy + cell*0.32, cell*0.18, cell*0.14);
+      ctx.fillRect(zx + cell*0.87 + wob, zy + cell*0.32, cell*0.18, cell*0.14);
+      // eyes — head toward snake
+      const ex = offX + snake[0].x*cell + cell/2 - (zx + cell/2);
+      const ey = offY + snake[0].y*cell + cell/2 - (zy + cell/2);
+      const el = Math.hypot(ex, ey) || 1;
+      const ox = ex/el * cell*0.05, oy = ey/el * cell*0.05;
+      ctx.fillStyle = '#ff4d4d';
+      ctx.beginPath(); ctx.arc(zx + cell*0.36 + wob + ox, zy + cell*0.38 + oy, cell*0.09, 0, 6.29); ctx.fill();
+      ctx.beginPath(); ctx.arc(zx + cell*0.64 + wob + ox, zy + cell*0.38 + oy, cell*0.09, 0, 6.29); ctx.fill();
+      // mouth
+      ctx.fillStyle = '#1c2a12';
+      ctx.fillRect(zx + cell*0.38 + wob, zy + cell*0.62, cell*0.24, cell*0.08);
+    }
+
+    // snake: body with gradient head
+    for (let i = snake.length - 1; i >= 0; i--){
+      const s = snake[i];
+      const px = offX + s.x*cell, py = offY + s.y*cell;
+      if (i === 0){
+        ctx.fillStyle = '#9dff6e';
+        roundRect(px + cell*0.05, py + cell*0.05, cell*0.9, cell*0.9, cell*0.3);
+        // eyes look in dir
+        const exo = px + cell/2 + dir.x*cell*0.16, eyo = py + cell/2 + dir.y*cell*0.16;
+        ctx.fillStyle = '#0d0f0a';
+        if (dir.x !== 0){
+          ctx.beginPath(); ctx.arc(exo, py + cell*0.3, cell*0.09, 0, 6.29); ctx.fill();
+          ctx.beginPath(); ctx.arc(exo, py + cell*0.7, cell*0.09, 0, 6.29); ctx.fill();
+        } else {
+          ctx.beginPath(); ctx.arc(px + cell*0.3, eyo, cell*0.09, 0, 6.29); ctx.fill();
+          ctx.beginPath(); ctx.arc(px + cell*0.7, eyo, cell*0.09, 0, 6.29); ctx.fill();
+        }
+        // tongue flick
+        if (Math.sin(t*10) > 0.4){
+          ctx.strokeStyle = '#ff5d7a'; ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(px + cell/2 + dir.x*cell*0.5, py + cell/2 + dir.y*cell*0.5);
+          ctx.lineTo(px + cell/2 + dir.x*cell*0.85, py + cell/2 + dir.y*cell*0.85);
+          ctx.stroke();
+        }
+      } else {
+        const f = i / snake.length;
+        ctx.fillStyle = 'rgb(' + Math.round(110 - f*40) + ',' + Math.round(200 - f*60) + ',' + Math.round(80 - f*30) + ')';
+        roundRect(px + cell*0.1, py + cell*0.1, cell*0.8, cell*0.8, cell*0.25);
+      }
+    }
+
+    // HUD
+    ctx.fillStyle = '#a9c48f';
+    ctx.font = 'bold ' + Math.max(14, cell*0.6) + 'px Courier New';
+    ctx.textAlign = 'left';
+    ctx.fillText('BRAINZ: ' + score, offX, offY - 12 > 14 ? offY - 12 : 18);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#ffd76e';
+    ctx.fillText('HI: ' + Math.max(hiScore, score), offX + cell*COLS, offY - 12 > 14 ? offY - 12 : 18);
+  }
+
+  function roundRect(x, y, w, h, r){
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y, x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x, y+h, r);
+    ctx.arcTo(x, y+h, x, y, r);
+    ctx.arcTo(x, y, x+w, y, r);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // ---------- Main loop ----------
+  function loop(now){
+    requestAnimationFrame(loop);
+    if (!running || paused || gameOver){ draw(); return; }
+    acc += now - lastTime;
+    lastTime = now;
+    while (acc >= tickMs && !gameOver){
+      acc -= tickMs;
+      step();
+    }
+    draw();
+  }
+
+  // ---------- Input ----------
+  function queueDir(d){
+    if (!running || paused || gameOver) return;
+    if (inputLock > 0) return;
+    if (d.x === -dir.x && d.y === -dir.y) return; // no reversing
+    nextDir = d; inputLock = 1;
+  }
+
+  function startGame(){
+    initAudio();
+    reset();
+    running = true;
+    startScreen.classList.add('hidden');
+    overScreen.classList.add('hidden');
+    pauseScreen.classList.add('hidden');
+    sfx.start();
+  }
+
+  window.addEventListener('keydown', function(e){
+    const k = e.key;
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(k)) e.preventDefault();
+    initAudio();
+
+    if (k === 'Enter' || k === 'r' || k === 'R'){
+      if (!running || gameOver) startGame();
+      return;
+    }
+    if ((k === 'p' || k === 'P') && running && !gameOver){
+      paused = !paused;
+      pauseScreen.classList.toggle('hidden', !paused);
+      lastTime = performance.now(); acc = 0;
+      return;
+    }
+    if (k === 'ArrowUp' || k === 'w' || k === 'W')   queueDir(DIRS.up);
+    else if (k === 'ArrowDown' || k === 's' || k === 'S') queueDir(DIRS.down);
+    else if (k === 'ArrowLeft' || k === 'a' || k === 'A')  queueDir(DIRS.left);
+    else if (k === 'ArrowRight' || k === 'd' || k === 'D') queueDir(DIRS.right);
+  });
+
+  // touch / click: swipe on canvas + buttons
+  let tStart = null;
+  canvas.addEventListener('touchstart', e => { initAudio(); const t = e.touches[0]; tStart = {x:t.clientX, y:t.clientY}; }, {passive:true});
+  canvas.addEventListener('touchend', e => {
+    if (!tStart) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - tStart.x, dy = t.clientY - tStart.y;
+    if (Math.max(Math.abs(dx), Math.abs(dy)) < 24){ 
+      if (!running || gameOver) startGame();
+    } else if (Math.abs(dx) > Math.abs(dy)) queueDir(dx > 0 ? DIRS.right : DIRS.left);
+    else queueDir(dy > 0 ? DIRS.down : DIRS.up);
+    tStart = null;
+  }, {passive:true});
+  canvas.addEventListener('mousedown', () => { initAudio(); if (!running || gameOver) startGame(); });
+
+  document.getElementById('startBtn').addEventListener('click', startGame);
+  document.getElementById('restartBtn').addEventListener('click', startGame);
+
+  // initial render behind start screen
+  reset();
+  requestAnimationFrame(function(n){ lastTime = n; loop(n); });
+})();
+</script>
+</body>
+</html>
+```
