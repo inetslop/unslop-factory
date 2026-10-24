@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tetris Sokoban</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, cellSize, gridX, gridY;
+const COLS = 8, ROWS = 12;
+
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    cellSize = Math.min(Math.floor((W * 0.6) / COLS), Math.floor((H * 0.75) / ROWS));
+    gridX = Math.floor((W - COLS * cellSize) / 2);
+    gridY = Math.floor((H - ROWS * cellSize) / 2) - 10;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.value = vol || 0.15;
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+function sfxMove() { playSound(200, 0.05, 'square', 0.08); }
+function sfxPush() { playSound(300, 0.08, 'triangle', 0.12); }
+function sfxPlace() { playSound(600, 0.15, 'sine', 0.2); setTimeout(()=>playSound(900,0.2,'sine',0.15),80); }
+function sfxLevelUp() { [523,659,784,1047].forEach((f,i)=>setTimeout(()=>playSound(f,0.2,'sine',0.15),i*100)); }
+function sfxGameOver() { playSound(200, 0.5, 'sawtooth', 0.2); setTimeout(()=>playSound(150,0.6,'sawtooth',0.15),200); }
+
+// Game state
+let gameState = 'start'; // start, playing, levelup, gameover
+let grid = [];
+let player = { x: 3, y: 10 };
+let targets = [];
+let fallingPiece = null;
+let fallTimer = 0;
+let fallSpeed = 50;
+let score = 0;
+let level = 1;
+let particles = [];
+let animTimer = 0;
+let message = '';
+let messageTimer = 0;
+
+const PIECE_SHAPES = [
+    [[0,0],[1,0],[0,1],[1,1]], // O
+    [[0,0],[1,0],[2,0],[3,0]], // I horizontal
+    [[0,0],[0,1],[1,1],[2,1]], // T down
+    [[0,0],[0,1],[0,2],[1,2]], // L
+    [[1,0],[1,1],[1,2],[0,2]], // J
+    [[0,0],[1,0],[1,1],[2,1]], // S
+    [[0,1],[1,1],[0,2],[1,2]], // Z
+    [[0,0],[1,0],[2,0],[2,1]], // L variant
+    [[0,0],[0,1],[1,1],[2,1],[2,2]], // skip this one, too big
+];
+
+const TETROMINOES = [
+    { cells: [[0,0],[1,0],[0,1],[1,1]], color: '#f5d547' }, // O - yellow
+    { cells: [[0,0],[1,0],[2,0],[3,0]], color: '#4ee6b0' }, // I - cyan
+    { cells: [[0,0],[1,0],[2,0],[1,1]], color: '#a855f7' }, // T - purple
+    { cells: [[0,0],[0,1],[0,2],[1,2]], color: '#f97316' }, // L - orange
+    { cells: [[1,0],[1,1],[1,2],[0,2]], color: '#ef4444' }, // J - red
+    { cells: [[0,0],[1,0],[1,1],[2,1]], color: '#22c55e' }, // S - green
+    { cells: [[0,1],[1,1],[0,2],[1,2]], color: '#ec4899' }, // Z - pink
+];
+
+function initGrid() {
+    grid = Array.from({ length: ROWS }, () => Array(COLS).fill(null));
+}
+
+function generateTargets() {
+    targets = [];
+    const count = Math.min(3 + level, 6);
+    const used = new Set();
+    for (let i = 0; i < count; i++) {
+        let tx, ty;
+        do {
+            tx = Math.floor(Math.random() * COLS);
+            ty = 4 + Math.floor(Math.random() * (ROWS - 5));
+        } while (used.has(tx + ',' + ty) || grid[ty][tx]);
+        used.add(tx + ',' + ty);
+        targets.push({ x: tx, y: ty, filled: false });
+    }
+}
+
+function spawnPiece() {
+    const shape = TETROMINOES[Math.floor(Math.random() * TETROMINOES.length)];
+    let maxStartX = COLS - 3;
+    let px = Math.floor(Math.random() * (maxStartX + 1));
+    // Clamp so piece fits
+    if (shape.cells.some(c => c[0] + px >= COLS)) {
+        px = Math.max(0, COLS - 4);
+    }
+    fallingPiece = { x: px, y: -2, shape, color: shape.color };
+}
+
+function canFall(piece) {
+    if (!piece) return false;
+    const ny = piece.y + 1;
+    for (const [cx, cy] of piece.shape.cells) {
+        const gx = cx + piece.x;
+        const gy = cy + ny;
+        if (gy >= ROWS || (gy >= 0 && grid[gy][gx])) return false;
+    }
+    return true;
+}
+
+function lockPiece() {
+    if (!fallingPiece) return;
+    for (const [cx, cy] of fallingPiece.shape.cells) {
+        const gx = cx + fallingPiece.x;
+        const gy = cy + fallingPiece.y;
+        if (gy >= 0 && gy < ROWS && gx >= 0 && gx < COLS) {
+            if (grid[gy][gx]) { /* collision, shouldn't happen */ }
+            else grid[gy][gx] = { color: fallingPiece.color, isBlock: true };
+        }
+    }
+    // Check if piece landed on player
+    for (const [cx, cy] of fallingPiece.shape.cells) {
+        const gx = cx + fallingPiece.x;
+        const gy = cy + fallingPiece.y;
+        if (gx === player.x && gy === player.y) {
+            gameOver();
+            return;
+        }
+    }
+    // Check if grid is full at top
+    for (let x = 0; x < COLS; x++) {
+        if (grid[0][x]) {
+            gameOver();
+            return;
+        }
+    }
+    fallingPiece = null;
+}
+
+function startLevel() {
+    initGrid();
+    player = { x: 3, y: ROWS - 2 };
+    generateTargets();
+    fallTimer = 0;
+    fallingPiece = null;
+    spawnPiece();
+    gameState = 'playing';
+}
+
+function startGame() {
+    score = 0;
+    level = 1;
+    particles = [];
+    message = '';
+    messageTimer = 0;
+    fallSpeed = 55;
+    startLevel();
+}
+
+function gameOver() {
+    gameState = 'gameover';
+    sfxGameOver();
+}
+
+function nextLevel() {
+    level++;
+    fallSpeed = Math.max(20, 55 - level * 4);
+    message = 'Level ' + level;
+    messageTimer = 90;
+    startLevel();
+    sfxLevelUp();
+}
+
+function checkLevelComplete() {
+    if (targets.every(t => t.filled)) {
+        score += 50 * level;
+        gameState = 'levelup';
+        setTimeout(() => nextLevel(), 1200);
+    }
+}
+
+function movePlayer(dx, dy) {
+    if (gameState !== 'playing') return;
+    initAudio();
+    const nx = player.x + dx;
+    const ny = player.y + dy;
+    if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) return;
+
+    if (grid[ny][nx]) {
+        // Try to push
+        const px = nx + dx;
+        const py = ny + dy;
+        if (px < 0 || px >= COLS || py < 0 || py >= ROWS) return;
+        if (grid[py][px]) return; // Can't push into another block
+
+        // Push the block
+        const block = grid[ny][nx];
+        grid[ny][nx] = null;
+        grid[py][px] = block;
+        sfxPush();
+
+        // Check if pushed onto target
+        for (const t of targets) {
+            if (!t.filled && t.x === px && t.y === py) {
+                t.filled = true;
+                grid[py][px] = null;
+                score += 10;
+                sfxPlace();
+                spawnParticles(px, py, block.color);
+                checkLevelComplete();
+            }
+        }
+    } else {
+        player.x = nx;
+        player.y = ny;
+        sfxMove();
+    }
+
+    // Check if player walked into a falling piece's path (not landed yet)
+    if (fallingPiece) {
+        for (const [cx, cy] of fallingPiece.shape.cells) {
+            const gx = cx + fallingPiece.x;
+            const gy = cy + fallingPiece.y;
+            if (gx === player.x && gy === player.y) {
+                gameOver();
+            }
+        }
+    }
+}
+
+function spawnParticles(gx, gy, color) {
+    const cx = gridX + gx * cellSize + cellSize / 2;
+    const cy = gridY + gy * cellSize + cellSize / 2;
+    for (let i = 0; i < 12; i++) {
+        const angle = (i / 12) * Math.PI * 2;
+        particles.push({
+            x: cx, y: cy,
+            vx: Math.cos(angle) * (2 + Math.random() * 3),
+            vy: Math.sin(angle) * (2 + Math.random() * 3),
+            life: 30,
+            color: color
+        });
+    }
+}
+
+function update() {
+    if (gameState !== 'playing') return;
+
+    fallTimer++;
+    if (fallingPiece && fallTimer >= fallSpeed) {
+        fallTimer = 0;
+        if (canFall(fallingPiece)) {
+            fallingPiece.y++;
+            // Check collision with player during fall
+            for (const [cx, cy] of fallingPiece.shape.cells) {
+                const gx = cx + fallingPiece.x;
+                const gy = cy + fallingPiece.y;
+                if (gx === player.x && gy === player.y) {
+                    gameOver();
+                    return;
+                }
+            }
+        } else {
+            lockPiece();
+            if (gameState === 'playing') spawnPiece();
+        }
+    }
+
+    // Update particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.2;
+        p.life--;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    if (messageTimer > 0) messageTimer--;
+}
+
+function draw() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    // Draw grid background
+    for (let y = 0; y < ROWS; y++) {
+        for (let x = 0; x < COLS; x++) {
+            const px = gridX + x * cellSize;
+            const py = gridY + y * cellSize;
+            ctx.fillStyle = (x + y) % 2 === 0 ? '#1a1a2e' : '#16162a';
+            ctx.fillRect(px, py, cellSize, cellSize);
+        }
+    }
+
+    // Grid lines
+    ctx.strokeStyle = '#2a2a4a';
+    ctx.lineWidth = 1;
+    for (let x = 0; x <= COLS; x++) {
+        ctx.beginPath();
+        ctx.moveTo(gridX + x * cellSize, gridY);
+        ctx.lineTo(gridX + x * cellSize, gridY + ROWS * cellSize);
+        ctx.stroke();
+    }
+    for (let y = 0; y <= ROWS; y++) {
+        ctx.beginPath();
+        ctx.moveTo(gridX, gridY + y * cellSize);
+        ctx.lineTo(gridX + COLS * cellSize, gridY + y * cellSize);
+        ctx.stroke();
+    }
+
+    // Draw targets
+    const pulse = 0.5 + 0.5 * Math.sin(Date.now() * 0.005);
+    for (const t of targets) {
+        if (!t.filled) {
+            const px = gridX + t.x * cellSize;
+            const py = gridY + t.y * cellSize;
+            ctx.strokeStyle = `rgba(255, 215, 0, ${0.4 + pulse * 0.4})`;
+            ctx.lineWidth = 2;
+            ctx.strokeRect(px + 4, py + 4, cellSize - 8, cellSize - 8);
+            ctx.fillStyle = `rgba(255, 215, 0, ${0.1 + pulse * 0.1})`;
+            ctx.fillRect(px + 4, py + 4, cellSize - 8, cellSize - 8);
+            // Draw star/diamond
+            ctx.fillStyle = `rgba(255, 215, 0, ${0.3 + pulse * 0.3})`;
+            const cx = px + cellSize / 2;
+            const cy = py + cellSize / 2;
+            const s = cellSize * 0.2;
+            ctx.beginPath();
+            ctx.moveTo(cx, cy - s);
+            ctx.lineTo(cx + s, cy);
+            ctx.lineTo(cx, cy + s);
+            ctx.lineTo(cx - s, cy);
+            ctx.closePath();
+            ctx.fill();
+        } else {
+            const px = gridX + t.x * cellSize;
+            const py = gridY + t.y * cellSize;
+            ctx.fillStyle = 'rgba(34, 197, 94, 0.2)';
+            ctx.fillRect(px + 4, py + 4, cellSize - 8, cellSize - 8);
+        }
+    }
+
+    // Draw grid blocks
+    for (let y = 0; y < ROWS; y++) {
+        for (let x = 0; x < COLS; x++) {
+            if (grid[y][x]) {
+                const px = gridX + x * cellSize;
+                const py = gridY + y * cellSize;
+                ctx.fillStyle = grid[y][x].color;
+                ctx.fillRect(px + 2, py + 2, cellSize - 4, cellSize - 4);
+                // Highlight
+                ctx.fillStyle = 'rgba(255,255,255,0.15)';
+                ctx.fillRect(px + 2, py + 2, cellSize - 4, (cellSize - 4) * 0.3);
+            }
+        }
+    }
+
+    // Draw falling piece
+    if (fallingPiece && gameState === 'playing') {
+        for (const [cx, cy] of fallingPiece.shape.cells) {
+            const gx = cx + fallingPiece.x;
+            const gy = cy + fallingPiece.y;
+            if (gy < 0) continue; // Don't draw above grid
+            const px = gridX + gx * cellSize;
+            const py = gridY + gy * cellSize;
+            ctx.fillStyle = fallingPiece.color;
+            ctx.globalAlpha = 0.7;
+            ctx.fillRect(px + 2, py + 2, cellSize - 4, cellSize - 4);
+            ctx.globalAlpha = 1;
+        }
+    }
+
+    // Draw player
+    if (gameState === 'playing' || gameState === 'levelup') {
+        const px = gridX + player.x * cellSize;
+        const py = gridY + player.y * cellSize;
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(px + 6, py + 6, cellSize - 12, cellSize - 12);
+        // Face
+        ctx.fillStyle = '#0a0a1a';
+        const eyeSize = cellSize * 0.12;
+        ctx.fillRect(px + cellSize * 0.3, py + cellSize * 0.35, eyeSize, eyeSize);
+        ctx.fillRect(px + cellSize * 0.55, py + cellSize * 0.35, eyeSize, eyeSize);
+        // Mouth
+        ctx.fillRect(px + cellSize * 0.32, py + cellSize * 0.65, cellSize * 0.3, eyeSize * 0.6);
+    }
+
+    // Draw particles
+    for (const p of particles) {
+        ctx.globalAlpha = p.life / 30;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+    }
+    ctx.globalAlpha = 1;
+
+    // HUD
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.max(14, cellSize * 0.4)}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillText('Score: ' + score, gridX, gridY - 25);
+    ctx.textAlign = 'right';
+    ctx.fillText('Level: ' + level, gridX + COLS * cellSize, gridY - 25);
+
+    // Targets remaining
+    const remaining = targets.filter(t => !t.filled).length;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillText('Targets: ' + remaining, W / 2, gridY - 25);
+
+    // Overlays
+    if (gameState === 'start') {
+        drawStartScreen();
+    } else if (gameState === 'gameover') {
+        drawGameOver();
+    } else if (gameState === 'levelup') {
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = '#4ee6b0';
+        ctx.font = `bold ${Math.max(24, cellSize * 0.8)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('LEVEL COMPLETE!', W / 2, H / 2);
+    }
+
+    if (messageTimer > 0 && gameState === 'playing') {
+        ctx.fillStyle = `rgba(255,215,0,${messageTimer/90})`;
+        ctx.font = `bold ${Math.max(18, cellSize * 0.6)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText(message, W / 2, gridY + ROWS * cellSize + 40);
+    }
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = 'rgba(10,10,26,0.9)';
+    ctx.fillRect(0, 0, W, H);
+
+    const cx = W / 2;
+    let cy = H * 0.2;
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#f5d547';
+    ctx.font = `bold ${Math.min(W*0.08, 48)}px monospace`;
+    ctx.fillText('TETRIS SOKOBAN', cx, cy);
+
+    cy += Math.min(H * 0.12, 80);
+    ctx.fillStyle = '#ccc';
+    ctx.font = `${Math.min(W*0.035, 18)}px monospace`;
+    const lines = [
+        'Push blocks onto golden targets to clear them!',
+        '',
+        'Tetrominoes fall from above — they become',
+        'blocks that can be pushed (Sokoban style).',
+        '',
+        'CONTROLS:',
+        'Arrow Keys / WASD — Move & Push',
+        '',
+        'Don\'t let the grid fill to the top!',
+        'Don\'t get crushed by falling pieces!',
+        '',
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, cx, cy + i * Math.min(H*0.045, 30));
+    });
+
+    cy += lines.length * Math.min(H * 0.045, 30) + 20;
+    const blink = Math.sin(Date.now() * 0.005) > 0;
+    if (blink) {
+        ctx.fillStyle = '#4ee6b0';
+        ctx.font = `bold ${Math.min(W*0.04, 22)}px monospace`;
+        ctx.fillText('Press SPACE or ENTER to Start', cx, cy);
+    }
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(10,10,26,0.85)';
+    ctx.fillRect(0, 0, W, H);
+
+    const cx = W / 2;
+    let cy = H * 0.3;
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ef4444';
+    ctx.font = `bold ${Math.min(W*0.07, 42)}px monospace`;
+    ctx.fillText('GAME OVER', cx, cy);
+
+    cy += Math.min(H * 0.1, 60);
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.min(W*0.035, 20)}px monospace`;
+    ctx.fillText('Final Score: ' + score, cx, cy);
+    ctx.fillText('Level Reached: ' + level, cx, cy + Math.min(H*0.05, 30));
+
+    cy += Math.min(H * 0.12, 70);
+    const blink = Math.sin(Date.now() * 0.005) > 0;
+    if (blink) {
+        ctx.fillStyle = '#4ee6b0';
+        ctx.font = `bold ${Math.min(W*0.035, 20)}px monospace`;
+        ctx.fillText('Press SPACE to Restart', cx, cy);
+    }
+}
+
+function drawLoop() {
+    update();
+    draw();
+    requestAnimationFrame(drawLoop);
+}
+
+// Input
+window.addEventListener('keydown', (e) => {
+    initAudio();
+
+    if (gameState === 'start') {
+        if (e.key === ' ' || e.key === 'Enter') {
+            startGame();
+        }
+        return;
+    }
+
+    if (gameState === 'gameover') {
+        if (e.key === ' ' || e.key === 'Enter') {
+            startGame();
+        }
+        return;
+    }
+
+    if (gameState !== 'playing') return;
+
+    let dx = 0, dy = 0;
+    switch (e.key) {
+        case 'ArrowUp': case 'w': case 'W': dy = -1; break;
+        case 'ArrowDown': case 's': case 'S': dy = 1; break;
+        case 'ArrowLeft': case 'a': case 'A': dx = -1; break;
+        case 'ArrowRight': case 'd': case 'D': dx = 1; break;
+        default: return;
+    }
+    e.preventDefault();
+    movePlayer(dx, dy);
+});
+
+// Prevent scrolling with arrow keys
+window.addEventListener('keydown', (e) => {
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) {
+        e.preventDefault();
+    }
+});
+
+drawLoop();
+</script>
+</body>
+</html>
