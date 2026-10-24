@@ -1,0 +1,2142 @@
+<think>
+Let me design a pinball shooter game. A single HTML file, canvas-based, physics simulation: a ball that bounces around a playfield with bumpers, flippers at the bottom (or maybe just a shooter plunger), and a target score.
+
+Actually "pinball shooter" — probably a combination of pinball and shooting mechanics. Let me think about what's most fun and feasible in one file:
+
+Option A: Classic pinball with flippers, bumpers, slingshots, plunger. This is the iconic "pinball." The word "shooter" can be interpreted as the ball being shot from the plunger lane. That's actually authentic — you shoot the ball up from the shooter lane. So a full-fledged pinball game with:
+- Plunger/shoot mechanic (hold space to charge, release to fire)
+- Flippers at the bottom (left/right arrows or A/D, or Z/X keys)
+- Bumpers that bounce the ball and give score
+- Slingshots
+- Targets that light up
+- Ball lost → outlanes
+- 3 balls per game
+- Score, high score in localStorage
+- Sound via Web Audio (bounces, bumper hits, flipper sounds, ball loss)
+
+That's a rich, complete game. Let me build it carefully with decent physics:
+
+Physics:
+- Ball: circle, position, velocity, gravity.
+- Walls: line segments with collision (circle vs segment). Coefficient of restitution.
+- Bumpers: circles with strong impulse + score.
+- Flippers: rotating capsules/segments. When the flipper is active, it gives the ball a tangential velocity based on its angular velocity at the contact point.
+
+Physics engine approach: circle vs segment collision:
+- Find the closest point on the segment to the ball center; if distance < radius, push out and reflect velocity about the normal, applying restitution coefficient and adding the flipper surface velocity.
+
+Flipper implementation: a pivot point, length, angle range (rest angle, raised angle). The tip position is computed from the angle. When activated, the angle interpolates quickly toward the raised angle; when released, it returns to rest. For collision, treat the flipper as a capsule: a segment from the pivot to the tip with radius = flipperRadius. Contact point velocity = ω × r (in 2D: perpendicular). Add that to the relative velocity before reflecting.
+
+Let me write the core loop:
+
+```
+const G = 0.55; // gravity per frame at 60fps — use dt-based
+```
+
+Use fixed timestep or dt scaling. Simpler: run physics with a dt in seconds, cap dt, and sub-step for tunneling prevention (ball can move fast). Sub-steps: split each frame into N steps based on velocity.
+
+Playfield layout: canvas is logically about 480 wide x 720 tall (portrait), scaled to fit the window while preserving aspect ratio; letterbox with background around it. Actually "fill the window, rescale on resize" — scale the canvas to cover/fit and center it, drawing a decorative background outside the playfield.
+
+Layout (logical units): W=480, H=760 or so. Let me define:
+- Outer walls: left x=20, right x=460, top arc (rounded top). Top is an arc of radius ~220 centered at (240, 240)? Simpler: use segments to approximate the rounded top: left wall goes up to y=160, then arc segments to the right side.
+
+Simpler and more robust approach: build walls as a list of line segments; top is an arc approximated with ~16 segments. That works fine for collision.
+
+- Shooter lane: on the right side, a vertical channel from x=420 to 460 (width 40), separated by an inner wall from y=~300 down to the bottom. Ball starts at the bottom of the lane (x=440, y=~700). One-way gate at the top of the lane so ball can enter the playfield but not come back? Simpler: a small deflector above the lane entrance; if the ball falls back into the lane, it just comes to rest in the plunger area — which is fine, the player shoots again. Actually with the flippers below, if the ball drops into the shooter lane it's lost/respawned. Common design: outlane on right side of lane → ball lost. Let me do this: if the ball crosses y > H-40 in the lane (x>420), ball is lost (drain). Hmm but flippers are only under the main field.
+
+Let me define geometry concretely. Canvas logical size: W=520, H=780? Let me pick W=480, H=760.
+
+Coordinates:
+- Outer bounds: left wall x=16, right wall x=464, floor y=744 (bottom). Top arc: center (240, 200), radius 224? So the arc goes from left wall top (16, 200) to right (464,200) with radius 224. Actually distance from center (240,200) to (16,200) is 224. Good: arc from angle π to 2π (upper half)? The upper semicircle of that circle spans y=−24? No — top of circle is y = 200-224 = -24, slightly above the canvas. Adjust: center (240, 230), radius 224 → top y=6. Left wall x=16 goes from y=744 up to y=230; arc from (16,230) over to (464,230); right wall goes down to bottom.
+
+- Shooter lane: right side. Lane inner wall at x=416, from y=250 (below the top curve region… hmm, at x=416 the arc: dx=176, dy=sqrt(224²−176²)=sqrt(50176−30976)=sqrt(19200)≈138.6, so arc y at that x = 230−138.6=91.4). Lane wall from (416, 250) to (416, 744)? Then lane width = 464−416=48. Ball radius 10 → fits (lane inner half-width 24 vs ball 10 + wall… fine).
+
+Lane top gate: one-way flap — a segment from (416,250) to (436,232)? A small diagonal that deflects the ball into the playfield and lets it pass upward but blocks downward? Implementing one-way is complex; simpler: put an angled deflector at the top of the lane pointing up-left so a rising ball gets pushed left into the field. When descending from the field, if it enters the lane area past the deflector, it falls to the plunger — acceptable (player reshoots). But then the "ball lost" only happens when… hmm, in real pinball the lane has an outlane and a ball that drops back is lost. To keep gameplay flow: if ball rests/moves at bottom of lane (y > 700 && x>416), treat as drain → next ball. That's clean.
+
+Actually wait — flippers occupy the bottom center. Ball drains between the flippers and falls to the bottom y=744 → drain there too. Good: any ball reaching floor y > H - 20 = drain, except… plunger ball starts in lane; it's launched upward. If shot weakly, it falls back into the lane, comes to rest at bottom of lane → counts as drain? Harsh but that's how pinball works (you need sufficient force). Actually in real pinball a weak shot returns to the plunger and you can reshoot — no ball lost. But simpler: treat any floor contact as drain. To be kinder: if the ball is in the lane area with low velocity, auto-reshoot? Let me do this: ball touches bottom inside lane → "no good" — ball respawns at plunger without losing a ball (since it never entered play). Track `inPlay` flag: false until first shot. If it drains while !inPlay → respawn in lane, no ball lost. If inPlay and it falls back into the lane to the floor → that's a drain (ball lost). Hmm, but that punishes an unlucky bounce. Many games do treat the shooter lane as outlane. Let me keep: drain = lose ball unless it never entered play.
+
+Flippers:
+- Left flipper pivot at (170, 690), length 85, rest angle pointing down-right ~ +32° from horizontal (i.e., tip is lower right): restAngle = 0.55 rad (~31°) measured from +x axis (screen y-down so positive angle is downward). Active angle = -0.62 rad (upward).
+- Right flipper pivot at (310, 690), length 85, mirrored: restAngle = π - 0.55, active = π + 0.62? Let me define with direction vectors.
+
+Flipper capsule radius ~ 11. Ball radius 10.
+
+Approach to flippers (inlanes): angled walls funneling from the side walls toward the flipper pivots:
+- Left: segment from (16, 560) to (170, 690)? That's a long slope. Maybe add an outlane channel too… let me keep it simple: left wall goes straight down to y=560, then slopes to the flipper pivot area, with a small gap for the outlane between the end of the slope and the flipper? A real table has inlane/outlane. For simplicity and fun: no outlanes; walls converge directly onto flippers (like many casual pinball games). Ball only drains through the center gap between flippers. That's friendlier.
+
+So the boundary segments:
+1. Left wall: (16, 744) → (16, 230)
+2. Arc top: from (16,230) to (464,230) via upper semicircle of center (240,230) r=224 — approximated with 24 segments.
+3. Right wall: (464, 230) → (464, 744)
+4. Lane divider: (416, 252) → (416, 744). Hmm the lane divider meets the floor; ball in the lane is trapped between x=416 and 464 — good for plunger.
+   Wait, but if the ball drains through the flipper gap (x between ~205 and ~275) it hits the floor → drain. Good.
+5. Left funnel: (16, 545) → (95, 640) → (170, 688)? Let me simplify to one segment (16, 545) → (172, 688). Slope is fine. The ball rolls down onto the flipper.
+   Actually a steeper two-part look is better: (16,545)→(90,632), then (90,632)→(172,688). Collisions handle either. Let me use two segments for looks.
+6. Right funnel mirrors the left but on the right side of the lane divider: from lane divider at y=545? The right playfield edge is x=416 (lane divider), so right funnel: (416, 545) → (308, 688). Mirror.
+
+Slingshots: triangles above the flippers near the funnels — small boosters on the sides. Place two slingshot triangles:
+- Left sling: triangle with points A(95,585), B(150,585)?? Hmm typical slingshots sit just above and inside of the flipper area, facing inward/downward toward center. Let me place: left sling triangle vertices (105, 610), (170, 640)?? I need to be careful not to block the funnel path.
+
+Maybe skip slingshots as separate triangles; instead add "bumper" circles in the upper field and a few "drop targets" that give score when hit. Bumpers: three big pop bumpers arranged in a triangle in the upper middle: (150, 260), (330, 260), (240, 360), radius 26 each. When ball hits: strong impulse along normal (set velocity to at least BUMP_SPEED ≈ 520 px/s outward), +75 points, flash animation, sound.
+
+Drop targets: row of 3-4 small rectangles in the upper-left area, each worth 150; when all hit → "BANKED" bonus + special mode? Keep it modest: 4 targets on a slight arc or straight line at top center-right? They can be static segments (paddles) that get removed once hit. Place them horizontally at y=170, x=140 to 340? But the top is an arc; at y=170, the field width: at y=170 circle: dy = 230-170=60 → dx = sqrt(224²−60²)=sqrt(50176−3600)= sqrt(46576)≈215.8 → x from 24.2 to 455.8. So a horizontal target row at y=180, x=150..330 fits. Targets as short vertical paddles (segments) with thickness; when hit, they flip (removed), +200 each. All four → "TARGET BANK" +1000 and respawn after 3s? Or a rollover lane in the middle for extra points.
+
+Add rollover lights: three small circles at (180,470), (240,470), (300,470)? When ball passes through → light up +50; all lit → +500 and reset. This adds life.
+
+Score system:
+- Bumper: 75
+- Target: 200 each; full bank: +1000
+- Rollover: 50 each; all three: +500
+- Combo / multiplier? Keep it simple.
+
+Ball: 3 per game. Ball lost → decrement, respawn in plunger lane. Game over → show final score, high score (localStorage with try/catch), press Enter to restart.
+
+Controls:
+- Space or ↑: hold to charge plunger, release to shoot. Also initial "press space" to start ball? Let me do: ball sits on the plunger; hold space to charge (power meter), release to fire.
+- Z / Left Arrow: left flipper. X / Right Arrow: right flipper. (Also A/D.)
+
+Key handling on window keydown/keyup, preventDefault for arrow/space to avoid scrolling.
+
+Start screen overlay: game name "PINBALL BLITZ" or "NEON PIN…", hmm. Name: "PINBALL FURY"? Let me call it "STAR PIN" or "PINBALL NOVA". I like "PINBALL NOVA". Title tag: Pinball Nova.
+
+Start screen shows the name, controls, high score, "PRESS SPACE / CLICK TO START". Restart available anytime too? R key to restart? Add R = restart game. Also on game-over screen press Enter/Space to restart. The request asks for a way to restart without reloading the page — covered by game over → space, plus R key at any time.
+
+Sound via WebAudio: create AudioContext on first input. Sounds:
+- Bounce (wall): short filtered noise/tick, pitch varies with impact velocity.
+- Flipper: low thock.
+- Bumper: bright blip (square wave oscillator with fast decay) + maybe two-tone.
+- Target hit: chime.
+- Rollover: soft blip.
+- Plunger charge: rising tone while charging? Maybe simpler: release → "thwip" sound; small tick while charging. Keep it: shoot sound = noise burst + descending pitch.
+- Ball lost: descending sad tone.
+- Score bank jingle: quick arpeggio.
+
+Implement a `sfx` module with functions using osc/gain envelopes. Master gain ~0.25. Throttle bounce sounds (min interval 30ms, volume based on velocity).
+
+Visuals: this should feel lively and polished. Style choice: retro arcade cabinet / CRT-ish? Or neon synthwave? A dark blue-green table with warm neons is a classic pinball aesthetic — deep navy/teal felt background, glowing amber/cyan/red elements, chrome ball (radial gradient), incandescent dot matrix score display in the header. I'll use multiple accent colors (amber, cyan, magenta, green) rather than a single neon on near-black.
+
+Layout on page: full-window canvas; draw everything on the canvas including HUD? Or mix DOM + canvas. Let me do mostly canvas-drawn playfield with a DOM overlay for start/game-over screens and maybe score display. Canvas-drawn HUD is fine but DOM text is crisper. Let me do:
+- CSS body background: layered radial gradient (deep space blue), subtle animated stars? Can draw stars on canvas behind the table or use CSS. Since I'll fill the whole window with canvas, I'll draw a starfield background in the canvas each frame (cheap: pre-generate star positions, twinkle via sin).
+- Cabinet frame around playfield: rounded dark metal border with screws, header panel at top of canvas showing "PINBALL NOVA" and score/balls in dot-matrix font style (using monospace font + letter-spacing, or draw segmented digits — simpler: use CSS font for DOM HUD).
+
+Hmm. Decision: make the whole game UI on canvas except start/game-over overlays as DOM (easy text layout, buttons). Score display: DOM top bar? But playfield is a portrait canvas centered in window; can position DOM absolutely over the canvas area. That requires syncing DOM position with canvas scale — doable: compute scale and offset in JS, set style transform on wrapper div. Simpler alternative: draw score on canvas in a chunky digital font (monospace, bold, with glow). Canvas text is fine.
+
+Let me go all-canvas for the game view (score, ball icons, message) plus DOM overlays only for start screen and game over (absolute positioned, centered over everything — since they're full-window overlays, no scaling sync needed; style with CSS, scale font via clamp()).
+
+Actually even simpler and more robust: keep overlays in DOM as full-screen flex-centered panels. Start panel: title, controls list, high score, "INSERT COIN — PRESS SPACE". Game over panel similar with final score, "NEW HIGH SCORE!" if applicable. Hide via class. During play, canvas HUD shows score top-left… but the top of the table is an arc; let me put a header strip above the playfield within the canvas? The canvas fills the window; the playfield is centered with margin around it for the cabinet art: title text on the side or top strip "PINBALL NOVA", score display, ball count, high score. Let me design the canvas layout:
+
+Canvas = full window (w,h). Compute scale s = min(w / 640, h / 860) or so, leaving room for a top HUD bar of height ~90 in scaled units? Let me define the cabinet's logical size: total CW=560, CH=920; playfield (W=480,H=760) offset inside at x=(560-480)/2=40, y=130. Top 130px is for the cabinet header: game name + score digits. Scale to fit window: s=min(w/560,h/920); center offsets ox=(w-560s)/2, oy=(h-920s)/2.
+
+Draw order each frame:
+1. Background: fill with deep gradient, stars (positions in screen space, precomputed for current w/h; regenerate on resize).
+2. Cabinet header panel: rounded rect, title "PINBALL NOVA" in a display font, score with glow, high score, ball icons (draw 3 circles), power meter maybe near the plunger instead.
+3. Playfield transform: translate(ox+40*s? …) actually apply ctx.setTransform(s,0,0,s, ox+40s, oy+130s). Then draw field in logical coords.
+
+Playfield visuals:
+- Felt background: dark teal-blue vertical gradient with subtle vignette; faint radial glow that pulses when a multiplier is active? Keep it: soft radial highlight at center.
+- Walls: draw as glowing lines (outer stroke thick, inner bright) — amber/warm chrome.
+- Top arc area: dot art / starburst behind the targets.
+- Bumpers: layered circles — outer ring color per bumper (red, cyan, magenta), inner dome with radial gradient, flash white when hit (store flash timer). Number label "75".
+- Targets: paddle rectangles with "200" text; when removed → small socket stub and spark particles.
+- Rollover lanes: 3 circles on the field; unlit = dim ring, lit = bright glow + pulse.
+- Slingshots? I decided to skip; but add two small "nudge" deflector segments above the flipper funnels for looks? The funnel itself is enough. Maybe add slingshot triangles as bumpers: triangle with boost on hit. Let me include simple slingshots: two triangles just above the flippers, angled inward; when ball hits their inner face, apply a boost impulse + 25 points. Implementation: treat as three segments each; if collision speed > threshold and normal points in boost direction, add impulse. Simpler: make them "bumper segments" — on hit set velocity along outward normal to min(current, 480). That works with generic segment collision using a `boost` flag per segment.
+
+Let me finalize geometry numbers (logical field 480x760):
+
+- Outer left wall: x=16, y=230 to y=744.
+- Outer right wall: x=464, y=230 to y=744.
+- Top arc: center (240,230) r=224, angles π→0? Parameterize from angle 180° to 360° (i.e., upper half since screen y is down: point at angle θ: (240+224cosθ, 230+224sinθ); upper half = sinθ<0 → θ∈[π,2π]). Sample 28 segments.
+- Lane divider: (416,252)→(416,744). Also small angled cap at top of lane: from (416,252) to (432,236)? That creates a deflector so ball rising in the lane gets kicked left. But then a ball descending into the lane can't re-enter? If the cap is a solid segment both ways, a ball coming down over the lane from the field will bounce off the cap and stay in the field — good (prevents accidental lane entry). A ball shot up along the right wall inside the lane hits the cap (from below) → deflects left into the field.
+
+So one-way behavior is approximated by geometry: place cap so a rising ball in the lane (x∈[416,464]) contacts its underside and goes left; a descending ball from the field above x>416 hits… hmm if it's solid both ways, a descending ball also bounces off and stays out. A ball can only reach the lane floor via the plunger start position (lane is open at bottom? no — lane divider runs to floor 744; lane is a closed channel open at top). So the ball starts in the lane at (440, 716). It rises; cap kicks it left. If it bounces back down into the lane before getting enough height… it lands on plunger → since !inPlay and low velocity, allow re-charge. If inPlay (came out of field) — can it re-enter? Only if it flies over the cap from above into the lane: the cap is at top of divider; a fast descending ball could pass over it and land in the lane, then roll to lane floor → drain (counts as lost since inPlay). That's realistic enough.
+
+- Left funnel segments: F1: (16,548)→(92,634); F2: (92,634)→(176,690).
+- Right funnel: G1: (416,548)→(340,634); G2: (340,634)→(264,690).
+
+Wait flipper pivots: left pivot (176,690)? Earlier I said 170; let me set leftPivot=(180,688), rightPivot=(300,688), length 82. Gap between rest tips: left tip at angle +0.52 rad: tip = pivot + (cos0.52, sin0.52)*82 = (180+71.4, 688+40.9) = (251,729). Right tip mirrored: (300-71.4, 729)=(229,729). Tips overlap?? 251 > 229 → they cross! Need bigger gap or shorter flippers. Set pivots at (168,686) and (312,686), length 74: left tip=(168+64.5,686+36.7)=(232.5,722.7); right tip=(247.5,722.7). Gap ~15px vs ball diameter 20 → ball can barely fall through when flippers down; when up it's blocked. Actually classic pinball drain gap is a bit bigger than the ball. Let me make rest angle steeper: 0.6 rad: cos=0.825, sin=0.565. Left tip=(168+61, 686+41.8)=(229,727.8); right tip=(251,727.8). Gap = 22px > ball 20 → can fall through. Good: pivots (168,686) and (312,686), length 74, restAngle=0.6, activeAngle=-0.55 (left); right flipper mirrored: angle = π−0.6 at rest, π+0.55 when active? For the right flipper, direction from pivot to tip should point down-left at rest: tip=(312-61,727.8)=(251,727.8). Yes so right rest angle = π - 0.6 ≈ 2.54 rad; active = π + 0.55? cos(π+0.55)=-0.85, sin=… wait sin(π+0.55)=−sin(0.55)? sin(π+x) = −sin x → negative → tip above pivot: (312-62.9, 686-37.4)=(249,648.6). Hmm that's up-left — correct for active (flipper flipped up and inward). Left active: angle=-0.55: tip=(168+62.9,686-37.4)=(231,648.6). Both tips near center above pivot when active.
+
+But funnel endpoints should meet flipper pivots: F2 ends at (176,690)≈pivot(168,686) close enough; let me set F2 to end exactly at pivot (168,686): F2: (92,634)→(168,686). G2: (340,634)→(312,686)? mirror of F2: F2 vector (76,52); mirror around x=240: start (480-92=388? no — lane divider is 416 not 464; right side playfield width differs from left. Left field spans x 16..(center), right spans ..416. Center of full outer = 240, but center of right boundary = (16+416)/2=216? Hmm asymmetry: lane takes up the right 48px. Playfield center between left wall and lane divider: x=(16+416)/2=216. So I should center flippers at 216, not 240! Let me re-center: leftPivot=(152,686), rightPivot=(280,686)? Gap distance 128; tip gap = 128−2*61=6?? too small. Recompute: pivots (148,686) and (284,686): dist 136, rest tips x: 148+61=209 and 284-61=223 → gap 14 < ball 20 → can't drain. Need shorter flippers or wider pivots: pivots (140,686) & (292,686), length 70, rest 0.6: tip dx=cos0.6*70=57.5 → tips at 197.5 and 234.5 → gap 37. Ball 20 drains fine, and active tips meet near center (active angle -0.58: dx=70*cos(-0.58)=56.6? cos(0.58)=0.836→58.5; tips at 198.5 and 233.5, dy = −34 → both up). Hmm active tips don't fully close the gap (gap 35) but with flipper capsule radius 11 + ball 10, effective closing: capsules extend 11 past tip; gap between capsule edges = 37−2*11=15 < 20 → closed when up.
+
+Funnel endpoints: F2 ends at left pivot (140,686): F1:(16,540)→(86,622), F2:(86,622)→(140,686). Right: G1:(416,540)→(346,622), G2:(346,622)→(292,686).
+
+Slingshots: place triangles above the funnels. Left sling triangle vertices: P1(86,556)? Should sit just above funnel start and face inward toward center. Let me define left sling as a right-triangle-ish shape: outer edge along left wall from (16,470) to (16,540), hypotenuse from (16,540) to (110,568)? That gives an inward-down face. Hmm slingshot "kick" face typically faces up and inward (toward center of table). Let me do: left sling triangle vertices A(16,468), B(16,548), C(112,570)? Kick face = B→C? Ball hits B–C face from upper right region; normal points up-right (toward center) → boost sends ball to center. Hmm but F1 starts at (16,540)… conflict: F1 top at y=540 vs sling bottom corner (16,548). Let me restructure left side vertical layout:
+
+Left wall x=16 from 230 down to 470. Sling triangle: A(16,470), B(96,556), C(16,556)? Kick face A→B (diagonal up-left). Then funnel F1 starts at (96,556)?? Let me simplify: skip slingshot triangles; instead put two "kick bumper" circles? Hmm.
+
+Alternative simpler lively design: no slingshots; funnels directly to flippers; extra elements = 3 pop bumpers + 4 drop targets + 3 rollovers + maybe a "spike" lane at top center with a bonus for hitting all? That's plenty of interactivity. Plus plunger, flippers, particles, flashes. Good scope.
+
+But slingshots are iconic… Let me try including them properly. Left side layout:
+- Wall goes down to y=460.
+- Sling triangle: points A(16,460), B(16,552), C(104,570). Edges: A–B (along wall, vertical — redundant with wall but fine as part of triangle outline; ball can't get there from left since wall is there), B–C (bottom edge, slight downward slope to the right), C–A (kick face, from (104,570) up-left to (16,460)). Kick face normal: direction A−C = (−88,−110) normalized → points up-left — that's toward wall side, wrong. I want the kick face to be the one facing center (right/up). The triangle occupies the left edge; its inner face is C–A? Points: triangle is (16,460),(16,552),(104,570). Interior is to the left of segment A→C. Ball approaches from right/center side and hits the A–C line from outside → collision normal points toward ball = up-right direction? Normal of segment A(16,460)→C(104,570): direction d=(88,110); normals: (−110,88)/|d| or (110,−88)/|d|. Which side is ball on? Ball is to the right of this line (e.g., point (200,560)). Line from A to C; point P=(200,560): cross = d × (P−A) = 88*(560−460) − 110*(200−16) = 88*100 − 110*184 = 8800 − 20240 <0 → P is on negative cross side. Normal pointing to P: rotate d by +90° (screen coords, y-down): n=(dy,−dx)=(110,−88)→ points up-right ✓. So kick face = segment A–C with boost; ball hitting it gets pushed up-right toward center.
+- Then funnel F1: from C(104,570) to (140? pivot at 140,686): F2: (104,570)→(140,686)? Steep slope; fine: single segment C→pivot. But then the ball slides from sling bottom corner to flipper — ok.
+
+Wait, but that means the funnel wall is the kick face itself? No: the kick face goes from (16,460) to (104,570). The funnel continues from (104,570) down to left pivot (140,686). Ball path: descends along left wall to y=460… hits triangle corner A; rolls down kick face? Kick face slopes down-right at ~51°; ball rolling on it goes toward C (down-right) and then onto funnel segment C→pivot. But when a ball hits the kick face at speed, we boost it up-right — that's the slingshot action. If slowly rolling, no boost (only boost if impact velocity along normal > threshold). Good.
+
+Mirror right side: lane divider x=416 goes down to y=460; sling triangle A'(416,460), B'(416,552), C'(328,570); kick face A'–C'; funnel C'→right pivot (292,686).
+
+Check kick face boost direction on right: segment A'(416,460)→C'(328,570): d=(−88,110); ball at center (200,560): cross = d×(P−A') = (−88)(100) − (110)(200−416)= −8800 − 110*(−216)= −8800+23760=14960>0 → positive side; normal via rotate +90: n=(dy,−dx)=(110,88)→ points down-right?? That's toward wall. Use other normal (−110,−88): up-left toward center ✓. My collision code picks the normal pointing from surface to ball center — computed as sign of (ballCenter − closestPoint). So no need to precompute; boost just uses whatever normal is found. The boost direction = outward normal from segment, which for a ball outside the triangle will be away from the triangle = toward center.
+
+Bumper positions (field center x=216): (140,270), (292,270), (216,368), r=26. Check clearance with targets at y~180: fine. Rollover lanes at y≈470? Sling top is 460… place rollovers higher: (150,440),(216,440),(282,440)? Hmm that's between bumpers (368) and slings (460) — tight but ok. Maybe (150,432),(216,432),(282,432), r=9 lights. Ball passes through → light.
+
+Drop targets: 4 paddles in a row at top: y=170? At x=150..300 or so: paddle at x=150,196,242,288 with width 8 height 34 (vertical), y from 153 to 187. Check arc clearance at y=153: dy=230−153=77 → dx=sqrt(224²−77²)=sqrt(50176−5929)=sqrt(44247)≈210.4 → x∈[29.6,450.4] ✓ plenty.
+
+Targets as segments (vertical lines) with `target` reference; when hit: remove (mark dead), spark particles, +200, sound; all 4 done → +1000 banner "TARGET BANK!", respawn after 2.5s (with pop-in animation? just reappear).
+
+Rollovers: 3 circles at y=436, x=150/216/282, r=9: when ball center passes within distance < ballR+6 → trigger once per pass (cooldown or require exit): track per-lane lit state; unlit→lit: +50, blip. All 3 lit: +500, "LANES LIT!", all reset to unlit after brief flash.
+
+Plunger: in the lane bottom: draw a spring plunger at (440, y) with base y=740; while charging, compress down? Visually: plunger head is at y=716 + charge*18 (moves down), ball rests on head — actually ball should be pushed up when released. Simulate: while charging, hold ball stationary at start position (or let it sit on the head). On release: vy = −(500 + 520*power) px/s? Max ~ -1020 px/s upward. Gravity g≈1400 px/s². Height reached: v²/2g = 1020²/2800 ≈ 370px → from y=716 up to y≈346 — not enough to clear the cap at y~250?? Cap top is ~236-252. Ball needs to reach y<~250, i.e., rise 466px: v=sqrt(2*1400*466)=sqrt(1,304,800)≈1142. So max power velocity ~1250 px/s, min ~700 (weak shot returns). vy = -(700+550*power). Power from hold time: charge t in [0, 1.2s] → p=min(1,t/1.1), maybe with oscillation? Keep simple linear to cap; meter shows it.
+
+Hmm but also need ball to enter field and come back down with good velocity — fine.
+
+Gravity: 1400 px/s² feels right at this scale (field height 760). Terminal-ish handling: clamp max speed to ~1500.
+
+Substepping: per frame dt (cap 1/30), steps = ceil(speed*dt / (ballR*0.8)) clamped 1..8; integrate in substeps.
+
+Collision with segment: for each segment, find closest point Q on segment to ball center C. d = |C−Q| < r → penetration. Normal n=(C−Q)/d. Push out: C += n*(r−d). Velocity: relative velocity vr = v − vSurface (surface velocity only for flippers; 0 otherwise). vn = vr·n. If vn<0: v' = v − (1+e)*vn*n, e=0.55 for walls? Let me tune: walls e=0.6, add slight tangential friction (v_t *= 0.995). Bounce sound if |vn|>threshold.
+
+Flipper collision: segment from pivot P to tip T(t), radius fr=11 → capsule. Closest point on segment; distance < r+fr → resolve similarly with n, plus surface velocity at contact: flipper angular velocity ω (rad/s, signed). Contact point Q; vector r_vec = Q−P. Surface velocity = ω × r_vec = ω*(−ry, rx) (2D cross with scalar ω). Compute e=0.3 for flippers (they're the "driver"). Also add a small bias: when flipper is actively rotating and ball is near, this naturally gives it speed. ω comes from actual per-frame angle delta: ω = (angle−prevAngle)/dt_sub? Use per-substep dt. Since flipper angle updates each frame with easing, compute omega analytically: during activation, angle moves toward target at rate ~ 18 rad/s; store current omega = dAngle/dt used this substep.
+
+Implementation detail: update flipper angle in substeps too (so contact velocity is consistent): move angle toward target with max angular speed ωmax=16 rad/s (up) / 9 rad/s (down). Then surfaceVel = ω_actual * perp(r_vec).
+
+Edge cases: ball resting on flipper at rest — gravity pushes in; resolve each substep; should be stable enough.
+
+Drain detection: if ball.y > 744+? Actually the floor: no floor segment drawn between flippers — let the ball fall past y=760 → drain. But wait outer bottom: lane divider ends at 744, left/right walls end at 744 — below that is open (drain area). Draw a dark "drain" strip at bottom. If ball center y > 780 → ball lost.
+
+Also safety: if ball gets stuck moving very slowly for 3 seconds in an impossible spot? Add anti-stall: if speed<20 and not on flipper/plunger for >2.5s, nudge slightly upward (like a pinball table nudge). Or just leave it; gravity resolves most. Let me add gentle auto-nudge: if |v|<15 for 2s → apply small random impulse. Fine.
+
+Ball-in-play flow states:
+- state 'menu' (start overlay)
+- state 'ready': ball on plunger, awaiting charge (after spawn). Show "HOLD SPACE TO CHARGE" hint.
+- state 'play': ball flying.
+- On drain: if !enteredPlay → respawn in lane (stay 'ready', no ball lost). Else ballsLeft--; if 0 → game over overlay; else respawn, 'ready'.
+- enteredPlay = true when ball crosses above y<240 in lane / or x<416.
+
+Also allow click/touch: hold mouse/touch to charge & release to shoot; left/right halves of screen tap for flippers? Mobile support would be nice: touch left half = left flipper, right half = right flipper, and when state==='ready' anywhere long-press = charge. Let me add basic pointer support: pointerdown in left third → left flipper; right third → right flipper; middle → charge. Or simpler: on-screen? Keep keyboard primary (it's an arcade game), plus pointer: hold to charge (anywhere during ready), tap left/right halves for flippers during play. Implement with pointer events mapping x relative to canvas center… but field is centered in cabinet which is centered — compute logical x from screen. Doable: store current transform (s, ox, oy) globally; convert.
+
+Let me not over-scope touch; keyboard is required ("listen for keys on window"). I'll add basic pointer as a bonus if easy. Yes, include: pointerdown → if state ready: start charging. If playing: x < center of field → left flipper else right (only one at a time… allow multi-touch? track two active pointers by id: assign side by position; multiple pointers fine). Release → stop / shoot. OK.
+
+Score display on canvas header: big amber digits with glow, "SCORE 0001250" style (zero-padded 7), plus HI score and ball icons. Also a small banner text at center of field for bonuses (fade).
+
+Particles: sparks on bumper hit (small colored dots that fade), target bank burst, drain flash. Array with life.
+
+Screen shake? Slight on bumper hits — subtle (amp 2-3px, decay). Yes adds juice; keep it tiny.
+
+Star background: pre-generate ~90 stars with x,y in [0,1], size, twinkle phase; draw each frame with alpha = base + sin(t*speed+phase)*amp. Also two soft nebula radial gradients (deep blue/purple) — subtle layered background ✓.
+
+Fonts: distinctive display + readable body pair without external fonts… constraint: no external fonts. Use font stacks: display: "Impact, 'Arial Black', sans-serif" or better a stack like `'Trebuchet MS'`? For arcade feel: Impact/'Haettenschweiler' for big titles with letter-spacing; numbers/HUD: `'Courier New', monospace` bold (dot matrix vibe); body/controls: `'Segoe UI', system-ui`. That gives a distinctive pairing within constraints. Canvas text uses the same stacks.
+
+Title: "PINBALL NOVA". Palette: deep space navy (#0b1026→#141b3d) background; table felt #123a5c→#0d2740 teal-blue; chrome/amber accent #ffb640; cyan #35e0ff; magenta/red bumper #ff4f66; green lights #57ffa0. Multi-accent, not single neon ✓.
+
+Cabinet header: dark panel with rivets, title in Impact italic-ish with amber→? Solid amber with glow + small "NOVA" tag. Score right side cyan digits. HI below smaller. Ball icons bottom-left of header as circles.
+
+Now let me write the code structure:
+
+```html
+<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1,user-scalable=no"><title>Pinball Nova</title><style>...</style></head>
+<body>
+<canvas id=c></canvas>
+<div id=overlay class=panel> ... start screen ... </div>
+<script>...</script>
+</body></html>
+```
+
+CSS: html,body margin0 height100% overflow hidden background #070b1c; canvas display block width/height 100%; overlay absolute inset 0 flex center, pointer-events none? Start screen needs clicks — but we also listen for space on window. Panel styling: not a glassmorphism blur; use solid dark panel with border glow, chamfered corners (clip-path polygon for angular arcade look), scanline texture via repeating-linear-gradient. Title huge Impact, letter-spacing, amber with layered text-shadow. Controls list in monospace keycaps (styled kbd).
+
+Overlay states: #screen element reused for start and game over; JS sets content? Better: two divs: #startScr, #overScr. Toggle display.
+
+Start screen content:
+- Small "INSERT COIN" blink? Cute.
+- Title PINBALL NOVA with star/spark icon (canvas-drawn ball behind? just text + ✦).
+- Controls grid: [SPACE] hold=charge plunger, release=shoot; [Z or ←] left flipper; [X or →] right flipper; [R] restart.
+- High score display (from localStorage try/catch).
+- "PRESS SPACE TO PLAY" pulsing.
+
+Game over screen: "GAME OVER", final score big, high score (with "NEW HIGH SCORE!" if updated), "PRESS SPACE / ENTER TO PLAY AGAIN".
+
+Restart: R key anytime → reset to ready state (skip start screen? or go to menu?). Let me make R = instant restart into new game (state ready). And from game over, space/enter.
+
+Audio module:
+```js
+let AC=null, master;
+function audioInit(){ if(AC) return; try{ AC=new (window.AudioContext||window.webkitAudioContext)(); master=AC.createGain(); master.gain.value=0.28; master.connect(AC.destination);}catch(e){} }
+function tone(freq,dur,type='square',vol=1,slide=0){ if(!AC)return; const t=AC.currentTime; const o=AC.createOscillator(),g=AC.createGain(); o.type=type;o.frequency.setValueAtTime(freq,t); if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(30,freq+slide? ...)); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.001,t+dur); o.connect(g).connect(master); o.start(t);o.stop(t+dur+.02);}
+function noise(dur,vol,filterFreq){ create bufferSource with random buffer + biquad lowpass }
+```
+Sounds:
+- sBounce(v): short noise 0.05 vol min(1,v/900)*0.5 filter 1800? Plus a low tick tone 120Hz. Throttle 40ms.
+- sFlipper(): tone 90→60 slide, square, 0.07 + noise thump.
+- sBumper(i): two quick tones: freq base per bumper [520,640,760] + noise pop; vol .8.
+- sTarget(): chime 880 then 1320 (two-tone).
+- sRollover(): tone 980 sine 0.06.
+- sBank(): arpeggio [523,659,784,1046] spaced 70ms.
+- sShoot(p): noise burst + tone slide 300→90? Actually plunger: springy "boing": tone type 'sawtooth' freq 180+300p → slide down to 60, dur .18 + noise.
+- sDrain(): descending [400,300,200,120] spaced 90ms square.
+- sGameover: low tone.
+- sLane (rollover all): small arpeggio.
+
+Throttle map with last-play times.
+
+Now main JS structure:
+
+```js
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+let W=0,H=0,DPR=1; function resize(){...} window.addEventListener('resize',resize);
+// Cabinet layout constants
+const CW=560, CH=940, FX=40, FY=140, FW=480, FH=760; // field origin within cabinet? wait 40+480+40=560 ✓, 140+760=900, plus bottom margin 40 → CH=940.
+let S=1, OX=0, OY=0; // scale, offsets computed on resize: S=min(W/CW,H/CH); OX=(W-CW*S)/2; OY=(H-CH*S)/2; field screen origin = (OX+FX*S, OY+FY*S).
+```
+
+Wait DPR handling: set cv.width=innerWidth*DPR etc., ctx.setTransform(DPR,...) base. Simpler: canvas width=clientWidth*dpr, and in the draw do everything scaled by dpr via initial ctx.scale(dpr,dpr) each frame: at start of frame ctx.setTransform(dpr,0,0,dpr,0,0), then work in CSS px.
+
+Field geometry constants (logical):
+```js
+const R=10; // ball radius
+walls = [ {x1,y1,x2,y2,e?,boost?} ... ] built including arc segments.
+laneCap segment: (416,252)→(438,232)? let me compute: cap from top of divider angled up-right so a rising ball hits its underside. Divider top at (416,252). Cap: (416,252) to (444,230). A ball rising in lane (center x≈440) going up: cap underside faces down-left; normal toward ball = down-right?? Ball below cap moving up → collision pushes it… let me think: cap line from (416,252) to (444,230), direction d=(28,-22). Ball at (440, 300): which side? cross = d×(P−A)=28*(300−252) −(−22)*(440−416)=28*48+22*24=1344+528>0. Normal rotate +90: (dy,−dx)=(−22,−28)→ up-left?? Hmm that points away from ball (ball is at cross>0 side; normal to that side is…). Ugh let me just trust runtime sign selection: n = (C−Q)/|C−Q| always points from surface to ball. So the geometry decides: a rising ball below cap will collide and be pushed down-right?? That's not what we want — we want it deflected left into field, i.e., push toward -x.
+
+Let me design cap as a slope that guides up-left ball: place cap from divider top going UP-LEFT? No—divider is at lane's left edge; cap should extend from divider top to the right (into lane), angled upward: (416,258)→(452,234). A ball rising in lane hits underside of this slope. Underside normal points down-left?? For a line going up-right, its lower side faces down-right… Let me compute with concrete numbers: A(416,258), B(452,234). d=(36,-24). Ball center C(440, 290) below. Closest point Q on segment ≈ project: t=((C−A)·d)/|d|² = ((24)(36)+(32)(−24))/ (1296+576)= (864−768)/1872= 0.051 → Q≈(417.8,256.8). n=(C−Q)=(22.2,33.2)/|..| → points down-right. So collision pushes ball down-right — into right wall. That's wrong; we want the ball kicked left (into field) when it rises past divider height.
+
+Better: cap should angle from outer top going down-left: i.e., from near right wall (462, 238) to divider top (416, 258): d = A(462,238)→B(416,258) = (−46,20). Ball below at C(440,290): closest Q: t=((C−A)·d)/|d|² = ((−22)(−46)+(52)(20))/(2116+400)= (1012+1040)/2516=0.815 → Q=(462−37.5, 238+16.3)=(424.5,254.3). n=C−Q=(15.5,35.7)→ down-right again. Hmm still down-right because ball is below and to the right of Q…
+
+Physically: I want a deflector that when ball rising in lane hits it, sends it left over the divider. That's like a ramp sloping up-left on the underside: from (416,250) going up-right? No wait. Let me think about real tables: shooter lane has a one-way gate; the lane top curves into the playfield — the outer wall itself curves in at the top and the ball follows the arc over. In my geometry the lane is bounded by right wall (x=464) which curves over via the top arc! The arc goes from (16,230) to (464,230). So a rising ball in lane follows the right wall up to y=230 and then along the arc to the left — it naturally enters the field at the top! No cap needed. But then a descending ball can also come back into the lane via the arc (no one-way) → falls to plunger floor → drain if inPlay. That's acceptable (like an open shooter). And a weak shot: ball rises, doesn't reach arc height, comes back down onto plunger → since !enteredPlay… wait enteredPlay is set when x<416 or y<235? A weak shot stays in lane → !enteredPlay → free reshoot.
+
+But one issue: a ball descending into the lane while inPlay will land on plunger top and rest at lane floor → my drain check (y>780) won't trigger since it's resting at y≈716. Need: if inPlay && ball in lane region (x>416) && speed < 30 for >1s → drain (ball lost). Let me add that check. Or simpler: put a small angled segment at the top of divider to block re-entry from above: cap from (416,258) to (430,272)?? A short wall angled down-right would block ball coming from field side (left/above) into lane? Ball descending from field over lane area hits… it's still possible. Honestly the simplest and most robust: make lane divider taller so it reaches above arc entry point, plus a cap segment from divider top to right wall at an angle that slopes upward toward right wall — then ball coming down from field into lane region can't get past? A solid line from (416,250) to (464,230): ball descending in x∈(416,464) above y~230 hits this line and bounces… back up or sideways — could ping-pong but eventually either goes into field over the divider? The divider top is at 250; a ball bouncing off cap might cross over divider to left (field) — good, that's what we want (it stays in play). Ball can't enter lane from above because cap seals it. From below (rising weak shot): hits underside of cap → bounces down or deflects… n direction = toward ball (downward-ish) → ball pushed down/right → back to plunger → free reshoot since !enteredPlay ✓. And a strong rising shot: reaches y<230 before hitting cap? Cap spans x 416→464 at y 250→230; a ball rising along right wall (x≈454, radius 10 → center ~454) hits cap line at around y≈234 — that's the block! So even strong shots bounce off cap downward. Bad.
+
+OK final answer: no cap. Open shooter lane like many classic tables (ball can return to plunger). Rules:
+- enteredPlay when ball.x < 410 (crosses divider plane) OR y<225.
+- If !enteredPlay and ball rests in lane → can reshoot anytime (state back to 'ready' when speed low? actually just leave it: player holds space; charging works whenever ball is at rest in lane bottom region… simpler: allow charge any time state==='ready'; after shot, state='play'. If weak shot returns and settles: set a timer; if speed<25 for 0.8s && !enteredPlay → state='ready' (reshoot free).
+- If enteredPlay and ball rests in lane bottom (speed<25 for 1s) → drain.
+
+Plunger mechanics: when state==='ready', ball is locked: pos=(440,706), v=0, draw plunger head below at y=718. Charging compresses visual (head drops by p*14, spring coils). On release: vy=-(620+640*p)?? Let me compute needed: rise from 706 to arc top region ~y=110 (ball needs to get over the apex-ish; actually it just needs to travel left along arc — reaching y<235 with sufficient horizontal momentum… it follows wall, so reaching y≈240 at right side is enough, then curves). Rise 706→240 = 466px. v=sqrt(2*1400*466)≈1142. So set vy=-(820+520*p) → max 1340 (p=1): rise=1340²/2800=644px → reaches y=62 ✓ good with margin; min 820: rise 240px → to y≈466, returns. p needed for success ≈ (1142-820)/520 = 0.62. Good gameplay: needs ~60% power.
+
+Charge time to full: 0.9s. Meter drawn in lane beside plunger + a small bar in header? Draw vertical meter along right side of lane.
+
+While charging, ball sits on head; physics off for ball (state ready). On release → state='play', v=(0, -vy), plus tiny random x jitter ±15 to avoid perfect centering? Lane is narrow; keep vx=0 but add jitter ±10.
+
+Flipper input: keys z/ArrowLeft/a → leftDown; x/ArrowRight/d → rightDown. Also 'r' restart, 'space' charge/start, Enter also start/restart on game over. Prevent default for space/arrows to avoid page scroll (no scrollbars anyway).
+
+Now the flipper update in substep:
+```js
+function updFlipper(f,dt){ const tgt=f.down?f.aUp:f.aRest; const sp=f.down?17:10; const d=tgt-f.ang; const step=Math.sign(d)*Math.min(Math.abs(d),sp*dt); f.ang+=step; f.omega=step/dt; }
+```
+Left flipper: aRest=0.62, aUp=-0.58. Right: aRest=π-0.62≈2.5216, aUp=π+0.58? Wait for right flipper, "up" means tip moves up-left: rest angle 2.52 (points down-left); active should point up-left: angle π+0.58 = 3.72 → cos=-0.836 (left), sin(3.72)=−0.548 (up) ✓. Movement from 2.52 to 3.72 is increasing — fine, generic code handles sign.
+
+But angular speed: left flipper moves from 0.62 → -0.58 (decreasing). Generic sign handling OK.
+
+Flipper draw: capsule: thick line pivot→tip with round cap, gradient color (amber/chrome), plus a glow ring when active.
+
+Tip point T = P + (cos a, sin a)*len.
+
+Collision (capsule): closest point Q on segment P–T to ball C; dist < R+FR → n=(C−Q)/dist; push out; surface velocity at Q: rvec=Q−P; vs=(f.omega*( -rvec.y), f.omega* rvec.x)?? 2D cross ω×r with scalar ω (z-component): v = ω ẑ × r = ω(-ry, rx). Yes vs=(-ω*ry, ω*rx). Then relative vr = v − vs; vn=vr·n; if vn<0: impulse j=-(1+e)*vn; v+=j*n; e=0.35; also tangential damping 0.99. Sound on flipper hit if |vn|>120.
+
+Also when flipper is actively up and hits ball, the vs term gives it a strong kick — with ω=17 rad/s and r≈70: surface speed ≈ 1190 px/s — plenty. Cap resulting velocity to maxSpeed 1400.
+
+Bumper collision: circle-circle: dist<R+br → n; push out; set v = v + n*max(0, bumpV − (v·n))? Standard: ensure outward normal speed ≥ 520: vn=v·n; if(vn<520) v+=n*(520−vn)*1.15? Let me do: v += n * (560 - Math.max(0,vn)); then clamp speed. Score, flash=1, particles, sound, tiny shake.
+
+Target collision: each target = vertical segment; standard segment collision with e=0.8 (paddles are bouncy) + on hit if alive && cooldown → dead, score, spark, chime. Cooldown to avoid double-trigger in same pass? Once dead it's removed so fine; but ball might graze two at once — each triggers once, ok.
+
+Rollover: check dist(ball, laneCenter) < R+7 && !lane.lit → lit… but ball sitting on top of light? Light is a circle in open field (no physical collision) — ball passes through it. Trigger when passing: just use distance check; set cooldown 0.5s per lane after trigger to prevent retrigger before moving on, plus require unlit state for scoring. All lit → bonus + reset all with flash.
+
+Score popups: floating text particles ("+75") at hit location, rise and fade.
+
+Banner: queue of messages {text, t} drawn big at center field with scale-in/fade.
+
+High score: localStorage 'pinballNovaHi' try/catch.
+
+Game state machine:
+- 'menu': overlay visible; canvas behind shows attract mode? Run sim with an AI? Overkill — just show table idle with a demo ball bouncing? Could run physics with no flippers for ambient life (ball bounces off bumpers). Cheap and lively: spawn a ghost ball in menu that just bounces (no drain handling—respawn at random velocity when it drains). Actually let me keep menu simple: render table + starfield, static ball on plunger; overlay covers center anyway. But "alive" — the star twinkle + pulsing bumper idle glow is enough behind the panel (panel is semi-transparent? Panel is mostly solid but has margin around showing stars). Good enough; maybe add slow demo ball for fun — I'll include: in menu, run physics with a ball at random position/velocity, respawn if drains. That's a nice touch and reuses code. Let me do it: on entering menu, spawn ghost ball with random velocity; skip scoring (guard score functions by state==='play').
+
+- 'ready': hint text "HOLD SPACE" drawn near plunger on canvas.
+- 'play'
+- 'over': overlay.
+
+Restart (R or after game over): reset score, balls=3, targets, lanes, spawn ball in lane, state='ready'.
+
+Also pause? Not required; skip (keep scope). Maybe P to pause — small addition, fine: toggle a flag, draw "PAUSED". Cheap to add and useful. I'll add.
+
+Draw details for polish:
+- Table felt: linearGradient top #16405f → bottom #0c2438; plus radial glow at (216,300) rgba cyan 0.06. Subtle noise? Skip noise (perf), use faint diagonal sheen lines? Keep it gradient + vignette (radial dark edges).
+- Walls: two-pass stroke: outer #2a3550 width 7, inner #ffd27a? Hmm walls should read as chrome rails: stroke with gradient? Use rgba(255,190,90,.9) glow via shadowBlur on bright core. shadowBlur is expensive but the field is small; ok if used sparingly (walls once per frame, bumpers). Let me use ctx.shadowColor/shadowBlur for glows on key elements — moderate usage.
+- Arc top: draw decorative "starfield" dot art inside arc area above targets? Draw a few small stars + planet ring motif ("NOVA" theme): a stylized starburst at top center behind targets (216,120)? Top of arc interior is around y 8..60. Draw a glowing star ✦ with rays there — thematic! Draw a 4-point star with gradient, pulsing scale.
+- Bumpers: ring color per bumper; body radialGradient(#fff→color→dark); "75" label in dark text; flash overlay alpha=flash (decay). Idle pulse: subtle sin glow.
+- Targets: rounded rect paddle, amber face, when dead → darker socket + small "×"? Draw stub.
+- Rollover lanes: circle ring; lit = bright fill glow + inner dot; unlit dim.
+- Flippers: capsule with linear gradient (amber→orange), dark outline, pivot cap circle (chrome). Active: add cyan glow shadow.
+- Plunger: below lane bottom? Lane floor at 744; plunger drawn inside lane bottom: rect shaft from y=720 to 760, head is a disc at 716; spring zigzag below head. Charge → head + spring compress… actually when charging, the head should move down (pull back) and on release snap up pushing ball? Ball sits on top of head at y≈706; head moves down p*14 while charging; on release vy applied instantly. Visual: draw spring between 744 and headY with zigzag lines (number of coils fixed, spacing changes).
+- Power meter: vertical bar along x=452? Lane right edge is 464, wall thickness… place meter inside lane left side: x=420..428, y from 700 up to 620; fill height=p*80, color gradient green→amber→red by p. With tick marks.
+- Ball: radialGradient white core → #cfd8e8 → #5a6b85 edge + specular dot; slight motion blur? Skip; add subtle drop shadow ellipse? In top-down view no shadow needed… pinball is viewed from above — "shadow" doesn't make sense but a soft dark ring under ball looks good. Add faint.
+- Drain area: below y=744: dark slot with red glow when ball just drained (flash timer).
+- Header cabinet: panel #1b2340 with border #3a4670, corner screws (small circles), title left "PINBALL NOVA" Impact 34px amber with cyan sub? Right side: SCORE label small + digits monospace 30px cyan glow; HI smaller below; ball icons: 3 small chrome balls bottom-left of header. Also small "N°" — keep clean.
+- Banner text: Impact 40px, centered y≈420, scale pop, additive glow, fade after 1.4s.
+- Hint text (ready state): "HOLD [SPACE] TO CHARGE • RELEASE TO LAUNCH" monospace 13px at y≈640 center, pulsing alpha.
+
+Screen shake: shakeT decays; offset = rand*amp*shakeT applied to field transform only (not header). amp small (2.5px).
+
+Performance: fine.
+
+Now the code — let me write it carefully. Let me draft the entire JS in my head with care for correctness.
+
+```js
+'use strict';
+// ---------- canvas setup
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let vw=0, vh=0, dpr=1;
+function resize(){
+  dpr = Math.min(2, window.devicePixelRatio||1);
+  vw = window.innerWidth; vh = window.innerHeight;
+  cv.width = Math.round(vw*dpr); cv.height=Math.round(vh*dpr);
+  cv.style.width=vw+'px'; cv.style.height=vh+'px';
+  makeStars();
+}
+window.addEventListener('resize', resize);
+```
+
+Cabinet metrics: CW=560, CH=940; field FX=40, FY=150? Header needs ~120. Let me set FY=150, FH=760 → 150+760=910, bottom margin 30 → CH=940 ✓. FW=480, FX=(560-480)/2=40 ✓.
+
+Scale: S=Math.min(vw/CW, vh/CH); OX=(vw-CW*S)/2; OY=(vh-CH*S)/2.
+
+Stars: array {x:rand, y:rand, r:0.5-1.8, ph, sp, hue?}. Count ~ (vw*vh)/9000 clamped 40..160. Drawn in screen space.
+
+Game constants and state:
+
+```js
+const FW=480,FH=760, BR=10;
+const G=1500, MAXV=1500;
+let state='menu'; // menu|ready|play|over
+let score=0, hi=load, balls=3, entered=false;
+let ball={x:440,y:706,vx:0,vy:0};
+let charge=-1; // -1 not charging else 0..1 power
+```
+
+Walls array built once:
+
+```js
+const walls=[];
+function seg(x1,y1,x2,y2,o){walls.push(Object.assign({x1,y1,x2,y2,e:0.58,boost:0},o));}
+seg(16,744,16,230);
+// arc
+const ACX=240,ACY=230,AR=224;
+for(let i=0;i<=26;i++){ const a=Math.PI + (i/26)*Math.PI; // from π to 2π
+  const x1=ACX+AR*Math.cos(a), y1=ACY+AR*Math.sin(a);
+  if(i>0) seg(x1,y1, prevx,prevy); } 
+```
+Wait order: i=0 → a=π → point (16,230). i=26 → a=2π → (464,230). Segments between consecutive. ✓ (sin for a∈(π,2π) is negative → y<230 upper arc ✓.)
+
+```js
+seg(464,230,464,744);        // right wall
+seg(416,258,416,744);        // lane divider (start slightly below 230 so ball can pass over top? At x=416 arc y: computed ≈91 earlier; hmm the divider top at 258 leaves a gap between arc and divider — ball from field descending near right wall can cross x=416 line above y=258 → enter lane region → fall to plunger. That's the "open shooter" re-entry. Fine.)
+```
+Hmm wait actually: if divider top is at 258, a ball in the field on the right side bouncing down between arc and divider… it falls into lane → drain (if entered). Real tables have this as outlane-ish. OK keep; that's authentic "shooter lane outlane."
+
+Actually let me raise divider top to y=140 to make re-entry rare (only near top)? At x=416, arc is at y≈91. Divider from (416,120) to (416,744): then the lane is a long chimney; ball rising in lane goes up to arc region and over — fine; re-entry from field requires crossing x<416→>416 above y=120 (near top center-right). That area is where ball curves over the top → natural outlane. I like divider top at 130. Let me use seg(416,130,416,744). Ball in lane rising: passes y=130 region and continues along right wall/arc into field ✓ (right wall continues from 230 up via arc; between x 416..464 the boundary above is arc; at x=440 arc y = 230−sqrt(224²−200²)=230−sqrt(50176−40000)=230−sqrt(10176)=230−100.9=129. So lane channel narrows to arc at ~y=129 — ball center must be ≤ y 129−10 to pass… it curves left ✓).
+
+Funnel + slings:
+```js
+// left side
+seg(16,470,16? no wall already covers left down to 744; sling triangle overlaps wall region. Sling edges:
+Left sling: A(16,470) B(16,552) C(104,572):
+seg(16,470,16,552,{e:.5}); // along wall (redundant but ok — actually skip since wall covers it; keep triangle outline for drawing though. Let me store sling shapes separately for drawing and add their edges to walls: kick face + bottom edge.
+Kick: seg(16,470,104,572,{boost:520});  // from A to C
+Bottom: seg(104,572,16,552)?? B→C = (16,552)→(104,572): seg(16,552,104,572,{e:.4});
+Funnel: seg(104,572,140,686,{e:.45}); // C → leftPivot
+```
+Hmm wait funnel from C(104,572) to pivot (140,686): slope dx=36, dy=114 — steep ~72° from horizontal. Ball rolling down it goes fast toward flipper ✓.
+
+Right side mirror around x=?? Field center 216: left wall 16 ↔ right boundary 416 (distance 400). Mirror of x: x' = 432 − x. C'(432−104,572)=(328,572); A'(432−16,470)=(416,470) ✓ matches divider; B'(416,552). Kick: seg(416,470,328,572,{boost:520}); bottom: seg(416,552,328,572); funnel: seg(328,572,292,686).
+
+Flippers:
+```js
+const fl={ x:140,y:686,len:70,rest:0.62,up:-0.58,ang:0.62,om:0,down:false };
+const fr={ x:292,y:686,len:70,rest:Math.PI-0.62,up:Math.PI+0.58,ang:Math.PI-0.62,om:0,down:false };
+```
+Wait right flipper "up": I derived earlier angle π+0.58 ≈ 3.721 → tip direction (cos,sin)=(−0.843,−0.538) up-left ✓. But note: left rest 0.62 tip down-right; right rest π−0.62=2.5216 tip direction (cos=−0.814, sin=+0.581)→ down-left ✓ symmetric.
+
+Check funnel endpoints meet pivots: left funnel ends at (140,686)=fl.x,y ✓; right ends at (292,686)=fr ✓.
+
+Gap between rest tips: left tip=(140+70*0.814, 686+70*0.581)=(197,726.7); right tip=(292−57, 686+40.7)=(235,726.7). Gap=38 > 2R=20 ✓ drain works. With capsule radius FR=11: effective gap at tips = 38−22=16 <20 → hmm the ball (r=10) can't fully pass between the capsules? Ball center needs to be ≥ R+FR=21 from each tip circle… distance between tip centers 38; ball center 19 from each (midpoint): 19 < 21 → collision! Ball gets pinched at rest flippers — it'll sit on top of both tips. That's actually how pinball works (ball rests on flipper tips) but should be able to drain when falling through center… In real tables, gap between tip faces > ball. My geometry: tip face gap 16 < 20 → can't drain. Fix: lengthen distance — move pivots outward: fl.x=132, fr.x=300 (dist 168). Tips: left=(132+57,726.7)=(189,726.7); right=(243,726.7); gap=54; face gap=54−22=32 >20 ✓ drains. Update funnel endpoints: left funnel → (132,686); right → (300,686).
+
+Active tips: left up angle −0.58: tip=(132+70*0.836, 686−70*0.548)=(190.5,647.6); right: (300−58.5,686−38.4)=(241.5,647.6). Face gap=51−22=29 > 20 → ball can still slip through center even when both up! Bad — need active tips to close the gap: increase |up angle|: up=−0.78 left? tip=(132+70*cos(−0.78)=70*0.711=49.8, 686−70*sin(0.78)=70*0.703=49.2)→(181.8,636.8); right (250.2,636.8) gap=68?? Moving more vertical makes tips farther apart horizontally! To close gap need steeper… no wait: closing gap = tips move toward center = tip x moves inward = smaller horizontal reach = more vertical flipper. Left tip x should increase toward 216; right tip x should decrease. At rest left tip at x=189 (dx +57); when up, dx=+49.8 → moved 7px inward. To close need dx small: angle −1.3 rad: cos=0.267→dx=18.7, sin(1.3)=0.964→dy=−67.5: tip=(150.7,618.5)?? That's barely moved inward in x — wait dx=18.7 means tip is 18.7 right of pivot (132) → x=150.7, but rest tip was at 189! Moving up made it go back toward the wall — wrong direction? No: rest angle +0.62 points down-right; up angle −0.58 points up-right with similar dx (62). The flipper sweeps like a clock hand from ~35° below horizontal to 35° above: tip traces an arc; x stays roughly constant (~+57..62), y goes 727→648. So tips don't close the gap horizontally — they just lift up, and ball would fall between them into… wait if tips are at (190.5,648) & (241.5,648) with faces gap 29>20, a ball falling from center hits the flippers? No—ball falls through the 32px face gap → drains even when both flipped up! But real pinball: flipped-up flippers form a V that blocks the gap… actually no! In real pinball, raised flippers point up-outward (toward walls), and the gap between them is wider than at rest; a ball falling straight down can drain between raised flippers too — it's about timing. Hmm let me recall: at rest, flippers slope down toward center (tips lowest in middle). When flipped, tips swing up so flippers point up-outward. The blocking of the ball comes from the flipper bodies being higher — a ball descending onto the V-shape formed by two raised flippers bounces off them. A ball falling straight down at center: at rest it falls through (gap between tips). When raised, the flipper faces point up-center forming a V; a ball hitting the V gets bounced back up/away. The tips when raised are higher (y≈648 vs 727) — the V intercepts the ball above the drain gap. A ball falling at x=216: does it intersect the capsule line of the flipper? Left capsule from pivot(132,686) to tip(190,648): this segment is on the left half (x 132..190). Ball at x=216: nearest point = tip (190,648); distance from (216, y) — if ball falls at x=216 with y reaching ~650: dist to tip ≈ sqrt(26²+2²)=26 > R+FR=21 → no collision → drains. Hmm so center drain through raised flippers is possible? In real tables, a ball falling dead-center between raised flippers… the flippers are angled up-outward and their inner faces face the center — a ball at center x=216 falls into the V notch between the two flipper tips: tip-to-tip gap at y 648 is 51px (center-to-face 29)… ball diameter 20 < 32 → passes through. But in real pinball, can a ball drain through both raised flippers? Actually YES — if you time it wrong, the ball can fall between raised flippers into the drain! That's why timing matters. OK so my geometry is authentic.
+
+But for casual play, that might feel unfair… many digital pinballs have similar behavior. Keep; players will learn to hold. Also raise up angle slightly less extreme (−0.62) so V is shallower? At −0.58 it's fine. Actually let me set up=∓0.72 for a bit more vertical lift: tip y = 686−70*sin(0.72)=686−45.9=640, dx=70*cos(0.72)=53 → left tip (185,640), right (245,640): face gap=60−22=38. Fine.
+
+Hmm wait I realize I should double-check the "rest" orientation: rest angle 0.62 rad ≈ 35.5° below horizontal — real flippers are ~30-35° ✓.
+
+Bumpers:
+```js
+const bumpers=[
+ {x:140,y:280,r:26,c:'#ff5d73',f:0,ph:0},
+ {x:292,y:280,r:26,c:'#3fd9ff',f:0,ph:2.1},
+ {x:216,y:378,r:26,c:'#ffb640',f:0,ph:4.2}
+];
+```
+Check clearance from targets at y 153-187 and rollovers at 436: bumper top at 254; target bottom 187 → gap ok. Bumper bottom 404; rollover 436 r9+ball… fine.
+
+Targets:
+```js
+const targets=[150,198,246,294].map(x=>({x,y1:150,y2:190,alive:true,t:0}));
+```
+Wait row from 150 to 294 (center 222 ~ near field center 216 ok). Segments vertical length 40. Add to walls as dynamic: handle separately in collision loop (so we can remove).
+
+Rollovers:
+```js
+const lanes=[{x:150,y:436},{x:216,y:436},{x:282,y:436}].map(o=>({...o,lit:false,cool:0,flash:0}));
+```
+
+Physics step (dt substep):
+
+```js
+function physStep(dt){
+  // flippers
+  for(const f of [fl,fr]){ const tgt=f.down?f.up:f.rest; const spd=f.down?20:11; let d=tgt-f.ang; const m=Math.min(Math.abs(d), spd*dt); f.ang+=Math.sign(d)*m; f.om=m/dt || 0; }
+  if(state==='menu'){ /* ghost ball */ }
+  if(state!=='play' && state!=='menu') return; // ready: ball locked
+  const b=ball;
+  b.vy+=G*dt;
+  // clamp speed
+  let sp=Math.hypot(b.vx,b.vy); if(sp>MAXV){b.vx*=MAXV/sp;b.vy*=MAXV/sp;}
+  b.x+=b.vx*dt; b.y+=b.vy*dt;
+  collideWalls(); collideBumpers(); collideTargets(); checkLanes();
+}
+```
+
+Substepping in frame update:
+```js
+function step(dt){
+  if(paused) return;
+  const n = clamp(Math.ceil((speedOf(ball)*dt)/(BR*0.7)),1,10);
+  for(let i=0;i<n;i++) physStep(dt/n);
+  // timers, particles, etc (per frame)
+}
+```
+
+collideWalls: loop walls + flipper capsules:
+```js
+function hitSeg(s, vsx=0, v sy=0?) — generic with optional surface velocity.
+for(const s of walls){ collideSeg(s, 0,0); }
+flipperCapsule(fl); flipperCapsule(fr);
+```
+
+collideSeg(s):
+```js
+const dx=s.x2-s.x1, dy=s.y2-s.y1; const L2=dx*dx+dy*dy;
+let t=((b.x-s.x1)*dx+(b.y-s.y1)*dy)/L2; t=Math.max(0,Math.min(1,t));
+const qx=s.x1+t*dx, qy=s.y1+t*dy;
+let nx=b.x-qx, ny=b.y-qy; const d2=nx*nx+ny*ny;
+if(d2 >= (BR+s.rad||0)^2) return... 
+```
+Walls rad=0 (lines). Flipper rad=FR. Use s.r default 0.
+
+If d2 < (BR+r)²: d=sqrt; if d<1e-6 → n=(0,-1) else n/=d. Push: b.x+=n*(BR+r−d). Relative vel: rvx=b.vx−svx, rvy=…; vn=rv·n; if(vn<0){ const e=s.e??0.58; let j=-(1+e)*vn; // apply to ball velocity
+ b.vx += j*nx; b.vy += j*ny;
+ // tangential friction: vt = v−(v·n)n scaled by 0.995 — minor, skip or small.
+ if(s.boost){ const vn2=b.vx*nx+b.vy*ny; if(vn2 < s.boost){ b.vx+=nx*(s.boost-vn2); b.vy+=ny*(s.boost-vn2); onSling(s);} }
+ bounce sound if |vn|>90: sfx.bounce(min(1,|vn|/700));
+}
+```
+
+Flipper capsule: compute Q etc with r=FR=11; surface velocity at Q: rx=qx−f.x, ry=qy−f.y; svx=−f.om*ry, svy=f.om*rx. e=0.32. Also cap: after impulse clamp total speed to 1450.
+
+Note: flipper om should be computed in the same substep before collision — yes, physStep updates flippers first ✓. But multiple substeps: each substep advances angle by spd*dt/n ✓ consistent.
+
+collideBumpers:
+```js
+for(const bp of bumpers){ const dx=b.x-bp.x, dy=b.y-bp.y; const R=BR+bp.r; const d2=dx*dx+dy*dy; if(d2<R*R){ const d=Math.sqrt(d2)||1e-4; const nx=dx/d, ny=dy/d; b.x=bp.x+nx*R; b.y=bp.y+ny*R; let vn=b.vx*nx+b.vy*ny; const push=560; if(vn<push){ b.vx+=nx*(push-vn); b.vy+=ny*(push-vn);} bp.f=1; addScore(75,b.x,b.y,'#fff'); sparks(...); sfx.bumper(i); shake=Math.min(1,shake+0.35); } }
+```
+Guard scoring by state==='play' (ghost ball in menu: skip score/sound? Sound in menu is fine but no score; actually let's mute ghost to avoid noise before start — audio isn't initialized until first input anyway, and once user starts playing… menu→play transition. Keep ghost silent & scoreless: if(state==='menu') only physics.)
+
+Targets collide: for alive targets treat as segment (x,y1)-(x,y2) e=0.85; on hit (vn<−40): target.alive=false; addScore(200); spark burst; sfx.target(); if all dead → banner "TARGET BANK +1000", score+=1000, sfx.bank(), respawnTimer=2.6.
+
+Lanes check: for each lane: cool-=dt frame-level. dist<BR+8 && !lit && cool<=0 → lit=true, flash=1, cool=1; if state play: score+=50 small popup +50? Rollover 50. sfx.lane(). If all lit → banner "LANES LIT! +500", +500, sfx.bank2(), after 0.8s reset (timer) — simpler: schedule with a timer var laneReset=0.9; when it hits 0 → unlit all.
+
+Also ball might rest on top of a lit lane? Lanes are non-solid dots in open field; ball can't "rest" there (gravity, no support). ok.
+
+Drain & respawn:
+```js
+function checkDrain(dt){
+ if(state!=='play') return;
+ if(ball.y > FH+30){ loseBall(); }
+ else { // lane rest
+   inLane = ball.x>416;
+   if(inLane && Math.hypot(v)<25){ still+=dt; if(!entered) { if(still>0.7) state='ready' ... but ball should be at plunger position: snap to (440,706). } else if(still>1.0) loseBall(); }
+   else still=0;
+ }
+ entered ||= ball.x<410 || ball.y<235;
+}
+```
+Hmm entered when x<410 — but divider is 416 and ball r10 → center <406 to cross. Use x<408. Or y<235 (over the top). ok.
+
+loseBall(): sfx.drain(); drainFlash=1; balls--; if(balls<=0){ gameOver() } else { spawnBall(); state='ready'; entered=false; }
+
+spawnBall(): ball={x:440,y:706,vx:0,vy:0}; charge=-1.
+
+gameOver(): state='over'; update hi + localStorage try/catch; show overlay with score.
+
+Shoot:
+```js
+function releaseCharge(){ if(charge<0)return; const p=charge; charge=-1; ball.vy=-(820+560*p); ball.vx=(Math.random()*24-12); state='play'; sfx.shoot(p); }
+```
+
+Charging update: if(state==='ready' && charging){ charge=Math.min(1,charge+dt/0.9); }
+
+Input:
+```js
+const keys={};
+window.addEventListener('keydown',e=>{
+  const k=e.key;
+  if([' ','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(k)) e.preventDefault();
+  audioInit(); resume AC if suspended.
+  if(e.repeat) { still process flippers? just return for repeats but keep down state }
+  switch lowercased: 'z','arrowleft','a' → leftDown=true; sfx.flipper on press (edge only).
+  'x','arrowright','d' → rightDown.
+  ' ' or 'enter': if state menu→ startGame(); if over→ startGame(); if ready && !charging → charging=true, charge=0.
+  'r': startGame() (any time except menu? allow always → new game).
+  'p': toggle pause (only in play/ready).
+});
+keyup: flipper release; space → releaseCharge().
+```
+Also flippers should work during 'ready' too (harmless) ✓.
+
+Flipper sound only on press edge (transition false→true) and vn-based hit sounds from collision.
+
+Pointer (touch/mouse):
+```js
+cv.addEventListener('pointerdown', e=>{ audioInit(); const {x,y}=toField(e); if(state==='menu'){startGame();return;} if(state==='over'){startGame();return;} if(state==='ready'){charging=true;charge=0; return;} // play: flipper by side
+  const active = pointers.set(e.pointerId, x<216?'L':'R'); apply down.
+});
+pointerup/cancel: if that pointer was charging? Track chargePointer id. Simplify: only one charge at a time (first pointer during ready). Flippers: on up, release any side held by that pointer (if no other pointer holds same side).
+```
+Keep simple: track map id→side; recompute sides on each event.
+
+toField(e): fx=(e.clientX - OX - FX*S)/S.
+
+Draw code — sizable but straightforward. Let me write helper `rr(x,y,w,h,r)` roundRect path (canvas has ctx.roundRect in modern browsers; implement manual fallback for safety).
+
+Frame:
+```js
+function frame(t){ requestAnimationFrame(frame); const dt=Math.min(0.033,(t-last)/1000||0.016); last=t; if(!paused) step(dt); updateFx(dt); draw(t/1000); }
+```
+
+updateFx: decay flash, particles, popups, banner timers, shake decay, respawn timer, lane reset, drainFlash, still timer? (still handled in checkDrain per frame — call there with dt).
+
+Now let me write out the drawing carefully.
+
+draw(t):
+1. ctx.setTransform(dpr,0,0,dpr,0,0); clear all: fill background gradient vertical (#05081a→#0a1230→#070b1e?). Actually layered: base fill #060a1c; then two nebula radial gradients (indigo at 20%,70%? and teal at 80%,20%) alpha ~0.5 — subtle color depth, not the aurora-blob style… keep it very dark and structural: maybe a soft vignette + faint grid? Let me do: base #070c1e; radial glow behind cabinet (warm faint) to spotlight the table; stars with twinkle; faint horizon scanline? Skip scanlines.
+
+2. Cabinet transform: ctx.translate(OX,OY); scale(S,S)? Combine: setTransform(dpr*S, 0,0, dpr*S, dpr*OX, dpr*OY). Then draw in cabinet coords (CW×CH).
+   - Header panel at (14,14,CW-28,118): fill #131a36, stroke #33406e lw2; corner screw dots.
+     - Title: font `italic 900 40px Impact...` fillStyle amber gradient? Use two-tone: "PINBALL" white-amber, "NOVA" cyan? Draw text with shadowBlur glow. Place at x=38,y=78 baseline; smaller sub "shooter edition"? Keep: title left-aligned, right side score block.
+     - SCORE: label 11px mono #8fa3ff; digits font `700 34px 'Courier New'` cyan #59e6ff with glow, right-aligned at CW-40. Zero-padded 7.
+     - HI: below digits smaller amber "HI "+padded.
+     - Ball icons: 3 circles r7 chrome-ish at (40..,108), filled for remaining balls, dim for lost.
+   - Playfield frame: outer glow rect behind field: draw rounded rect (FX-10,FY-10,FW+20,FH+20) fill #0a0f24 stroke amber-ish; then field clip.
+
+3. Field: save; translate(FX,FY + shake offset); beginPath rect(0,0,FW,FH) clip.
+   - Felt gradient; vignette radial (transparent center → rgba(0,0,10,.55) edges).
+   - Starburst decoration at top center (216,86): rotating rays? 4-point star: draw with path, fill amber glow, pulse scale = 1+0.08 sin(t*2). Plus small orbiting dot? Keep star + a few dots along arc.
+   - Wall strokes: for each wall segment (except divider?) draw with two passes: pass1 strokeStyle 'rgba(255,170,60,.25)' lw 9 (glow), pass2 '#ffd9a0'?? Hmm bright yellow walls may dominate; use chrome: pass2 '#e8ecf5' lw3 core + pass1 glow rgba(120,180,255,.35) lw8 blue-ish. Mixed: outer rails = warm amber glow (#ffb640 alpha .3 lw10) + core #f4d9a8 lw3. Lane divider: cyan tint to distinguish (it's a "shooter lane" wall): glow rgba(80,220,255,.3), core #bfeaff.
+   - Sling triangle fills: dark base #1d2a4a with amber kick face highlight stroke on boost edges lw4 + small arrow chevrons? Draw chevrons pointing toward center (small triangles) pulsing alpha — shows they're active.
+   - Bumpers: for each: outer ring (r+5) stroke c lw3 glow; body radialGradient white core → c → #10182e; flash: overlay circle white alpha f*0.9, plus expanding ring (r + (1-f)*? ) — use f as 1→0: ring radius r+(1-f)*26 alpha f. Text '75' font bold 13 mono dark #1a2030 center.
+   - Targets: alive → rounded rect (x−5, y1, 10, y2−y1) fill gradient amber→#ff8c3a stroke #ffe9c0 lw1.5 + small '200' below? Space tight; put number on top area? Draw '200' above each at y1−6 font 10 mono alpha .7. Dead → stub rect (x−4, y1+8, 8, y2−y1−8) fill #232c4a stroke #3a4670 + tiny red dot? ok.
+   - Lanes: circle r9: unlit: stroke rgba(150,170,220,.5) lw2; lit: fill radial green glow + pulse ring alpha .5+.3sin(t*6). flash>0 white overlay.
+   - Flippers: draw capsule: line from pivot to tip with round cap: ctx.lineCap='round'; stroke lw=2*FR+? use lw 22 (FR=11) color gradient along? Simple: two strokes: outer #3a2c14? Let me do: base stroke '#2b1f10' lw 25, then gradient stroke createLinearGradient pivot→tip colors #ffd27a→#ff9a3d lw 19, plus when down: shadowBlur cyan. Pivot: circle r8 chrome (#dfe6f2→#5a6a8c) + center dot.
+   - Plunger and lane: lane area shading: rect(416,0? no (416,130)-(464,744)) fill rgba(0,0,0,.25); "SHOOT" vertical text rotated? Draw small text 'SHOOT HERE' rotated 90° at lane center alpha .35 mono. Plunger: shaft rect x 432..448 y headY+6..744 fill #2a3350 stroke; head: rounded rect (424,headY,32,10) chrome gradient; spring: zigzag from (440,744) to head bottom? Draw as N-segment polyline with alternating x offset ±7. headY = 706+BR−? ball bottom at 716; head top should touch ball bottom: headTop=716+p*12 (compress down while charging). Spring between headBottom (headTop+10) and 744.
+   - Power meter: x=421..429 (8 wide), y 640..712: frame stroke; fill from bottom h=p*72 color lerp green→red by p; tick lines every 1/4. Only show when state==='ready'.
+   - Drain slot: rect(150,736,160,8)? Actually drain is center gap between flipper tips x≈190..245 → draw dark slot (185,742,62,10) with red glow when drainFlash>0.
+   - Particles: additive (globalCompositeOperation='lighter') small circles alpha life.
+   - Popups: text rising.
+   - Banner: if bannerT>0: scale pop: a = min(1,(bannerDur−bannerT)/0.15) easeOut; alpha fade last 0.4s; font Impact 42, center (216, 470)? place at y=470 which is between lanes… let me use y=300? that's over bumpers — fine with glow. Use y=520 (below lanes, above flippers). Hmm flippers at 686; 520 ok.
+   - Ready hint: if state==='ready': pulsing text at (240? center of main field x≈216) y=630: "HOLD SPACE — CHARGE" and second line "Z / ← FLIP L • X / → FLIP R"? Keep one line + small controls reminder below. Also if charging, show "RELEASE TO LAUNCH!" flashing.
+   - Pause overlay text.
+   restore clip; draw outer border stroke again (above clip edge): rounded rect stroke lw3 #ffb640 alpha .8 + glow.
+
+4. Overlay DOM handles menu/gameover.
+
+Ghost ball in menu: spawn at (216, 500) with random v (±300, −400). If y>FH+30 → respawn new random. Skip scoring/sound. Draw normally. This gives the background life behind start panel ✓.
+
+Start screen DOM:
+```html
+<div id="scr" class="scr">
+  <div class="panel" id="startP">
+    <div class="coin blink">● INSERT COIN ●</div>
+    <h1>PINBALL<span>NOVA</span></h1>  // styled
+    <p class="tag">shooter arcade edition</p>
+    <div class="keys">
+      rows: kbd SPACE → hold to charge plunger · release to launch
+      kbd Z / ← → left flipper ; kbd X / → right flipper
+      kbd R restart · kbd P pause
+    </div>
+    <div class="hi">HIGH SCORE <b id=hiStart>0</b></div>
+    <button? no — "PRESS SPACE TO PLAY" pulsing div. (Button is fine too but keyboard suffices; add a clickable button for mouse users: <button id=btnStart>PLAY</button>) — click to start ✓ good for accessibility.
+  </div>
+  <div class="panel over hidden" id="overP"> GAME OVER / final score / hi / new record badge / PLAY AGAIN button + "or press SPACE"</div>
+</div>
+```
+Style: panel background #0d1330f2 (almost solid, slight translucency), border 2px solid #ffb640, clip-path chamfered corners (polygon 12px cuts), box-shadow outer glow amber + inner. Scanline overlay via ::after repeating-linear-gradient rgba(255,255,255,.03) lines — subtle CRT feel ✓. Title: Impact, size clamp(44px,9vw,76px), letter-spacing 2px; "PINBALL" color #fff with amber glow shadow, "NOVA" cyan with cyan glow, italic skew for speed? Use transform: skewX(-6deg) on h1 — arcade energy. Kbd style: mono, border 1px #5a6a9c, background #1a2348, padding, border-radius 4px (small radius ok), box-shadow inset bottom.
+
+Buttons: chunky arcade button: background gradient amber, black text, bold Impact? Use font-weight 800 system; clip-path chamfer; hover: brightness + translateY; active pressed. Focus-visible outline cyan.
+
+Blink animation for "INSERT COIN"; pulse for play prompt.
+
+Also small footer in panel: "© NOVA AMUSEMENT 1987" flavor? Cute — add a tiny line "NOVA AMUSEMENT CO." mono 10px alpha .5.
+
+Fonts: body font stack: `"Trebuchet MS", "Segoe UI", Verdana, sans-serif`? Trebuchet has character. Display: `Impact, "Arial Black", "Franklin Gothic Medium", sans-serif`. Mono: `"Courier New", ui-monospace, monospace` — Courier New is thin; use bold weight for legibility.
+
+Now let me write out the audio functions concretely:
+
+```js
+let AC=null, master=null, noiseBuf=null;
+function audioInit(){ if(AC) { if(AC.state==='suspended') AC.resume(); return; }
+ try{ AC=new (window.AudioContext||window.webkitAudioContext)(); master=AC.createGain(); master.gain.value=0.3; master.connect(AC.destination);
+  noiseBuf=AC.createBuffer(1, AC.sampleRate*0.5, AC.sampleRate); const d=noiseBuf.getChannelData(0); for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;
+ }catch(e){}
+}
+function env(g,t,v,dur){ g.gain.setValueAtTime(v,t); g.gain.exponentialRampToValueAtTime(0.001,t+dur); }
+function tone(f,dur,type,vol,slideTo){ if(!AC)return; const t=AC.currentTime; const o=AC.createOscillator(),g=AC.createGain(); o.type=type||'square'; o.frequency.setValueAtTime(f,t); if(slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(30,slideTo),t+dur); env(g,t,vol||0.5,dur); o.connect(g); g.connect(master); o.start(t); o.stop(t+dur+0.03); }
+function noise(dur,vol,fq,type='lowpass'){ if(!AC)return; const t=AC.currentTime; const s=AC.createBufferSource(); s.buffer=noiseBuf; s.loop=true; const f=AC.createBiquadFilter(); f.type=type; f.frequency.value=fq; const g=AC.createGain(); env(g,t,vol,dur); s.connect(f);f.connect(g);g.connect(master); s.start(t); s.stop(t+dur+0.03); }
+const lastS={};
+function gate(key,min){ const n=performance.now(); if(lastS[key]&&n-lastS[key]<min)return false; lastS[key]=n; return true; }
+const sfx={
+ bounce(v){ if(!gate('b',45))return; noise(0.05, 0.25*v, 1600); tone(90+60*v,0.05,'triangle',0.2*v,60); },
+ flip(){ if(!gate('f',60))return; tone(140,0.08,'square',0.35,70); noise(0.06,0.3,900); },
+ bumper(i){ if(!gate('bp'+i,40))return; const f=[620,780,940][i%3]; tone(f,0.09,'square',0.5,f*1.6); noise(0.06,0.35,2500,'highpass'); },
+ sling(){ if(!gate('s',70))return; tone(300,0.07,'sawtooth',0.4,180); noise(0.05,0.3,1200); },
+ target(){ if(!gate('t',60))return; tone(880,0.12,'triangle',0.5,1320); },
+ lane(){ if(!gate('l',80))return; tone(1180,0.07,'sine',0.35,1400); },
+ bank(){ [523,659,784,1046].forEach((f,i)=> setTimeout(()=>tone(f,0.14,'square',0.4),i*70)); },
+ shoot(p){ noise(0.12,0.5,700); tone(120+380*p,0.22,'sawtooth',0.45,60); },
+ drain(){ [392,311,233,155].forEach((f,i)=> setTimeout(()=>tone(f,0.16,'square',0.4),i*100)); },
+ over(){ [262,196,131].forEach((f,i)=> setTimeout(()=>tone(f,0.3,'triangle',0.45),i*180)); },
+ start(){ [392,523,659,784].forEach((f,i)=> setTimeout(()=>tone(f,0.1,'square',0.35),i*60)); }
+};
+```
+
+setTimeout for arpeggios — fine.
+
+High score:
+```js
+let hi=0; try{ hi=+localStorage.getItem('pinballNovaHi')||0; }catch(e){}
+function saveHi(){ try{ localStorage.setItem('pinballNovaHi', String(hi)); }catch(e){} }
+```
+
+Score popups and particles:
+```js
+const parts=[], pops=[]; let banner={txt:'',t:0,dur:0};
+function sparks(x,y,c,n=14,sp=260){ for(...) parts.push({x,y,vx:cos*sp*rnd,vy:sin...,l:1,c}); }
+function addScore(n,x,y){ score+=n; if(score>hi){hi=score;} small popup {x,y,txt:'+'+n,l:1} }
+```
+Live-update hi display ✓ (and save on game over and also throttle-save when changed? Save on gameOver + on visibilitychange? Just on gameOver is fine, plus when state changes to menu… keep only on gameOver).
+
+Banner function: setBanner(txt) → banner={txt,t:1.5,dur:1.5}.
+
+Target respawn: targetTimer>0 → count down; at 0 → all targets alive=true (with pop flash t=0.2 each? add small scale-in: store spawn anim st=0→1). Simple: on respawn set target.t=0.3 for pop flash.
+
+Lane reset timer similar laneTimer.
+
+Shake: shake=Math.max(0,shake-dt*3); offset=(Math.random()*2-1)*4*shake? Use sin-based deterministic: off = Math.sin(t*70)*3*shake + ... random is fine.
+
+Ghost ball (menu): menuBall separate object to not disturb real ball state:
+```js
+let ghost={x:216,y:520,vx:180,vy:-320};
+if(state==='menu'){ step it with same physics but skip score/sound: pass a flag. }
+```
+Simplest: in physStep use `const b = state==='menu'? ghost : ball;` and wrap scoring/sfx calls with `state==='play'`. For drain: if y>FH+40 && menu → respawn ghost at random top? Respawn at (216, 500) with new random v. Also flippers inactive in menu (down=false) — fine, ball bounces around bumpers forever and eventually drains and respawns ✓ ambient life.
+
+Pause: only when state play/ready: toggle paused; draw "PAUSED" overlay on canvas; skip step but still draw (and update t). Space during pause? Keep P to unpause; R restarts.
+
+Edge: keydown space during 'play' → nothing (or nudge? add table nudge: small upward impulse + tiny shake, sound — fun! Real pinball has nudge button. Let me add: space during play = nudge (vy −= 250, vx ±40 random, small shake). But be careful not to break charge release… charge is only in ready ✓. Add it — nice feature; list in controls as "SPACE nudge". Hmm keep? Yes, adds depth and uses the key during play.
+
+Also prevent context menu on long-press touch: css touch-action none on canvas + user-select none.
+
+Now let me write out the drawing code with attention to text metrics. Header layout (cabinet coords CW=560):
+- Panel rect (14,14,532,118).
+- Title at x=40: "PINBALL NOVA" — Impact 42px italic; measure? Just place: y baseline 72. Two colors: draw "PINBALL" in #ffe9c0 with amber glow, then " NOVA" in cyan — need width of first part: ctx.measureText. Fine.
+- Below title: small "SHOOTER EDITION" 11px mono letter-spaced (manual spacing? just text) #7f92c8 at y=95.
+- Right block: "SCORE" label 10px at (CW-46, 44) right-aligned; digits 30px mono bold #6ee8ff glow right-aligned (CW-46,76); "HI 0012345" 13px #ffb640 right (CW-46,100).
+- Ball icons: circles at (40+ i*22, 104) r8.
+
+Wait title width: Impact 42 "PINBALL NOVA" ≈ 42*0.55*12chars ≈ 277px — fits in left ~300px before score block (score digits ~7 chars * 18 = 126 + label) ✓.
+
+Field origin: FX=40, FY=150. Cabinet bottom margin: 940−(150+760)=30 ✓.
+
+Also draw cabinet side accents? Vertical text on sides? Skip — keep clean; maybe faint vertical rails with dots along field frame sides (drawn as part of the frame): small amber dots every 40px along left/right edges of the frame outside the field: x=FX−6 and FX+FW+6, y from FY+20..FY+FH−20 step 36, r2 alpha .5. Adds detail ✓.
+
+Popup text font: bold 15 mono, color per event, rise 40px over 0.9s, fade.
+
+Particles update: p.l-=dt*1.8; pos+=v*dt; vy+=600*dt (spark gravity); draw with 'lighter' alpha=p.l.
+
+Banner draw: t countdown; a=min(1,(dur−t)/0.12); scale=1+ (1-a)*0.5? pop from big to normal: s=1+(1-a)*0.6; alpha = t<0.4? t/0.4 : 1 (fade out at end). Font Impact 44, color #fff with amber glow + cyan underglow double shadow. Center x=216 y=530.
+
+Ready hint: alpha pulse 0.55+0.35 sin(t*5): text "HOLD SPACE TO CHARGE PLUNGER" at (216, 640) mono bold 15 #cfe3ff; second line "RELEASE TO LAUNCH • Z/← X/→ FLIPPERS" 11px alpha .5 y=662. If charging: replace first line with "RELEASE TO LAUNCH!" color amber flashing (alpha square wave).
+
+Lane 'SHOOT' text: save translate(438,560) rotate(-PI/2) fillText('S H O O T',0,0)? Rotated -90 reads bottom-up. Font 12 mono alpha .3 #7fd4ff. Center lane x=440 → use 444 to clear divider? Lane center = (416+464)/2=440 ✓ but plunger shaft occupies lower part; place at y 560 mid-lane ✓.
+
+Draw order in field: felt → decoration star → lane shading → walls glow/core → slings → targets → lanes → bumpers → plunger+meter → flippers → drain slot → ball → particles → popups → banner → hint.
+
+Ball draw:
+```js
+const g=ctx.createRadialGradient(b.x-3,b.y-4,1,b.x,b.y,BR);
+g.addColorStop(0,'#ffffff');g.addColorStop(.45,'#dfe8f6');g.addColorStop(.8,'#8fa2c0');g.addColorStop(1,'#5a6b88');
+fill circle. Plus specular: small white circle at (-3,-4) r2 alpha .9 (already in gradient). Add faint rim stroke rgba(255,255,255,.25).
+```
+
+Flipper draw with gradient along length: createLinearGradient(px,py,tx,ty): '#ffe0a0'→'#ff9c3f'; outline pass first lw 24 color 'rgba(20,12,4,.9)'? That's dark rim; then core lw 18. When down add ctx.shadowColor='#59e6ff', shadowBlur=14 for core stroke only (reset after).
+
+Pivot cap: circle r9 gradient chrome + ring.
+
+Now the flipper collision uses FR — draw with lw=2*FR? I said FR=11 → lw 22 core… let me set FR=10, outline lw 23, core lw 18 (visual slightly smaller than physics — fine, be generous to player: physics radius 10.5?). Use FR=10 for collision; draw core lw 19, rim lw 24.
+
+Also handle ball caught between flipper and wall corner etc — generic capsule handles.
+
+One more mechanic check: bumpers push 560 along normal — but if ball is moving fast toward bumper (vn negative large), formula v+=n*(push−vn) with vn<push always adds… e.g., vn=−400 → add 960 → new vn = 560 ✓ good elastic-ish.
+
+Sling boost 520 similar but only when vn<boost, plus require initial impact |vn|>60 else skip boost (so slow rolling doesn't rocket): track vnBefore before reflection: if(vnBefore<−80) apply boost & sfx.sling & sparks small & score 25.
+
+Sling score: addScore(25).
+
+Bumper score guard state play ✓.
+
+checkLanes only in play.
+
+Now the DOM overlay show/hide: function showScr(el){ scr.style.display='flex'; el.classList.remove('hidden'); other hidden }. Start: show startP; over: fill final score and show overP. Hide both during game.
+
+Also update hiStart text on show.
+
+New high score badge: track prevHi at game start (hiAtStart); if score>hiAtStart && score>0 → show "★ NEW HIGH SCORE ★".
+
+Let me also add subtle CRT vignette overlay in CSS on top of canvas? Add a fixed div with radial gradient transparent→rgba(0,0,0,.35) pointer-events none — cheap atmosphere ✓ plus faint scanlines at 3% opacity across the whole screen. Nice arcade feel. Keep it very subtle so as not to muddy.
+
+Resize handling: recompute S,OX,OY and stars. Also on resize during game — fine.
+
+Prevent arrow/space scrolling: preventDefault in keydown for those keys (window listener). ✓
+
+Restart flow: startGame(): score=0; balls=3; entered=false; reset targets/lanes/timers/parts/pops/banner; spawnBall(); state='ready'; paused=false; hide overlay; sfx.start(); hiAtStart=hi.
+
+Menu init on load: state='menu'; ghost spawned; show startP with hi.
+
+Game over flow: state='over'; sfx.over(); saveHi(); fill DOM; show overP after a short delay? Immediate fine but let drain animation play — 900ms delay via setTimeout then show overlay (guard if user pressed R in meantime: check state). Use a small timeout.
+
+Ball icon drawing uses balls count.
+
+Let me also double-check arc segment generation code with prev point:
+```js
+let px,py;
+for(let i=0;i<=26;i++){ const a=Math.PI+i/26*Math.PI; const x=ACX+AR*Math.cos(a), y=ACY+AR*Math.sin(a); if(i>0) seg(px,py,x,y,{e:0.5}); px=x;py=y; }
+```
+✓.
+
+Wall e defaults 0.58 — maybe 0.62 for lively bounces. Bumper push dominates anyway.
+
+Ball resting on flipper at rest: gravity per substep adds vy; collision resolves with e=0.32 → small jitter acceptable; add "rest" handling: if |vn|<40 use e=0 (no bounce) to settle: e = vn<-90? 0.35 : 0. Same for walls (prevents micro-bounce sound): bounce sound only when |vn|>120.
+
+Stuck guard: track lowT: if in play && speed<18 → lowT+=dt else 0; if lowT>2.5 → nudge vy-=300, vx+=(rnd-0.5)*120, lowT=0 (silent). ✓
+
+Now — lane divider top at y=130: check ball path rising in lane: lane width 48, ball r10 → center x≈440±? Fine. At top of lane the arc boundary curves left; ball follows. The divider segment from (416,130) to (416,744): a ball on the field side near right wall descending hits divider's left face and bounces left ✓.
+
+But wait: funnel G1 starts at (416,470) — that's on top of divider line; overlap is fine.
+
+Right sling bottom edge seg(416,552,328,572): combined with divider forms a pocket? Ball rolling down right side: wall/divider down to 470 → hit sling A'(416,470) corner → kick face A'–C' slopes down-left; ball rolls along it toward C'(328,572) → then funnel C'→(300,686). ✓ symmetric with left.
+
+Left sling bottom edge (16,552)-(104,572): ball can't get below it from left (wall), only from right/below — fine.
+
+Draw sling triangle: path A,B,C fill #1c2947 stroke #38466f; kick face line stroke amber lw4 with glow + 2 chevrons along it (small triangles pointing perpendicular into field, pulsing alpha). Compute chevron positions at t=0.35,0.65 along A→C, direction = normal toward center: for left: n=(dy,−dx) normalized? Left kick face A(16,470)→C(104,572): d=(88,102); rotate +90 (screen y-down, +90 rotation gives (dy,−dx)=(102,−88)) → up-right = toward center ✓. Right face A'(416,470)→C'(328,572): d=(−88,102); (dy,−dx)=(102,88) → down-right ✗; use (−102,−88) → up-left toward center ✓. Hardcode per side.
+
+Chevron: at point P, draw small triangle: tip = P + n*7, base corners P ± d̂*5 − n*4… I'll just write a helper drawing a filled arrow path. Or simpler: draw two short parallel lines (speed dashes) — easier and looks good: for k in [0.3,0.6]: line from P−d̂*8 to P+d̂*8 offset by n*(4+2sin(t*6+k)) alpha .5 amber. Do dashes ✓ simpler.
+
+Popup colors: bumper white, target #ffd27a, sling #9fe8ff, lane #a7ffb0, bank big.
+
+Now let me finalize the HTML/CSS.
+
+CSS plan:
+```css
+*{margin:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;background:#05081a}
+body{font-family:"Trebuchet MS","Segoe UI",Verdana,sans-serif;color:#dfe7ff;-webkit-user-select:none;user-select:none}
+#cv{position:fixed;inset:0;display:block;touch-action:none;cursor:pointer}
+#fx{position:fixed;inset:0;pointer-events:none;background:radial-gradient(120% 90% at 50% 42%,transparent 55%,rgba(2,4,12,.55) 100%)}
+#fx::after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(0deg,rgba(255,255,255,.028) 0 1px,transparent 1px 3px);mix-blend-mode:overlay? no keep normal}
+#scr{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;z-index:5}
+.hidden{display:none!important}
+.panel{position:relative;background:linear-gradient(180deg,#10173a 0%,#0b1129 100%);border:2px solid #ffb640;box-shadow:0 0 0 4px rgba(255,182,64,.12),0 0 42px rgba(255,150,40,.28), inset 0 0 34px rgba(10,16,40,.9);padding:34px 44px 30px;max-width:min(92vw,560px);text-align:center;clip-path:polygon(18px 0,calc(100% - 18px) 0,100% 18px,100% calc(100% - 18px),calc(100% - 18px) 100%,18px 100%,0 calc(100% - 18px),0 18px)}
+```
+Hmm clip-path will cut the box-shadow glow… shadow outside clip is clipped. Use outline instead? Simpler: skip clip-path on panel; use border + double-border effect via ::before inset border. Or chamfer only inner decoration. Let me keep a rectangular panel with corner "notch" decorations via ::before/::after small squares? Overkill — go with strong bordered panel with thick top accent bar. Arcade cabinets are rectangular anyway ✓. Add corner brackets: 4 small L-shapes in corners absolutely positioned (two divs each? use background gradients): let me do it with a single ::before covering the panel with 8 linear-gradients forming corner brackets. That's a nice touch:
+```css
+.panel::before{content:"";position:absolute;inset:6px;pointer-events:none;background:
+ linear-gradient(#59e6ff,#59e6ff) top left/22px 3px,
+ linear-gradient(#59e6ff,#59e6ff) top left/3px 22px,
+ ... 8 entries no-repeat}
+```
+✓ cyan corner ticks.
+
+h1: font-family Impact...; font-size clamp(40px,8vw,72px); letter-spacing:.04em; transform skewX(-5deg); color #fff; text-shadow: 0 0 14px rgba(255,190,80,.9), 0 3px 0 #7a4b00? Layered: `text-shadow:0 0 6px #ffb640,0 0 22px rgba(255,140,20,.55), 0 4px 0 rgba(90,40,0,.8)`. span (NOVA): color #7df3ff; text-shadow cyan.
+.tag: mono small letter-spacing .5em? "SHOOTER EDITION" 11px ls .45em color #8fa3d8.
+.coin: mono 12px amber, animation blink 1.2s steps(2) infinite, margin-bottom 10px.
+.keys{margin:18px auto 6px;display:grid;gap:9px;text-align:left?} rows: each row flex gap 10 align center justify center? Let me do grid-template-columns auto 1fr; kbd group left, description right — readable. Font 13px.
+kbd{font-family:"Courier New",monospace;font-weight:bold;font-size:12px;background:#1b2450;border:1px solid #5a6a9c;border-bottom-width:3px;padding:3px 8px;color:#ffe9c0;min-width:34px;text-align:center;display:inline-block}
+.hi{margin-top:14px;font-family mono;letter-spacing:.2em;font-size:13px;color:#8fa3d8} b{color:#ffb640;font-size:16px}
+.prompt{margin-top:18px;font-weight:bold;font-size:15px;letter-spacing:.18em;color:#fff;animation:pulse 1.1s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.35}}
+button.arcade{margin-top:16px;font-family:Impact...;font-size:20px;letter-spacing:.12em;padding:12px 34px;background:linear-gradient(180deg,#ffd27a,#ff9c3f);color:#241300;border:2px solid #ffe9c0;box-shadow:0 5px 0 #8a4d00,0 0 22px rgba(255,160,40,.4);cursor:pointer}
+button:hover{filter:brightness(1.08)} button:active{transform:translateY(4px);box-shadow:0 1px 0 #8a4d00...}
+.over h2 {font Impact 54 color #ff5d73 glow red; letter-spacing .06em}
+.final{mono big 30px cyan}
+.badge{display:none?;color #ffe9c0 border amber inline-block padding mono ls .3em margin-top 10 animation pulse}
+.foot{margin-top:16px;font-size:10px;letter-spacing:.35em;color:#5f6f9e;font-family mono}
+```
+
+Game over panel content: h2 GAME OVER; "FINAL SCORE" label; #finalScore big; hi line; badge NEW HIGH SCORE; button PLAY AGAIN; prompt "OR PRESS SPACE".
+
+JS DOM refs and wiring.
+
+Also focus: buttons need click → startGame + blur (so space doesn't retrigger button). Call e.currentTarget.blur() in handler. And keydown space preventDefault stops button activation anyway? Space on focused button fires click on keyup? Actually button activates on space on keydown→click on keyup; our window keydown preventDefault should stop it. To be safe, blur after click ✓.
+
+Edge: user clicks PLAY AGAIN → startGame; pointer handler on canvas also triggers start when state is menu/over — but canvas is behind overlay; overlay covers screen and intercepts clicks (scr has no pointer-events none — keep default auto so button clickable). So canvas pointer events only during game ✓ good. But then "click anywhere to start" doesn't work via canvas; the button + space suffices. Also add click on scr background → start? When state menu/over, clicking anywhere in #scr starts: attach listener to scr: if(e.target===scr) startGame(). Nice.
+
+Also mobile: overlay button works ✓; touch during play: pointer events on canvas — but canvas is fixed and scr hidden → fine. Multi-touch flippers: implement pointers map.
+
+Let me write the pointer logic:
+```js
+const ptrs=new Map(); let chargePtr=null;
+cv.addEventListener('pointerdown',e=>{ e.preventDefault(); audioInit();
+ if(state==='menu'||state==='over'){ return; } // overlay handles
+ if(state==='ready'){ charging=true; charge=0; chargePtr=e.pointerId; return; }
+ const fx=(e.clientX-(OX+FX*S))/S;
+ ptrs.set(e.pointerId, fx<216?0:1); applyFlippers();
+});
+function applyFlippers(){ let l=false,r=false; for(const v of ptrs.values()){ if(v===0)l=true;else r=true;} setFlip(fl,l,'L'); setFlip(fr,r,'R'); }
+setFlip(f,down,label): if(down!==f.down){f.down=down; if(down)sfx.flip();}
+window pointerup/pointercancel: if(e.pointerId===chargePtr){charging=false; releaseCharge(); chargePtr=null;} else { ptrs.delete(id); applyFlippers(); }
+```
+Keyboard flipper state separate: fl.keyDown and combined down = keyOrPointer. Store f.held (bool from any source): recompute: fl.down = kL||ptrL. Keep a function updateFlipState() called on both inputs.
+
+Simplify: vars kL,kR (keys) + ptrs map; updateFlippers():
+```js
+let pl=false,pr=false; for v of ptrs... ; 
+const nl=kL||pl, nr=kR||pr;
+if(nl&&!fl.down)sfx.flip(); fl.down=nl; if(nr&&!fr.down)sfx.flip(); fr.down=nr;
+```
+
+Keydown: kL=true (for z/a/arrowleft) → updateFlippers(); keyup false.
+
+Space keydown: if menu→start; over→start; ready→ begin charge (if !charging); play→ nudge. Keyup space: if charging release.
+
+Charging var: `let charging=false, power=0;` in step: if(charging&&state==='ready') power=min(1,power+dt/0.9). On startCharge reset power=0.
+
+releaseCharge(): if(!charging)return; charging=false; const p=power; power=0; state='play'; ball.vy=-(820+560*p); ball.vx=(Math.random()-0.5)*26; sfx.shoot(p); entered stays false until crosses.
+
+Nudge: on space during play: ball.vy-=320; ball.vx+=(Math.random()-.5)*140; shake=max(shake,.25); sfx.bounce(.3). Also guard: only if ball is in main field? Anywhere ok… nudge while ball in lane before entered could launch it weirdly — allow, fun.
+
+Now let me write out the draw code fully. Let me also add a "field frame" with slight 3D: outer rect fill #0a0e22 (FX-14,FY-14,FW+28,FH+28) stroke #2c3a68 lw2; inner amber line around field (FX-4,...) stroke rgba(255,182,64,.5) lw2.
+
+Header panel: rect(14,14,CW-28,118) fill gradient #141b3c→#0e1430 stroke #33406e; screws at corners (r3 circles #55629a + darker dot).
+
+Also small "ball save" indicator? Skip.
+
+I think the design is solid. Let me also verify the top arc decoration star doesn't collide with target row (targets y150-190, x150..294; star at (216,86) r~24 → bottom 110 ✓ clear).
+
+Rollover lanes at y=436: between bumper 3 (378+26=404) and sling top (470): lane circle r9 → 427..445 ✓ fits in gap. Ball path from bumpers to slings passes through lanes naturally ✓.
+
+Lane light trigger radius BR+8=18 — ball passing between them: spacing 66 > 36 ✓ can't double-trigger per pass… but a slow ball could overlap two? Center distance 66, need <18 from each → impossible simultaneously ✓.
+
+Score values: bumper 75, sling 25, target 200 (bank +1000), lane 50 (all +500). Typical game maybe 5k-30k. Good.
+
+Popup positions clamp within field to avoid clipping at edges: x in [40, FW-40].
+
+Banner y=530 — above flippers (686) ✓ below lanes ✓.
+
+Ready hint y: 620/644 center x=216. Plunger lane is on the right; hint over main field ✓.
+
+Now let me write out the code, carefully and completely. Let me estimate ~700-800 lines total. That's fine — a rich, polished build.
+
+Double-checking tricky math:
+- toField for pointer: fx=(e.clientX-(OX+FX*S))/S ✓ (CSS px space; OX etc in CSS px since we computed from vw/vh).
+- In draw we use ctx.setTransform(dpr*sc,0,0,dpr*sc,dpr*(OX+shkx),dpr*(OY+shky))? Shake should only apply to field… simpler: shake entire cabinet (subtle) — fine, apply to cabinet transform.
+
+Wait: header is also inside cabinet transform ✓ good.
+
+Stars drawn before cabinet in screen space with setTransform(dpr,0,0,dpr,0,0).
+
+Also draw a soft glow behind cabinet: radial gradient at center (vw/2, vh*0.45) r=max(vw,vh)*0.5 color rgba(60,90,180,.10). In screen space ✓.
+
+Ball in 'ready' is drawn locked at plunger position; draw with head touching: ball.y=706 → bottom 716 = headTop base ✓ (head top y=716+power*12? When charging, head drops and ball should drop with it: ball.y=706+power*12 during charge. On release, set ball position to current then apply vy. Let me do that: in step, if ready&&charging: ball.y=706+power*12; ball.x=440.)
+
+Draw plunger head top at ball.y+BR (touching) ✓ consistent.
+
+Spring zigzag: from y=headBottom to 744: n=5 segments alternating x 432/448. lineWidth 3 color #8fa0c8? Metallic #9fb0d8 alpha .8. Shaft behind: rect(436,headBottom,8,744-headBottom) fill #2a3350? Actually plunger: shaft is central; spring wraps around it. Draw shaft first (rect x 434..446), then spring zigzag on top ✓.
+
+Base block: rect(424,740,32,10)? Lane floor at 744 — base at bottom of lane: rect(426,738,28,8) fill #33406e. ok.
+
+Meter: x=421? That's on top of divider (416) +5… meter at x 419..427 might visually overlap wall line; place inside lane right: x 452..460, y 630..706. Fill from bottom. Colors: p<.5 green #57ffa0 → mid amber → red: pick color by p with lerp between stops. Simple: hsl(120*(1-p),90%,60%).
+
+Tick at .62 (min success power) — draw a small white notch there! Nice detail teaching player ✓. Label? No.
+
+Draw order: meter after plunger.
+
+Drain slot: centered between flippers x 185..247 y 736..744 dark; red glow flash on drainFlash>0: shadow red alpha.
+
+Also draw a faint center guide arrow above the drain? Skip.
+
+Ghost ball in menu uses same ball render ✓ (b=ghost).
+
+OK — also "attract" hint text on canvas during menu not needed since overlay covers it.
+
+Pause draw: dim field + "PAUSED" Impact 40 center + "P TO RESUME".
+
+Time to write the final file. Let me be meticulous with syntax. I'll write clean, compact but readable JS.
+
+Also verify: no external resources ✓; title in <title> ✓ ("Pinball Nova"); start screen with name+controls ✓; restart without reload (R + game over) ✓; window key listeners ✓; no alert/confirm/prompt ✓; localStorage try/catch ✓; sound after first input ✓ (audioInit on keydown/pointerdown).
+
+One concern: `e.key` for space is ' ' (space bar). Arrow keys: 'ArrowLeft' etc. Use toLowerCase for letters.
+
+Prevent page zoom on double-tap? touch-action:none on canvas + meta viewport user-scalable=no ✓.
+
+Let me write out the arc points loop with proper initialization:
+```js
+(function(){ let ax=ACX+AR*Math.cos(Math.PI), ay=ACY+AR*Math.sin(Math.PI); // (16,230)
+ for(let i=1;i<=26;i++){ const a=Math.PI+i/26*Math.PI; const x=ACX+AR*Math.cos(a), y=ACY+AR*Math.sin(a); seg(ax,ay,x,y,{e:0.55}); ax=x; ay=y; } })();
+```
+✓.
+
+Wall list order irrelevant.
+
+Flipper capsule collision function:
+```js
+function flipCollide(f){
+ const tx=f.x+Math.cos(f.ang)*f.len, ty=f.y+Math.sin(f.ang)*f.len;
+ const dx=tx-f.x, dy=ty-f.y, L2=dx*dx+dy*dy;
+ let t=((ball.x-f.x)*dx+(ball.y-f.y)*dy)/L2; t=t<0?0:t>1?1:t;
+ const qx=f.x+t*dx, qy=f.y+t*dy;
+ let nx=ball.x-qx, ny=ball.y-qy; let d=Math.hypot(nx,ny); const rr=BR+FR;
+ if(d>=rr||d<1e-6)return;
+ nx/=d;ny/=d;
+ ball.x+=nx*(rr-d); ball.y+=ny*(rr-d);
+ const rx=qx-f.x, ry=qy-f.y;
+ const svx=-f.om*ry, svy=f.om*rx;
+ let rvx=ball.vx-svx, rvy=ball.vy-svy;
+ const vn=rvx*nx+rvy*ny;
+ if(vn<0){ const e=vn<-140?0.35:0; ball.vx-=(1+e)*vn*nx; ball.vy-=(1+e)*vn*ny;
+  // clamp speed
+  const sp=Math.hypot(ball.vx,ball.vy); if(sp>1450){ball.vx*=1450/sp;ball.vy*=1450/sp;}
+  if(vn<-160) sfx.bounce(Math.min(1,-vn/800)); // only in play? bounce sound gated by state check inside sfx call — do `if(state==='play')`
+ }
+}
+```
+For ghost: wrap all sfx/score in `const live = state==='play';` and guard.
+
+Actually physStep uses b (ball or ghost). Let me pass b as a parameter through helpers to keep it clean… simpler: use global `b` set at top of physStep? Helpers need ball — let me just reference a module-level `curB` variable assigned in physStep. Slightly hacky but compact. Or make functions take (b). I'll pass b explicitly to collideSeg(b,s), flipCollide(b,f) etc.
+
+Walls loop: for(const s of walls) collideSeg(b,s); then flipCollide(b,fl),(b,fr); bumpers; targets; lanes (play only… ghost passes through fine — skip lanes in menu).
+
+collideSeg with boost/sling detection:
+```js
+function collideSeg(b,s){
+ const dx=s.x2-s.x1,dy=s.y2-s.y1,L2=dx*dx+dy*dy||1e-6;
+ let t=((b.x-s.x1)*dx+(b.y-s.y1)*dy)/L2; if(t<0)t=0;else if(t>1)t=1;
+ const qx=s.x1+t*dx,qy=s.y1+t*dy;
+ let nx=b.x-qx,ny=b.y-qy; const d2=nx*nx+ny*ny, rr=BR+(s.r||0);
+ if(d2>=rr*rr)return;
+ const d=Math.sqrt(d2)||1e-6; nx/=d;ny/=d;
+ b.x+=nx*(rr-d); b.y+=ny*(rr-d);
+ const vn=b.vx*nx+b.vy*ny;
+ if(vn<0){ const e=(vn<-120)?(s.e??0.58):0; b.vx-=(1+e)*vn*nx; b.vy-=(1+e)*vn*ny;
+  if(live&&vn<-140)sfx.bounce(Math.min(1,-vn/900));
+  if(s.boost&&vn<-80){ const vn2=b.vx*nx+b.vy*ny; b.vx+=nx*(s.boost-vn2); b.vy+=ny*(s.boost-vn2);
+    if(live){addScore(25,b.x,b.y,'#9fe8ff'); sparks(b.x,b.y,'#9fe8ff',6,200); sfx.sling();} }
+ }
+}
+```
+
+Target collide (alive only): segment e=0.8; on strong hit: kill.
+```js
+function targetHit(tg){ tg.alive=false; tg.t=0.35; addScore(200,tg.x,168,'#ffd27a'); sparks(tg.x,170,'#ffd27a',16,300); sfx.target(); if(targets.every(x=>!x.alive)){ addScore(1000,216,168,'#fff'); setBanner('TARGET BANK +1000'); sfx.bank(); targetTimer=2.6; } }
+```
+
+Lane:
+```js
+if(laneTimer>0){ laneTimer-=dt; if(laneTimer<=0) lanes.forEach(l=>{l.lit=false;}); }
+for(const l of lanes){ l.cool=Math.max(0,l.cool-dt); l.flash=Math.max(0,l.flash-dt*2.5);
+ const dx=b.x-l.x,dy=b.y-l.y; if(!l.lit&&l.cool<=0&&dx*dx+dy*dy<(BR+9)*(BR+9)){ l.lit=true;l.flash=1;l.cool=0.6; if(live){addScore(50,l.x,l.y-14,'#a7ffb0');sfx.lane(); if(lanes.every(x=>x.lit)){addScore(500,216,436,'#fff');setBanner('LANES LIT +500');sfx.bank();laneTimer=1.1;} } }
+}
+```
+
+Bumper:
+```js
+for(let i=0;i<3;i++){const bp=bumpers[i]; const dx=b.x-bp.x,dy=b.y-bp.y,R=BR+bp.r,d2=dx*dx+dy*dy; if(d2<R*R){ const d=Math.sqrt(d2)||1e-6,nx=dx/d,ny=dy/d; b.x=bp.x+nx*R;b.y=bp.y+ny*R; const vn=b.vx*nx+b.vy*ny; if(vn<560){b.vx+=nx*(560-vn);b.vy+=ny*(560-vn);} if(live){ bp.f=1; addScore(75,bp.x-nx*bp.r? use b position) ... sfx.bumper(i); shake=Math.min(1,shake+0.3); sparks(b.x,b.y,bp.c,12,320);} } }
+```
+Bumper flash should trigger even if already pushed out? Only on actual contact (d2<R²) ✓ but consecutive substeps will keep triggering score while overlapping… after push out b is exactly at R; next substep gravity may re-penetrate → double count. Add per-bumper cooldown: bp.cool; only score/flash if cool<=0 else just physics. Set cool=0.15 (in seconds) decrement in step. ✓ same for sling? Sling boost requires vn<-80 each time — after boost ball moves away fast; ok but add small s.cool too? Keep bumper-only cooldown; sling's threshold is fine (ball leaves).
+
+Actually similar double-hit possible with walls? No score on walls, just sound (gated 45ms ✓).
+
+Drain check per frame (not substep) in step():
+```js
+if(state==='play'){
+ if(ball.y>FH+26){ loseBall(); }
+ else{
+  const sp=Math.hypot(ball.vx,ball.vy);
+  if(ball.x>416&&sp<26){ stillT+=dt; if(stillT> (entered?0.9:0.5)){ if(entered) loseBall(); else { snapToPlunger(); state='ready'; } } }
+  else stillT=0;
+  if(ball.x<408||ball.y<230) entered=true;
+ }
+ // stuck guard
+ const sp2=...; if(sp2<16) lowT+=dt else lowT=0; if(lowT>2.5){ ball.vy-=320; ball.vx+=(Math.random()-.5)*160; lowT=0; }
+}
+```
+snapToPlunger: ball.x=440;y=706;vx=vy=0;power=0.
+
+loseBall(): charging=false; sfx.drain(); drainFlash=1; balls--; shake=1; if(balls<=0){ doGameOver(); } else { spawnBall(); state='ready'; entered=false; stillT=0; lowT=0; }
+
+doGameOver(): state='over'; saveHi(); fill DOM (finalScore text, hi display, new record badge), setTimeout(()=>{ if(state==='over') showScr(overP); },900).
+
+startGame(): as above + updateFlippers reset (fl.down=fr.down=false? keep held keys — recompute is fine: set both to false then updateFlippers() respects keys) — just call updateFlippers().
+
+Ghost spawn: g={x:216,y:480,vx:(Math.random()*300-150),vy:-350}; in step if menu: substep physics with ghost; if ghost.y>FH+30 → respawn. Also bumpers flash for ghost (bp.f=1 without score) — I set bp.f only when live… let me set bp.f=1 always on contact but gate score/sfx/shake by live ✓ ambient lights behind menu ✓ nice.
+
+But sfx in menu: AC may exist if user restarted via R? state menu only initially (R starts game directly, not menu). After first play session, no return to menu — fine, ghost sounds won't happen because… actually after game over we go to 'over' overlay (not menu) ✓.
+
+Draw functions — write them out. Let me define color constants for reuse.
+
+Popup update: p.l-=dt/0.9; y-=45*dt. Draw with alpha l, font bold 15 mono, strokeText dark + fillText color? Just fillText with shadow glow.
+
+Particles: as above.
+
+Banner: banner.t-=dt; if >0 draw.
+
+Target pop-in anim: tg.t counts down from .35 → scale = 1+ (tg.t/0.35)*0.6 for alive respawn… but on kill t also set? On kill the paddle is gone (draw stub) — use separate spawnT for pop-in. Simplify: no pop-in; just sparks on respawn? Fine: when targetTimer fires, small sparks at each target position. OK.
+
+Ball icon in header: for i<3: x=44+i*24,y=106: if i<balls chrome ball else dark ring.
+
+Also draw a small "BALL n" text next to icons? Icons suffice. Add label 'BALLS' 9px above? Keep icons + small mono label at x=44 y=88 alpha .5 'BALLS'. Hmm title sub is at y95… place ball icons at bottom-left (40,112)? Panel height 118 → y 106 fits ✓ label skip.
+
+Score digits: pad score to 7: String(score).padStart(7,'0'). HI similarly.
+
+Font strings:
+- DISPLAY = `Impact, "Arial Black", "Franklin Gothic Medium", sans-serif` (canvas font requires valid CSS font shorthand: 'italic 900 42px Impact, sans-serif' — canvas accepts list? ctx.font="italic 42px Impact" is fine; with fallback list also ok.)
+- MONO = `"Courier New", monospace`.
+
+Canvas letter-spacing not widely supported (ctx.letterSpacing exists in Chrome) — skip or guard: if('letterSpacing' in ctx) set for tags. Use sparingly.
+
+OK, "SHOOT" lane text and meter only when state ready/play? Always draw plunger; meter only during ready (or while charging). SHOOT label always (alpha .3).
+
+Edge case: ball crossing into field from lane — divider top at y=130; ball rising in lane along right wall will hit arc around x≈454,y≈136 and curve left. Does it collide with divider top endpoint (416,130)? Divider is a line segment; its top endpoint is a point — capsule ends are round via closest-point clamping ✓ no snag.
+
+Weak shot that returns to lane: enters 'ready' again via stillT logic (entered=false) → snapToPlunger. But if ball bounces around in lane for >0.5s with speed<26 → snaps; fine.
+
+If weak shot reaches y<230 (top of arc region) but stays x>416? entered triggers at y<230 — then it's a real play; if it falls back into lane and rests → 0.9s → lose ball. Harsh but correct-ish (it did reach the top). Hmm y<230 is too low threshold: apex of arc is y=6; entering field needs only x<416-ish… let me use entered = ball.x < 410 (crossed divider plane at any height) — that's the true "entered play" moment ✓. Drop the y condition? Ball rising in lane has x≈440>410 until it curves left over top → then x<410 ✓ triggers. Weak shots never cross → free reshoot ✓.
+
+But a ball descending from field into lane: already entered → drain on rest ✓.
+
+Nudge during 'ready': allow? Space in ready = charge; so nudge only in play ✓ per my keydown branches.
+
+Now let me finalize the header title drawing with measureText for two-tone:
+```js
+ctx.font='italic 900 40px '+DISP; const t1='PINBALL',t2='NOVA';
+const w1=ctx.measureText(t1).width, sp=10;
+ctx.textAlign='left'; ctx.shadowColor='#ffb640'; ctx.shadowBlur=16;
+ctx.fillStyle='#ffe9c0'; ctx.fillText(t1,40,74);
+ctx.shadowColor='#35e0ff'; ctx.fillStyle='#8df2ff'; ctx.fillText(t2,40+w1+sp,74);
+ctx.shadowBlur=0;
+```
+Sub tag: font 11px MONO letterSpacing? fillStyle #7f92c8 'S H O O T E R   E D I T I O N' at (40,96) with manual spaces ✓ cute.
+
+Score block right-aligned: ctx.textAlign='right'; label 'SCORE' 10px mono #7f92c8 at (CW-38,42); digits font 'bold 30px MONO' fillStyle '#5eeaff' shadow cyan blur 12 at (CW-38,74); hi: 'HI '+padded 13px mono #ffb640 at (CW-38,98).
+
+Wait panel is y 14..132. Digits baseline 74 ok, HI 98, ball icons y≈112 r8 ✓ inside.
+
+Title baseline 74 vs digits 74 aligned ✓. Sub tag 96 might collide with ball icons at x40 (icons start x=44)! Move ball icons to right side? Or below hi? Icons at bottom-right: x=CW-38-i*24? Below HI text… HI baseline 98, icons y 114 r7 → ok on right side. Let me place icons at (CW-38 - i*22, 114).
+
+Hmm panel bottom 132: icon cy 114 r7 → 107..121 ✓.
+
+Good. Also add small "NOVA AMUSEMENT" text? Skip in header (in DOM footer instead).
+
+Now let me also verify flipper geometry vs funnel: left funnel seg(104,572)→(132,686): slope dx=28, dy=114. Ball rolling down it lands near pivot where flipper capsule begins (pivot at 132,686, capsule radius 10 around pivot) ✓ smooth handoff.
+
+Sling kick face left: A(16,470)→C(104,572). Funnel starts at C ✓ continuous. Wall covers x=16 up to 470 (seg(16,744,16,230) covers all) ✓ triangle edge A-B along wall is redundant — don't add as collision (wall handles), only draw.
+
+Right: divider seg(416,130,416,744) covers x=416 fully ✓; sling edges kick A'(416,470)→C'(328,572) + bottom (416,552)→(328,572).
+
+Wait right sling triangle vertices: A'(416,470), B'(416,552), C'(328,572). Bottom edge B'→C'. ✓.
+
+Left bottom edge (16,552)→(104,572) — ball approaching from above between kick face and… fine.
+
+Check no gap on left wall: wall covers 230..744 ✓; sling adds faces inside ✓.
+
+Arc + walls cover top/right/left ✓. Bottom open (drain) except lane divider end at 744 and plunger base — ball in lane rests on plunger head (state ready lock) or… if entered ball falls to lane: it will fall past 744? Divider ends at 744, right wall ends at 744 — below is open → falls to y>FH+26=786 → loseBall ✓ (no need for stillT in that case; but ball resting on plunger head physically? Plunger isn't a collider! Ball would fall through the "head" → drain ✓ actually simpler: no plunger collision at all. In ready state ball is locked anyway. Entered ball falling into lane passes through head graphic and drains ✓. But wait — visually it'd clip through the head; head is at 716, ball falls to 786 → passes through. Minor visual issue; acceptable (or draw head lower). Alternatively make plunger head a collider segment in play state: seg(424,720,456,720) added when state==='play'… then entered ball rests on head at lane floor → stillT→drain ✓ cleaner visuals. Let me do that: include plungerSeg in walls list only during play? Simpler: always include; in ready state ball is locked so no collision needed (we skip physics for locked ball). But ghost ball in menu would collide with it — fine. Add seg(424,722,456,722,{e:0.3}) to walls ✓. Head drawn at top y=716..? Ball bottom 716 → head top should be ~716. Set head rect (422,718,36,9) and plunger seg at y=718: ball rests on it with center 708 ≈ close to locked 706 ✓ consistent enough.
+
+Lane rest detection uses x>416 & speed<26 — resting on head at ~ (440,708) ✓ triggers.
+
+Great. Also make sure the plunger seg doesn't block a ball shot upward: ball rising from y 706 → immediately above 718? Ball center 706, bottom 716 < 718 → hmm ball bottom (716) is above seg (718)? Seg at y=718; ball occupies 696..716 — no overlap with line at 718 (distance from center to line = 12 > BR=10) ✓ no collision on launch. When locked I set ball.y=706+power*12 → up to 718: bottom 728 overlaps seg → but in ready we skip physics ✓. On release: state='play' first, then vy applied — physics runs next substep; ball at y≤718 may penetrate head slightly → collision pushes it down and vn<0? Moving up (vy<0), n=(0,-1)?? Ball above seg: n points up; vn = v·n = negative (moving up toward… wait if penetrating, ball center below line? If power=1: y=718 → center on line; d tiny. Edge case: release at full power with slight penetration → resolve pushes out upward (ball is slightly above? center 718 equals line → n=(0,-1) arbitrary). vn = v·n = (-vy)= positive large → no impulse ✓ passes through harmlessly. Fine.
+
+Also clamp ball within x bounds as safety: if(ball.x<2||>FW-2) reflect softly — shouldn't happen with walls; add gentle clamp to prevent escape bugs:
+```js
+if(b.x<BR){b.x=BR;b.vx=Math.abs(b.vx)*0.5} etc for right FW-BR? But lane right wall is 464 not 480! Field width 480, outer walls at 16/464 — my coords: walls at x=16 and 464 within a field of width 480 → 16px margin on each side inside the felt (that's the "wall thickness" area). So clamp bounds are 16+BR .. 464-BR, top arc handles. Use those as safety:
+if(b.x<16+BR){b.x=16+BR;b.vx=Math.abs(b.vx)*0.5} if(b.x>464-BR){...}
+```
+✓.
+
+Top safety: if b.y < 8 → push down? Arc handles; add: if(b.y<BR+2){b.y=BR+2; b.vy=Math.abs(b.vy)*0.5}.
+
+Now DOM overlay content and JS wiring done. Let me also update hiStart on load and after game over (startP not shown then, but update anyway for R→? R goes to ready not menu; fine).
+
+Actually should R from 'over' work? Yes startGame() ✓ hide overlay too.
+
+Also add: pressing space while paused → unpause? Add: if(paused){paused=false;return;} in space handler before other branches ✓ and P toggles.
+
+visibilitychange: auto-pause when hidden during play (nice): document.addEventListener('visibilitychange',()=>{if(document.hidden&&(state==='play'||state==='ready'))paused=true;});
+
+Now let me write out the CSS fully, then JS fully. Also ensure no scrollbars: overflow hidden ✓ canvas fixed inset 0 ✓.
+
+Let me write it all now, carefully, with mental syntax check as I go.
+
+One more consideration on `sfx.bounce` volume param — pass v 0..1.
+
+Also add a subtle "combo" text? No, scope is enough.
+
+Final check on flipper angular speeds: up 20 rad/s → sweep 0.62→-0.72 (Δ=1.34) in ~67ms ✓ snappy. Down 11 rad/s → 120ms return ✓.
+
+Surface velocity at tip when up: ω*len = 20*70 = 1400 px/s max — strong flip ✓. Cap ball speed at 1450 after flipper ✓ (and global MAXV 1500 clamp).
+
+Substeps: n = clamp(ceil(speed*dt/6),1,12) — dt~0.016, speed 1400 → 22.4px/7 ≈ 3-4 substeps ✓.
+
+Gravity per substep uses dt/n ✓ (physStep receives h=dt/n).
+
+Flipper om: m/h where m=min(|d|, spd*h) → om = ±spd when moving ✓.
+
+I think I'm ready to write. Let me also include a small "how to play" line on the game over panel? Keep it minimal.
+
+Let me draft the complete file now.
+
+Also — start screen should list controls clearly:
+- SPACE — hold: charge · release: launch (also nudge in play)
+- Z / ← : left flipper
+- X / → : right flipper  
+- R : restart · P : pause
+
+Write kbd rows in a grid.
+
+Panel width ~ 520px.
+
+Let me write the code now. I'll be careful with template literals and quotes.
+
+JS order:
+1. canvas/resize/stars
+2. audio
+3. storage hi
+4. constants & geometry (walls, flippers, bumpers, targets, lanes)
+5. state vars
+6. input (keys, pointers)
+7. game flow fns (startGame, loseBall, gameOver, spawnBall)
+8. physics fns
+9. fx (sparks, pops, banner, addScore)
+10. step()
+11. draw helpers + draw()
+12. rAF loop init
+
+Stars: makeStars(): count = clamp(vw*vh/14000, 50, 180); {x,y (0..1),r,ph,sp}. Draw: for each: a=0.3+0.5*(0.5+0.5*sin(t*sp+ph)); fillStyle rgba(200,220,255,a) circle. Some stars tinted amber/cyan: pick color from small palette per star ✓ variety.
+
+Vignette/fx div handles dark edges; canvas bg gradient also.
+
+Let me write draw():
+```js
+function draw(t){
+ ctx.setTransform(dpr,0,0,dpr,0,0);
+ // bg
+ const g=ctx.createLinearGradient(0,0,0,vh); g.addColorStop(0,'#070b1e');g.addColorStop(.5,'#0a1030');g.addColorStop(1,'#060919'); ctx.fillStyle=g; ctx.fillRect(0,0,vw,vh);
+ // glow behind cabinet
+ const rg=ctx.createRadialGradient(vw/2,vh*0.44,10,vw/2,vh*0.44,Math.max(vw,vh)*0.55); rg.addColorStop(0,'rgba(70,110,200,0.16)'); rg.addColorStop(1,'rgba(0,0,0,0)'); ctx.fillStyle=rg; ctx.fillRect(0,0,vw,vh);
+ // stars
+ for(const s of stars){ const a=s.a*(0.55+0.45*Math.sin(t*s.sp+s.ph)); ctx.globalAlpha=a; ctx.fillStyle=s.c; ctx.beginPath(); ctx.arc(s.x*vw,s.y*vh,s.r,0,7); ctx.fill(); }
+ ctx.globalAlpha=1;
+ // cabinet
+ const shx=(Math.random()*2-1)*3.2*shake, shy=(Math.random()*2-1)*3.2*shake;
+ ctx.setTransform(dpr*S,0,0,dpr*S,dpr*(OX+shx),dpr*(OY+shy));
+ drawHeader(); drawField(t);
+}
+```
+
+drawField: translate to FX,FY and clip rect 0..FW/FH.
+
+All field drawing in local coords ✓.
+
+Walls drawn: group by style: railGlow (amber) for outer walls + arc + slings bottom + funnel; lane divider cyan; plunger seg hidden (drawn as part of plunger). Store a 'cls' property on segments: 'rail'|'lane'. Divider cls lane. Sling kick face drawn separately with highlight (but also in walls — skip drawing its glow twice? It's fine to draw all rail segments uniformly, then additional highlight for kick faces).
+
+Draw each seg:
+```js
+for(const s of walls){ if(s.solid===false)continue; // plunger head maybe
+ ctx.strokeStyle= s.cls==='lane'?'rgba(90,215,255,.30)':'rgba(255,178,64,.28)';
+ ctx.lineWidth=8; line(s);
+}
+second pass core: '#ffd9a3' or '#c9f2ff' lw 2.5.
+```
+Use round caps for smooth joints ✓ (lineCap='round', lineJoin='round').
+
+Kick face highlight: for the two boost segs: stroke 'rgba(255,120,80,.9)' lw3 with pulsing alpha + dashes.
+
+Plunger head segment: mark s.nodraw=true.
+
+OK let me write it all now. Also remember `ctx.textBaseline` settings where needed (default alphabetic fine).
+
+Popup draw: ctx.font='bold 15px MONO'; textAlign center; shadow glow color= p.c; fillStyle=p.c; globalAlpha=p.l.
+
+Banner: font 'italic 900 44px DISP'.
+
+Hint text uses MONO bold 15.
+
+Pause overlay: rect rgba(4,8,20,.6) over field + text.
+
+Game name in title tag: "Pinball Nova".
+
+Edge: `ctx.font='italic 900 44px Impact, sans-serif'` — comma list ok; but 'Impact' has no italic/900 → synthesized ✓ fine.
+
+Also for DOM h1 I'll use same stack.
+
+Let me count the controls grid rows and write HTML.
+
+Also add small "credits" line on start panel: "NOVA AMUSEMENT CO. · EST 1987" mono tiny.
+
+Now, let me write out the final answer. Ensure code block is html only. Let me draft the entire file text in my head buffer while ensuring balanced braces… I'll just write it carefully directly.
+
+One more: `updateFx(dt)` merges into step? Let me keep timers updated in a single `step(dt)` even when paused? When paused, freeze everything (timers too) — simpler: skip all. Draw continues with t for star twinkle (uses wall clock t) ✓ fine, but bumper flash frozen ok.
+
+Banner/flash decay in step when !paused ✓.
+
+Ghost physics also only when !paused ✓.
+
+Let me write `step(dt)`:
+```js
+function step(dt){
+ // timers
+ shake=Math.max(0,shake-dt*2.8); drainFlash=Math.max(0,drainFlash-dt*1.6);
+ bumpers.forEach(b=>{b.f=Math.max(0,b.f-dt*3); b.cool=Math.max(0,(b.cool||0)-dt);});
+ targets.forEach(tg=>tg.t=Math.max(0,tg.t-dt));
+ if(targetTimer>0){targetTimer-=dt; if(targetTimer<=0){targets.forEach(tg=>{tg.alive=true; sparks(tg.x,170,'#ffd27a',8,160);});}}
+ lanes.forEach(l=>{}); // cool/flash handled in physics? Ghost also passes — handle here: l.cool-=dt; l.flash decay. Trigger check only when live. Move all lane logic here with b=curBallRef… simpler keep in physStep with live guard, ghost still decays via same path ✓ fine as is (I wrote cool decrement inside physStep loop earlier — but that runs per substep → dt/n each time = correct total ✓).
+ parts: for i-- ... pops...
+ banner.t-=dt.
+ // charging
+ if(charging&&state==='ready'){ power=Math.min(1,power+dt/0.9); ball.x=440; ball.y=706+power*13; }
+ // physics substeps
+ const b = state==='menu'? ghost : ball;
+ if(state==='play'||state==='menu'){
+  const sp=Math.hypot(b.vx,b.vy);
+  const n=Math.max(1,Math.min(12,Math.ceil(sp*dt/6)));
+  for(let i=0;i<n;i++) physStep(dt/n, b);
+ }
+ // ghost respawn
+ if(state==='menu'&&ghost.y>FH+30){ ghost.x=216;ghost.y=460;ghost.vx=(Math.random()*440-220);ghost.vy=-380-Math.random()*160; }
+ // drain/rest/stuck (play only) as above
+}
+```
+physStep(h,b): update flippers (only meaningful in play/ready? ghost menu: flippers idle at rest — still run, fine), gravity etc.
+
+Wait: state 'ready' → ball locked: skip physics entirely ✓ handled by condition (only play/menu).
+
+In ready, flipper keys should animate visually! Flippers update inside physStep which is skipped in ready… Move flipper update out of physStep into step() per substep? Need per-substep for om consistency. Compromise: always run flipper update loop in step with same n substeps (compute n based on ball speed or 1). Let me restructure:
+
+```js
+const b= state==='menu'?ghost:ball;
+const sp=Math.hypot(b.vx,b.vy);
+const n=(state==='play'||state==='menu')?Math.max(1,Math.min(12,Math.ceil(sp*dt/6))):1;
+for(let i=0;i<n;i++){ const h=dt/n; updFlippers(h); if(state==='play'||state==='menu') physMove(h,b); }
+```
+updFlippers always runs (visual in ready/pause? paused skips whole step ✓). In 'over' state: flippers settle to rest ✓ nice.
+
+physMove: gravity, integrate, collisions, lane triggers (with live guard inside), bumper cooldowns use h ✓.
+
+Lane cool decrement inside physMove loop per substep — but in ready/over physMove skipped → cool frozen — fine.
+
+Also stillT/lowT logic uses dt per frame after substeps ✓.
+
+I think the plan is complete and consistent. Let me write it out.
+
+For drawHeader, panel rect(14,14,CW-28,118): CW=560 → width 532.
+
+Ball icons: chrome mini: radial gradient white→#7a8bab.
+
+Also draw a small divider line in header? Skip.
+
+Let me write out the sling dash animation: for each kick face seg (store refs kL_s, kR_s), for tOff in [0.32,0.62]: P = lerp(A,C,tOff); d̂=(C−A)/|..|; n per side precomputed; off=4+2.5*Math.sin(t*7+tOff*9); start=P−d̂*7+n*off… draw line to P+d̂*7+n*off? That draws a dash parallel to face, offset toward field with oscillation ✓ alpha 0.55 amber-red.
+
+Precompute: kL={a:{x:16,y:470},c:{x:104,y:572},n:(normalized (102,-88)→ /134.4 ≈(0.759,-0.655))}; kR={a:{x:416,y:470},c:{x:328,y:572}, n normalized (-102,-88) → (−0.759,−0.655)}.
+
+|d| for left: sqrt(88²+102²)=sqrt(7744+10404)=sqrt(18148)=134.7 ✓.
+
+Draw triangle fill before walls? Order: felt → star deco → lane shade → sling triangles (fill) → walls (glow/core) → kick highlights+dashes → targets → lanes → bumpers → plunger/meter → flippers → drain → ball → fx.
+
+Lane shade: rect(416,130,48,614)? To 744: height 614 ✓ fill rgba(0,0,20,.35). Also inner shadow line along divider? Divider stroke covers.
+
+Star decoration at (216,84): draw with rotation t*0.3 slow: 4-point star path: for k in 0..7 alternate r=26 and r=9 at angles k*π/4 + rot; fill amber gradient; plus glow shadowBlur 18 amber; pulse scale 1+0.07 sin(t*2.4). Also ring circle r 34 stroke alpha .25 rotating dashed? ctx.setLineDash([4,7]) rotate ✓ subtle.
+
+Also small dots along the arc: for i in 0..9: angle = π + (i+0.5)/10*π; pos=(ACX+(AR-14)cosθ, ACY+(AR-14)sinθ); r2 alpha .3 cyan/amber alternating ✓ detail.
+
+Banner/popup positions in field coords ✓.
+
+Ready hint center x=216 (main field center between walls 16..416 = 216 ✓).
+
+Drain slot rect: between tips at rest ~ (189..243): draw (180,738,72,7) fill #05070f; if drainFlash>0 stroke rgba(255,60,60,flash) lw3 + glow.
+
+Also add subtle floor shading under flipper area: rect(0,700,FW,44)? Gradient darkening bottom: linearGradient 700→760 transparent→rgba(0,0,10,.5) ✓ depth.
+
+OK let me write it. Also don't forget `ctx.lineCap='round'` set once where needed.
+
+Font constants:
+```js
+const DISPF='Impact,"Arial Black","Franklin Gothic Medium",sans-serif';
+const MONOF='"Courier New",monospace';
+```
+
+DOM ids: cv, scr, startP, overP, hiStart, finalScore, hiOver, newHi, btnStart, btnAgain.
+
+btnStart click → audioInit(); startGame(). Same for btnAgain.
+
+scr click (target===scr) → same.
+
+hiStart textContent = pad(hi,7)? Display as number with padding ✓.
+
+newHi badge: classList toggle 'show'.
+
+Also on doGameOver: hiOver text updated; finalScore.
+
+Alright — also initial call: resize(); showScr(startP); requestAnimationFrame(frame). last=performance.now().
+
+Double-check releaseCharge when state!=='ready' (e.g., keyup after game over?) guard with charging flag ✓ reset in startGame/loseBall.
+
+Charging starts only in ready; if state changes to play during charge (impossible) fine.
+
+Nudge: also add small particle puff? Skip.
+
+Also confirm that `sfx.shoot` uses noise before audioInit? audioInit called on keydown first ✓.
+
+OK let me write the final file. I'll aim for clean formatting with section comments. Also wrap everything in an IIFE? Top-level fine; use 'use strict'.
+
+Potential pitfall: ctx.font with quotes inside a string — build like `ctx.font='italic 900 '+40+'px '+DISPF` ✓.
+
+roundRect fallback:
+```js
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+```
+
+Target draw with rr.
+
+Flipper gradient: create per frame ok (only 2).
+
+Ball specular: gradient handles it.
+
+Let me write the popup addScore: pops.push({x:clamp(x,50,430),y:Math.max(40,y-14),txt:'+'+n,c,l:1}).
+
+addScore also live-updates hi ✓ (hi=score max) — but only in play (callers guard) ✓. Ghost addScore not called (guarded by live in caller? Bumper code: `if(live){addScore...}` ✓ target/lane/sling also guarded ✓).
+
+Sparks in menu (ghost): I gated sparks under live for bumper; but flash visual bp.f set always? Let me set bp.f=1 only when live, else 0.35 subtle: `bp.f = live?1:0.4` — ambient lights behind menu ✓.
+
+Alright let me write it all now. Length is fine.
+
+One more check — start overlay initially visible; canvas behind runs ghost attract ✓ lively start screen with moving background (panel is opaque-ish; stars visible around). Panel max-width 560, window probably wider → sees table edges? Cabinet width 560 scaled to fit height… on desktop 1280×800: S=min(1280/560,800/940)=0.85 → cabinet 476×800 centered; panel 560 wide overlaps cabinet sides? Panel is DOM over canvas — will cover center of table. Table visible on top/bottom edges? Cabinet fills full height (800) so panel (height ~520?) covers middle band; header + bottom of table visible around panel ✓ nice framing.
+
+Mobile portrait 390×760: S=min(390/560,760/940)=0.696 → cabinet 389×654 centered vertically (oy≈53). Panel width min(92vw,560)=359 — covers most of table; header peeks out top ✓ fine.
+
+Done thinking; let me write it.
+
+Actually one more: keydown 'r' during menu → startGame? R only makes sense in game; allow it (starts). Fine.
+
+And Enter on over starts ✓.
+
+Also ensure `e.preventDefault()` on space to avoid re-clicking a focused button even if we blurred — double safety ✓.
+
+Let me write the file.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Pinball Nova</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden;background:#05081a}
+  body{font-family:"Trebuchet MS","Segoe UI",Verdana,sans-serif;color:#dfe7ff;-webkit-user-select:none;user-select:none}
+  #cv{position:fixed;inset:0;display:block;touch-action:none;cursor:pointer}
+  #fx{position:fixed;inset:0;pointer-events:none;z-index:2;
+      background:radial-gradient(120% 95% at 50% 42%,transparent 52%,rgba(2,4,12,.5) 100%)}
+  #fx::after{content:"";position:absolute;inset:0;
+      background:repeating-linear-gradient(0deg,rgba(255,255,255,.025) 0 1px,transparent 1px 3px)}
+  #scr{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:16px;z-index:5}
+  .hidden{display:none!important}
+  .panel{position:relative;text-align:center;width:min(92vw,540px);
+    background:linear-gradient(180deg,#111a3e 0%,#0b1129 100%);
+    border:2px solid #ffb640;padding:26px 34px 24px;
+    box-shadow:0 0 0 5px rgba(255,182,64,.10),0 0 46px rgba(255,150,40,.30),inset 0 0 40px rgba(6,10,30,.9)}
+  .panel::before{content:"";position:absolute;inset:7px;pointer-events:none;background:
+    linear-gradient(#59e6ff,#59e6ff) left top/26px 3px no-repeat,
+    linear-gradient(#59e6ff,#59e6ff) left top/3px 26px no-repeat,
+    linear-gradient(#59e6ff,#59e6ff) right top/26px 3px no-repeat,
+    linear-gradient(#59e6ff,#59e6ff) right top/3px 26px no-repeat,
+    linear-gradient(#59e6ff,#59e6ff) left bottom/26px 3px no-repeat,
+    linear-gradient(#59e6ff,#59e6ff) left bottom/3px 26px no-repeat,
+    linear-gradient(#59e6ff,#59e6ff) right bottom/26px 3px no-repeat,
+    linear-gradient(#59e6ff,#59e6ff) right bottom/3px 26px no-repeat}
+  .coin{font-family:"Courier New",monospace;font-weight:bold;font-size:12px;letter-spacing:.35em;color:#ffb640;margin-bottom:8px;animation:blink 1.2s steps(2) infinite}
+  @keyframes blink{50%{opacity:.25}}
+  h1{font-family:Impact,"Arial Black","Franklin Gothic Medium",sans-serif;font-weight:900;font-style:italic;
+     font-size:clamp(42px,8.5vw,72px);line-height:1;letter-spacing:.03em;color:#fff;transform:skewX(-5deg);
+     text-shadow:0 0 8px #ffb640,0 0 26px rgba(255,140,20,.55),0 4px 0 rgba(90,40,0,.85)}
+  h1 span{color:#7df3ff;text-shadow:0 0 8px #35e0ff,0 0 26px rgba(40,200,255,.6),0 4px 0 rgba(0,50,80,.9)}
+  .tag{font-family:"Courier New",monospace;font-size:11px;letter-spacing:.5em;color:#8fa3d8;margin-top:8px}
+  .keys{margin:20px auto 4px;display:grid;gap:9px;font-size:13.5px;color:#c4d2f5}
+  .keys div{display:flex;align-items:center;justify-content:center;gap:10px;flex-wrap:wrap}
+  kbd{font-family:"Courier New",monospace;font-weight:bold;font-size:12px;background:#1b2450;color:#ffe9c0;
+      border:1px solid #5a6a9c;border-bottom-width:3px;padding:3px 9px;display:inline-block;min-width:38px;text-align:center}
+  .hi{margin-top:16px;font-family:"Courier New",monospace;font-size:12px;letter-spacing:.25em;color:#8fa3d8}
+  .hi b{color:#ffb640;font-size:17px;letter-spacing:.15em;margin-left:8px}
+  .prompt{margin-top:16px;font-weight:bold;font-size:14px;letter-spacing:.22em;color:#fff;animation:pulse 1.1s ease-in-out infinite}
+  @keyframes pulse{50%{opacity:.3}}
+  button.arcade{margin-top:18px;font-family:Impact,"Arial Black",sans-serif;font-size:21px;letter-spacing:.14em;
+    padding:12px 40px;color:#241300;background:linear-gradient(180deg,#ffd27a,#ff9c3f);
+    border:2px solid #ffe9c0;box-shadow:0 5px 0 #8a4d00,0 0 24px rgba(255,160,40,.45);cursor:pointer}
+  button.arcade:hover{filter:brightness(1.1)}
+  button.arcade:active{transform:translateY(4px);box-shadow:0 1px 0 #8a4d00,0 0 24px rgba(255,160,40,.45)}
+  button.arcade:focus-visible{outline:3px solid #59e6ff;outline-offset:3px}
+  .foot{margin-top:18px;font-family:"Courier New",monospace;font-size:10px;letter-spacing:.4em;color:#5f6f9e}
+  .over h2{font-family:Impact,"Arial Black",sans-serif;font-style:italic;font-size:clamp(38px,7vw,58px);color:#ff5d73;
+    letter-spacing:.05em;text-shadow:0 0 10px #ff2d4e,0 0 30px rgba(255,40,80,.5),0 4px 0 rgba(90,0,20,.8)}
+  .lab{font-family:"Courier New",monospace;font-size:12px;letter-spacing:.4em;color:#8fa3d8;margin-top:16px}
+  #finalScore{font-family:"Courier New",monospace;font-weight:bold;font-size:38px;color:#5eeaff;letter-spacing:.12em;
+    text-shadow:0 0 14px rgba(60,220,255,.7);margin-top:4px}
+  .badge{display:none;margin-top:12px;font-family:"Courier New",monospace;font-weight:bold;font-size:13px;letter-spacing:.3em;
+    color:#ffe9c0;border:1px solid #ffb640;padding:6px 16px;animation:pulse 1s ease-in-out infinite}
+  .badge.show{display:inline-block}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="fx"></div>
+
+<div id="scr">
+  <div class="panel" id="startP">
+    <div class="coin">&#9679; INSERT COIN &#9679;</div>
+    <h1>PINBALL<span>NOVA</span></h1>
+    <div class="tag">SHOOTER EDITION</div>
+    <div class="keys">
+      <div><kbd>SPACE</kbd><span>hold to charge plunger &middot; release to launch (nudge in play)</span></div>
+      <div><kbd>Z</kbd><kbd>&larr;</kbd><span>left flipper</span>&nbsp;&nbsp;<kbd>X</kbd><kbd>&rarr;</kbd><span>right flipper</span></div>
+      <div><kbd>R</kbd><span>restart</span>&nbsp;&nbsp;<kbd>P</kbd><span>pause</span></div>
+    </div>
+    <div class="hi">HIGH SCORE<b id="hiStart">0000000</b></div>
+    <button class="arcade" id="btnStart">PLAY</button>
+    <div class="prompt">PRESS SPACE TO PLAY</div>
+    <div class="foot">NOVA AMUSEMENT CO. &middot; EST 1987</div>
+  </div>
+
+  <div class="panel over hidden" id="overP">
+    <h2>GAME OVER</h2>
+    <div class="lab">FINAL SCORE</div>
+    <div id="finalScore">0000000</div>
+    <div class="badge" id="newHi">&#9733; NEW HIGH SCORE &#9733;</div>
+    <div class="hi">HIGH SCORE<b id="hiOver">0000000</b></div>
+    <button class="arcade" id="btnAgain">PLAY AGAIN</button>
+    <div class="prompt">OR PRESS SPACE</div>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* ================= CANVAS / LAYOUT ================= */
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+let vw=0,vh=0,dpr=1;
+const CW=560,CH=940,FX=40,FY=150,FW=480,FH=760;
+let S=1,OX=0,OY=0,stars=[];
+function makeStars(){
+  const n=Math.max(50,Math.min(180,Math.round(vw*vh/14000)));
+  const cols=['#cfe0ff','#ffe9c0','#a8f4ff','#ffd2e0'];
+  stars=[];for(let i=0;i<n;i++)stars.push({x:Math.random(),y:Math.random(),r:.5+Math.random()*1.4,
+    ph:Math.random()*6.28,sp:.4+Math.random()*1.6,c:cols[i%4],a:.25+Math.random()*.5});
+}
+function resize(){
+  dpr=Math.min(2,window.devicePixelRatio||1);
+  vw=window.innerWidth;vh=window.innerHeight;
+  cv.width=Math.round(vw*dpr);cv.height=Math.round(vh*dpr);
+  cv.style.width=vw+'px';cv.style.height=vh+'px';
+  S=Math.min(vw/CW,vh/CH);OX=(vw-CW*S)/2;OY=(vh-CH*S)/2;
+  makeStars();
+}
+window.addEventListener('resize',resize);
+
+/* ================= AUDIO (Web Audio, post first input) ================= */
+let AC=null,master=null,noiseBuf=null,lastS={};
+function audioInit(){
+  if(AC){if(AC.state==='suspended')AC.resume();return;}
+  try{
+    AC=new (window.AudioContext||window.webkitAudioContext)();
+    master=AC.createGain();master.gain.value=.3;master.connect(AC.destination);
+    noiseBuf=AC.createBuffer(1,AC.sampleRate*.5,AC.sampleRate);
+    const d=noiseBuf.getChannelData(0);for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;
+  }catch(e){}
+}
+function tone(f,dur,type,vol,slideTo){
+  if(!AC)return;const t=AC.currentTime,o=AC.createOscillator(),g=AC.createGain();
+  o.type=type||'square';o.frequency.setValueAtTime(f,t);
+  if(slideTo)o.frequency.exponentialRampToValueAtTime(Math.max(30,slideTo),t+dur);
+  g.gain.setValueAtTime(vol||.5,t);g.gain.exponentialRampToValueAtTime(.001,t+dur);
+  o.connect(g);g.connect(master);o.start(t);o.stop(t+dur+.03);
+}
+function noise(dur,vol,fq,type){
+  if(!AC)return;const t=AC.currentTime,s=AC.createBufferSource();s.buffer=noiseBuf;s.loop=true;
+  const f=AC.createBiquadFilter();f.type=type||'lowpass';f.frequency.value=fq;
+  const g=AC.createGain();g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(.001,t+dur);
+  s.connect(f);f.connect(g);g.connect(master);s.start(t);s.stop(t+dur+.03);
+}
+function gate(k,min){const n=performance.now();if(lastS[k]&&n-lastS[k]<min)return false;lastS[k]=n;return true;}
+const sfx={
+  bounce(v){if(!gate('b',45))return;noise(.05,.22*v,1600);tone(90+70*v,.05,'triangle',.18*v,55);},
+  flip(){if(!gate('f',60))return;tone(150,.08,'square',.32,70);noise(.06,.28,900);},
+  bumper(i){if(!gate('bp'+i,40))return;const f=[620,780,940][i%3];tone(f,.09,'square',.5,f*1.7);noise(.06,.3,2600,'highpass');},
+  sling(){if(!gate('s',70))return;tone(300,.07,'sawtooth',.4,180);noise(.05,.28,1300);},
+  target(){if(!gate('t',60))return;tone(880,.12,'triangle',.5,1320);},
+  lane(){if(!gate('l',80))return;tone(1180,.07,'sine',.34,1420);},
+  bank(){[523,659,784,1046].forEach((f,i)=>setTimeout(()=>tone(f,.14,'square',.4),i*70));},
+  shoot(p){noise(.12,.5,700);tone(120+380*p,.22,'sawtooth',.45,60);},
+  drain(){[392,311,233,155].forEach((f,i)=>setTimeout(()=>tone(f,.16,'square',.4),i*100));},
+  over(){[262,196,131].forEach((f,i)=>setTimeout(()=>tone(f,.32,'triangle',.45),i*180));},
+  start(){[392,523,659,784].forEach((f,i)=>setTimeout(()=>tone(f,.1,'square',.35),i*60));}
+};
+
+/* ================= STORAGE ================= */
+let hi=0;try{hi=+localStorage.getItem('pinballNovaHi')||0;}catch(e){}
+function saveHi(){try{localStorage.setItem('pinballNovaHi',String(hi));}catch(e){}}
+const pad=n=>String(Math.max(0,n|0)).padStart(7,'0');
+
+/* ================= TABLE GEOMETRY ================= */
+const BR=10,FR=10,GRAV=1500,MAXV=1500;
+const walls=[];
+function seg(x1,y1,x2,y2,o){walls.push(Object.assign({x1,y1,x2,y2,e:.58,boost:0},o||{}));}
+seg(16,744,16,230);                       // left rail
+{ let ax=ACX(),ay=ACY();function ACX(){return 240;}function ACCY(){return 230;}
+  const CX=240,CY=230,R=224;ax=CX-R;ay=CY;
+  for(let i=1;i<=26;i++){const a=Math.PI+i/26*Math.PI,x=CX+R*Math.cos(a),y=CY+R*Math.sin(a);seg(ax,ay,x,y,{e:.55});ax=x;ay=y;} }
+seg(464,230,464,744);                     // right rail
+seg(416,130,416,744,{cls:'lane',e:.5});   // shooter-lane divider
+// slingshots (left)
+seg(16,470,104,572,{boost:520,e:.5});     // kick face L
+seg(16,552,104,572,{e:.4});               // bottom edge L
+seg(104,572,132,686,{e:.45});             // funnel L -> flipper pivot
+// slingshots (right)
+seg(416,470,328,572,{boost:520,e:.5});    // kick face R
+seg(416,552,328,572,{e:.4});              // bottom edge R
+seg(328,572,300,686,{e:.45});             // funnel R -> flipper pivot
+seg(424,722,456,722,{e:.3,nodraw:true});  // plunger head (rest pad)
+
+const fl={x:132,y:686,len:70,rest:.62,up:-.72,ang:.62,om:0,down:false};
+const fr={x:300,y:686,len:70,rest:Math.PI-.62,up:Math.PI+.72,ang:Math.PI-.62,om:0,down:false};
+
+const bumpers=[
+  {x:140,y:280,r:26,c:'#ff5d73',f:0,cool:0},
+  {x:292,y:280,r:26,c:'#3fd9ff',f:0,cool:0},
+  {x:216,y:378,r:26,c:'#ffb640',f:0,cool:0}
+];
+const targets=[150,198,246,294].map(x=>({x,y1:150,y2:190,alive:true,t:0}));
+const lanes=[{x:150},{x:216},{x:282}].map(o=>Object.assign(o,{y:436,lit:false,cool:0,flash:0}));
+
+/* ================= STATE ================= */
+let state='menu';           // menu | ready | play | over
+let score=0,balls=3,entered=false,hiAtStart=0;
+let ball={x:440,y:706,vx:0,vy:0};
+let ghost={x:216,y:480,vx:160,vy:-340};
+let charging=false,power=0,paused=false;
+let stillT=0,lowT=0,shake=0,drainFlash=0,targetTimer=0,laneTimer=0;
+const parts=[],pops=[];let banner={txt:'',t:0,dur:1.5};
+function setBanner(txt){banner={txt,t:1.5,dur:1.5};}
+
+/* ================= FX ================= */
+function sparks(x,y,c,n,sp){
+  for(let i=0;i<n;i++){const a=Math.random()*6.283,v=sp*(.4+Math.random()*.9);
+    parts.push({x,y,vx:Math.cos(a)*v,vy:Math.sin(a)*v,l:1,c});}
+}
+function addScore(n,x,y,c){score+=n;if(score>hi)hi=score;
+  pops.push({x:Math.max(50,Math.min(430,x)),y:Math.max(46,y-14),txt:'+'+n,c,l:1});}
+
+/* ================= FLOW ================= */
+const startP=document.getElementById('startP'),overP=document.getElementById('overP'),scr=document.getElementById('scr');
+function showScr(el){scr.style.display='flex';startP.classList.add('hidden');overP.classList.add('hidden');el.classList.remove('hidden');}
+function hideScr(){scr.style.display='none';}
+document.getElementById('hiStart').textContent=pad(hi);
+
+function spawnBall(){ball={x:440,y:706,vx:0,vy:0};charging=false;power=0;stillT=0;lowT=0;}
+function startGame(){
+  score=0;balls=3;entered=false;hiAtStart=hi;paused=false;targetTimer=0;laneTimer=0;
+  parts.length=0;pops.length=0;banner.t=0;shake=0;drainFlash=0;
+  targets.forEach(t=>{t.alive=true;t.t=0;});lanes.forEach(l=>{l.lit=false;l.flash=0;});
+  fl.down=fr.down=false;spawnBall();state='ready';hideScr();sfx.start();
+}
+function loseBall(){
+  charging=false;sfx.drain();drainFlash=1;shake=1;balls--;
+  if(balls<=0){doGameOver();}else{spawnBall();state='ready';entered=false;}
+}
+function doGameOver(){
+  state='over';saveHi();sfx.over();
+  document.getElementById('finalScore').textContent=pad(score);
+  document.getElementById('hiOver').textContent=pad(hi);
+  document.getElementById('newHi').classList.toggle('show',score>hiAtStart&&score>0);
+  setTimeout(()=>{if(state==='over')showScr(overP);},900);
+}
+function releaseCharge(){
+  if(!charging)return;charging=false;const p=power;power=0;
+  state='play';ball.vy=-(820+560*p);ball.vx=(Math.random()-.5)*26;sfx.shoot(p);
+}
+
+/* ================= INPUT ================= */
+let kL=false,kR=false;const ptrs=new Map();let chargePtr=null;
+function updateFlippers(){
+  let pl=false,pr=false;for(const v of ptrs.values()){if(v===0)pl=true;else pr=true;}
+  const nl=kL||pl,nr=kR||pr;
+  if(nl&&!fl.down)sfx.flip();fl.down=nl;
+  if(nr&&!fr.down)sfx.flip();fr.down=nr;
+}
+window.addEventListener('keydown',e=>{
+  const k=e.key.length===1?e.key.toLowerCase():e.key;
+  if(k===' '||k.indexOf('Arrow')===0)e.preventDefault();
+  audioInit();
+  if(k==='z'||k==='arrowleft'||k==='a'){kL=true;updateFlippers();return;}
+  if(k==='x'||k==='arrowright'||k==='d'){kR=true;updateFlippers();return;}
+  if(e.repeat)return;
+  if(k===' '||k==='enter'){
+    if(paused){paused=false;return;}
+    if(state==='menu'||state==='over')startGame();
+    else if(state==='ready'&&!charging){charging=true;power=0;}
+    else if(state==='play'){ball.vy-=320;ball.vx+=(Math.random()-.5)*140;shake=Math.max(shake,.25);sfx.bounce(.3);}
+  }
+  if(k==='r')startGame();
+  if(k==='p'&&(state==='play'||state==='ready'))paused=!paused;
+});
+window.addEventListener('keyup',e=>{
+  const k=e.key.length===1?e.key.toLowerCase():e.key;
+  if(k==='z'||k==='arrowleft'||k==='a'){kL=false;updateFlippers();}
+  else if(k==='x'||k==='arrowright'||k==='d'){kR=false;updateFlippers();}
+  else if(k===' ')releaseCharge();
+});
+cv.addEventListener('pointerdown',e=>{
+  e.preventDefault();audioInit();
+  if(state==='menu'||state==='over')return;
+  if(state==='ready'&&!charging){charging=true;power=0;chargePtr=e.pointerId;return;}
+  const fx=(e.clientX-(OX+FX*S))/S;
+  ptrs.set(e.pointerId,fx<216?0:1);updateFlippers();
+});
+function ptrUp(e){
+  if(e.pointerId===chargePtr){releaseCharge();chargePtr=null;}
+  else{ptrs.delete(e.pointerId);updateFlippers();}
+}
+window.addEventListener('pointerup',ptrUp);
+window.addEventListener('pointercancel',ptrUp);
+document.getElementById('btnStart').addEventListener('click',function(){audioInit();startGame();this.blur();});
+document.getElementById('btnAgain').addEventListener('click',function(){audioInit();startGame();this.blur();});
+scr.addEventListener('click',e=>{if(e.target===scr){audioInit();startGame();}});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&(state==='play'||state==='ready'))paused=true;});
+
+/* ================= PHYSICS ================= */
+function updFlippers(h){
+  for(const f of [fl,fr]){
+    const tgt=f.down?f.up:f.rest,spd=f.down?20:11;
+    const d=tgt-f.ang,m=Math.min(Math.abs(d),spd*h);
+    f.ang+=Math.sign(d)*m;f.om=h>0?m/h:0;
+  }
+}
+function collideSeg(b,s){
+  const dx=s.x2-s.x1,dy=s.y2-s.y1,L2=dx*dx+dy*dy||1e-6;
+  let t=((b.x-s.x1)*dx+(b.y-s.y1)*dy)/L2;t=t<0?0:t>1?1:t;
+  const qx=s.x1+t*dx,qy=s.y1+t*dy;
+  let nx=b.x-qx,ny=b.y-qy;const d2=nx*nx+ny*ny,rr=BR;
+  if(d2>=rr*rr)return;
+  const d=Math.sqrt(d2)||1e-6;nx/=d;ny/=d;
+  b.x+=nx*(rr-d);b.y+=ny*(rr-d);
+  const vn=b.vx*nx+b.vy*ny;
+  if(vn<0){
+    const e=vn<-120?s.e:0;
+    b.vx-=(1+e)*vn*nx;b.vy-=(1+e)*vn*ny;
+    if(live&&vn<-140)sfx.bounce(Math.min(1,-vn/900));
+    if(s.boost&&vn<-80){
+      const vn2=b.vx*nx+b.vy*ny;
+      b.vx+=nx*(s.boost-vn2);b.vy+=ny*(s.boost-vn2);
+      if(live){addScore(25,b.x,b.y,'#9fe8ff');sparks(b.x,b.y,'#9fe8ff',6,200);sfx.sling();}
+    }
+  }
+}
+function flipCollide(b,f){
+  const tx=f.x+Math.cos(f.ang)*f.len,ty=f.y+Math.sin(f.ang)*f.len;
+  const dx=tx-f.x,dy=ty-f.y,L2=dx*dx+dy*dy||1e-6;
+  let t=((b.x-f.x)*dx+(b.y-f.y)*dy)/L2;t=t<0?0:t>1?1:t;
+  const qx=f.x+t*dx,qy=f.y+t*dy;
+  let nx=b.x-qx,ny=b.y-qy;const d=Math.hypot(nx,ny),rr=BR+FR;
+  if(d>=rr||d<1e-6)return;
+  nx/=d;ny/=d;b.x+=nx*(rr-d);b.y+=ny*(rr-d);
+  const rx=qx-f.x,ry=qy-f.y,svx=-f.om*ry,svy=f.om*rx;
+  const vn=(b.vx-svx)*nx+(b.vy-svy)*ny;
+  if(vn<0){
+    const e=vn<-140?.35:0;
+    b.vx-=(1+e)*vn*nx;b.vy-=(1+e)*vn*ny;
+    const sp=Math.hypot(b.vx,b.vy);if(sp>1450){b.vx*=1450/sp;b.vy*=1450/sp;}
+    if(live&&vn<-160)sfx.bounce(Math.min(1,-vn/800));
+  }
+}
+let live=false;
+function physMove(h,b){
+  b.vy+=GRAV*h;
+  const sp0=Math.hypot(b.vx,b.vy);if(sp0>MAXV){b.vx*=MAXV/sp0;b.vy*=MAXV/sp0;}
+  b.x+=b.vx*h;b.y+=b.vy*h;
+  if(b.x<16+BR){b.x=16+BR;b.vx=Math.abs(b.vx)*.5;}
+  if(b.x>464-BR){b.x=464-BR;b.vx=-Math.abs(b.vx)*.5;}
+  if(b.y<BR+2){b.y=BR+2;b.vy=Math.abs(b.vy)*.5;}
+  for(const s of walls)collideSeg(b,s);
+  flipCollide(b,fl);flipCollide(b,fr);
+  // bumpers
+  for(let i=0;i<3;i++){
+    const bp=bumpers[i],dx=b.x-bp.x,dy=b.y-bp.y,R=BR+bp.r,d2=dx*dx+dy*dy;
+    if(d2<R*R){
+      const d=Math.sqrt(d2)||1e-6,nx=dx/d,ny=dy/d;
+      b.x=bp.x+nx*R;b.y=bp.y+ny*R;
+      const vn=b.vx*nx+b.vy*ny;
+      if(vn<560){b.vx+=nx*(560-vn);b.vy+=ny*(560-vn);}
+      bp.f=live?1:.4;
+      if(live&&bp.cool<=0){bp.cool=.18;addScore(75,b.x,b.y,'#ffffff');sparks(b.x,b.y,bp.c,12,320);sfx.bumper(i);shake=Math.min(1,shake+.3);}
+    }
+  }
+  // drop targets
+  if(live)for(const tg of targets){
+    if(!tg.alive)continue;
+    const s={x1:tg.x,y1:tg.y1,x2:tg.x,y2:tg.y2,e:.8};
+    const dx=0,dy=tg.y2-tg.y1,L2=dy*dy;
+    let t=((b.x-s.x1)*dx+(b.y-s.y1)*dy)/L2;t=t<0?0:t>1?1:t;
+    const qx=s.x1+t*dx,qy=s.y1+t*dy;
+    let nx=b.x-qx,ny=b.y-qy;const d=Math.hypot(nx,ny);
+    if(d<BR&&d>1e-6){
+      nx/=d;ny/=d;b.x+=nx*(BR-d);b.y+=ny*(BR-d);
+      const vn=b.vx*nx+b.vy*ny;
+      if(vn<0){b.vx-=1.8*vn*nx;b.vy-=1.8*vn*ny;}
+      if(vn<-60){
+        tg.alive=false;addScore(200,tg.x,168,'#ffd27a');sparks(tg.x,170,'#ffd27a',16,300);sfx.target();
+        if(targets.every(x=>!x.alive)){addScore(1000,216,168,'#ffffff');setBanner('TARGET BANK +1000');sfx.bank();targetTimer=2.6;}
+      }
+    }
+  }
+  // rollover lanes
+  for(const l of lanes){
+    l.cool=Math.max(0,l.cool-h);l.flash=Math.max(0,l.flash-h*2.5);
+    const dx=b.x-l.x,dy=b.y-l.y;
+    if(live&&!l.lit&&l.cool<=0&&dx*dx+dy*dy<(BR+9)*(BR+9)){
+      l.lit=true;l.flash=1;l.cool=.6;addScore(50,l.x,l.y-14,'#a7ffb0');sfx.lane();
+      if(lanes.every(x=>x.lit)){addScore(500,216,436,'#ffffff');setBanner('LANES LIT +500');sfx.bank();laneTimer=1.1;}
+    }
+  }
+}
+function step(dt){
+  shake=Math.max(0,shake-dt*2.8);drainFlash=Math.max(0,drainFlash-dt*1.6);
+  bumpers.forEach(b=>{b.f=Math.max(0,b.f-dt*3);b.cool=Math.max(0,b.cool-dt);});
+  if(targetTimer>0){targetTimer-=dt;
+    if(targetTimer<=0)targets.forEach(tg=>{tg.alive=true;sparks(tg.x,170,'#ffd27a',8,160);});}
+  if(laneTimer>0){laneTimer-=dt;if(laneTimer<=0)lanes.forEach(l=>l.lit=false);}
+  for(let i=parts.length-1;i>=0;i--){const p=parts[i];p.l-=dt*1.9;p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=620*dt;if(p.l<=0)parts.splice(i,1);}
+  for(let i=pops.length-1;i>=0;i--){const p=pops[i];p.l-=dt/0.95;p.y-=46*dt;if(p.l<=0)pops.splice(i,1);}
+  if(banner.t>0)banner.t-=dt;
+
+  const b=state==='menu'?ghost:ball;
+  const sp=Math.hypot(b.vx,b.vy);
+  const n=(state==='play'||state==='menu')?Math.max(1,Math.min(12,Math.ceil(sp*dt/6))):1;
+  live=state==='play';
+  for(let i=0;i<n;i++){const h=dt/n;updFlippers(h);
+    if(state==='play'||state==='menu')physMove(h,b);}
+
+  if(charging&&state==='ready'){power=Math.min(1,power+dt/.9);ball.x=440;ball.y=706+power*13;}
+
+  if(state==='menu'&&ghost.y>FH+30){
+    ghost.x=216;ghost.y=460;ghost.vx=Math.random()*440-220;ghost.vy=-380-Math.random()*160;
+  }
+  if(state==='play'){
+    if(ball.y>FH+26){loseBall();}
+    else{
+      const sp2=Math.hypot(ball.vx,ball.vy);
+      if(ball.x>416&&sp2<26){
+        stillT+=dt;
+        if(stillT>(entered?.9:.5)){if(entered)loseBall();else{spawnBall();state='ready';}}
+      }else stillT=0;
+      if(ball.x<410)entered=true;
+      if(sp2<16)lowT+=dt;else lowT=0;
+      if(lowT>2.5){ball.vy-=320;ball.vx+=(Math.random()-.5)*160;lowT=0;}
+    }
+  }
+}
+
+/* ================= DRAWING ================= */
+const DISPF='Impact,"Arial Black","Franklin Gothic Medium",sans-serif';
+const MONOF='"Courier New",monospace';
+function rr(x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+function line(s){ctx.beginPath();ctx.moveTo(s.x1,s.y1);ctx.lineTo(s.x2,s.y2);ctx.stroke();}
+
+function drawHeader(){
+  const g=ctx.createLinearGradient(0,14,0,132);g.addColorStop(0,'#151d40');g.addColorStop(1,'#0e1430');
+  ctx.fillStyle=g;rr(14,14,CW-28,118,6);ctx.fill();
+  ctx.strokeStyle='#33406e';ctx.lineWidth=2;ctx.stroke();
+  [[26,26],[CW-26,26],[26,120],[CW-26,120]].forEach(p=>{
+    ctx.fillStyle='#55629a';ctx.beginPath();ctx.arc(p[0],p[1],3.4,0,7);ctx.fill();
+    ctx.fillStyle='#20284a';ctx.beginPath();ctx.arc(p[0],p[1],1.4,0,7);ctx.fill();});
+  // title
+  ctx.textAlign='left';ctx.textBaseline='alphabetic';
+  ctx.font='italic 900 40px '+DISPF;
+  const t1='PINBALL',w1=ctx.measureText(t1).width;
+  ctx.shadowColor='#ffb640';ctx.shadowBlur=16;ctx.fillStyle='#ffe9c0';ctx.fillText(t1,40,72);
+  ctx.shadowColor='#35e0ff';ctx.fillStyle='#8df2ff';ctx.fillText('NOVA',40+w1+10,72);
+  ctx.shadowBlur=0;
+  ctx.font='11px '+MONOF;ctx.fillStyle='#7f92c8';ctx.fillText('S H O O T E R   E D I T I O N',40,94);
+  // score block
+  ctx.textAlign='right';
+  ctx.font='bold 10px '+MONOF;ctx.fillStyle='#7f92c8';ctx.fillText('SCORE',CW-38,42);
+  ctx.font='bold 30px '+MONOF;ctx.shadowColor='#35e0ff';ctx.shadowBlur=12;ctx.fillStyle='#5eeaff';
+  ctx.fillText(pad(score),CW-38,76);ctx.shadowBlur=0;
+  ctx.font='bold 13px '+MONOF;ctx.fillStyle='#ffb640';ctx.fillText('HI '+pad(hi),CW-38,99);
+  // ball icons
+  for(let i=0;i<3;i++){
+    const x=CW-44-i*24,y=115;
+    if(i<balls){
+      const bg=ctx.createRadialGradient(x-2,y-2,.5,x,y,8);
+      bg.addColorStop(0,'#ffffff');bg.addColorStop(.6,'#b9c6de');bg.addColorStop(1,'#5a6b88');
+      ctx.fillStyle=bg;ctx.beginPath();ctx.arc(x,y,7,0,7);ctx.fill();
+    }else{ctx.strokeStyle='#3a4670';ctx.lineWidth=2;ctx.beginPath();ctx.arc(x,y,6.5,0,7);ctx.stroke();}
+  }
+}
+
+function drawStarDeco(t){
+  ctx.save();ctx.translate(216,84);
+  const s=1+.07*Math.sin(t*2.4);ctx.scale(s,s);ctx.rotate(t*.3);
+  ctx.shadowColor='#ffb640';ctx.shadowBlur=18;
+  const g=ctx.createRadialGradient(0,0,1,0,0,26);g.addColorStop(0,'#fff6dd');g.addColorStop(.5,'#ffd27a');g.addColorStop(1,'rgba(255,150,40,.05)');
+  ctx.fillStyle=g;ctx.beginPath();
+  for(let k=0;k<8;k++){const r=k%2?9:26,a=k*Math.PI/4;ctx.lineTo(Math.cos(a)*r,Math.sin(a)*r);}
+  ctx.closePath();ctx.fill();ctx.shadowBlur=0;
+  ctx.setLineDash([4,7]);ctx.strokeStyle='rgba(140,220,255,.3)';ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.arc(0,0,36,0,7);ctx.stroke();ctx.setLineDash([]);
+  ctx.restore();
+  for(let i=0;i<9;i++){const a=Math.PI+(i+.5)/10*Math.PI;
+    const x=240+210*Math.cos(a),y=230+210*Math.sin(a);
+    ctx.fillStyle=i%2?'rgba(255,210,122,.35)':'rgba(140,220,255,.35)';
+    ctx.beginPath();ctx.arc(x,y,2,0,7);ctx.fill();}
+}
+
+function drawField(t){
+  ctx.save();ctx.translate(FX,FY);
+  ctx.beginPath();ctx.rect(0,0,FW,FH);ctx.clip();
+  // felt
+  let g=ctx.createLinearGradient(0,0,0,FH);g.addColorStop(0,'#17415f');g.addColorStop(.6,'#0f2c46');g.addColorStop(1,'#0a2033');
+  ctx.fillStyle=g;ctx.fillRect(0,0,FW,FH);
+  g=ctx.createRadialGradient(216,300,20,216,300,340);g.addColorStop(0,'rgba(90,200,255,.08)');g.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=g;ctx.fillRect(0,0,FW,FH);
+  g=ctx.createRadialGradient(240,380,180,240,380,460);g.addColorStop(0,'rgba(0,0,0,0)');g.addColorStop(1,'rgba(2,6,16,.55)');
+  ctx.fillStyle=g;ctx.fillRect(0,0,FW,FH);
+
+  drawStarDeco(t);
+  // shooter lane shading
+  ctx.fillStyle='rgba(0,0,22,.38)';ctx.fillRect(416,130,48,614);
+  // slingshot bodies
+  [[16,470,16,552,104,572],[416,470,416,552,328,572]].forEach(tr=>{
+    ctx.beginPath();ctx.moveTo(tr[0],tr[1]);ctx.lineTo(tr[2],tr[3]);ctx.lineTo(tr[4],tr[5]);ctx.closePath();
+    ctx.fillStyle='#1c2947';ctx.fill();ctx.strokeStyle='#38466f';ctx.lineWidth=2;ctx.stroke();});
+
+  // walls: glow pass + core pass
+  ctx.lineCap='round';
+  for(const s of walls){if(s.nodraw)continue;
+    ctx.strokeStyle=s.cls==='lane'?'rgba(90,215,255,.3)':'rgba(255,178,64,.26)';ctx.lineWidth=8;line(s);}
+  for(const s of walls){if(s.nodraw)continue;
+    ctx.strokeStyle=s.cls==='lane'?'#c9f2ff':'#ffd9a3';ctx.lineWidth=2.5;line(s);}
+
+  // kick-face highlights + animated dashes
+  const kfs=[{x1:16,y1:470,x2:104,y2:572,nx:.759,ny:-.655},{x1:416,y1:470,x2:328,y2:572,nx:-.759,ny:-.655}];
+  for(const k of kfs){
+    ctx.strokeStyle='rgba(255,120,80,'+(0.5+0.3*Math.sin(t*6))+')';ctx.lineWidth=4;
+    ctx.beginPath();ctx.moveTo(k.x1,k.y1);ctx.lineTo(k.x2,k.y2);ctx.stroke();
+    const dx=k.x2-k.x1,dy=k.y2-k.y1,L=Math.hypot(dx,dy),ux=dx/L,uy=dy/L;
+    for(const tt of [.3,.6]){
+      const px=k.x1+dx*tt,py=k.y1+dy*tt,off=4+2.5*Math.sin(t*7+tt*9);
+      ctx.strokeStyle='rgba(255,190,120,.55)';ctx.lineWidth=2;
+      ctx.beginPath();ctx.moveTo(px-ux*7+k.nx*off,py-uy*7+k.ny*off);
+      ctx.lineTo(px+ux*7+k.nx*off,py+uy*7+k.ny*off);ctx.stroke();}
+  }
+
+  // drop targets
+  for(const tg of targets){
+    if(tg.alive){
+      const g2=ctx.createLinearGradient(0,tg.y1,0,tg.y2);g2.addColorStop(0,'#ffe9c0');g2.addColorStop(.5,'#ffb640');g2.addColorStop(1,'#ff8c3a');
+      ctx.fillStyle=g2;rr(tg.x-5,tg.y1,10,tg.y2-tg.y1,3);ctx.fill();
+      ctx.strokeStyle='#fff3da';ctx.lineWidth=1.4;ctx.stroke();
+      ctx.font='bold 10px '+MONOF;ctx.textAlign='center';ctx.fillStyle='rgba(255,225,170,.65)';
+      ctx.fillText('200',tg.x,tg.y1-6);
+    }else{
+      ctx.fillStyle='#232c4a';rr(tg.x-4,tg.y1+8,8,tg.y2-tg.y1-8,2);ctx.fill();
+      ctx.strokeStyle='#3a4670';ctx.lineWidth=1.2;ctx.stroke();
+    }
+  }
+
+  // rollover lanes
+  for(const l of lanes){
+    if(l.lit){
+      const g3=ctx.createRadialGradient(l.x,l.y,1,l.x,l.y,14);
+      g3.addColorStop(0,'rgba(220,255,230,.95)');g3.addColorStop(.5,'rgba(87,255,160,.8)');g3.addColorStop(1,'rgba(87,255,160,0)');
+      ctx.fillStyle=g3;ctx.beginPath();ctx.arc(l.x,l.y,14,0,7);ctx.fill();
+      ctx.strokeStyle='rgba(120,255,180,'+(.5+.3*Math.sin(t*6))+')';ctx.lineWidth=2;
+      ctx.beginPath();ctx.arc(l.x,l.y,9,0,7);ctx.stroke();
+    }else{ctx.strokeStyle='rgba(150,170,220,.45)';ctx.lineWidth=2;ctx.beginPath();ctx.arc(l.x,l.y,9,0,7);ctx.stroke();}
+    if(l.flash>0){ctx.fillStyle='rgba(255,255,255,'+l.flash*.8+')';ctx.beginPath();ctx.arc(l.x,l.y,10,0,7);ctx.fill();}
+  }
+
+  // bumpers
+  for(let i=0;i<3;i++){
+    const bp=bumpers[i],pulse=.6+.4*Math.sin(t*2+i*2.1);
+    ctx.strokeStyle=bp.c;ctx.globalAlpha=.5*pulse;ctx.lineWidth=3;
+    ctx.beginPath();ctx.arc(bp.x,bp.y,bp.r+5,0,7);ctx.stroke();ctx.globalAlpha=1;
+    const g4=ctx.createRadialGradient(bp.x-6,bp.y-8,2,bp.x,bp.y,bp.r);
+    g4.addColorStop(0,'#ffffff');g4.addColorStop(.35,bp.c);g4.addColorStop(1,'#131c34');
+    ctx.fillStyle=g4;ctx.beginPath();ctx.arc(bp.x,bp.y,bp.r,0,7);ctx.fill();
+    ctx.strokeStyle='rgba(255,255,255,.35)';ctx.lineWidth=1.5;ctx.stroke();
+    if(bp.f>0){
+      ctx.fillStyle='rgba(255,255,255,'+bp.f*.85+')';ctx.beginPath();ctx.arc(bp.x,bp.y,bp.r,0,7);ctx.fill();
+      ctx.strokeStyle='rgba(255,255,255,'+bp.f+')';ctx.lineWidth=3;
+      ctx.beginPath();ctx.arc(bp.x,bp.y,bp.r+(1-bp.f)*26,0,7);ctx.stroke();
+    }
+    ctx.font='bold 13px '+MONOF;ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillStyle='#182036';ctx.fillText('75',bp.x,bp.y+1);ctx.textBaseline='alphabetic';
+  }
+
+  // plunger + power meter
+  const headTop=ball.y+BR;
+  ctx.fillStyle='#33406e';rr(426,738,28,8,2);ctx.fill();
+  ctx.fillStyle='#2a3350';ctx.fillRect(434,headTop+9,8,744-headTop-9);
+  const n=5,sy0=headTop+9,sy1=744;
+  ctx.strokeStyle='rgba(160,178,216,.85)';ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(440,sy0);
+  for(let i=1;i<=n;i++)ctx.lineTo(i%2?431:449,sy0+(sy1-sy0)*i/n);ctx.stroke();
+  const hg=ctx.createLinearGradient(0,headTop,0,headTop+10);hg.addColorStop(0,'#e8eefb');hg.addColorStop(1,'#7286ab');
+  ctx.fillStyle=hg;rr(422,headTop,36,10,3);ctx.fill();ctx.strokeStyle='#cdd9f2';ctx.lineWidth=1;ctx.stroke();
+  if(state==='ready'){
+    const mx=452,my=630,mh=76,p=power;
+    ctx.strokeStyle='#4a5a8c';ctx.lineWidth=1.5;rr(mx,my,9,mh,2);ctx.stroke();
+    if(p>0){ctx.fillStyle='hsl('+Math.round(120*(1-p))+',90%,60%)';ctx.fillRect(mx+1.5,my+mh-(mh-3)*p,6,(mh-3)*p);}
+    ctx.strokeStyle='#fff';ctx.beginPath();ctx.moveTo(mx-3,my+mh-mh*.62);ctx.lineTo(mx+12,my+mh-mh*.62);ctx.stroke();
+  }
+  ctx.save();ctx.translate(440,560);ctx.rotate(-Math.PI/2);
+  ctx.font='bold 12px '+MONOF;ctx.textAlign='center';ctx.fillStyle='rgba(127,212,255,.3)';
+  ctx.fillText('S H O O T',0,4);ctx.restore();
+
+  // flippers
+  for(const f of [fl,fr]){
+    const tx=f.x+Math.cos(f.ang)*f.len,ty=f.y+Math.sin(f.ang)*f.len;
+    ctx.lineCap='round';
+    ctx.strokeStyle='rgba(25,14,3,.9)';ctx.lineWidth=24;
+    ctx.beginPath();ctx.moveTo(f.x,f.y);ctx.lineTo(tx,ty);ctx.stroke();
+    const fg=ctx.createLinearGradient(f.x,f.y,tx,ty);fg.addColorStop(0,'#ffe0a0');fg.addColorStop(1,'#ff9c3f');
+    if(f.down){ctx.shadowColor='#59e6ff';ctx.shadowBlur=14;}
+    ctx.strokeStyle=fg;ctx.lineWidth=18;
+    ctx.beginPath();ctx.moveTo(f.x,f.y);ctx.lineTo(tx,ty);ctx.stroke();ctx.shadowBlur=0;
+    const pg=ctx.createRadialGradient(f.x-2,f.y-2,1,f.x,f.y,9);pg.addColorStop(0,'#f2f6ff');pg.addColorStop(.7,'#8fa2c4');pg.addColorStop(1,'#3c4a6e');
+    ctx.fillStyle=pg;ctx.beginPath();ctx.arc(f.x,f.y,9,0,7);ctx.fill();
+    ctx.strokeStyle='#dfe8fa';ctx.lineWidth=1.5;ctx.stroke();
+  }
+
+  // drain slot
+  ctx.fillStyle='#04060f';rr(178,737,76,8,3);ctx.fill();
+  if(drainFlash>0){ctx.strokeStyle='rgba(255,70,70,'+drainFlash+')';ctx.lineWidth=3;
+    ctx.shadowColor='#ff4040';ctx.shadowBlur=14*drainFlash;rr(178,737,76,8,3);ctx.stroke();ctx.shadowBlur=0;}
+  // bottom shading
+  g=ctx.createLinearGradient(0,700,0,760);g.addColorStop(0,'rgba(0,0,10,0)');g.addColorStop(1,'rgba(0,0,10,.5)');
+  ctx.fillStyle=g;ctx.fillRect(0,700,FW,60);
+
+  // ball
+  const b=state==='menu'?ghost:ball;
+  const bg2=ctx.createRadialGradient(b.x-3,b.y-4,1,b.x,b.y,BR);
+  bg2.addColorStop(0,'#ffffff');bg2.addColorStop(.45,'#dfe8f6');bg2.addColorStop(.8,'#8fa2c0');bg2.addColorStop(1,'#5a6b88');
+  ctx.fillStyle=bg2;ctx.beginPath();ctx.arc(b.x,b.y,BR,0,7);ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,.25)';ctx.lineWidth=1;ctx.stroke();
+
+  // particles (additive)
+  ctx.globalCompositeOperation='lighter';
+  for(const p of parts){ctx.globalAlpha=Math.max(0,p.l);ctx.fillStyle=p.c;
+    ctx.beginPath();ctx.arc(p.x,p.y,2.4*p.l+.6,0,7);ctx.fill();}
+  ctx.globalAlpha=1;ctx.globalCompositeOperation='source-over';
+
+  // score popups
+  for(const p of pops){ctx.globalAlpha=Math.max(0,p.l);ctx.font='bold 15px '+MONOF;ctx.textAlign='center';
+    ctx.shadowColor=p.c;ctx.shadowBlur=8;ctx.fillStyle=p.c;ctx.fillText(p.txt,p.x,p.y);ctx.shadowBlur=0;}
+  ctx.globalAlpha=1;
+
+  // banner
+  if(banner.t>0){
+    const a=Math.min(1,(banner.dur-banner.t)/.12),fade=banner.t<.4?banner.t/.4:1;
+    ctx.save();ctx.translate(216,530);ctx.scale(1+(1-a)*.6,1+(1-a)*.6);
+    ctx.globalAlpha=fade;ctx.font='italic 900 42px '+DISPF;ctx.textAlign='center';
+    ctx.shadowColor='#ffb640';ctx.shadowBlur=22;ctx.fillStyle='#fff';
+    ctx.fillText(banner.txt,0,0);ctx.shadowColor='#35e0ff';ctx.shadowBlur=10;ctx.fillText(banner.txt,0,0);
+    ctx.restore();ctx.globalAlpha=1;
+  }
+
+  // ready hint / charging
+  if(state==='ready'&&!paused){
+    const pa=.55+.35*Math.sin(t*5);
+    ctx.textAlign='center';
+    if(charging){
+      ctx.globalAlpha=Math.sin(t*20)>0?1:.4;ctx.font='bold 17px '+MONOF;ctx.fillStyle='#ffd27a';
+      ctx.shadowColor='#ffb640';ctx.shadowBlur=10;ctx.fillText('RELEASE TO LAUNCH!',216,636);ctx.shadowBlur=0;
+    }else{
+      ctx.globalAlpha=pa;ctx.font='bold 15px '+MONOF;ctx.fillStyle='#cfe3ff';
+      ctx.fillText('HOLD SPACE - CHARGE PLUNGER',216,632);
+      ctx.globalAlpha=pa*.55;ctx.font='bold 11px '+MONOF;ctx.fillStyle='#9fb2dd';
+      ctx.fillText('Z / \u2190 FLIP L     X / \u2192 FLIP R',216,654);
+    }
+    ctx.globalAlpha=1;
+  }
+  if(paused){
+    ctx.fillStyle='rgba(4,8,20,.62)';ctx.fillRect(0,0,FW,FH);
+    ctx.textAlign='center';ctx.font='italic 900 44px '+DISPF;ctx.fillStyle='#fff';
+    ctx.shadowColor='#59e6ff';ctx.shadowBlur=18;ctx.fillText('PAUSED',240,370);ctx.shadowBlur=0;
+    ctx.font='bold 13px '+MONOF;ctx.fillStyle='#9fb2dd';ctx.fillText('PRESS P TO RESUME',240,404);
+  }
+  ctx.restore();
+
+  // field frame
+  ctx.strokeStyle='rgba(255,182,64,.55)';ctx.lineWidth=2;rr(FX-5,FY-5,FW+10,FH+10,8);ctx.stroke();
+  ctx.fillStyle='#0a0e22';// (drawn under? no - just accent dots)
+  for(let y=FY+24;y<FY+FH-16;y+=36){
+    ctx.fillStyle='rgba(255,182,64,.4)';ctx.beginPath();ctx.arc(FX-10,y,2,0,7);ctx.fill();
+    ctx.beginPath();ctx.arc(FX+FW+10,y,2,0,7);ctx.fill();}
+}
+
+function draw(t){
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  const g=ctx.createLinearGradient(0,0,0,vh);g.addColorStop(0,'#070b1e');g.addColorStop(.5,'#0a1030');g.addColorStop(1,'#060919');
+  ctx.fillStyle=g;ctx.fillRect(0,0,vw,vh);
+  const rg=ctx.createRadialGradient(vw/2,vh*.44,10,vw/2,vh*.44,Math.max(vw,vh)*.55);
+  rg.addColorStop(0,'rgba(70,110,200,.16)');rg.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle=rg;ctx.fillRect(0,0,vw,vh);
+  for(const s of stars){
+    ctx.globalAlpha=s.a*(.55+.45*Math.sin(t*s.sp+s.ph));
+    ctx.fillStyle=s.c;ctx.beginPath();ctx.arc(s.x*vw,s.y*vh,s.r,0,7);ctx.fill();}
+  ctx.globalAlpha=1;
+  const shx=(Math.random()*2-1)*3.2*shake,shy=(Math.random()*2-1)*3.2*shake;
+  ctx.setTransform(dpr*S,0,0,dpr*S,dpr*(OX+shx),dpr*(OY+shy));
+  // cabinet base plate
+  const bg=ctx.createLinearGradient(0,0,0,CH);bg.addColorStop(0,'#101634');bg.addColorStop(1,'#0a0e24');
+  ctx.fillStyle=bg;rr(4,4,CW-8,CH-8,14);ctx.fill();
+  ctx.strokeStyle='#2c3a68';ctx.lineWidth=2;ctx.stroke();
+  drawHeader();
+  drawField(t);
+}
+
+/* ================= MAIN LOOP ================= */
+let last=performance.now();
+function frame(now){
+  requestAnimationFrame(frame);
+  const dt=Math.min(.033,(now-last)/1000)||.016;last=now;
+  if(!paused)step(dt);
+  draw(now/1000);
+}
+resize();
+showScr(startP);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
+```
