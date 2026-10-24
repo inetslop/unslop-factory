@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snake Minesweeper</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; overflow: hidden; display: flex; justify-content: center; align-items: center; height: 100vh; width: 100vw; font-family: 'Courier New', monospace; }
+canvas { display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, CELL, COLS, ROWS;
+let scale = 1;
+
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    const maxCellW = (W - 20) / 22;
+    const maxCellH = (H - 80) / 16;
+    CELL = Math.floor(Math.min(maxCellW, maxCellH));
+    COLS = Math.floor((W - 20) / CELL);
+    ROWS = Math.floor((H - 80) / CELL);
+}
+
+window.addEventListener('resize', () => { resize(); if (state === 'PLAYING') initGame(); });
+resize();
+
+let state = 'START';
+let snake = [];
+let dir = { x: 1, y: 0 };
+let nextDir = { x: 1, y: 0 };
+let mines = new Set();
+let food = [];
+let numbers = {};
+let score = 0;
+let highScore = 0;
+let tickMs = 150;
+let lastTick = 0;
+let particles = [];
+let audioCtx = null;
+
+try { highScore = parseInt(localStorage.getItem('snakeMines_high') || '0'); } catch(e) {}
+
+function playSound(freq, dur, type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function getNeighbors(cx, cy) {
+    const n = [];
+    for (let dx = -1; dx <= 1; dx++)
+        for (let dy = -1; dy <= 1; dy++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = cx + dx, ny = cy + dy;
+            if (nx >= 0 && nx < COLS && ny >= 0 && ny < ROWS) n.push(nx * COLS + ny);
+        }
+    return n;
+}
+
+function initGame() {
+    snake = [];
+    const sy = Math.floor(ROWS / 2);
+    for (let i = 0; i < 3; i++) {
+        snake.unshift({ x: 2 - i, y: sy });
+    }
+    dir = { x: 1, y: 0 };
+    nextDir = { x: 1, y: 0 };
+    score = 0;
+    tickMs = 150;
+    particles = [];
+
+    const safeSet = new Set();
+    for (let i = 0; i < 3; i++) safeSet.add((2 - i) * COLS + sy);
+    for (let dx = 0; dx < 4; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+            const nx = 2 + dx, ny = sy + dy;
+            if (nx >= 0 && nx < COLS && ny >= 0 && ny < ROWS) safeSet.add(nx * COLS + ny);
+        }
+    }
+
+    mines = new Set();
+    const mineCount = Math.floor(COLS * ROWS * 0.12);
+    let attempts = 0;
+    while (mines.size < mineCount && attempts < 5000) {
+        attempts++;
+        const cx = Math.floor(Math.random() * COLS);
+        const cy = Math.floor(Math.random() * ROWS);
+        const key = cx * COLS + cy;
+        if (!safeSet.has(key) && !mines.has(key)) mines.add(key);
+    }
+
+    food = [];
+    const foodCount = 6;
+    let foodAttempts = 0;
+    while (food.length < foodCount && foodAttempts < 5000) {
+        foodAttempts++;
+        const cx = Math.floor(Math.random() * COLS);
+        const cy = Math.floor(Math.random() * ROWS);
+        const key = cx * COLS + cy;
+        if (!mines.has(key) && !safeSet.has(key) && !food.some(f => f.x === cx && f.y === cy)) {
+            food.push({ x: cx, y: cy });
+        }
+    }
+
+    numbers = {};
+    for (const mk of mines) {
+        const mx = mk % COLS, my = Math.floor(mk / COLS);
+        const neighbors = getNeighbors(mx, my);
+        for (const nk of neighbors) {
+            if (!mines.has(nk)) {
+                numbers[nk] = (numbers[nk] || 0) + 1;
+            }
+        }
+    }
+
+    lastTick = performance.now();
+}
+
+function addParticle(x, y, color) {
+    for (let i = 0; i < 8; i++) {
+        const angle = (Math.PI * 2 / 8) * i + Math.random() * 0.5;
+        particles.push({ x: x * CELL + CELL/2, y: y * CELL + CELL/2, vx: Math.cos(angle) * 60, vy: Math.sin(angle) * 60, life: 1, color });
+    }
+}
+
+function updateParticles(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx * dt;
+        p.y += p.vy * dt;
+        p.life -= dt * 2;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+}
+
+function update(now) {
+    if (state !== 'PLAYING') return;
+    if (now - lastTick >= tickMs) {
+        lastTick = now;
+        dir = nextDir;
+        const head = { x: snake[0].x + dir.x, y: snake[0].y + dir.y };
+
+        // Wall collision
+        if (head.x < 0 || head.x >= COLS || head.y < 0 || head.y >= ROWS) {
+            gameOver(false);
+            return;
+        }
+        // Self collision
+        for (const seg of snake) {
+            if (seg.x === head.x && seg.y === head.y) {
+                gameOver(false);
+                return;
+            }
+        }
+
+        const key = head.x * COLS + head.y;
+        if (mines.has(key)) {
+            gameOver(false, true);
+            return;
+        }
+
+        snake.unshift(head);
+
+        // Eat food
+        let ate = false;
+        for (let i = food.length - 1; i >= 0; i--) {
+            if (food[i].x === head.x && food[i].y === head.y) {
+                food.splice(i, 1);
+                score += 10;
+                ate = true;
+                addParticle(head.x, head.y, '#4ade80');
+                playSound(520 + Math.random() * 100, 0.1, 'sine');
+            }
+        }
+
+        if (!ate) snake.pop();
+
+        if (score > highScore) {
+            highScore = score;
+            try { localStorage.setItem('snakeMines_high', highScore.toString()); } catch(e) {}
+        }
+
+        if (food.length === 0) {
+            // Win - spawn more food
+            let newAttempts = 0;
+            while (newAttempts < 5000) {
+                const cx = Math.floor(Math.random() * COLS);
+                const cy = Math.floor(Math.random() * ROWS);
+                const nk = cx * COLS + cy;
+                if (!mines.has(nk) && !snake.some(s => s.x === cx && s.y === cy)) {
+                    food.push({ x: cx, y: cy });
+                    break;
+                }
+                newAttempts++;
+            }
+            tickMs = Math.max(80, tickMs - 10);
+        }
+    }
+}
+
+function gameOver(won, mineHit) {
+    state = 'OVER';
+    if (won) playSound(800, 0.3, 'sine');
+    else {
+        playSound(150, 0.4, 'sawtooth');
+        addParticle(snake[0].x, snake[0].y, '#ef4444');
+    }
+}
+
+function draw() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+
+    const offsetX = Math.floor((W - COLS * CELL) / 2);
+    const offsetY = 40;
+
+    // Draw grid
+    for (let cx = 0; cx < COLS; cx++) {
+        for (let cy = 0; cy < ROWS; cy++) {
+            const px = offsetX + cx * CELL;
+            const py = offsetY + cy * CELL;
+            ctx.fillStyle = (cx + cy) % 2 === 0 ? '#16213e' : '#1a1a2e';
+            ctx.fillRect(px, py, CELL - 1, CELL - 1);
+
+            const key = cx * COLS + cy;
+            if (numbers[key] && state !== 'OVER') {
+                ctx.fillStyle = '#fbbf24';
+                ctx.font = `bold ${Math.floor(CELL * 0.5)}px monospace`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(numbers[key], px + CELL / 2, py + CELL / 2);
+            } else if (numbers[key] && state === 'OVER') {
+                // On game over show mines
+                if (mines.has(key)) {
+                    ctx.fillStyle = '#ef4444';
+                    ctx.font = `bold ${Math.floor(CELL * 0.6)}px monospace`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText('✕', px + CELL / 2, py + CELL / 2);
+                } else if (numbers[key]) {
+                    ctx.fillStyle = '#fbbf24';
+                    ctx.font = `bold ${Math.floor(CELL * 0.5)}px monospace`;
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(numbers[key], px + CELL / 2, py + CELL / 2);
+                }
+            }
+        }
+    }
+
+    // Draw mines on game over
+    if (state === 'OVER') {
+        for (const mk of mines) {
+            const mx = mk % COLS, my = Math.floor(mk / COLS);
+            const px = offsetX + mx * CELL;
+            const py = offsetY + my * CELL;
+            ctx.fillStyle = '#7f1d1d';
+            ctx.beginPath();
+            ctx.arc(px + CELL/2, py + CELL/2, CELL * 0.35, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.strokeStyle = '#ef4444';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        }
+    }
+
+    // Draw food
+    for (const f of food) {
+        const px = offsetX + f.x * CELL;
+        const py = offsetY + f.y * CELL;
+        ctx.fillStyle = '#4ade80';
+        ctx.beginPath();
+        ctx.arc(px + CELL / 2, py + CELL / 2, CELL * 0.3, 0, Math.PI * 2);
+        ctx.fill();
+        // Stem
+        ctx.strokeStyle = '#16a34a';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(px + CELL / 2, py + CELL * 0.2);
+        ctx.lineTo(px + CELL / 2 + CELL * 0.1, py + CELL * 0.1);
+        ctx.stroke();
+    }
+
+    // Draw snake
+    for (let i = 0; i < snake.length; i++) {
+        const seg = snake[i];
+        const px = offsetX + seg.x * CELL;
+        const py = offsetY + seg.y * CELL;
+        const t = i / snake.length;
+        const g = Math.floor(180 - t * 80);
+        ctx.fillStyle = `rgb(${i === 0 ? 74 : 34}, ${g}, 52)`;
+        const pad = 1;
+        ctx.fillRect(px + pad, py + pad, CELL - 2, CELL - 2);
+
+        if (i === 0) {
+            // Eyes
+            ctx.fillStyle = '#fff';
+            const ex1 = px + CELL * 0.3 + dir.x * 3;
+            const ey1 = py + CELL * 0.35 + dir.y * 3;
+            const ex2 = px + CELL * 0.7 + dir.x * 3;
+            const ey2 = py + CELL * 0.65 + dir.y * 3;
+            if (dir.x !== 0) {
+                ctx.fillRect(ex1 - 2, ey1 - 2, 4, 4);
+                ctx.fillRect(ex2 - 2, ey2 - 2, 4, 4);
+            } else {
+                const exA = px + CELL * 0.35;
+                const exB = px + CELL * 0.65;
+                ctx.fillRect(exA - 2, py + CELL * 0.4 - 2, 4, 4);
+                ctx.fillRect(exB - 2, py + CELL * 0.4 - 2, 4, 4);
+            }
+        }
+    }
+
+    // Particles
+    for (const p of particles) {
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+    }
+    ctx.globalAlpha = 1;
+
+    // HUD
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.min(20, CELL * 0.7)}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(`Score: ${score}`, offsetX, 10);
+    ctx.textAlign = 'right';
+    ctx.fillText(`High: ${highScore}`, offsetX + COLS * CELL, 10);
+
+    // Overlays
+    if (state === 'START') {
+        drawOverlay('SNAKE MINESWEEPER', [
+            'Navigate the grid to eat all food!',
+            'Avoid hidden mines - use numbers as clues.',
+            '',
+            'Controls:',
+            'Arrow Keys / WASD to move',
+            'R to restart',
+            '',
+            'Press SPACE or ENTER to start!'
+        ]);
+    } else if (state === 'OVER') {
+        const won = food.length === 0 && score > 0;
+        drawOverlay(won ? 'YOU WIN!' : 'GAME OVER', [
+            `Final Score: ${score}`,
+            `High Score: ${highScore}`,
+            '',
+            'Press R or SPACE to restart'
+        ]);
+    }
+}
+
+function drawOverlay(title, lines) {
+    ctx.fillStyle = 'rgba(10, 10, 30, 0.85)';
+    ctx.fillRect(0, 0, W, H);
+
+    const titleSize = Math.min(48, W * 0.06);
+    ctx.fillStyle = '#4ade80';
+    ctx.font = `bold ${titleSize}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(title, W / 2, H * 0.25);
+
+    const lineSize = Math.min(18, W * 0.025);
+    ctx.fillStyle = '#e2e8f0';
+    ctx.font = `${lineSize}px monospace`;
+    lines.forEach((line, i) => {
+        ctx.fillText(line, W / 2, H * 0.38 + i * lineSize * 1.6);
+    });
+
+    // Blinking prompt
+    if (Math.floor(performance.now() / 500) % 2 === 0) {
+        ctx.fillStyle = '#fbbf24';
+        ctx.font = `bold ${lineSize}px monospace`;
+        ctx.fillText('▶ START ◀', W / 2, H * 0.85);
+    }
+}
+
+let lastFrame = performance.now();
+function gameLoop(now) {
+    const dt = (now - lastFrame) / 1000;
+    lastFrame = now;
+
+    updateParticles(dt);
+    update(now);
+    draw();
+
+    requestAnimationFrame(gameLoop);
+}
+
+window.addEventListener('keydown', (e) => {
+    initAudio();
+
+    if (state === 'START') {
+        if (e.key === ' ' || e.key === 'Enter') {
+            state = 'PLAYING';
+            initGame();
+        }
+        return;
+    }
+
+    if (state === 'OVER') {
+        if (e.key === ' ' || e.key === 'Enter' || e.key.toLowerCase() === 'r') {
+            state = 'PLAYING';
+            initGame();
+        }
+        return;
+    }
+
+    if (state === 'PLAYING') {
+        let newDir = null;
+        switch (e.key) {
+            case 'ArrowUp': case 'w': case 'W': newDir = { x: 0, y: -1 }; break;
+            case 'ArrowDown': case 's': case 'S': newDir = { x: 0, y: 1 }; break;
+            case 'ArrowLeft': case 'a': case 'A': newDir = { x: -1, y: 0 }; break;
+            case 'ArrowRight': case 'd': case 'D': newDir = { x: 1, y: 0 }; break;
+        }
+        if (newDir) {
+            // Prevent 180 degree turns
+            if (!(newDir.x === -dir.x && newDir.y === -dir.y)) {
+                nextDir = newDir;
+            }
+            e.preventDefault();
+        }
+        if (e.key.toLowerCase() === 'r') {
+            state = 'PLAYING';
+            initGame();
+        }
+    }
+});
+
+// Touch controls
+let touchStartX = 0, touchStartY = 0;
+canvas.addEventListener('touchstart', (e) => {
+    initAudio();
+    if (state === 'START' || state === 'OVER') {
+        if (state === 'START') { state = 'PLAYING'; }
+        else { state = 'PLAYING'; initGame(); }
+        e.preventDefault();
+    }
+    touchStartX = e.touches[0].clientX;
+    touchStartY = e.touches[0].clientY;
+});
+canvas.addEventListener('touchmove', (e) => {
+    if (state !== 'PLAYING') return;
+    const dx = e.touches[0].clientX - touchStartX;
+    const dy = e.touches[0].clientY - touchStartY;
+    if (Math.abs(dx) > 20 || Math.abs(dy) > 20) {
+        let newDir;
+        if (Math.abs(dx) > Math.abs(dy)) newDir = dx > 0 ? {x:1,y:0} : {x:-1,y:0};
+        else newDir = dy > 0 ? {x:0,y:1} : {x:0,y:-1};
+        if (!(newDir.x === -dir.x && newDir.y === -dir.y)) nextDir = newDir;
+    }
+    e.preventDefault();
+}, { passive: false });
+
+resize();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
