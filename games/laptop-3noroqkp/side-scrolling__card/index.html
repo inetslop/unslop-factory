@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Card Stream</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', sans-serif; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(type, freq, duration, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+function sfxCatch() { playSound('sine', 880, 0.15, 0.3); playSound('sine', 1320, 0.1, 0.2); }
+function sfxGold() { playSound('sine', 1047, 0.2, 0.3); playSound('sine', 1568, 0.15, 0.25); }
+function sfxBomb() { playSound('sawtooth', 150, 0.3, 0.4); }
+function sfxMiss() { playSound('square', 200, 0.2, 0.2); }
+function sfxWild() { playSound('sine', 660, 0.3, 0.3); playSound('sine', 990, 0.25, 0.25); }
+
+// Game State
+let state = 'start'; // start, playing, gameover
+let score = 0;
+let best = 0;
+let combo = 0;
+let maxCombo = 0;
+let speed = 3;
+let difficulty = 1;
+let cards = [];
+let particles = [];
+let floatTexts = [];
+let shakeTime = 0;
+let shakeIntensity = 0;
+
+try { best = JSON.parse(localStorage.getItem('cardStreamBest') || '0'); } catch(e) { best = 0; }
+
+const LANES = 3;
+const CATCH_X_RATIO = 0.15;
+const CARD_W_RATIO = 0.08;
+const CARD_H_RATIO = 0.14;
+
+let playerLane = 1;
+let catchPulse = 0;
+
+function getCardW() { return W * CARD_W_RATIO; }
+function getCardH() { return H * CARD_H_RATIO; }
+function getLaneY(lane) {
+    const laneH = H / LANES;
+    return laneH * lane + laneH / 2;
+}
+
+function spawnCard() {
+    const types = ['normal', 'normal', 'normal', 'gold', 'bomb', 'wild'];
+    if (difficulty > 3) types.push('bomb');
+    if (difficulty > 5) types.push('wild');
+    let type = types[Math.floor(Math.random() * types.length)];
+    const suits = ['♠','♥','♦','♣'];
+    const ranks = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+    const card = {
+        x: W + 50,
+        lane: Math.floor(Math.random() * LANES),
+        type: type,
+        suit: suits[Math.floor(Math.random() * 4)],
+        rank: ranks[Math.floor(Math.random() * 13)],
+        caught: false,
+        missed: false,
+        rot: 0,
+        rotSpeed: (Math.random() - 0.5) * 0.02
+    };
+    cards.push(card);
+}
+
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const spd = 2 + Math.random() * 4;
+        particles.push({
+            x: x, y: y,
+            vx: Math.cos(angle) * spd,
+            vy: Math.sin(angle) * spd - 2,
+            life: 1,
+            color: color,
+            size: 3 + Math.random() * 4
+        });
+    }
+}
+
+function addFloatText(x, y, text, color) {
+    floatTexts.push({ x, y, text, color, life: 1 });
+}
+
+function resetGame() {
+    score = 0; combo = 0; maxCombo = 0; speed = 3; difficulty = 1;
+    cards = []; particles = []; floatTexts = [];
+    playerLane = 1; catchPulse = 0; shakeTime = 0;
+    spawnTimer = 0;
+}
+
+let spawnTimer = 0;
+
+function update(dt) {
+    if (state !== 'playing') return;
+    
+    difficulty = 1 + Math.floor(score / 200);
+    speed = 3 + difficulty * 0.8;
+    const maxSpeed = 12;
+    if (speed > maxSpeed) speed = maxSpeed;
+    
+    spawnTimer += dt;
+    const spawnInterval = Math.max(0.6, 1.5 - difficulty * 0.1);
+    if (spawnTimer >= spawnInterval) {
+        spawnTimer = 0;
+        spawnCard();
+        if (difficulty > 4 && Math.random() < 0.3) spawnCard();
+    }
+    
+    const catchX = W * CATCH_X_RATIO;
+    
+    for (let i = cards.length - 1; i >= 0; i--) {
+        const c = cards[i];
+        c.x -= speed * dt * 60;
+        c.rot += c.rotSpeed;
+        
+        if (!c.caught && !c.missed) {
+            if (c.x < -getCardW()) {
+                c.missed = true;
+                if (c.type !== 'bomb') {
+                    combo = 0;
+                    sfxMiss();
+                }
+                cards.splice(i, 1);
+                continue;
+            }
+        }
+        
+        // Check catch
+        if (!c.caught && c.lane === playerLane) {
+            const dx = c.x - catchX;
+            if (Math.abs(dx) < getCardW() * 0.6) {
+                if (catchPulse > 0) {
+                    c.caught = true;
+                    catchPulse = 0;
+                    
+                    let pts = 0;
+                    let color = '#fff';
+                    let text = '';
+                    
+                    if (c.type === 'normal') {
+                        combo++;
+                        maxCombo = Math.max(maxCombo, combo);
+                        pts = 10 * (1 + Math.floor(combo / 5));
+                        text = '+' + pts;
+                        color = '#4fc3f7';
+                        sfxCatch();
+                        spawnParticles(c.x, getLaneY(c.lane), '#4fc3f7', 12);
+                    } else if (c.type === 'gold') {
+                        combo++;
+                        maxCombo = Math.max(maxCombo, combo);
+                        pts = 50;
+                        text = '+' + pts + '!';
+                        color = '#ffd700';
+                        sfxGold();
+                        spawnParticles(c.x, getLaneY(c.lane), '#ffd700', 20);
+                    } else if (c.type === 'bomb') {
+                        combo = 0;
+                        pts = -30;
+                        text = '-30';
+                        color = '#ff5252';
+                        sfxBomb();
+                        shakeTime = 0.3;
+                        shakeIntensity = 8;
+                        spawnParticles(c.x, getLaneY(c.lane), '#ff5252', 15);
+                    } else if (c.type === 'wild') {
+                        combo += 3;
+                        maxCombo = Math.max(maxCombo, combo);
+                        pts = 25;
+                        text = 'WILD +25';
+                        color = '#ce93d8';
+                        sfxWild();
+                        spawnParticles(c.x, getLaneY(c.lane), '#ce93d8', 25);
+                    }
+                    
+                    score += pts;
+                    if (score < 0) score = 0;
+                    addFloatText(c.x, getLaneY(c.lane) - 30, text, color);
+                    
+                    cards.splice(i, 1);
+                }
+            }
+        }
+    }
+    
+    // Particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.3;
+        p.life -= dt * 2;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+    
+    // Float texts
+    for (let i = floatTexts.length - 1; i >= 0; i--) {
+        const f = floatTexts[i];
+        f.y -= dt * 40;
+        f.life -= dt * 1.5;
+        if (f.life <= 0) floatTexts.splice(i, 1);
+    }
+    
+    catchPulse = Math.max(0, catchPulse - dt * 4);
+    shakeTime = Math.max(0, shakeTime - dt);
+    
+    if (score >= best) {
+        try { localStorage.setItem('cardStreamBest', JSON.stringify(score)); } catch(e) {}
+        best = score;
+    }
+}
+
+function drawCard(c) {
+    const cw = getCardW();
+    const ch = getCardH();
+    const x = c.x - cw/2;
+    const y = getLaneY(c.lane) - ch/2;
+    
+    ctx.save();
+    ctx.translate(c.x, getLaneY(c.lane));
+    ctx.rotate(c.rot);
+    
+    // Card body
+    let bg = '#f5f5dc';
+    if (c.type === 'gold') bg = '#fff8e1';
+    if (c.type === 'bomb') bg = '#ffccbc';
+    if (c.type === 'wild') bg = '#f3e5f5';
+    
+    ctx.shadowColor = 'rgba(0,0,0,0.4)';
+    ctx.shadowBlur = 8;
+    ctx.shadowOffsetY = 4;
+    
+    ctx.fillStyle = bg;
+    ctx.beginPath();
+    ctx.roundRect(-cw/2, -ch/2, cw, ch, 8);
+    ctx.fill();
+    
+    ctx.shadowColor = 'transparent';
+    
+    // Border
+    let border = '#90caf9';
+    if (c.type === 'gold') border = '#ffd700';
+    if (c.type === 'bomb') border = '#ff5252';
+    if (c.type === 'wild') border = '#ce93d8';
+    
+    ctx.strokeStyle = border;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.roundRect(-cw/2, -ch/2, cw, ch, 8);
+    ctx.stroke();
+    
+    // Suit and rank
+    let suitColor = '#000';
+    if (c.suit === '♥' || c.suit === '♦') suitColor = '#d32f2f';
+    if (c.type === 'bomb') { suitColor = '#ff5252'; ctx.font = `bold ${ch*0.6}px sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('💣', 0, 0); ctx.restore(); return; }
+    
+    ctx.fillStyle = suitColor;
+    ctx.font = `bold ${ch * 0.35}px sans-serif`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillText(c.rank, -cw/2 + 8, -ch/2 + 6);
+    ctx.font = `${ch * 0.4}px sans-serif`;
+    ctx.fillText(c.suit, -cw/2 + 8, -ch/2 + 6 + ch*0.35);
+    
+    // Center suit
+    ctx.font = `${ch * 0.5}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(c.suit, 0, 10);
+    
+    ctx.restore();
+}
+
+function draw() {
+    ctx.save();
+    
+    if (shakeTime > 0) {
+        const sx = (Math.random() - 0.5) * shakeIntensity;
+        const sy = (Math.random() - 0.5) * shakeIntensity;
+        ctx.translate(sx, sy);
+    }
+    
+    // Background
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, '#1a1a2e');
+    grad.addColorStop(1, '#16213e');
+    ctx.fillStyle = grad;
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+    
+    // Lane lines
+    const laneH = H / LANES;
+    for (let i = 0; i <= LANES; i++) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, i * laneH);
+        ctx.lineTo(W, i * laneH);
+        ctx.stroke();
+    }
+    
+    // Catch zone
+    const catchX = W * CATCH_X_RATIO;
+    const cw = getCardW();
+    const ch = getCardH();
+    const pulseAlpha = 0.3 + catchPulse * 0.5;
+    
+    ctx.fillStyle = `rgba(79, 195, 247, ${pulseAlpha})`;
+    ctx.beginPath();
+    ctx.roundRect(catchX - cw/2 - 10, getLaneY(playerLane) - ch/2 - 10, cw + 20, ch + 20, 12);
+    ctx.fill();
+    
+    ctx.strokeStyle = `rgba(79, 195, 247, ${0.6 + catchPulse * 0.4})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.roundRect(catchX - cw/2 - 10, getLaneY(playerLane) - ch/2 - 10, cw + 20, ch + 20, 12);
+    ctx.stroke();
+    
+    // Cards
+    for (const c of cards) {
+        if (!c.caught) drawCard(c);
+    }
+    
+    // Particles
+    for (const p of particles) {
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    
+    // Float texts
+    for (const f of floatTexts) {
+        ctx.globalAlpha = f.life;
+        ctx.fillStyle = f.color;
+        ctx.font = `bold ${20 + combo * 2}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText(f.text, f.x, f.y);
+    }
+    ctx.globalAlpha = 1;
+    
+    // HUD
+    if (state === 'playing') {
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.beginPath();
+        ctx.roundRect(10, 10, 200, 90, 10);
+        ctx.fill();
+        
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 24px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText(`Score: ${score}`, 20, 40);
+        ctx.font = '16px sans-serif';
+        ctx.fillStyle = '#4fc3f7';
+        ctx.fillText(`Combo: x${combo}`, 20, 65);
+        ctx.fillStyle = '#ffd700';
+        ctx.fillText(`Best: ${best}`, 20, 88);
+        
+        // Speed indicator
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.beginPath();
+        ctx.roundRect(W - 130, 10, 120, 40, 10);
+        ctx.fill();
+        ctx.fillStyle = '#ff8a65';
+        ctx.font = '14px sans-serif';
+        ctx.textAlign = 'right';
+        ctx.fillText(`Speed: ${speed.toFixed(1)}x`, W - 20, 35);
+    }
+    
+    // Start screen
+    if (state === 'start') {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, W, H);
+        
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold ${Math.min(W*0.1, 64)}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText('CARD STREAM', W/2, H * 0.25);
+        
+        ctx.font = `${Math.min(W*0.03, 20)}px sans-serif`;
+        ctx.fillStyle = '#4fc3f7';
+        ctx.fillText('A Side-Scrolling Card Game', W/2, H * 0.35);
+        
+        ctx.fillStyle = '#ccc';
+        ctx.font = `${Math.min(W*0.025, 18)}px sans-serif`;
+        const lines = [
+            '↑ / ↓ or W/S — Move between lanes',
+            'SPACE or Enter — Catch card',
+            '',
+            'Catch cards in the glowing zone!',
+            '',
+            '♠ ♥ ♦ ♣ Normal = 10 pts (x combo)',
+            '★ Gold = 50 pts',
+            '💣 Bomb = -30 pts',
+            '✦ Wild = 25 pts + combo boost'
+        ];
+        lines.forEach((line, i) => {
+            ctx.fillText(line, W/2, H * 0.42 + i * Math.min(W*0.03, 28));
+        });
+        
+        ctx.fillStyle = '#ffd700';
+        ctx.font = `bold ${Math.min(W*0.03, 22)}px sans-serif`;
+        const pulse = 0.5 + Math.sin(Date.now() * 0.004) * 0.5;
+        ctx.globalAlpha = pulse;
+        ctx.fillText('Press SPACE to Start', W/2, H * 0.85);
+        ctx.globalAlpha = 1;
+        
+        if (best > 0) {
+            ctx.fillStyle = '#ffd700';
+            ctx.font = `${Math.min(W*0.02, 16)}px sans-serif`;
+            ctx.fillText(`Best: ${best}`, W/2, H * 0.9);
+        }
+    }
+    
+    // Game Over
+    if (state === 'gameover') {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(0, 0, W, H);
+        
+        ctx.fillStyle = '#ff5252';
+        ctx.font = `bold ${Math.min(W*0.08, 56)}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W/2, H * 0.3);
+        
+        ctx.fillStyle = '#fff';
+        ctx.font = `${Math.min(W*0.035, 28)}px sans-serif`;
+        ctx.fillText(`Final Score: ${score}`, W/2, H * 0.42);
+        ctx.fillStyle = '#4fc3f7';
+        ctx.fillText(`Max Combo: x${maxCombo}`, W/2, H * 0.5);
+        
+        if (score >= best && score > 0) {
+            ctx.fillStyle = '#ffd700';
+            ctx.font = `bold ${Math.min(W*0.03, 24)}px sans-serif`;
+            ctx.fillText('★ NEW BEST! ★', W/2, H * 0.58);
+        }
+        
+        ctx.fillStyle = '#ccc';
+        ctx.font = `${Math.min(W*0.025, 18)}px sans-serif`;
+        const pulse = 0.5 + Math.sin(Date.now() * 0.004) * 0.5;
+        ctx.globalAlpha = pulse;
+        ctx.fillText('Press SPACE to Play Again', W/2, H * 0.7);
+        ctx.globalAlpha = 1;
+    }
+    
+    ctx.restore();
+}
+
+// Input
+let keys = {};
+window.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    initAudio();
+    
+    if (state === 'start' && e.code === 'Space') {
+        state = 'playing';
+        resetGame();
+        e.preventDefault();
+    } else if (state === 'gameover' && e.code === 'Space') {
+        state = 'playing';
+        resetGame();
+        e.preventDefault();
+    } else if (state === 'playing') {
+        if (e.code === 'ArrowUp' || e.code === 'KeyW') {
+            playerLane = Math.max(0, playerLane - 1);
+            e.preventDefault();
+        }
+        if (e.code === 'ArrowDown' || e.code === 'KeyS') {
+            playerLane = Math.min(LANES - 1, playerLane + 1);
+            e.preventDefault();
+        }
+        if (e.code === 'Space' || e.code === 'Enter') {
+            catchPulse = 1;
+            e.preventDefault();
+        }
+    }
+});
+
+window.addEventListener('keyup', (e) => {
+    keys[e.code] = false;
+});
+
+// Game Over condition: miss too many normal cards
+let missCount = 0;
+const originalUpdate = update;
+function gameLoop() {
+    const dt = Math.min(1/30, lastTime ? (now - lastTime) / 1000 : 0);
+    
+    if (state === 'playing') {
+        // Track misses for game over
+        const beforeCount = cards.length;
+        originalUpdate(dt);
+        // Check for game over: score-based challenge - game ends after enough points or time
+        // Actually let's make it endless with a "life" system
+    }
+    
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+// Let me restructure - I'll use a lives system
+let lives = 3;
+function resetGame2() {
+    score = 0; combo = 0; maxCombo = 0; speed = 3; difficulty = 1;
+    cards = []; particles = []; floatTexts = [];
+    playerLane = 1; catchPulse = 0; shakeTime = 0;
+    spawnTimer = 0; lives = 3;
+}
+
+// Override update to track lives
+const _origUpdate = update;
+function fullUpdate(dt) {
+    if (state !== 'playing') return;
+    
+    difficulty = 1 + Math.floor(score / 200);
+    speed = 3 + difficulty * 0.8;
+    if (speed > 12) speed = 12;
+    
+    spawnTimer += dt;
+    const spawnInterval = Math.max(0.6, 1.5 - difficulty * 0.1);
+    if (spawnTimer >= spawnInterval) {
+        spawnTimer = 0;
+        spawnCard();
+        if (difficulty > 4 && Math.random() < 0.3) spawnCard();
+    }
+    
+    const catchX = W * CATCH_X_RATIO;
+    
+    for (let i = cards.length - 1; i >= 0; i--) {
+        const c = cards[i];
+        c.x -= speed * dt * 60;
+        c.rot += c.rotSpeed;
+        
+        if (!c.caught && !c.missed) {
+            if (c.x < -getCardW()) {
+                c.missed = true;
+                if (c.type !== 'bomb') {
+                    combo = 0;
+                    lives--;
+                    sfxMiss();
+                    addFloatText(c.x + getCardW(), getLaneY(c.lane), 'MISS', '#ff5252');
+                    if (lives <= 0) {
+                        state = 'gameover';
+                        try { localStorage.setItem('cardStreamBest', JSON.stringify(Math.max(best, score))); } catch(e) {}
+                    }
+                }
+                cards.splice(i, 1);
+                continue;
+            }
+        }
+        
+        if (!c.caught && c.lane === playerLane) {
+            const dx = c.x - catchX;
+            if (Math.abs(dx) < getCardW() * 0.6) {
+                if (catchPulse > 0) {
+                    c.caught = true;
+                    catchPulse = 0;
+                    
+                    let pts = 0;
+                    let color = '#fff';
+                    let text = '';
+                    
+                    if (c.type === 'normal') {
+                        combo++;
+                        maxCombo = Math.max(maxCombo, combo);
+                        pts = 10 * (1 + Math.floor(combo / 5));
+                        text = '+' + pts;
+                        color = '#4fc3f7';
+                        sfxCatch();
+                        spawnParticles(c.x, getLaneY(c.lane), '#4fc3f7', 12);
+                    } else if (c.type === 'gold') {
+                        combo++;
+                        maxCombo = Math.max(maxCombo, combo);
+                        pts = 50;
+                        text = '+' + pts + '!';
+                        color = '#ffd700';
+                        sfxGold();
+                        spawnParticles(c.x, getLaneY(c.lane), '#ffd700', 20);
+                    } else if (c.type === 'bomb') {
+                        combo = 0;
+                        pts = -30;
+                        text = '-30';
+                        color = '#ff5252';
+                        sfxBomb();
+                        shakeTime = 0.3;
+                        shakeIntensity = 8;
+                        spawnParticles(c.x, getLaneY(c.lane), '#ff5252', 15);
+                    } else if (c.type === 'wild') {
+                        combo += 3;
+                        maxCombo = Math.max(maxCombo, combo);
+                        pts = 25;
+                        text = 'WILD +25';
+                        color = '#ce93d8';
+                        sfxWild();
+                        spawnParticles(c.x, getLaneY(c.lane), '#ce93d8', 25);
+                    }
+                    
+                    score += pts;
+                    if (score < 0) score = 0;
+                    addFloatText(c.x, getLaneY(c.lane) - 30, text, color);
+                    
+                    cards.splice(i, 1);
+                }
+            }
+        }
+    }
+    
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.3;
+        p.life -= dt * 2;
+        if (p.life <= 0) particles.splice(i, 1);
+    }
+    
+    for (let i = floatTexts.length - 1; i >= 0; i--) {
+        const f = floatTexts[i];
+        f.y -= dt * 40;
+        f.life -= dt * 1.5;
+        if (f.life <= 0) floatTexts.splice(i, 1);
+    }
+    
+    catchPulse = Math.max(0, catchPulse - dt * 4);
+    shakeTime = Math.max(0, shakeTime - dt);
+    
+    if (score >= best) {
+        try { localStorage.setItem('cardStreamBest', JSON.stringify(score)); } catch(e) {}
+        best = score;
+    }
+}
+
+// Redraw with lives
+function draw2() {
+    ctx.save();
+    
+    if (shakeTime > 0) {
+        const sx = (Math.random() - 0.5) * shakeIntensity;
+        const sy = (Math.random() - 0.5) * shakeIntensity;
+        ctx.translate(sx, sy);
+    }
+    
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, '#1a1a2e');
+    grad.addColorStop(1, '#16213e');
+    ctx.fillStyle = grad;
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+    
+    const laneH = H / LANES;
+    for (let i = 0; i <= LANES; i++) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, i * laneH);
+        ctx.lineTo(W, i * laneH);
+        ctx.stroke();
+    }
+    
+    // Lane labels
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'right';
+    for (let i = 0; i < LANES; i++) {
+        ctx.fillText(`Lane ${i+1}`, W - 15, getLaneY(i) + 4);
+    }
+    
+    // Catch zone
+    const catchX = W * CATCH_X_RATIO;
+    const cw = getCardW();
+    const ch = getCardH();
+    const pulseAlpha = 0.2 + catchPulse * 0.5;
+    
+    ctx.fillStyle = `rgba(79, 195, 247, ${pulseAlpha})`;
+    ctx.beginPath();
+    ctx.roundRect(catchX - cw/2 - 10, getLaneY(playerLane) - ch/2 - 10, cw + 20, ch + 20, 12);
+    ctx.fill();
+    
+    ctx.strokeStyle = `rgba(79, 195, 247, ${0.6 + catchPulse * 0.4})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.roundRect(catchX - cw/2 - 10, getLaneY(playerLane) - ch/2 - 10, cw + 20, ch + 20, 12);
+    ctx.stroke();
+    
+    // Cards
+    for (const c of cards) {
+        if (!c.caught) drawCard(c);
+    }
+    
+    // Particles
+    for (const p of particles) {
+        ctx.globalAlpha = Math.max(0, p.life);
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    
+    // Float texts
+    for (const f of floatTexts) {
+        ctx.globalAlpha = Math.max(0, f.life);
+        ctx.fillStyle = f.color;
+        ctx.font = `bold ${20}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText(f.text, f.x, f.y);
+    }
+    ctx.globalAlpha = 1;
+    
+    // HUD
+    if (state === 'playing') {
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.beginPath();
+        ctx.roundRect(10, 10, 220, 105, 10);
+        ctx.fill();
+        
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 22px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText(`Score: ${score}`, 20, 38);
+        ctx.font = '15px sans-serif';
+        ctx.fillStyle = '#4fc3f7';
+        ctx.fillText(`Combo: x${combo}`, 20, 62);
+        ctx.fillStyle = '#ffd700';
+        ctx.fillText(`Best: ${best}`, 20, 82);
+        
+        // Lives as hearts
+        ctx.font = '18px sans-serif';
+        let heartStr = '';
+        for (let i = 0; i < 3; i++) {
+            heartStr += i < lives ? '❤️' : '🖤';
+        }
+        ctx.fillText(heartStr, 20, 105);
+        
+        // Speed
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.beginPath();
+        ctx.roundRect(W - 140, 10, 130, 35, 10);
+        ctx.fill();
+        ctx.fillStyle = '#ff8a65';
+        ctx.font = '14px sans-serif';
+        ctx.textAlign = 'right';
+        ctx.fillText(`Speed: ${speed.toFixed(1)}x`, W - 20, 33);
+    }
+    
+    // Start screen
+    if (state === 'start') {
+        ctx.fillStyle = 'rgba(0,0,0,0.75)';
+        ctx.fillRect(0, 0, W, H);
+        
+        const titleSize = Math.min(W * 0.1, 64);
+        ctx.fillStyle = '#fff';
+        ctx.font = `bold ${titleSize}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText('CARD STREAM', W/2, H * 0.22);
+        
+        const subSize = Math.min(W * 0.03, 20);
+        ctx.font = `${subSize}px sans-serif`;
+        ctx.fillStyle = '#4fc3f7';
+        ctx.fillText('A Side-Scrolling Card Game', W/2, H * 0.3);
+        
+        const lineSize = Math.min(W * 0.025, 18);
+        const lineH = subSize + 12;
+        const startLineY = H * 0.38;
+        ctx.fillStyle = '#ccc';
+        ctx.font = `${lineSize}px sans-serif`;
+        const lines = [
+            '↑ / ↓ or W/S — Move between lanes',
+            'SPACE or Enter — Catch card',
+            '',
+            'Catch cards in the glowing zone!',
+            '',
+            'Normal (♠♥♦♣) = 10 pts × combo',
+            'Gold ★ = 50 pts',
+            'Bomb 💣 = -30 pts (avoid!)',
+            'Wild ✦ = 25 pts + combo boost',
+            '',
+            'Miss a card and lose a life!',
+            'Lose all 3 lives = Game Over'
+        ];
+        lines.forEach((line, i) => {
+            ctx.fillText(line, W/2, startLineY + i * lineH);
+        });
+        
+        const pulse = 0.5 + Math.sin(Date.now() * 0.004) * 0.5;
+        ctx.fillStyle = '#ffd700';
+        ctx.font = `bold ${Math.min(W*0.03, 22)}px sans-serif`;
+        ctx.globalAlpha = pulse;
+        ctx.fillText('Press SPACE to Start', W/2, H * 0.88);
+        ctx.globalAlpha = 1;
+        
+        if (best > 0) {
+            ctx.fillStyle = '#ffd700';
+            ctx.font = `${Math.min(W*0.02, 16)}px sans-serif`;
+            ctx.fillText(`Best: ${best}`, W/2, H * 0.94);
+        }
+    }
+    
+    // Game Over
+    if (state === 'gameover') {
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.fillRect(0, 0, W, H);
+        
+        ctx.fillStyle = '#ff5252';
+        ctx.font = `bold ${Math.min(W*0.08, 56)}px sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.fillText('GAME OVER', W/2, H * 0.3);
+        
+        ctx.fillStyle = '#fff';
+        ctx.font = `${Math.min(W*0.035, 28)}px sans-serif`;
+        ctx.fillText(`Final Score: ${score}`, W/2, H * 0.42);
+        ctx.fillStyle = '#4fc3f7';
+        ctx.fillText(`Max Combo: x${maxCombo}`, W/2, H * 0.5);
+        
+        if (score >= best && score > 0) {
+            ctx.fillStyle = '#ffd700';
+            ctx.font = `bold ${Math.min(W*0.03, 24)}px sans-serif`;
+            ctx.fillText('★ NEW BEST! ★', W/2, H * 0.58);
+        }
+        
+        const pulse = 0.5 + Math.sin(Date.now() * 0.004) * 0.5;
+        ctx.fillStyle = '#ccc';
+        ctx.font = `${Math.min(W*0.025, 18)}px sans-serif`;
+        ctx.globalAlpha = pulse;
+        ctx.fillText('Press SPACE to Play Again', W/2, H * 0.72);
+        ctx.globalAlpha = 1;
+    }
+    
+    ctx.restore();
+}
+
+// Main loop
+let lastTime = 0;
+function gameLoop(timestamp) {
+    const now = timestamp || performance.now();
+    const dt = lastTime ? Math.min(0.05, (now - lastTime) / 1000) : 0;
+    lastTime = now;
+    
+    if (state === 'playing') {
+        fullUpdate(dt);
+    }
+    
+    draw2();
+    requestAnimationFrame(gameLoop);
+}
+
+// Override reset to include lives
+const _resetGame = resetGame;
+function newReset() {
+    score = 0; combo = 0; maxCombo = 0; speed = 3; difficulty = 1;
+    cards = []; particles = []; floatTexts = [];
+    playerLane = 1; catchPulse = 0; shakeTime = 0;
+    spawnTimer = 0; lives = 3;
+}
+
+// Patch the start/gameover handlers
+window.removeEventListener('keydown', () => {});
+const _origKeyDown = window.onkeydown;
+
+// We need to re-register. Let's just use a flag approach:
+let inputHandled = false;
+window.addEventListener('keydown', (e) => {
+    if (inputHandled) return;
+    initAudio();
+    
+    if (state === 'start' && e.code === 'Space') {
+        state = 'playing';
+        newReset();
+        e.preventDefault();
+    } else if (state === 'gameover' && e.code === 'Space') {
+        state = 'playing';
+        newReset();
+        e.preventDefault();
+    }
+}, true);
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
