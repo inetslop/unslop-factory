@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Top-Down Pinball</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+const TABLE_W = 400, TABLE_H = 620;
+
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    const sx = W / (TABLE_W + 80);
+    const sy = H / (TABLE_H + 60);
+    scale = Math.min(sx, sy);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+function playSound(freq, dur, type, vol) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol || 0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + dur);
+}
+
+// Game state
+let gameState = 'START'; // START, PLAYING, BALL_LOST, GAME_OVER
+let score = 0;
+let balls = 3;
+let highScore = 0;
+try { highScore = parseInt(localStorage.getItem('pinball_high') || '0'); } catch(e) {}
+let ballLostTimer = 0;
+let comboCount = 0;
+
+// Ball
+const BALL_R = 8;
+let ball = { x: 200, y: 100, vx: 0, vy: 0 };
+
+// Flippers
+const flipperL = { px: 130, py: 570, len: 85, restAngle: Math.PI * 0.4, activeAngle: -Math.PI * 0.25, angle: 0, angVel: 0 };
+const flipperR = { px: 270, py: 570, len: 85, restAngle: Math.PI - Math.PI * 0.4, activeAngle: Math.PI + Math.PI * 0.25, angle: 0, angVel: 0 };
+let leftPressed = false, rightPressed = false;
+
+// Bumpers
+const bumpers = [
+    { x: 130, y: 180, r: 30 },
+    { x: 270, y: 180, r: 30 },
+    { x: 200, y: 260, r: 30 }
+];
+
+// Walls (line segments)
+const walls = [
+    // Left wall
+    { x1: 10, y1: 40, x2: 10, y2: 570 },
+    // Right wall
+    { x1: 390, y1: 40, x2: 390, y2: 570 },
+    // Top-left angled
+    { x1: 10, y1: 40, x2: 80, y2: 10 },
+    // Top-right angled
+    { x1: 320, y1: 10, x2: 390, y2: 40 },
+    // Top flat
+    { x1: 80, y1: 10, x2: 320, y2: 10 },
+    // Middle angled walls (create channels)
+    { x1: 10, y1: 350, x2: 90, y2: 420 },
+    { x1: 390, y1: 350, x2: 310, y2: 420 },
+    // Sling areas (angled walls near flippers)
+    { x1: 10, y1: 570, x2: 60, y2: 570 },
+    { x1: 340, y1: 570, x2: 390, y2: 570 },
+];
+
+// Rollover lanes (for bonus)
+const rollovers = [
+    { x: 60, y: 480, r: 12, lit: false },
+    { x: 200, y: 460, r: 12, lit: false },
+    { x: 340, y: 480, r: 12, lit: false }
+];
+
+function resetBall() {
+    ball.x = 200;
+    ball.y = 50;
+    ball.vx = (Math.random() - 0.5) * 3;
+    ball.vy = 2;
+}
+
+function startGame() {
+    score = 0;
+    balls = 3;
+    comboCount = 0;
+    rollovers.forEach(r => r.lit = false);
+    resetBall();
+    gameState = 'PLAYING';
+}
+
+function loseBall() {
+    balls--;
+    comboCount = 0;
+    if (balls <= 0) {
+        gameState = 'GAME_OVER';
+        if (score > highScore) {
+            highScore = score;
+            try { localStorage.setItem('pinball_high', highScore); } catch(e) {}
+        }
+    } else {
+        gameState = 'BALL_LOST';
+        ballLostTimer = 60;
+    }
+}
+
+// Input
+window.addEventListener('keydown', e => {
+    initAudio();
+    if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') leftPressed = true;
+    if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') rightPressed = true;
+    if (gameState === 'START' && (e.key === 'Enter' || e.key === ' ')) startGame();
+    if (gameState === 'GAME_OVER' && (e.key === 'Enter' || e.key === ' ')) { gameState = 'START'; }
+});
+window.addEventListener('keyup', e => {
+    if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') leftPressed = false;
+    if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') rightPressed = false;
+});
+
+// Mouse/touch for flippers
+canvas.addEventListener('mousedown', e => {
+    initAudio();
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    if (mx < W / 2) leftPressed = true; else rightPressed = true;
+});
+window.addEventListener('mouseup', () => { leftPressed = false; rightPressed = false; });
+
+// Physics
+const GRAVITY = 0.15;
+const FRICTION = 0.998;
+const RESTITUTION = 0.75;
+const BUMPER_KICK = 6;
+
+function distToSegment(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const len2 = dx * dx + dy * dy;
+    let t = ((px - x1) * dx + (py - y1) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    const cx = x1 + t * dx, cy = y1 + t * dy;
+    return { x: cx, y: cy, dist: Math.hypot(px - cx, py - cy) };
+}
+
+function updatePhysics() {
+    if (gameState !== 'PLAYING') return;
+
+    // Gravity
+    ball.vy += GRAVITY;
+    ball.vx *= FRICTION;
+    ball.vy *= FRICTION;
+
+    // Speed cap
+    const spd = Math.hypot(ball.vx, ball.vy);
+    if (spd > 15) { ball.vx *= 15 / spd; ball.vy *= 15 / spd; }
+
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+
+    // Wall collisions
+    for (const w of walls) {
+        const hit = distToSegment(ball.x, ball.y, w.x1, w.y1, w.x2, w.y2);
+        if (hit.dist < BALL_R) {
+            const nx = (ball.x - hit.x) / hit.dist;
+            const ny = (ball.y - hit.y) / hit.dist;
+            ball.x += nx * (BALL_R - hit.dist);
+            ball.y += ny * (BALL_R - hit.dist);
+            const dot = ball.vx * nx + ball.vy * ny;
+            if (dot < 0) {
+                ball.vx -= 2 * dot * nx * RESTITUTION;
+                ball.vy -= 2 * dot * ny * RESTITUTION;
+                playSound(200, 0.1, 'triangle', 0.15);
+            }
+        }
+    }
+
+    // Bumper collisions
+    for (const b of bumpers) {
+        const dx = ball.x - b.x, dy = ball.y - b.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist < BALL_R + b.r) {
+            const nx = dx / dist, ny = dy / dist;
+            ball.x = b.x + nx * (BALL_R + b.r);
+            ball.y = b.y + ny * (BALL_R + b.r);
+            ball.vx += nx * BUMPER_KICK;
+            ball.vy += ny * BUMPER_KICK;
+            score += 100;
+            comboCount++;
+            if (comboCount > 3) { rollovers.forEach(r => r.lit = true); }
+            playSound(400 + Math.random() * 200, 0.15, 'square', 0.25);
+        }
+    }
+
+    // Rollover sensors
+    for (const r of rollovers) {
+        const dist = Math.hypot(ball.x - r.x, ball.y - r.y);
+        if (dist < BALL_R + r.r && !r.lit) {
+            r.lit = true;
+            score += 50;
+            playSound(600, 0.2, 'sine', 0.3);
+            if (rollovers.every(rr => rr.lit)) {
+                score += 500;
+                rollovers.forEach(rr => rr.lit = false);
+                comboCount = 0;
+                playSound(800, 0.4, 'sine', 0.4);
+            }
+        }
+    }
+
+    // Flipper collision
+    collideFlipper(flipperL);
+    collideFlipper(flipperR);
+
+    // Drain check
+    if (ball.y > TABLE_H + 30) {
+        loseBall();
+        playSound(150, 0.5, 'sawtooth', 0.2);
+    }
+}
+
+function collideFlipper(f) {
+    const ex = f.px + Math.cos(f.angle) * f.len;
+    const ey = f.py + Math.sin(f.angle) * f.len;
+    const hit = distToSegment(ball.x, ball.y, f.px, f.py, ex, ey);
+    if (hit.dist < BALL_R + 5) {
+        const nx = (ball.x - hit.x) / (hit.dist || 1);
+        const ny = (ball.y - hit.y) / (hit.dist || 1);
+        ball.x += nx * (BALL_R + 5 - hit.dist);
+        ball.y += ny * (BALL_R + 5 - hit.dist);
+        const dot = ball.vx * nx + ball.vy * ny;
+        if (dot < 0) {
+            ball.vx -= 2 * dot * nx * RESTITUTION;
+            ball.vy -= 2 * dot * ny * RESTITUTION;
+        }
+        // Add kick from flipper motion
+        const t = hit.dist > 0 ? Math.hypot(ball.x - f.px, ball.y - f.py) / f.len : 0;
+        const kickSpeed = Math.abs(f.angVel) * (BALL_R + 5);
+        if (Math.abs(f.angVel) > 0.01) {
+            const perpX = -Math.sin(f.angle);
+            const perpY = Math.cos(f.angle);
+            ball.vx += perpX * f.angVel * t * 8;
+            ball.vy += perpY * f.angVel * t * 8;
+        }
+    }
+}
+
+function updateFlippers() {
+    // Left flipper
+    const targetL = leftPressed ? flipperL.activeAngle : flipperL.restAngle;
+    const diffL = targetL - flipperL.angle;
+    flipperL.angVel = diffL * 0.35;
+    flipperL.angle += flipperL.angVel;
+
+    // Right flipper
+    const targetR = rightPressed ? flipperR.activeAngle : flipperR.restAngle;
+    const diffR = targetR - flipperR.angle;
+    flipperR.angVel = diffR * 0.35;
+    flipperR.angle += flipperR.angVel;
+}
+
+// Rendering
+function toScreen(x, y) {
+    return { x: (x - TABLE_W / 2) * scale + W / 2, y: (y - TABLE_H / 2) * scale + H / 2 };
+}
+
+function drawTable() {
+    // Background
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+
+    // Table surface
+    const tl = toScreen(0, 0);
+    ctx.save();
+    ctx.translate(tl.x, tl.y);
+    ctx.scale(scale, scale);
+
+    // Table body
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(0, 0, TABLE_W, TABLE_H);
+
+    // Surface glow
+    const grad = ctx.createRadialGradient(TABLE_W/2, TABLE_H/3, 50, TABLE_W/2, TABLE_H/3, 300);
+    grad.addColorStop(0, 'rgba(52, 152, 219, 0.08)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, TABLE_W, TABLE_H);
+
+    // Walls
+    ctx.strokeStyle = '#e94560';
+    ctx.lineWidth = 5;
+    ctx.lineCap = 'round';
+    for (const w of walls) {
+        ctx.beginPath();
+        ctx.moveTo(w.x1, w.y1);
+        ctx.lineTo(w.x2, w.y2);
+        ctx.stroke();
+    }
+
+    // Bumpers
+    for (const b of bumpers) {
+        const g = ctx.createRadialGradient(b.x, b.y, 0, b.x, b.y, b.r);
+        g.addColorStop(0, '#f39c12');
+        g.addColorStop(0.7, '#e67e22');
+        g.addColorStop(1, '#d35400');
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        // Inner circle
+        ctx.fillStyle = '#f1c40f';
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.r * 0.5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    // Rollover lanes
+    for (const r of rollovers) {
+        ctx.fillStyle = r.lit ? '#2ecc71' : '#34495e';
+        ctx.beginPath();
+        ctx.arc(r.x, r.y, r.r, 0, Math.PI * 2);
+        ctx.fill();
+        if (r.lit) {
+            ctx.shadowColor = '#2ecc71';
+            ctx.shadowBlur = 10;
+            ctx.fill();
+            ctx.shadowBlur = 0;
+        }
+    }
+
+    // Flippers
+    drawFlipper(flipperL);
+    drawFlipper(flipperR);
+
+    // Ball
+    if (gameState === 'PLAYING' || gameState === 'BALL_LOST') {
+        const bg = ctx.createRadialGradient(ball.x - 2, ball.y - 2, 1, ball.x, ball.y, BALL_R);
+        bg.addColorStop(0, '#fff');
+        bg.addColorStop(0.5, '#ddd');
+        bg.addColorStop(1, '#999');
+        ctx.fillStyle = bg;
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, BALL_R, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#666';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+    }
+
+    ctx.restore();
+}
+
+function drawFlipper(f) {
+    const ex = f.px + Math.cos(f.angle) * f.len;
+    const ey = f.py + Math.sin(f.angle) * f.len;
+    ctx.strokeStyle = '#e94560';
+    ctx.lineWidth = 12;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(f.px, f.py);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+    // Pivot cap
+    ctx.fillStyle = '#c0392b';
+    ctx.beginPath();
+    ctx.arc(f.px, f.py, 8, 0, Math.PI * 2);
+    ctx.fill();
+}
+
+function drawHUD() {
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.max(14, scale * 16)}px monospace`;
+    ctx.textAlign = 'left';
+    const tl = toScreen(0, -20);
+    ctx.fillText(`SCORE: ${score}`, tl.x + 10, tl.y + 30);
+    ctx.textAlign = 'right';
+    ctx.fillText(`BALLS: ${balls}`, toScreen(TABLE_W, -20).x - 10, tl.y + 30);
+
+    if (comboCount > 0) {
+        ctx.fillStyle = '#f39c12';
+        ctx.textAlign = 'center';
+        ctx.fillText(`COMBO x${comboCount}`, toScreen(TABLE_W/2, 350).x, toScreen(TABLE_W/2, 350).y);
+    }
+}
+
+function drawStartScreen() {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+
+    const cx = W / 2, cy = H / 2;
+    ctx.textAlign = 'center';
+
+    ctx.fillStyle = '#e94560';
+    ctx.font = `bold ${Math.min(W * 0.08, 48)}px monospace`;
+    ctx.fillText('TOP-DOWN PINBALL', cx, cy - 80);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.min(W * 0.035, 20)}px monospace`;
+    ctx.fillText('\u2190 / A : Left Flipper', cx, cy - 20);
+    ctx.fillText('\u2192 / D : Right Flipper', cx, cy + 15);
+    ctx.fillText('', cx, cy + 50);
+    ctx.fillStyle = '#f39c12';
+    ctx.fillText('Hit bumpers for points!', cx, cy + 60);
+    ctx.fillText('Light all rollovers for bonus!', cx, cy + 90);
+
+    ctx.fillStyle = '#2ecc71';
+    ctx.font = `${Math.min(W * 0.03, 18)}px monospace`;
+    ctx.fillText(`High Score: ${highScore}`, cx, cy + 140);
+
+    ctx.fillStyle = `rgba(255,255,255,${0.5 + Math.sin(Date.now() / 500) * 0.5})`;
+    ctx.font = `bold ${Math.min(W * 0.04, 24)}px monospace`;
+    ctx.fillText('Press ENTER or SPACE to Start', cx, cy + 200);
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0, 0, W, H);
+
+    const cx = W / 2, cy = H / 2;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#e94560';
+    ctx.font = `bold ${Math.min(W * 0.07, 42)}px monospace`;
+    ctx.fillText('GAME OVER', cx, cy - 40);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.min(W * 0.04, 24)}px monospace`;
+    ctx.fillText(`Final Score: ${score}`, cx, cy + 10);
+    ctx.fillStyle = '#f39c12';
+    ctx.fillText(`High Score: ${highScore}`, cx, cy + 50);
+
+    ctx.fillStyle = `rgba(255,255,255,${0.5 + Math.sin(Date.now() / 500) * 0.5})`;
+    ctx.font = `${Math.min(W * 0.03, 18)}px monospace`;
+    ctx.fillText('Press ENTER to return to menu', cx, cy + 110);
+}
+
+function drawBallLost() {
+    const cx = W / 2;
+    const cy = H / 2;
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#e94560';
+    ctx.font = `bold ${Math.min(W * 0.05, 32)}px monospace`;
+    ctx.fillText('BALL LOST!', cx, cy);
+}
+
+// Main loop
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = Math.min((time - lastTime) / 16.67, 3);
+    lastTime = time;
+
+    if (gameState === 'PLAYING') {
+        updateFlippers();
+        for (let i = 0; i < Math.ceil(dt); i++) {
+            updatePhysics();
+        }
+    } else if (gameState === 'BALL_LOST') {
+        ballLostTimer--;
+        if (ballLostTimer <= 0) {
+            resetBall();
+            gameState = 'PLAYING';
+        }
+    }
+
+    if (gameState === 'START') {
+        drawStartScreen();
+    } else if (gameState === 'GAME_OVER') {
+        drawTable();
+        drawHUD();
+        drawGameOver();
+    } else {
+        drawTable();
+        drawHUD();
+        if (gameState === 'BALL_LOST') drawBallLost();
+    }
+
+    requestAnimationFrame(gameLoop);
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
