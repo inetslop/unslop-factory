@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GLOW: The Light Pusher</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0e1a; }
+canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSound(type) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    if (type === 'move') {
+        osc.type = 'sine'; osc.frequency.value = 220;
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.1);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+    } else if (type === 'push') {
+        osc.type = 'triangle'; osc.frequency.value = 330;
+        gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.15);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.15);
+    } else if (type === 'place') {
+        osc.type = 'sine'; osc.frequency.value = 440;
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+    } else if (type === 'win') {
+        const notes = [523, 659, 784];
+        notes.forEach((f, i) => {
+            const o = audioCtx.createOscillator();
+            const g = audioCtx.createGain();
+            o.connect(g); g.connect(audioCtx.destination);
+            o.type = 'sine'; o.frequency.value = f;
+            g.gain.setValueAtTime(0.15, audioCtx.currentTime + i * 0.12);
+            g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + i * 0.12 + 0.3);
+            o.start(audioCtx.currentTime + i * 0.12);
+            o.stop(audioCtx.currentTime + i * 0.12 + 0.3);
+        });
+    }
+}
+
+// Game State
+const STATE = { MENU: 0, PLAYING: 1, LEVEL_COMPLETE: 2, GAME_COMPLETE: 3 };
+let gameState = STATE.MENU;
+let currentLevel = 0;
+let totalMoves = 0;
+let bestScore = null;
+try { bestScore = localStorage.getItem('glow_best') ? parseInt(localStorage.getItem('glow_best')) : null; } catch(e) {}
+
+// Particles
+let particles = [];
+
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 1 + Math.random() * 3;
+        particles.push({ x, y, vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed, life: 1, color });
+    }
+}
+
+// Levels (0=floor, #=wall, P=player, B=box, T=target, S=box on target)
+const levels = [
+    ["#####",
+     "#P.B#",
+     "#..T#",
+     "#####"],
+    ["######",
+     "#..#.#",
+     "#.B#T#",
+     "#P..##",
+     "######"],
+    ["#######",
+     "#...# #",
+     "#.B.# #",
+     "#.P.T#",
+     "#..###",
+     "#######"],
+    ["########",
+     "#......#",
+     "#.T.B.T#",
+     "#..P..##",
+     "#.B....#",
+     "#...T..#",
+     "########"],
+    ["#########",
+     "#...#...#",
+     "#.B.#.T.#",
+     "#.P..B..#",
+     "#.T..#.T#",
+     "#.......#",
+     "#########"],
+    ["##########",
+     "#........#",
+     "#.T....T.#",
+     "#..BB.BB.#",
+     "#..P.....#",
+     "#...T.T..#",
+     "#......###",
+     "##########"],
+    ["###########",
+     "#........ #",
+     "#.T..B..T.#",
+     "#..#..#...#",
+     "#.B.P.B..#",
+     "#..#..#...#",
+     "#.T.....T.#",
+     "#........ #",
+     "###########"],
+    ["############",
+     "#........##",
+     "#.T..BB.T.#",
+     "#..B..P.B.#",
+     "#.T..BB.T.#",
+     "#........##",
+     "############"],
+    ["#############",
+     "#..........#",
+     "#.T...B..T.#",
+     "#...#...#..#",
+     "#.B..P..B..#",
+     "#...#...#..#",
+     "#.T.......T.#",
+     "#..........#",
+     "#############"],
+    ["##############",
+     "#..........####",
+     "#.T..BB.BB..T.#",
+     "#..B...P...B..#",
+     "#.BB.....BB.T.#",
+     "#..B...P...B..#",
+     "#.T..BB.BB..T.#",
+     "#..........####",
+     "##############"]
+];
+
+let grid, playerX, playerY, boxes, targets, walls, cols, rows;
+let animX, animY, animT;
+let levelCompleteTimer = 0;
+
+function loadLevel(idx) {
+    const lvl = levels[idx];
+    rows = lvl.length;
+    cols = Math.max(...lvl.map(r => r.length));
+    grid = [];
+    boxes = [];
+    targets = [];
+    walls = [];
+    playerX = 0; playerY = 0;
+    
+    for (let r = 0; r < rows; r++) {
+        grid[r] = [];
+        for (let c = 0; c < cols; c++) {
+            const ch = lvl[r][c] || '#';
+            let cell = 0; // floor
+            if (ch === '#' || ch === ' ') { cell = -1; walls.push({x:c,y:r}); }
+            if (ch === 'P') { playerX = c; playerY = r; }
+            if (ch === 'B') { boxes.push({x:c, y:r}); }
+            if (ch === 'T') { targets.push({x:c, y:r}); }
+            grid[r][c] = cell;
+        }
+    }
+    animX = playerX; animY = playerY; animT = 1;
+    totalMoves = 0;
+}
+
+function cellAt(x, y) {
+    if (x < 0 || x >= cols || y < 0 || y >= rows) return -1;
+    // Check walls
+    for (const w of walls) if (w.x === x && w.y === y) return -1;
+    return 0;
+}
+
+function isWall(x, y) {
+    return cellAt(x, y) === -1;
+}
+
+function boxAt(x, y) {
+    return boxes.find(b => b.x === x && b.y === y);
+}
+
+function allPlaced() {
+    for (const t of targets) {
+        if (!boxes.some(b => b.x === t.x && b.y === t.y)) return false;
+    }
+    return true;
+}
+
+function tryMove(dx, dy) {
+    if (gameState !== STATE.PLAYING || animT < 1) return;
+    initAudio();
+    
+    const nx = playerX + dx;
+    const ny = playerY + dy;
+    
+    if (isWall(nx, ny)) return;
+    
+    const box = boxAt(nx, ny);
+    if (box) {
+        const bx = nx + dx;
+        const by = ny + dy;
+        if (isWall(bx, by) || boxAt(bx, by)) return;
+        box.x = bx; box.y = by;
+        playSound('push');
+        // Check if placed on target
+        if (targets.some(t => t.x === bx && t.y === by)) {
+            playSound('place');
+            spawnParticles(getCellCenter(bx, by).x, getCellCenter(bx, by).y, '#4ff', 12);
+        }
+    } else {
+        playSound('move');
+    }
+    
+    playerX = nx; playerY = ny;
+    animT = 0;
+    totalMoves++;
+    
+    if (allPlaced()) {
+        gameState = STATE.LEVEL_COMPLETE;
+        levelCompleteTimer = 0;
+        playSound('win');
+        for (const t of targets) {
+            spawnParticles(getCellCenter(t.x, t.y).x, getCellCenter(t.y, t.y), '#ff0', 8);
+        }
+    }
+}
+
+function getCellCenter(x, y) {
+    const cs = getCellSize();
+    return { x: offsetX() + (x + 0.5) * cs, y: offsetY() + (y + 0.5) * cs };
+}
+
+function getCellSize() {
+    const maxC = Math.max(cols, rows);
+    return Math.min((W - 40) / cols, (H - 120) / rows, 70);
+}
+
+function offsetX() { return (W - cols * getCellSize()) / 2; }
+function offsetY() { return (H - rows * getCellSize()) / 2 + 30; }
+
+// Input
+let keysDown = {};
+window.addEventListener('keydown', e => {
+    if (keysDown[e.key]) return;
+    keysDown[e.key] = true;
+    
+    if (gameState === STATE.MENU) {
+        if (e.key === ' ' || e.key === 'Enter') {
+            initAudio();
+            gameState = STATE.PLAYING;
+            currentLevel = 0;
+            loadLevel(0);
+        }
+    } else if (gameState === STATE.PLAYING) {
+        if (e.key === 'ArrowUp' || e.key === 'w') tryMove(0, -1);
+        else if (e.key === 'ArrowDown' || e.key === 's') tryMove(0, 1);
+        else if (e.key === 'ArrowLeft' || e.key === 'a') tryMove(-1, 0);
+        else if (e.key === 'ArrowRight' || e.key === 'd') tryMove(1, 0);
+        else if (e.key === 'r' || e.key === 'R') { loadLevel(currentLevel); }
+    } else if (gameState === STATE.LEVEL_COMPLETE) {
+        if (e.key === ' ' || e.key === 'Enter') {
+            currentLevel++;
+            if (currentLevel >= levels.length) {
+                gameState = STATE.GAME_COMPLETE;
+                try { localStorage.setItem('glow_best', totalMoves); } catch(e2) {}
+            } else {
+                loadLevel(currentLevel);
+                gameState = STATE.PLAYING;
+            }
+        }
+    } else if (gameState === STATE.GAME_COMPLETE) {
+        if (e.key === ' ' || e.key === 'Enter') {
+            gameState = STATE.MENU;
+        }
+    }
+});
+window.addEventListener('keyup', e => { keysDown[e.key] = false; });
+
+// Touch / swipe
+let touchStartX, touchStartY;
+canvas.addEventListener('touchstart', e => {
+    const t = e.touches[0];
+    touchStartX = t.clientX; touchStartY = t.clientY;
+});
+canvas.addEventListener('touchend', e => {
+    if (gameState === STATE.MENU) {
+        initAudio();
+        gameState = STATE.PLAYING;
+        currentLevel = 0;
+        loadLevel(0);
+        return;
+    }
+    if (gameState === STATE.LEVEL_COMPLETE) {
+        currentLevel++;
+        if (currentLevel >= levels.length) {
+            gameState = STATE.GAME_COMPLETE;
+            try { localStorage.setItem('glow_best', totalMoves); } catch(e2) {}
+        } else { loadLevel(currentLevel); gameState = STATE.PLAYING; }
+        return;
+    }
+    if (gameState === STATE.GAME_COMPLETE) { gameState = STATE.MENU; return; }
+    
+    const t = e.changedTouches[0];
+    const dx = t.clientX - touchStartX;
+    const dy = t.clientY - touchStartY;
+    if (Math.abs(dx) > Math.abs(dy)) {
+        if (Math.abs(dx) > 20) tryMove(dx > 0 ? 1 : -1, 0);
+    } else {
+        if (Math.abs(dy) > 20) tryMove(0, dy > 0 ? 1 : -1);
+    }
+});
+
+// Rendering
+let time = 0;
+function draw() {
+    ctx.fillStyle = '#0a0e1a';
+    ctx.fillRect(0, 0, W, H);
+    
+    if (gameState === STATE.MENU) drawMenu();
+    else if (gameState === STATE.PLAYING || gameState === STATE.LEVEL_COMPLETE) drawGame();
+    else if (gameState === STATE.GAME_COMPLETE) drawComplete();
+    
+    // Particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.x += p.vx; p.y += p.vy;
+        p.life -= 0.02;
+        if (p.life <= 0) { particles.splice(i, 1); continue; }
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 3 * p.life, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+}
+
+function drawMenu() {
+    const cx = W / 2, cy = H / 2;
+    
+    // Title glow
+    const glow = 0.5 + 0.5 * Math.sin(time * 2);
+    ctx.shadowColor = '#0ff';
+    ctx.shadowBlur = 20 + glow * 15;
+    ctx.fillStyle = '#4ff';
+    ctx.font = `bold ${Math.min(60, W/8)}px monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText('GLOW', cx, cy - 80);
+    ctx.shadowBlur = 0;
+    
+    ctx.fillStyle = '#aac';
+    ctx.font = `${Math.min(18, W/25)}px monospace`;
+    ctx.fillText('The Light Pusher', cx, cy - 45);
+    
+    ctx.fillStyle = '#789';
+    ctx.font = `${Math.min(16, W/30)}px monospace`;
+    const lines = [
+        'Guide the light orbs onto glowing pedestals.',
+        '',
+        'Controls: Arrow Keys / WASD to move',
+        'Swipe on mobile',
+        'R = Restart level',
+        'Space / Enter = Confirm',
+        '',
+        'Push all orbs to their targets to clear each level.'
+    ];
+    lines.forEach((l, i) => ctx.fillText(l, cx, cy + 10 + i * 24));
+    
+    ctx.fillStyle = `rgba(79,255,255,${0.5 + glow * 0.5})`;
+    ctx.font = `${Math.min(20, W/20)}px monospace`;
+    ctx.fillText('Press SPACE to Start', cx, cy + 10 + lines.length * 24 + 20);
+    
+    if (bestScore !== null) {
+        ctx.fillStyle = '#fa0';
+        ctx.font = `${Math.min(14, W/35)}px monospace`;
+        ctx.fillText(`Best: ${bestScore} moves`, cx, H - 30);
+    }
+}
+
+function drawGame() {
+    const cs = getCellSize();
+    const ox = offsetX(), oy = offsetY();
+    
+    // Grid floor
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            if (isWall(c, r)) continue;
+            const x = ox + c * cs, y = oy + r * cs;
+            ctx.fillStyle = '#141828';
+            ctx.fillRect(x, y, cs, cs);
+            ctx.strokeStyle = '#1e2540';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x, y, cs, cs);
+        }
+    }
+    
+    // Walls
+    for (const w of walls) {
+        const x = ox + w.x * cs, y = oy + w.y * cs;
+        ctx.fillStyle = '#2a3050';
+        ctx.fillRect(x, y, cs, cs);
+        ctx.strokeStyle = '#3a4070';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x + 2, y + 2, cs - 4, cs - 4);
+    }
+    
+    // Targets
+    for (const t of targets) {
+        const x = ox + t.x * cs + cs/2, y = oy + t.y * cs + cs/2;
+        const pulse = 0.3 + 0.2 * Math.sin(time * 3);
+        ctx.fillStyle = `rgba(255,180,50,${pulse})`;
+        ctx.beginPath();
+        ctx.arc(x, y, cs * 0.3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = `rgba(255,180,50,${pulse + 0.2})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(x, y, cs * 0.35, 0, Math.PI * 2);
+        ctx.stroke();
+    }
+    
+    // Boxes (orbs)
+    for (const b of boxes) {
+        const bx = ox + b.x * cs + cs/2, by = oy + b.y * cs + cs/2;
+        const onTarget = targets.some(t => t.x === b.x && t.y === b.y);
+        const color = onTarget ? '#ff0' : '#4ff';
+        const glow = onTarget ? 15 : 8 + 3 * Math.sin(time * 2 + b.x * 0.7);
+        
+        ctx.shadowColor = color;
+        ctx.shadowBlur = glow;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(bx, by, cs * 0.32, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        
+        // Inner highlight
+        ctx.fillStyle = 'rgba(255,255,255,0.4)';
+        ctx.beginPath();
+        ctx.arc(bx - cs*0.08, by - cs*0.08, cs * 0.1, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    
+    // Player (animated)
+    let px, py;
+    if (animT < 1) {
+        animT += 0.15;
+        if (animT > 1) animT = 1;
+        const ease = 1 - Math.pow(1 - animT, 3);
+        px = ox + (playerX + (animX - playerX) * (1 - ease)) * cs + cs/2;
+        py = oy + (playerY + (animY - playerY) * (1 - ease)) * cs + cs/2;
+    } else {
+        px = ox + playerX * cs + cs/2;
+        py = oy + playerY * cs + cs/2;
+    }
+    
+    // Player body
+    ctx.shadowColor = '#fff';
+    ctx.shadowBlur = 5;
+    ctx.fillStyle = '#eef';
+    ctx.beginPath();
+    ctx.arc(px, py, cs * 0.28, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    
+    // Player eyes (top-down: two dots facing last direction)
+    ctx.fillStyle = '#335';
+    const eyeOff = cs * 0.1;
+    ctx.beginPath(); ctx.arc(px - eyeOff, py - cs*0.05, cs*0.05, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(px + eyeOff, py - cs*0.05, cs*0.05, 0, Math.PI*2); ctx.fill();
+    
+    // HUD
+    ctx.fillStyle = '#89a';
+    ctx.font = `${Math.min(16, W/30)}px monospace`;
+    ctx.textAlign = 'left';
+    ctx.fillText(`Level ${currentLevel + 1}/${levels.length}`, 20, 30);
+    ctx.fillText(`Moves: ${totalMoves}`, 20, 55);
+    
+    ctx.textAlign = 'right';
+    const placedCount = targets.filter(t => boxes.some(b => b.x===t.x && b.y===t.y)).length;
+    ctx.fillText(`${placedCount}/${targets.length} orbs`, W - 20, 30);
+    ctx.fillText('R: Restart', W - 20, 55);
+    
+    // Level complete overlay
+    if (gameState === STATE.LEVEL_COMPLETE) {
+        levelCompleteTimer += 0.016;
+        ctx.fillStyle = `rgba(10,14,26,${Math.min(levelCompleteTimer * 2, 0.6)})`;
+        ctx.fillRect(0, 0, W, H);
+        
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ff0';
+        ctx.shadowColor = '#ff0';
+        ctx.shadowBlur = 15;
+        ctx.font = `bold ${Math.min(40, W/10)}px monospace`;
+        ctx.fillText('LEVEL COMPLETE!', cx(), H/2 - 30);
+        ctx.shadowBlur = 0;
+        
+        ctx.fillStyle = '#aac';
+        ctx.font = `${Math.min(18, W/25)}px monospace`;
+        ctx.fillText(`${totalMoves} moves used`, cx(), H/2 + 15);
+        ctx.fillText('Press SPACE to continue', cx(), H/2 + 50);
+    }
+    
+    function cx() { return W/2; }
+}
+
+function drawComplete() {
+    const cx = W / 2, cy = H / 2;
+    ctx.textAlign = 'center';
+    
+    ctx.shadowColor = '#ff0';
+    ctx.shadowBlur = 20;
+    ctx.fillStyle = '#ff0';
+    ctx.font = `bold ${Math.min(48, W/8)}px monospace`;
+    ctx.fillText('ALL LEVELS CLEARED!', cx, cy - 60);
+    ctx.shadowBlur = 0;
+    
+    ctx.fillStyle = '#aac';
+    ctx.font = `${Math.min(20, W/25)}px monospace`;
+    ctx.fillText(`Total moves: ${totalMoves}`, cx, cy);
+    
+    if (bestScore !== null) {
+        ctx.fillStyle = totalMoves <= bestScore ? '#4f8' : '#a88';
+        ctx.fillText(totalMoves <= bestScore ? 'New Best!' : `Best: ${bestScore}`, cx, cy + 35);
+    }
+    
+    const glow = 0.5 + 0.5 * Math.sin(time * 2);
+    ctx.fillStyle = `rgba(79,255,255,${glow})`;
+    ctx.font = `${Math.min(18, W/30)}px monospace`;
+    ctx.fillText('Press SPACE to return to menu', cx, cy + 80);
+}
+
+// Game Loop
+let lastTime = 0;
+function loop(ts) {
+    const dt = (ts - lastTime) / 1000;
+    time += dt;
+    lastTime = ts;
+    
+    draw();
+    requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// Initial load
+loadLevel(0);
+</script>
+</body>
+</html>
