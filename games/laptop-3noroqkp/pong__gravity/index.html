@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gravity Pong</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+    </style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+}
+function playSound(freq, duration, type, volume) {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(volume || 0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+}
+
+// Game State
+const STATE = { MENU: 0, PLAYING: 1, SCORED: 2, GAMEOVER: 3 };
+let gameState = STATE.MENU;
+let score1 = 0, score2 = 0;
+const WIN_SCORE = 5;
+let twoPlayer = false;
+let shakeTime = 0;
+let shakeIntensity = 0;
+
+// Paddles
+class Paddle {
+    constructor(x, side) {
+        this.x = x;
+        this.side = side;
+        this.w = 12;
+        this.h = H * 0.15;
+        this.y = H / 2 - this.h / 2;
+        this.vy = 0;
+        this.speed = 8;
+    }
+    update() {
+        this.y += this.vy;
+        this.y = Math.max(0, Math.min(H - this.h, this.y));
+    }
+    draw() {
+        const color = this.side === 'left' ? '#00ffcc' : '#ff6699';
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 15;
+        ctx.fillStyle = color;
+        ctx.fillRect(this.x, this.y, this.w, this.h);
+        ctx.shadowBlur = 0;
+    }
+}
+
+// Ball
+class Ball {
+    constructor() {
+        this.reset();
+        this.trail = [];
+    }
+    reset(dir) {
+        this.r = 8;
+        this.x = W / 2;
+        this.y = H / 2;
+        const angle = (Math.random() * 0.4 - 0.2);
+        const speed = 5 + Math.random() * 2;
+        const d = dir || (Math.random() < 0.5 ? 1 : -1);
+        this.vx = Math.cos(angle) * speed * d;
+        this.vy = Math.sin(angle) * speed;
+        this.trail = [];
+    }
+    update() {
+        const gravity = 0.15;
+        this.vy += gravity;
+        this.x += this.vx;
+        this.y += this.vy;
+
+        // Wall bounces
+        if (this.y - this.r < 0) { this.y = this.r; this.vy = Math.abs(this.vy) * 0.9; playSound(300, 0.1, 'sine', 0.2); }
+        if (this.y + this.r > H) { this.y = H - this.r; this.vy = -Math.abs(this.vy) * 0.9; playSound(300, 0.1, 'sine', 0.2); }
+
+        // Trail
+        this.trail.push({ x: this.x, y: this.y });
+        if (this.trail.length > 20) this.trail.shift();
+    }
+    draw() {
+        // Trail
+        for (let i = 0; i < this.trail.length; i++) {
+            const alpha = (i / this.trail.length) * 0.5;
+            const size = this.r * (i / this.trail.length);
+            ctx.beginPath();
+            ctx.arc(this.trail[i].x, this.trail[i].y, size, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(255, 220, 100, ${alpha})`;
+            ctx.fill();
+        }
+        // Ball
+        ctx.shadowColor = '#ffdd44';
+        ctx.shadowBlur = 20;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffdd44';
+        ctx.fill();
+        ctx.shadowBlur = 0;
+    }
+}
+
+let paddle1, paddle2, ball;
+let particles = [];
+
+class Particle {
+    constructor(x, y, color) {
+        this.x = x; this.y = y;
+        const angle = Math.random() * Math.PI * 2;
+        const speed = Math.random() * 6 + 2;
+        this.vx = Math.cos(angle) * speed;
+        this.vy = Math.sin(angle) * speed - 2;
+        this.life = 1;
+        this.decay = 0.02 + Math.random() * 0.03;
+        this.color = color;
+        this.size = Math.random() * 4 + 2;
+    }
+    update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        this.vy += 0.1;
+        this.life -= this.decay;
+    }
+    draw() {
+        ctx.globalAlpha = this.life;
+        ctx.fillStyle = this.color;
+        ctx.fillRect(this.x, this.y, this.size, this.size);
+        ctx.globalAlpha = 1;
+    }
+}
+
+function spawnParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+        particles.push(new Particle(x, y, color));
+    }
+}
+
+function resetGame() {
+    score1 = 0;
+    score2 = 0;
+    paddle1 = new Paddle(30, 'left');
+    paddle2 = new Paddle(W - 42, 'right');
+    ball = new Ball();
+    particles = [];
+}
+
+function hitPaddle(paddle) {
+    const hitPos = (ball.y - paddle.y) / paddle.h;
+    const angle = (hitPos - 0.5) * 2.2;
+    const speed = Math.sqrt(ball.vx * ball.vx + ball.vy * ball.vy) + 0.5;
+    const dir = paddle.side === 'left' ? 1 : -1;
+    ball.vx = Math.cos(angle) * speed * dir;
+    ball.vy = Math.sin(angle) * speed;
+    playSound(500, 0.15, 'square', 0.3);
+    spawnParticles(ball.x, ball.y, paddle.side === 'left' ? '#00ffcc' : '#ff6699', 8);
+}
+
+function checkPaddleCollision(paddle) {
+    if (ball.x + ball.r > paddle.x && ball.x - ball.r < paddle.x + paddle.w &&
+        ball.y + ball.r > paddle.y && ball.y - ball.r < paddle.y + paddle.h) {
+        hitPaddle(paddle);
+    }
+}
+
+// AI
+function updateAI() {
+    if (twoPlayer) return;
+    const targetY = ball.y;
+    const diff = targetY - (paddle2.y + paddle2.h / 2);
+    const maxSpeed = 6.5;
+    let move = 0;
+    if (Math.abs(diff) > 10) {
+        move = Math.max(-maxSpeed, Math.min(maxSpeed, diff * 0.08));
+    }
+    paddle2.vy = move;
+}
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e => {
+    keys[e.code] = true;
+    if (gameState === STATE.MENU) {
+        initAudio();
+        startGame();
+    } else if (gameState === STATE.GAMEOVER && (e.code === 'KeyR' || e.code === 'Space')) {
+        resetGame();
+        gameState = STATE.PLAYING;
+    }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function startGame() {
+    resetGame();
+    gameState = STATE.PLAYING;
+}
+
+function drawMenu() {
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(0, 0, W, H);
+
+    // Title with glow
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.min(W * 0.12, 72)}px monospace`;
+    ctx.shadowColor = '#ffdd44';
+    ctx.shadowBlur = 30;
+    ctx.fillStyle = '#ffdd44';
+    ctx.fillText('GRAVITY PONG', W / 2, H * 0.25);
+    ctx.shadowBlur = 0;
+
+    // Subtitle
+    ctx.font = `${Math.min(W * 0.035, 20)}px monospace`;
+    ctx.fillStyle = '#88ccff';
+    ctx.fillText('A Pong game where gravity pulls the ball down', W / 2, H * 0.35);
+
+    // Controls
+    ctx.font = `${Math.min(W * 0.03, 18)}px monospace`;
+    ctx.fillStyle = '#cccccc';
+    const lines = [
+        'P1: W / S  |  P2: ↑ / ↓',
+        'First to 5 points wins!',
+        '',
+        '[PRESS ANY KEY TO START]'
+    ];
+    lines.forEach((line, i) => {
+        ctx.fillText(line, W / 2, H * 0.5 + i * 35);
+    });
+
+    // Animated ball demo
+    const t = Date.now() * 0.003;
+    const bx = W / 2 + Math.sin(t) * 80;
+    const by = H * 0.75 + Math.cos(t * 1.5) * 30;
+    ctx.beginPath();
+    ctx.arc(bx, by, 8, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffdd44';
+    ctx.shadowColor = '#ffdd44';
+    ctx.shadowBlur = 15;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+}
+
+function drawGameOver() {
+    ctx.fillStyle = 'rgba(10, 10, 26, 0.8)';
+    ctx.fillRect(0, 0, W, H);
+
+    const winner = score1 > score2 ? 'PLAYER 1' : 'PLAYER 2';
+    const color = score1 > score2 ? '#00ffcc' : '#ff6699';
+
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.min(W * 0.08, 56)}px monospace`;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 20;
+    ctx.fillStyle = color;
+    ctx.fillText(`${winner} WINS!`, W / 2, H * 0.35);
+    ctx.shadowBlur = 0;
+
+    ctx.font = `${Math.min(W * 0.04, 28)}px monospace`;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(`${score1} - ${score2}`, W / 2, H * 0.48);
+
+    ctx.font = `${Math.min(W * 0.03, 18)}px monospace`;
+    ctx.fillStyle = '#aaaaaa';
+    ctx.fillText('Press R or SPACE to play again', W / 2, H * 0.65);
+}
+
+function drawScore() {
+    ctx.textAlign = 'center';
+    ctx.font = `bold ${Math.min(W * 0.06, 48)}px monospace`;
+    ctx.fillStyle = '#00ffcc';
+    ctx.shadowColor = '#00ffcc';
+    ctx.shadowBlur = 10;
+    ctx.fillText(score1, W / 2 - 60, 50);
+    ctx.fillStyle = '#ff6699';
+    ctx.shadowColor = '#ff6699';
+    ctx.fillText(score2, W / 2 + 60, 50);
+    ctx.shadowBlur = 0;
+
+    // Center line
+    ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([10, 15]);
+    ctx.beginPath();
+    ctx.moveTo(W / 2, 0);
+    ctx.lineTo(W / 2, H);
+    ctx.stroke();
+    ctx.setLineDash([]);
+}
+
+function drawGravityIndicator() {
+    const t = Date.now() * 0.05;
+    for (let i = 0; i < 5; i++) {
+        const y = ((t + i * 30) % H);
+        ctx.beginPath();
+        ctx.arc(W / 2, y, 2, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 221, 68, 0.2)';
+        ctx.fill();
+    }
+}
+
+let scoreTimer = 0;
+
+function update() {
+    if (gameState !== STATE.PLAYING && gameState !== STATE.SCORED) return;
+
+    // Paddle input
+    paddle1.vy = 0;
+    if (keys['KeyW']) paddle1.vy = -paddle1.speed;
+    if (keys['KeyS']) paddle1.vy = paddle1.speed;
+
+    if (twoPlayer) {
+        paddle2.vy = 0;
+        if (keys['ArrowUp']) paddle2.vy = -paddle2.speed;
+        if (keys['ArrowDown']) paddle2.vy = paddle2.speed;
+    } else {
+        updateAI();
+    }
+
+    paddle1.update();
+    paddle2.update();
+    ball.update();
+
+    // Paddle collisions
+    checkPaddleCollision(paddle1);
+    checkPaddleCollision(paddle2);
+
+    // Score detection
+    if (ball.x < -20) {
+        score2++;
+        shakeTime = 20;
+        shakeIntensity = 5;
+        spawnParticles(0, ball.y, '#ff6699', 30);
+        playSound(200, 0.4, 'sawtooth', 0.4);
+        if (score2 >= WIN_SCORE) { gameState = STATE.GAMEOVER; }
+        else { gameState = STATE.SCORED; scoreTimer = 60; }
+    }
+    if (ball.x > W + 20) {
+        score1++;
+        shakeTime = 20;
+        shakeIntensity = 5;
+        spawnParticles(W, ball.y, '#00ffcc', 30);
+        playSound(200, 0.4, 'sawtooth', 0.4);
+        if (score1 >= WIN_SCORE) { gameState = STATE.GAMEOVER; }
+        else { gameState = STATE.SCORED; scoreTimer = 60; }
+    }
+
+    // Particles
+    for (let i = particles.length - 1; i >= 0; i--) {
+        particles[i].update();
+        if (particles[i].life <= 0) particles.splice(i, 1);
+    }
+
+    // Score timer
+    if (gameState === STATE.SCORED) {
+        scoreTimer--;
+        if (scoreTimer <= 0) {
+            ball.reset();
+            gameState = STATE.PLAYING;
+        }
+    }
+}
+
+function draw() {
+    ctx.save();
+
+    // Screen shake
+    if (shakeTime > 0) {
+        const sx = (Math.random() - 0.5) * shakeIntensity;
+        const sy = (Math.random() - 0.5) * shakeIntensity;
+        ctx.translate(sx, sy);
+        shakeTime--;
+    }
+
+    // Background
+    ctx.fillStyle = '#0a0a1a';
+    ctx.fillRect(-10, -10, W + 20, H + 20);
+
+    if (gameState === STATE.MENU) {
+        drawMenu();
+    } else if (gameState === STATE.GAMEOVER) {
+        drawScore();
+        paddle1.draw();
+        paddle2.draw();
+        drawGameOver();
+    } else {
+        drawGravityIndicator();
+        drawScore();
+        paddle1.draw();
+        paddle2.draw();
+        ball.draw();
+        for (const p of particles) p.draw();
+
+        // Score flash
+        if (gameState === STATE.SCORED) {
+            ctx.textAlign = 'center';
+            ctx.font = `bold ${Math.min(W * 0.05, 40)}px monospace`;
+            ctx.fillStyle = 'rgba(255,255,255,0.7)';
+            ctx.fillText('SCORE!', W / 2, H / 2);
+        }
+    }
+
+    ctx.restore();
+}
+
+function loop() {
+    update();
+    draw();
+    requestAnimationFrame(loop);
+}
+
+// Init
+paddle1 = new Paddle(30, 'left');
+paddle2 = new Paddle(W - 42, 'right');
+ball = new Ball();
+loop();
+</script>
+</body>
+</html>
