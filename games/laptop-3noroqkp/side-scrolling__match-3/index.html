@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gem Scroller - Match 3</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #1a1a2e; font-family: 'Segoe UI', sans-serif; }
+canvas { display: block; }
+#ui-overlay {
+position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+display: flex; align-items: center; justify-content: center;
+pointer-events: none; z-index: 10;
+}
+#ui-overlay.active { pointer-events: all; }
+.panel {
+background: rgba(15,15,35,0.95); border: 2px solid #4a4a8a;
+border-radius: 16px; padding: 40px 50px; text-align: center;
+box-shadow: 0 0 40px rgba(100,100,255,0.3);
+}
+.panel h1 { color: #fff; font-size: 2.5em; margin-bottom: 10px; text-shadow: 0 0 20px #6a6aff; }
+.panel p { color: #aaa; font-size: 1.1em; margin: 8px 0; }
+.panel .score-display { color: #ffd700; font-size: 1.8em; margin: 15px 0; }
+.btn {
+background: linear-gradient(135deg, #6a6aff, #ff6a9e); border: none;
+color: #fff; padding: 14px 40px; font-size: 1.2em; border-radius: 8px;
+cursor: pointer; margin-top: 20px; transition: transform 0.2s, box-shadow 0.2s;
+}
+.btn:hover { transform: scale(1.05); box-shadow: 0 0 20px rgba(106,106,255,0.5); }
+#hud {
+position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+display: flex; gap: 30px; align-items: center; z-index: 5;
+background: rgba(15,15,35,0.8); padding: 10px 25px; border-radius: 12px;
+border: 1px solid #4a4a8a;
+}
+.hud-item { color: #fff; font-size: 1em; }
+.hud-item span { color: #ffd700; font-weight: bold; }
+.lives { color: #ff6a9e; font-size: 1.3em; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud" style="display:none;">
+<div class="hud-item">Score: <span id="score-hud">0</span></div>
+<div class="hud-item">Speed: <span id="speed-hud">1x</span></div>
+<div class="lives" id="lives-hud">♥♥♥</div>
+</div>
+<div id="ui-overlay" class="active">
+<div class="panel" id="start-panel">
+<h1>💎 Gem Scroller</h1>
+<p>Match-3 with side-scrolling action!</p>
+<p>Swap adjacent gems to match 3+ in a row or column.</p>
+<p>New columns scroll in from the right — don't let gems scroll off the left!</p>
+<p style="margin-top:15px;">Controls: Click/tap two adjacent gems to swap</p>
+<button class="btn" id="start-btn">Play</button>
+</div>
+<div class="panel" id="end-panel" style="display:none;">
+<h1>Game Over</h1>
+<p class="score-display">Score: <span id="final-score">0</span></p>
+<p id="best-score"></p>
+<button class="btn" id="restart-btn">Play Again</button>
+</div>
+</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W, H;
+
+function resize() {
+W = window.innerWidth;
+H = window.innerHeight;
+canvas.width = W;
+canvas.height = H;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Audio
+let audioCtx = null;
+function initAudio() {
+if (!audioCtx) audioCtx = new (window.AudioContext || webkitAudioContext)();
+}
+function playTone(freq, dur, type='sine', vol=0.15) {
+if (!audioCtx) return;
+const osc = audioCtx.createOscillator();
+const gain = audioCtx.createGain();
+osc.type = type;
+osc.frequency.value = freq;
+gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+osc.connect(gain);
+gain.connect(audioCtx.destination);
+osc.start();
+osc.stop(audioCtx.currentTime + dur);
+}
+function sfxSwap() { playTone(400, 0.1); playTone(500, 0.1); }
+function sfxMatch() { playTone(600, 0.15); setTimeout(()=>playTone(800,0.15),80); }
+function sfxLose() { playTone(200, 0.3, 'sawtooth', 0.2); }
+function sfxScore() { playTone(700, 0.1); setTimeout(()=>playTone(900,0.1),60); setTimeout(()=>playTone(1100,0.15),120); }
+
+// Game constants
+const COLS = 7;
+const ROWS = 6;
+const GEM_COLORS = ['#ff4466','#44aaff','#44ff88','#ffaa33','#cc66ff','#ff69b4'];
+const GEM_SHAPES = ['circle','diamond','square','triangle','hex','star'];
+
+let cellSize, boardX, boardY;
+function calcLayout() {
+cellSize = Math.min((W * 0.7) / COLS, (H * 0.65) / ROWS);
+boardX = (W - cellSize * COLS) / 2;
+boardY = (H - cellSize * ROWS) / 2 + 30;
+}
+
+// Game state
+let gems = [];
+let score = 0;
+let lives = 3;
+let speedMult = 1;
+let scrollTimer = 0;
+let scrollInterval = 4000;
+let gameRunning = false;
+let animating = false;
+let particles = [];
+let selectedGem = null;
+let lastTime = 0;
+
+function initGems() {
+calcLayout();
+gems = [];
+for (let c = 0; c < COLS; c++) {
+gems[c] = [];
+for (let r = 0; r < ROWS; r++) {
+gems[c][r] = { color: Math.floor(Math.random() * GEM_COLORS.length), x: boardX + c * cellSize, y: boardY + r * cellSize, scale: 1, alpha: 1, falling: false, targetY: 0 };
+}
+}
+// Remove initial matches
+while (findMatches().length > 0) {
+for (let c = 0; c < COLS; c++)
+for (let r = 0; r < ROWS; r++)
+gems[c][r].color = Math.floor(Math.random() * GEM_COLORS.length);
+}
+}
+
+function findMatches() {
+let matches = [];
+// Horizontal
+for (let r = 0; r < ROWS; r++) {
+let count = 1;
+for (let c = 1; c < COLS; c++) {
+if (gems[c][r] && gems[c-1][r] && gems[c][r].color === gems[c-1][r].color) count++;
+else { if (count >= 3) matches.push({type:'h', r, start: c-count, len: count}); count = 1; }
+}
+if (count >= 3) matches.push({type:'h', r, start: COLS-count, len: count});
+}
+// Vertical
+for (let c = 0; c < COLS; c++) {
+let count = 1;
+for (let r = 1; r < ROWS; r++) {
+if (gems[c][r] && gems[c][r-1] && gems[c][r].color === gems[c][r-1].color) count++;
+else { if (count >= 3) matches.push({type:'v', c, start: r-count, len: count}); count = 1; }
+}
+if (count >= 3) matches.push({type:'v', c, start: ROWS-count, len: count});
+}
+return matches;
+}
+
+function getMatchCells(matches) {
+let cells = new Set();
+for (let m of matches) {
+if (m.type === 'h') { for (let i = 0; i < m.len; i++) cells.add(m.start + i + ',' + m.r); }
+else { for (let i = 0; i < m.len; i++) cells.add(m.c + ',' + (m.start + i)); }
+}
+return [...cells].map(s => s.split(',').map(Number));
+}
+
+function processMatches() {
+let matches = findMatches();
+if (matches.length === 0) return false;
+let cells = getMatchCells(matches);
+let pts = cells.length * 10 * Math.floor(speedMult);
+score += pts;
+sfxMatch();
+for (let [c, r] of cells) {
+spawnParticles(boardX + c * cellSize + cellSize/2, boardY + r * cellSize + cellSize/2, gems[c][r].color);
+gems[c][r] = null;
+}
+document.getElementById('score-hud').textContent = score;
+return true;
+}
+
+function collapseGems() {
+let moved = false;
+for (let c = 0; c < COLS; c++) {
+let write = ROWS - 1;
+for (let r = ROWS - 1; r >= 0; r--) {
+if (gems[c][r] !== null) {
+if (write !== r) { gems[c][write] = gems[c][r]; gems[c][r] = null; moved = true; }
+write--;
+}
+}
+// Fill top
+for (let r = write; r >= 0; r--) {
+gems[c][r] = { color: Math.floor(Math.random() * GEM_COLORS.length), x: boardX + c * cellSize, y: boardY - cellSize * (write - r + 1), scale: 1, alpha: 1, falling: true, targetY: boardY + r * cellSize };
+moved = true;
+}
+}
+return moved;
+}
+
+function spawnParticles(x, y, colorIdx) {
+for (let i = 0; i < 8; i++) {
+particles.push({ x, y, vx: (Math.random()-0.5)*4, vy: (Math.random()-0.5)*4 - 2, life: 1, color: GEM_COLORS[colorIdx] });
+}
+}
+
+function addNewColumn() {
+// Shift all gems left by one column
+for (let r = 0; r < ROWS; r++) {
+for (let c = COLS - 1; c > 0; c--) {
+gems[c][r] = gems[c-1][r];
+}
+}
+// New rightmost column
+for (let r = 0; r < ROWS; r++) {
+gems[COLS-1][r] = { color: Math.floor(Math.random() * GEM_COLORS.length), x: boardX + COLS * cellSize, y: boardY + r * cellSize, scale: 1, alpha: 1, falling: false, targetY: 0 };
+}
+// Check leftmost column - if no matches possible, lose a life
+let leftMatch = checkLeftColumn();
+if (!leftMatch) {
+lives--;
+sfxLose();
+document.getElementById('lives-hud').textContent = '♥'.repeat(Math.max(0, lives));
+if (lives <= 0) endGame();
+}
+// Process any resulting matches
+setTimeout(() => { animating = true; processMatches(); }, 200);
+}
+
+function checkLeftColumn() {
+for (let r = 0; r < ROWS; r++) {
+if (gems[0][r]) {
+let col = gems[0][r].color;
+// Check horizontal match in row
+if (gems[1] && gems[1][r] && gems[1][r].color === col) return true;
+if (gems[2] && gems[2][r] && gems[2][r].color === col) {
+if (gems[1][r] && gems[1][r].color === col) return true;
+}
+// Check vertical
+if (r > 0 && gems[0][r-1] && gems[0][r-1].color === col) {
+if (r > 1 && gems[0][r-2] && gems[0][r-2].color === col) return true;
+}
+if (r < ROWS-1 && gems[0][r+1] && gems[0][r+1].color === col) {
+if (r < ROWS-2 && gems[0][r+2] && gems[0][r+2].color === col) return true;
+}
+}
+}
+return false;
+}
+
+function trySwap(c1, r1, c2, r2) {
+if (c1 < 0 || c1 >= COLS || r1 < 0 || r1 >= ROWS) return;
+if (c2 < 0 || c2 >= COLS || r2 < 0 || r2 >= ROWS) return;
+let t = gems[c1][r1]; gems[c1][r1] = gems[c2][r2]; gems[c2][r2] = t;
+// Check if valid match
+if (findMatches().length === 0) {
+// Swap back
+t = gems[c1][r1]; gems[c1][r1] = gems[c2][r2]; gems[c2][r2] = t;
+} else {
+sfxSwap();
+animating = true;
+processMatches();
+}
+}
+
+function updateAnimations(dt) {
+let done = true;
+for (let c = 0; c < COLS; c++) {
+for (let r = 0; r < ROWS; r++) {
+if (gems[c][r]) {
+let g = gems[c][r];
+let tx = boardX + c * cellSize;
+let ty = boardY + r * cellSize;
+let dx = tx - g.x;
+let dy = ty - g.y;
+if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+let speed = 12 * dt;
+g.x += dx * Math.min(speed, 1);
+g.y += dy * Math.min(speed, 1);
+done = false;
+} else { g.x = tx; g.y = ty; }
+if (g.scale < 1) g.scale = Math.min(1, g.scale + dt * 4);
+if (g.alpha < 1) g.alpha = Math.min(1, g.alpha + dt * 3);
+}
+}
+}
+// Particles
+for (let i = particles.length - 1; i >= 0; i--) {
+let p = particles[i];
+p.x += p.vx; p.y += p.vy; p.vy += 0.2;
+p.life -= dt * 2;
+if (p.life <= 0) particles.splice(i, 1);
+}
+// After animation done, check for cascading matches
+if (done && animating) {
+let more = processMatches();
+if (!more) {
+collapseGems();
+animating = false;
+}
+}
+}
+
+function drawGem(x, y, size, colorIdx, scale, alpha) {
+ctx.save();
+ctx.globalAlpha = alpha;
+ctx.translate(x + size/2, y + size/2);
+ctx.scale(scale, scale);
+let r = size * 0.35;
+let col = GEM_COLORS[colorIdx];
+// Glow
+ctx.shadowColor = col;
+ctx.shadowBlur = 8;
+// Shape based on color index
+ctx.fillStyle = col;
+ctx.beginPath();
+switch(colorIdx % 6) {
+case 0: // circle
+ctx.arc(0, 0, r, 0, Math.PI*2); break;
+case 1: // diamond
+ctx.moveTo(0,-r); ctx.lineTo(r,0); ctx.lineTo(0,r); ctx.lineTo(-r,0); ctx.closePath(); break;
+case 2: // square
+ctx.rect(-r*0.8, -r*0.8, r*1.6, r*1.6); break;
+case 3: // triangle
+ctx.moveTo(0,-r); ctx.lineTo(r,r*0.7); ctx.lineTo(-r,r*0.7); ctx.closePath(); break;
+case 4: // hex
+for(let i=0;i<6;i++){let a=i*Math.PI/3-Math.PI/6;let px=Math.cos(a)*r,py=Math.sin(a)*r;i===0?ctx.moveTo(px,py):ctx.lineTo(px,py);} ctx.closePath(); break;
+case 5: // star
+for(let i=0;i<10;i++){let a=i*Math.PI/5-Math.PI/2;let rad=i%2===0?r:r*0.5;let px=Math.cos(a)*rad,py=Math.sin(a)*rad;i===0?ctx.moveTo(px,py):ctx.lineTo(px,py);} ctx.closePath(); break;
+}
+ctx.fill();
+// Highlight
+ctx.shadowBlur = 0;
+ctx.fillStyle = 'rgba(255,255,255,0.3)';
+ctx.beginPath();
+ctx.arc(-r*0.25, -r*0.25, r*0.3, 0, Math.PI*2);
+ctx.fill();
+ctx.restore();
+}
+
+function draw() {
+ctx.fillStyle = '#1a1a2e';
+ctx.fillRect(0, 0, W, H);
+// Background stars
+let t = Date.now() * 0.001;
+for (let i = 0; i < 50; i++) {
+let sx = ((i * 137 + t * 20) % W);
+let sy = (i * 97) % H;
+ctx.fillStyle = `rgba(255,255,255,${0.3 + Math.sin(t + i) * 0.2})`;
+ctx.fillRect(sx, sy, 2, 2);
+}
+// Board background
+ctx.fillStyle = 'rgba(30,30,60,0.8)';
+ctx.strokeStyle = '#4a4a8a';
+let bx = boardX - cellSize * 0.1;
+let by = boardY - cellSize * 0.1;
+let bw = cellSize * COLS + cellSize * 0.2;
+let bh = cellSize * ROWS + cellSize * 0.2;
+ctx.beginPath();
+ctx.roundRect(bx, by, bw, bh, 10);
+ctx.fill();
+ctx.stroke();
+// Grid lines
+ctx.strokeStyle = 'rgba(74,74,138,0.3)';
+for (let c = 0; c <= COLS; c++) {
+ctx.beginPath(); ctx.moveTo(boardX + c * cellSize, boardY); ctx.lineTo(boardX + c * cellSize, boardY + ROWS * cellSize); ctx.stroke();
+}
+for (let r = 0; r <= ROWS; r++) {
+ctx.beginPath(); ctx.moveTo(boardX, boardY + r * cellSize); ctx.lineTo(boardX + COLS * cellSize, boardY + r * cellSize); ctx.stroke();
+}
+// Danger zone indicator (left edge)
+let pulse = 0.3 + Math.sin(Date.now() * 0.005) * 0.2;
+ctx.fillStyle = `rgba(255,50,50,${pulse})`;
+ctx.fillRect(boardX - 5, boardY, 5, ROWS * cellSize);
+// Gems
+for (let c = 0; c < COLS; c++) {
+for (let r = 0; r < ROWS; r++) {
+if (gems[c][r]) {
+let g = gems[c][r];
+drawGem(g.x, g.y, cellSize, g.color, g.scale, g.alpha);
+}
+}
+}
+// Selected gem highlight
+if (selectedGem) {
+ctx.strokeStyle = '#fff';
+ctx.lineWidth = 3;
+ctx.strokeRect(selectedGem.c * cellSize + boardX - 2, selectedGem.r * cellSize + boardY - 2, cellSize + 4, cellSize + 4);
+}
+// Particles
+for (let p of particles) {
+ctx.globalAlpha = p.life;
+ctx.fillStyle = p.color;
+ctx.fillRect(p.x - 3, p.y - 3, 6, 6);
+}
+ctx.globalAlpha = 1;
+}
+
+function gameLoop(time) {
+if (!gameRunning) return;
+let dt = Math.min((time - lastTime) / 1000, 0.05);
+lastTime = time;
+scrollTimer += dt * 1000 * speedMult;
+if (scrollTimer >= scrollInterval) {
+scrollTimer = 0;
+addNewColumn();
+speedMult = 1 + score / 5000;
+document.getElementById('speed-hud').textContent = speedMult.toFixed(1) + 'x';
+}
+updateAnimations(dt);
+draw();
+requestAnimationFrame(gameLoop);
+}
+
+function startGame() {
+initAudio();
+score = 0; lives = 3; speedMult = 1; scrollTimer = 0;
+document.getElementById('score-hud').textContent = '0';
+document.getElementById('lives-hud').textContent = '♥♥♥';
+document.getElementById('speed-hud').textContent = '1.0x';
+document.getElementById('hud').style.display = 'flex';
+document.getElementById('ui-overlay').classList.remove('active');
+document.getElementById('start-panel').style.display = '';
+document.getElementById('end-panel').style.display = 'none';
+initGems();
+gameRunning = true;
+lastTime = performance.now();
+requestAnimationFrame(gameLoop);
+}
+
+function endGame() {
+gameRunning = false;
+document.getElementById('hud').style.display = 'none';
+let overlay = document.getElementById('ui-overlay');
+overlay.classList.add('active');
+document.getElementById('start-panel').style.display = 'none';
+document.getElementById('end-panel').style.display = '';
+document.getElementById('final-score').textContent = score;
+try {
+let best = parseInt(localStorage.getItem('gemscroller_best') || '0');
+if (score > best) localStorage.setItem('gemscroller_best', score);
+best = Math.max(best, score);
+document.getElementById('best-score').textContent = 'Best: ' + best;
+} catch(e) { document.getElementById('best-score').textContent = ''; }
+}
+
+// Input
+let dragStart = null;
+canvas.addEventListener('mousedown', e => {
+if (!gameRunning || animating) return;
+initAudio();
+let mx = e.clientX, my = e.clientY;
+let c = Math.floor((mx - boardX) / cellSize);
+let r = Math.floor((my - boardY) / cellSize);
+if (c >= 0 && c < COLS && r >= 0 && r < ROWS) {
+selectedGem = { c, r };
+dragStart = { x: mx, y: my };
+}
+});
+
+canvas.addEventListener('mousemove', e => {
+if (!gameRunning || !selectedGem || animating) return;
+let dx = e.clientX - dragStart.x;
+let dy = e.clientY - dragStart.y;
+let dist = Math.sqrt(dx*dx + dy*dy);
+if (dist > cellSize * 0.3) {
+let dc = dx > 0 ? 1 : -1;
+let dr = dy > 0 ? 1 : -1;
+let nc, nr;
+if (Math.abs(dx) > Math.abs(dy)) { nc = selectedGem.c + dc; nr = selectedGem.r; }
+else { nc = selectedGem.c; nr = selectedGem.r + dr; }
+trySwap(selectedGem.c, selectedGem.r, nc, nr);
+selectedGem = null;
+}
+});
+
+canvas.addEventListener('mouseup', () => { selectedGem = null; dragStart = null; });
+
+// Touch support
+canvas.addEventListener('touchstart', e => {
+e.preventDefault();
+if (!gameRunning || animating) return;
+initAudio();
+let t = e.touches[0];
+let mx = t.clientX, my = t.clientY;
+let c = Math.floor((mx - boardX) / cellSize);
+let r = Math.floor((my - boardY) / cellSize);
+if (c >= 0 && c < COLS && r >= 0 && r < ROWS) {
+selectedGem = { c, r };
+dragStart = { x: mx, y: my };
+}
+});
+
+canvas.addEventListener('touchmove', e => {
+e.preventDefault();
+if (!gameRunning || !selectedGem || animating) return;
+let t = e.touches[0];
+let dx = t.clientX - dragStart.x;
+let dy = t.clientY - dragStart.y;
+let dist = Math.sqrt(dx*dx + dy*dy);
+if (dist > cellSize * 0.3) {
+let dc = dx > 0 ? 1 : -1;
+let dr = dy > 0 ? 1 : -1;
+let nc, nr;
+if (Math.abs(dx) > Math.abs(dy)) { nc = selectedGem.c + dc; nr = selectedGem.r; }
+else { nc = selectedGem.c; nr = selectedGem.r + dr; }
+trySwap(selectedGem.c, selectedGem.r, nc, nr);
+selectedGem = null;
+}
+});
+
+canvas.addEventListener('touchend', () => { selectedGem = null; dragStart = null; });
+
+// Keyboard restart
+window.addEventListener('keydown', e => {
+if (e.key === 'r' || e.key === 'R' || e.key === 'Enter') {
+if (!gameRunning) startGame();
+}
+});
+
+document.getElementById('start-btn').addEventListener('click', startGame);
+document.getElementById('restart-btn').addEventListener('click', startGame);
+
+// Initial draw
+function drawIdle() {
+ctx.fillStyle = '#1a1a2e';
+ctx.fillRect(0, 0, W, H);
+let t = Date.now() * 0.001;
+for (let i = 0; i < 50; i++) {
+let sx = ((i * 137 + t * 20) % W);
+let sy = (i * 97) % H;
+ctx.fillStyle = `rgba(255,255,255,${0.3 + Math.sin(t + i) * 0.2})`;
+ctx.fillRect(sx, sy, 2, 2);
+}
+if (!gameRunning) requestAnimationFrame(drawIdle);
+}
+requestAnimationFrame(drawIdle);
+</script>
+</body>
+</html>
