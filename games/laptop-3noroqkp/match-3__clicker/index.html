@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Gem Pop</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#1a1a2e}
+canvas{display:block;width:100%;height:100%}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas=document.getElementById('c');
+const ctx=canvas.getContext('2d');
+let W,H,cellSize,gridX,gridY,gridW,gridH;
+const COLS=8,ROWS=8,COLORS=6;
+const GEM_COLORS=['#ff4757','#1e90ff','#2ed573','#ffa502','#a855f7','#ff793c'];
+const GEM_NAMES=['Red','Blue','Green','Yellow','Purple','Orange'];
+
+let state='start';
+let grid=[];
+let score=0;
+let combo=0;
+let maxCombo=0;
+let selected=null;
+let animating=false;
+let particles=[];
+let floatingTexts=[];
+let swapAnim=null;
+let clearAnims=[];
+let fallAnims=[];
+let shakeTime=0;
+let bestScore=0;
+try{bestScore=parseInt(localStorage.getItem('gemPopBest'))||0}catch(e){}
+
+let audioCtx=null;
+
+function initAudio(){
+if(!audioCtx){
+audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+}
+}
+
+function playSound(type,freq,dur){
+if(!audioCtx)return;
+const osc=audioCtx.createOscillator();
+const gain=audioCtx.createGain();
+osc.connect(gain);
+gain.connect(audioCtx.destination);
+osc.type='sine';
+osc.frequency.value=freq||440;
+gain.gain.setValueAtTime(0.3,audioCtx.currentTime);
+gain.gain.exponentialRampToValueAtTime(0.001,(audioCtx.currentTime+(dur||0.2)));
+osc.start();
+osc.stop(audioCtx.currentTime+(dur||0.2));
+}
+
+function playSwap(){playSound('swap',500,0.1)}
+function playClear(combo){playSound('clear',300+combo*80,0.3)}
+function playFall(){playSound('fall',200,0.15)}
+function playInvalid(){playSound('invalid',150,0.2)}
+
+function resize(){
+W=window.innerWidth;H=window.innerHeight;
+canvas.width=W;canvas.height=H;
+cellSize=Math.min(W,H)*0.85/COLS;
+gridW=cellSize*COLS;
+gridH=cellSize*ROWS;
+gridX=(W-gridW)/2;
+gridY=(H-gridH)/2+20;
+}
+window.addEventListener('resize',resize);
+resize();
+
+function initGrid(){
+grid=[];
+for(let r=0;r<ROWS;r++){
+grid[r]=[];
+for(let c=0;c<COLS;c++){
+grid[r][c]=Math.floor(Math.random()*COLORS);
+}
+}
+// Remove initial matches
+let hasMatch=true;
+while(hasMatch){
+hasMatch=false;
+for(let r=0;r<ROWS;r++){
+for(let c=0;c<COLS;c++){
+if(c+2<COLS&&grid[r][c]===grid[r][c+1]&&grid[r][c]===grid[r][c+2]){
+grid[r][c]=Math.floor(Math.random()*COLORS);
+hasMatch=true;
+}
+if(r+2<ROWS&&grid[r][c]===grid[r+1][c]&&grid[r][c]===grid[r+2][c]){
+grid[r][c]=Math.floor(Math.random()*COLORS);
+hasMatch=true;
+}
+}}
+}
+}
+
+function getCellCoords(px,py){
+let c=Math.floor((px-gridX)/cellSize);
+let r=Math.floor((py-gridY)/cellSize);
+if(r>=0&&r<ROWS&&c>=0&&c<COLS)return{r,c};
+return null;
+}
+
+function isAdjacent(a,b){
+return Math.abs(a.r-b.r)+Math.abs(a.c-b.c)===1;
+}
+
+function findMatches(){
+let matches=[];
+for(let r=0;r<ROWS;r++){
+for(let c=0;c<COLS;c++){
+if(c+2<COLS&&grid[r][c]===grid[r][c+1]&&grid[r][c]===grid[r][c+2]){
+matches.push({r,c},{r,c:c+1},{r,c:c+2});
+}
+if(r+2<ROWS&&grid[r][c]===grid[r+1][c]&&grid[r][c]===grid[r+2][c]){
+matches.push({r,c},{r:r+1,c},{r:r+2,c});
+}
+}}
+// Deduplicate
+let unique=[];
+let seen=new Set();
+for(let m of matches){
+let key=m.r*COLS+m.c;
+if(!seen.has(key)){seen.add(key);unique.push(m);}
+}
+return unique;
+}
+
+function hasValidMoves(){
+for(let r=0;r<ROWS;r++){
+for(let c=0;c<COLS;c++){
+// Try swap right
+if(c+1<COLS){
+let temp=grid[r][c];
+grid[r][c]=grid[r][c+1];grid[r][c+1]=temp;
+if(findMatches().length>0){grid[r][c]=temp;grid[r][c+1]=grid[r][c];return true;}
+grid[r][c]=temp;grid[r][c+1]=grid[r][c];
+}
+// Try swap down
+if(r+1<ROWS){
+let temp=grid[r][c];
+grid[r][c]=grid[r+1][c];grid[r+1][c]=temp;
+if(findMatches().length>0){grid[r][c]=temp;grid[r+1][c]=grid[r][c];return true;}
+grid[r][c]=temp;grid[r+1][c]=grid[r][c];
+}
+}}
+return false;
+}
+
+function addFloatingText(x,y,text,color,size){
+floatingTexts.push({x,y,text,color:color||'#fff',size:size||20,life:1});
+}
+
+function spawnParticles(x,y,color,count){
+for(let i=0;i<(count||8);i++){
+let angle=Math.random()*Math.PI*2;
+let speed=2+Math.random()*4;
+particles.push({
+x,y,
+vx:Math.cos(angle)*speed,
+vy:Math.sin(angle)*speed-2,
+life:1,
+color,
+size:3+Math.random()*4
+});
+}
+}
+
+function startClearAnim(matches){
+clearAnims=[];
+for(let m of matches){
+let x=gridX+m.c*cellSize+cellSize/2;
+let y=gridY+m.r*cellSize+cellSize/2;
+clearAnims.push({r:m.r,c:m.c,life:1,x,y});
+}
+playClear(combo);
+let pts=matches.length*10*(combo);
+score+=pts;
+maxCombo=Math.max(maxCombo,combo);
+addFloatingText(W/2,gridY+gridH/2,'+'+pts,'#fff',24+combo*2);
+if(combo>1)addFloatingText(W/2,gridY+gridH/2-30,'x'+combo+' COMBO!','#ffa502',28);
+for(let m of matches){
+let x=gridX+m.c*cellSize+cellSize/2;
+let y=gridY+m.r*cellSize+cellSize/2;
+spawnParticles(x,y,GEM_COLORS[grid[m.r][m.c]]||'#fff',5);
+}
+try{if(score>bestScore){bestScore=score;localStorage.setItem('gemPopBest',''+bestScore);}}catch(e){}
+}
+
+function applyGravity(){
+fallAnims=[];
+for(let c=0;c<COLS;c++){
+let writeRow=ROWS-1;
+for(let r=ROWS-1;r>=0;r--){
+if(grid[r][c]!==-1&&grid[r][c]!==undefined){
+if(r!==writeRow){
+grid[writeRow][c]=grid[r][c];
+grid[r][c]=-1;
+fallAnims.push({fromC:c,fromR:r,toR:writeRow,life:0});
+}
+writeRow--;
+}}
+// Fill top with new gems
+for(let r=0;r<ROWS;r++){
+if(grid[r][c]===-1||grid[r][c]===undefined){
+grid[r][c]=Math.floor(Math.random()*COLORS);
+fallAnims.push({fromC:c,fromR:r-ROWS+r,toR:r,life:0});
+}
+}
+}
+playFall();
+}
+
+function update(dt){
+// Update particles
+for(let p of particles){
+p.x+=p.vx;
+p.y+=p.vy;
+p.vy+=0.3;
+p.life-=dt*2;
+}
+particles=particles.filter(p=>p.life>0);
+
+// Update floating texts
+for(let ft of floatingTexts){
+ft.y-=dt*40;
+ft.life-=dt*1.5;
+}
+floatingTexts=floatingTexts.filter(ft=>ft.life>0);
+
+if(shakeTime>0)shakeTime-=dt;
+
+if(animating)return;
+
+// Process clear animations
+if(clearAnims.length>0){
+for(let ca of clearAnims){
+ca.life-=dt*4;
+}
+clearAnims=clearAnims.filter(ca=>ca.life>0);
+if(clearAnims.length===0){
+// Remove cleared cells
+for(let m of lastMatches)grid[m.r][m.c]=-1;
+applyGravity();
+animating=true;
+setTimeout(()=>{
+animating=false;
+let newMatches=findMatches();
+if(newMatches.length>0){
+combo++;
+lastMatches=newMatches;
+startClearAnim(newMatches);
+}else{
+combo=0;
+if(!hasValidMoves()){
+shuffleBoard();
+}
+}
+},200);
+return;
+}
+}
+
+// Process fall animations
+if(fallAnims.length>0){
+for(let fa of fallAnims)fa.life+=dt*5;
+fallAnims=fallAnims.filter(fa=>fa.life<1);
+if(fallAnims.length===0){
+animating=false;
+let newMatches=findMatches();
+if(newMatches.length>0){
+combo++;
+lastMatches=newMatches;
+startClearAnim(newMatches);
+}
+return;
+}
+}
+
+// Swap animation
+if(swapAnim){
+swapAnim.t+=dt*5;
+if(swapAnim.t>=1){
+swapAnim.t=1;
+grid[swapAnim.r1][swapAnim.c1]=swapAnim.tmp;
+grid[swapAnim.r2][swapAnim.c2]=swapAnim.tmp2;
+// Check matches
+let matches=findMatches();
+if(matches.length>0){
+lastMatches=matches;
+startClearAnim(matches);
+}else{
+playInvalid();
+// Swap back
+let temp=grid[swapAnim.r1][swapAnim.c1];
+grid[swapAnim.r1][swapAnim.c1]=grid[swapAnim.r2][swapAnim.c2];
+grid[swapAnim.r2][swapAnim.c2]=temp;
+}
+swapAnim=null;
+}
+}
+}
+
+let lastMatches=[];
+
+function shuffleBoard(){
+addFloatingText(W/2,gridY+gridH/2,'SHUFFLE!','#ffa502',30);
+for(let r=0;r<ROWS;r++){
+for(let c=0;c<COLS;c++){
+grid[r][c]=Math.floor(Math.random()*COLORS);
+}
+}
+let attempts=0;
+while(!hasValidMoves()&&attempts<100){
+initGrid();attempts++;
+}
+}
+
+function drawGem(x,y,size,type,scale){
+if(type===-1||type===undefined)return;
+let r=size*0.4*scale;
+ctx.save();
+ctx.translate(x,y);
+let col=GEM_COLORS[type]||'#fff';
+// Glow
+ctx.shadowColor=col;
+ctx.shadowBlur=8;
+// Body
+ctx.beginPath();
+if(type===0){ // Red - diamond
+ctx.moveTo(0,-r);ctx.lineTo(r,0);ctx.lineTo(0,r);ctx.lineTo(-r,0);ctx.closePath();
+} else if(type===1){ // Blue - circle
+ctx.arc(0,0,r,0,Math.PI*2);
+} else if(type===2){ // Green - triangle
+ctx.moveTo(0,-r);ctx.lineTo(r*0.9,r*0.7);ctx.lineTo(-r*0.9,r*0.7);ctx.closePath();
+} else if(type===3){ // Yellow - square
+ctx.rect(-r*0.8,-r*0.8,r*1.6,r*1.6);
+} else if(type===4){ // Purple - hexagon
+for(let i=0;i<6;i++){let a=i*Math.PI/3-Math.PI/6;ctx.lineTo(Math.cos(a)*r,Math.sin(a)*r);}
+ctx.closePath();
+} else { // Orange - star
+for(let i=0;i<5;i++){
+let a=i*Math.PI*2/5-Math.PI/2;
+let b=a+Math.PI/5;
+ctx.lineTo(Math.cos(a)*r,Math.sin(a)*r);
+ctx.lineTo(Math.cos(b)*r*0.5,Math.sin(b)*r*0.5);
+}
+ctx.closePath();
+}
+ctx.fillStyle=col;
+ctx.fill();
+// Highlight
+ctx.beginPath();
+ctx.arc(-r*0.2,-r*0.2,r*0.3,0,Math.PI*2);
+ctx.fillStyle='rgba(255,255,255,0.3)';
+ctx.fill();
+ctx.restore();
+}
+
+function draw(){
+ctx.clearRect(0,0,W,H);
+// Background gradient
+let bg=ctx.createLinearGradient(0,0,0,H);
+bg.addColorStop(0,'#1a1a2e');
+bg.addColorStop(1,'#16213e');
+ctx.fillStyle=bg;
+ctx.fillRect(0,0,W,H);
+
+// Shake
+let sx=0,sy=0;
+if(shakeTime>0){
+sx=(Math.random()-0.5)*shakeTime*20;
+sy=(Math.random()-0.5)*shakeTime*20;
+}
+ctx.save();
+ctx.translate(sx,sy);
+
+// Draw grid background
+ctx.fillStyle='rgba(255,255,255,0.03)';
+for(let r=0;r<ROWS;r++){
+for(let c=0;c<COLS;c++){
+let x=gridX+c*cellSize;
+let y=gridY+r*cellSize;
+ctx.fillRect(x+1,y+1,cellSize-2,cellSize-2);
+}
+}
+
+// Draw gems
+if(state!=='start'){
+for(let r=0;r<ROWS;r++){
+for(let c=0;c<COLS;c++){
+let val=grid[r]&&grid[r][c];
+if(val===undefined||val===-1)continue;
+let x=gridX+c*cellSize+cellSize/2;
+let y=gridY+r*cellSize+cellSize/2;
+let scale=1;
+
+// Check if in clear anim
+for(let ca of clearAnims){
+if(ca.r===r&&ca.c===c){scale=ca.life;}
+}
+// Check if in swap anim
+if(swapAnim){
+if((swapAnim.r1===r&&swapAnim.c1===c)||(swapAnim.r2===r&&swapAnim.c2===c)){
+let t=swapAnim.t;
+let ease=t<0.5?2*t*t:1-Math.pow(-2*t+2,2);
+let isFrom=swapAnim.r1===r&&swapAnim.c1===c;
+let dx=(isFrom?-1:1)*(swapAnim.c2-swapAnim.c1)*cellSize*ease;
+let dy=(isFrom?-1:1)*(swapAnim.r2-swapAnim.r1)*cellSize*ease;
+x+=dx;y+=dy;
+}
+}
+drawGem(x,y,cellSize,val,scale);
+}
+}
+
+// Selected highlight
+if(selected){
+ctx.strokeStyle='rgba(255,255,255,0.8)';
+ctx.lineWidth=3;
+ctx.strokeRect(gridX+selected.c*cellSize+2,gridY+selected.r*cellSize+2,cellSize-4,cellSize-4);
+}
+
+// Particles
+for(let p of particles){
+ctx.globalAlpha=p.life;
+ctx.fillStyle=p.color;
+ctx.beginPath();
+ctx.arc(p.x,p.y,p.size*p.life,0,Math.PI*2);
+ctx.fill();
+}
+ctx.globalAlpha=1;
+
+// Floating texts
+for(let ft of floatingTexts){
+ctx.globalAlpha=ft.life;
+ctx.fillStyle=ft.color;
+ctx.font=`bold ${ft.size}px Arial`;
+ctx.textAlign='center';
+ctx.fillText(ft.text,ft.x,ft.y);
+}
+ctx.globalAlpha=1;
+
+// Score
+ctx.fillStyle='#fff';
+ctx.font='bold 24px Arial';
+ctx.textAlign='left';
+ctx.fillText('Score: '+score,gridX,gridY-30);
+ctx.font='16px Arial';
+ctx.fillStyle='#aaa';
+ctx.fillText('Best: '+bestScore,gridX+150,gridY-30);
+
+// Hint
+if(state==='playing'){
+ctx.fillStyle='rgba(255,255,255,0.4)';
+ctx.font='14px Arial';
+ctx.textAlign='center';
+ctx.fillText('Click two adjacent gems to swap',W/2,H-15);
+}
+
+// Start screen
+if(state==='start'){
+ctx.fillStyle='rgba(0,0,0,0.7)';
+ctx.fillRect(0,0,W,H);
+ctx.fillStyle='#fff';
+ctx.font='bold 48px Arial';
+ctx.textAlign='center';
+ctx.fillText('GEM POP',W/2,H/2-80);
+ctx.font='20px Arial';
+ctx.fillStyle='#aaa';
+ctx.fillText('Click two adjacent gems to swap them.',W/2,H/2-30);
+ctx.fillText('Match 3 or more in a row or column to clear!',W/2,H/2);
+ctx.fillText('Chain reactions for combo bonuses!',W/2,H/2+30);
+ctx.fillStyle='#ffa502';
+ctx.font='bold 28px Arial';
+let pulse=1+Math.sin(Date.now()*0.005)*0.1;
+ctx.save();
+ctx.translate(W/2,H/2+90);
+ctx.scale(pulse,pulse);
+ctx.fillText('Click to Start',0,0);
+ctx.restore();
+}
+
+// Restart button (drawn as text)
+if(state==='playing'){
+ctx.fillStyle='rgba(255,255,255,0.3)';
+ctx.font='14px Arial';
+ctx.textAlign='right';
+ctx.fillText('R = Restart',W-20,H-15);
+}
+
+ctx.restore();
+}
+
+let lastTime=0;
+function gameLoop(time){
+let dt=Math.min((time-lastTime)/1000,0.05);
+lastTime=time;
+update(dt);
+draw();
+requestAnimationFrame(gameLoop);
+}
+
+function handleInput(x,y){
+initAudio();
+if(state==='start'){
+state='playing';
+initGrid();
+score=0;combo=0;maxCombo=0;selected=null;
+return;
+}
+if(animating||swapAnim)return;
+let cell=getCellCoords(x,y);
+if(!cell){selected=null;return;}
+grid[sel_r][sel_c]=Math.floor(Math.random()*COLORS);
+if(!selected){
+selected={r:cell.r,c:cell.c};
+playSwap();
+}else{
+if(cell.r===selected.r&&cell.c===selected.c){
+selected=null;
+}else if(isAdjacent(selected,cell)){
+// Swap
+let tmp=grid[selected.r][selected.c];
+grid[selected.r][selected.c]=grid[cell.r][cell.c];
+grid[cell.r][cell.c]=tmp;
+swapAnim={r1:selected.r,c1:selected.c,r2:cell.r,c2:cell.c,t:0,tmp:grid[selected.r][selected.c],tmp2:grid[cell.r][cell.c]};
+// Fix swap anim values
+swapAnim.tmp=grid[cell.r][cell.c];
+swapAnim.tmp2=grid[selected.r][selected.c];
+selected=null;
+}else{
+selected={r:cell.r,c:cell.c};
+}
+}
+}
+
+canvas.addEventListener('click',(e)=>{
+let rect=canvas.getBoundingClientRect();
+let x=(e.clientX-rect.left)*(W/rect.width);
+let y=(e.clientY-rect.top)*(H/rect.height);
+handleInput(x,y);
+});
+
+window.addEventListener('keydown',(e)=>{
+if(e.key==='r'||e.key==='R'){
+state='playing';
+initGrid();
+score=0;combo=0;maxCombo=0;selected=null;
+clearAnims=[];fallAnims=[];swapAnim=null;particles=[];floatingTexts=[];
+}
+if(e.key===' '&&state==='start'){
+handleInput(W/2,H/2);
+}
+});
+
+initGrid();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
