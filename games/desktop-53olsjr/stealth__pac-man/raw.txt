@@ -1,0 +1,2749 @@
+<think>
+The user wants a Pac-Man stealth game — a single HTML file. Let me think about what makes this interesting:
+
+**Concept**: "Pac-Man stealth" — instead of eating all pellets and avoiding ghosts, you're an intruder (Pac) sneaking through the ghost's maze to reach a goal or deliver something, while ghosts are patrolling with vision cones/line-of-sight. If detected, alarm goes off, chase mode, game over. Classic stealth: crouch/sneak (slow but silent), walk (fast but noisy — attracts nearby ghosts), hide in shadow zones, throw decoys?
+
+Let me design the mechanics:
+- Grid-based maze (like Pac-Man) with walls, floor tiles.
+- Player: sneaking Pac-like character. Movement: grid movement with smooth interpolation, or free 8-directional? Grid feels more Pac-Man-y. Let's go with grid movement with smooth lerp between tiles.
+- Sneak mode (shift held): slow, silent — ghosts don't react to you, only visual detection if within their line of sight and close enough? Actually, let's do this:
+  - **Sneak** (Shift hold): slow, silent. Only detected by direct vision (line-of-sight + cone/range).
+  - **Run**: fast, makes noise — ghosts within a noise radius get alerted to your last position even through walls.
+- Ghosts patrol with waypoints; each has a "vision" — line-of-sight check via raycast through maze walls, plus detection range. States: PATROL → SUSPICIOUS (sees you sneaking? no — suspicious when hearing noise or catching glimpse) → ALERTED (chases you, faster).
+- Detection meter: while seen, suspicion fills up; if full → alarm → chase. If you break line of sight, suspicion decays.
+- Objective: reach the exit tile (or collect N "tokens"/pellets first?). Let's do this: collect 3 "energy cores" (glowing pellets) scattered in the maze, then head to the EXIT portal that opens once collected. Time-based? Or level with increasing ghosts. Multiple levels for replayability.
+- Decoy throw: Q key — throws a decoy pellet on a nearby tile; alerted/suspicious ghosts go investigate it for a few seconds. Limited supply (3 per level).
+- Hiding in "shadow" tiles too? Dark zones where you're invisible unless right next to them. Could add fog/darkness overlay where lights are around the player and ghost vision spots. This is nice: darkness with light radius — stealth + lighting. Ghosts have their own glow.
+
+Simpler but rich:
+- Grid maze ~21x15 tiles, tile size computed from canvas.
+- Vision cone rendering for ghosts (triangle showing where they're looking) — great visual feedback.
+- Suspicion HUD bar per ghost? Or a global "DETECTED" indicator + exclamation on the ghost head.
+- Sound: WebAudio — sneaking footsteps (soft), running footsteps (louder, with pitch), detection "!" sting, alarm siren, decoy throw, core pickup chime, level clear jingle, game over sound. All synthesized.
+
+Controls:
+- Arrow keys / WASD to move (grid).
+- Shift = sneak (hold) — or toggle? Hold is more responsive; but on some keyboards shift+arrow is fine. Let's use hold-to-sneak. Show state in HUD.
+- Space = throw decoy (consumes charge, up to 3).
+- R = restart. P/Esc = pause.
+
+Game states: START, PLAYING, PAUSED, CAUGHT (game over), LEVELCLEAR → next level, WIN (all levels cleared).
+
+Levels: 3 mazes? Or procedurally generate a maze each level with increasing ghost count. Procedural generation: recursive backtracker on an odd grid, then remove some walls to create loops (Pac-Man mazes have loops). Place cores in far locations, exit far from start. This gives replayability. Let's do 3 levels: Level 1: 2 ghosts, Level 2: 3 ghosts, Level 3: 4 ghosts + faster.
+
+Actually for reliability let me handcraft the maze layout — better tuned design, guaranteed solvable, deliberate sight lines. 3 different mazes as string arrays. This is safer and looks more intentional. Each level also increases ghost count/speed.
+
+Maze representation: array of strings, '#' wall, '.' floor, 'S' start, 'E' exit, 'C' core. Size ~21 wide x 15 tall (classic feel). Let me design 3 mazes carefully so they're solvable with loops.
+
+Let me draft maze 1 (21x15):
+
+```
+#####################
+#S...#.....#....#..E#
+#.###.#.###.#.##.###.#  -- width must be 21
+```
+
+Careful: exactly 21 chars each row, 15 rows. Let me write it out and count.
+
+Row template of length 21:
+Position indices 0-20.
+
+Level 1 maze:
+```
+#####################   (21 #)
+#S....#.........#...E.#   
+#.##..#.###.##..#.###.#   
+#....#.....#....#.....#   
+#.##.#.###.#.##.#.###.#   
+#.##.#...#.#...#...#..#   
+#....#####.C.#####..#.#   
+############.#.########   
+#....#.....#...#....#.#   
+#.##..#.####.##.#.##..#   
+#.##..#........#.....#.#  -- hmm, getting messy
+```
+
+This freehand is error-prone. Better: write a small generator in JS to create the maze with recursive backtracker + loop carving, and use a deterministic RNG seed per level so it's stable but varied. Then place S near top-left, E far away (max BFS distance), cores at 3 spots spread out by BFS distance. This guarantees solvability and is less code than 3 handcrafted mazes. Let's go with generator:
+
+- Grid W=21, H=15 (odd). Cells at odd coordinates; walls between them.
+- Standard maze carving on cell grid (10x7 cells → 21x15 tiles). Then remove about 12 random walls to create loops.
+- Use a seeded RNG (mulberry32) with per-level seed so each level is the same every time (fair), but different between levels and runs? Same seed each run = consistent difficulty; that's fine, or seed changes per run for replay value. Let me do this: seed = levelIndex * 1000 + runSeed where runSeed is random on new game. That gives variety.
+
+Ghost AI:
+- Patrol: pick a random reachable tile via BFS path from current position (or walk along corridors with randomized turns). Simplest and robust: ghosts move tile-to-tile; at each intersection (or always, cheap enough), compute BFS path to target tile. Target changes: patrol → random floor tile every N seconds or upon arrival; suspicious → player's last heard/seen position; alerted → player's current tile (recompute every ~0.5s or on move).
+- Detection:
+  - Vision: raycast from ghost tile center to player tile center using grid DDA through walls; if clear, distance < sightRange AND angle within FOV? FOV adds complexity; Pac ghosts can't turn heads... let's give them a forward-facing cone (direction of travel) with FOV ~70° and range ~4.5 tiles, plus 360° "close" detection radius 1.2 tiles (bumping into you). Sneaking reduces cone range to ~2.5? Actually sneak = silent, so detection is vision only; run = noise attracts: any ghost within noiseRadius (say 5 tiles, through walls — measure by BFS distance? Chebyshev is fine) becomes suspicious and heads for last noise position.
+  - Suspicion: while in cone + LOS with sneaking player, suspicion rises fast; if running and seen, instant alarm. If not seen, decays.
+  - Alerted ghosts: chase at high speed; if lose sight beyond trackRange (BFS distance > X or time since last sighting), revert to suspicious heading to last known position, then patrol.
+  - Decoy: when thrown, any suspicious/alerted ghost within radius targets the decoy tile for ~4 seconds (decoy visible as glowing pellet with ping).
+
+Caught: if ghost within 0.5 tile of player → caught game over (with brief slow-mo flash?). Keep it simple: overlay + restart button / R key.
+
+Movement details:
+- Player grid movement: hold direction; move to next tile if not wall. Speed: run ~6 tiles/sec, sneak ~3 tiles/sec. Smooth position lerp: keep logical tile + progress; render at interpolated position. Ghosts similar with their own speeds (patrol 2.5-3, chase 5.5).
+- Input buffering: remember desired direction; allow turn if current move axis allows (classic Pac-Man feel: store desiredDir; when reaching tile center or if perpendicular and next tile open, turn).
+
+Simpler robust approach: continuous position on grid with "commit to tile" logic: player has `tile` and `pos` (pixels/floating tile coords). Each frame, move along current axis by speed*dt toward target tile center. If reached center (within epsilon), snap, then if desiredDir is open, adopt it; else continue currentDir if open, else stop. Allow turn mid-tile only if perpendicular and target open — classic. Let me implement:
+
+```
+function tryTurn() { if player at tile center: dir = desired if open(desired) else keep }
+```
+Mid-tile: ignore (can't reverse? Pac-Man allows reversing mid-tile). Let's allow reversal anytime.
+
+Noise: while running and moving, every ~0.35s emit a noise event with position + radius; ghosts within radius (Euclidean through walls is fine, or BFS distance) switch to suspicious targeting that spot, play "ping" if ghost close? Also visual ripple ring at player pos (subtle).
+
+Cone rendering: draw semi-transparent triangle from ghost in facing direction with length = sightRange, half-angle ~35°. Color per state: patrol = soft blue/white low alpha; suspicious = amber; alerted = red pulsing. This is the key stealth feedback. Also exclamation "!" above suspicious ghosts (fill meter arc?), and "?" if just caught glimpse? Keep it: suspicion shown as a small arc/bar filling above the ghost head, color shifting to red; when full → "!" flash + alarm sound.
+
+Darkness/lighting: overlay canvas with destination-out radial gradients for lights: player has light radius (smaller while sneaking? or bigger — sneaking = cautious so smaller light radius... actually a lantern you hold: running = bigger faster flicker, sneaking = dim). Ghosts have small glow around themselves. Cores/exit glow. This creates the spooky atmosphere and supports stealth (you can't see distant ghosts unless they're in your light or their own glow leaks). Implementation: offscreen canvas same size, fill with rgba(0,0,10,0.92), punch holes with 'destination-out' radial gradients, then drawImage over scene. Plus a vignette. This is performant enough (one offscreen per frame).
+
+Also floor rendering: dark maze with subtle grid, walls as glowing edges? Let me make it look like an abandoned neon temple / machine room: deep navy-black background, walls drawn as slightly beveled dark slabs with faint cyan edge highlights on faces adjacent to floor; floor tiles near light get a faint dot pattern (like Pac-Man pellet field — tiny dim dots). Cores = pulsing gold orbs. Exit = swirling portal (animated) that only lights up once all cores collected.
+
+Palette: deep indigo/near-black bg (#05060e), wall faces #141a2e with edge glow #3aa0ff-ish; player classic yellow #ffd93b with mouth animation; ghosts each classic colors (red, pink/cyan, orange) but "hooded" look? Keep the ghost shape: rounded top with wavy bottom and eyes pointing in direction — instantly readable as Pac-Man. Player is a pac circle with chomp animation when running, closed mouth when sneaking + maybe a little shadow/scarf? Keep it simple: pac yellow; sneaking = smaller radius + darker tone to blend in (nice touch: sneak shrinks slightly and lowers brightness).
+
+HUD: top bar or corner panels: level name, cores collected (icons), decoys remaining (icons), suspicion state text ("HIDDEN"/"SNEAKING"/"HEARD?"/"DETECTED!"), maybe a timer. Use a distinctive font pairing — but no external fonts allowed! "No external scripts, fonts, images". So use system font stack: display could be a bold condensed system stack with letter-spacing; or render title in canvas with custom-drawn letters? Let's use CSS font stacks: display: `"Avenir Next Condensed", "Arial Narrow", ...` hmm. Better: `font-family: 'Trebuchet MS', 'Verdana'` for body, and a chunky display via heavy weight + letter-spacing + outline text-shadow. Or draw the title on canvas with a chunky custom vector font (Pac-Man logo style). That's a lot of work; simpler: HTML overlay title with stacked text-shadows to fake arcade glow, font-family: "Impact", "Haettenschweiler", "Franklin Gothic Bold" — Impact is widely available and gives an arcade-poster feel; body in "Trebuchet MS"/system-ui. Impact + Trebuchet pairing works.
+
+Actually for the start screen I can draw a mini demo of the maze on the canvas behind the overlay, with ambient animation — the start screen shows the game world dimmed with title over it. Good: run the game loop in "attract" mode (ghosts wandering) behind the start panel. This is very lively. Implementation: state START runs simulation with ghost patrol + player idle at start position, no HUD detection; overlay HTML on top with name, controls list, "ENTER/CLICK to start".
+
+Name ideas: "GHOSTLINE", "PAC & SNEAK", "MIDNIGHT PAC", "SNEAK PAC", "HOLLOW GLOW", "PAC STEALTH: MIDNIGHT RUN". Let's go with **"SNEAK PAC — Midnight Protocol"** or just "SNEAK PAC". Title: "Sneak Pac — a Pac-Man stealth game". Keep <title>Sneak Pac</title>.
+
+Restart without reload: R key + button. Also pause overlay.
+
+Level flow: 3 levels. On level clear (reach exit with all cores): brief "SECTOR CLEAR" banner, then next maze generates after 1.5s. After level 3: WIN screen with stats (time, times caught? best time in localStorage with try/catch).
+
+localStorage: save best total time + maybe a "ghosts evaded" counter. Wrap in try/catch.
+
+Sound design (WebAudio):
+- Master gain, created on first user gesture (keydown/click) — resume context.
+- Footsteps: short filtered noise tick; sneak = low volume lowpass 300Hz; run = louder bandpass ~700Hz alternating pitch.
+- Noise ripple for run steps: same as footsteps but slightly louder.
+- Ping/detection "!" : quick two-tone blip (square wave 880→1320).
+- Alarm: while any ghost alerted, looping siren? Could be annoying; let's do a pulsing low drone + fast beeps at 2Hz. Implement as scheduled oscillator with LFO in the loop — simpler: setInterval-ish in update to schedule beep every 0.25s when alerted && audio on.
+- Decoy throw: whoosh (noise sweep) + landing "pop".
+- Core pickup: arpeggio blip (3 notes).
+- Exit open: rising sweep.
+- Caught: descending saw + noise crash.
+- Level clear: little jingle 4 notes.
+- Mute toggle key M.
+
+Performance: canvas 2D, fixed internal resolution scaled to fit window (letterbox with CSS transform? Better: set canvas size = container * dpr and compute tile size). Handle resize: recompute scale; keep logical coordinate system in tiles, render scale = min(w/W, h/H) centered. Fill window, no scrollbars.
+
+Structure:
+- HTML: full-viewport container div#game; canvas#view; overlay divs (start, pause, gameover, win, levelbanner), HUD div on top (DOM for crisp text) — HUD in DOM is easier and crisper. HUD: left: sector name + core icons; right: decoys, state label, mute hint. Bottom-left: controls hint small.
+- CSS: dark theme, neon accents, scanline overlay? Maybe subtle CRT scanlines via repeating-linear-gradient at low opacity on an overlay div — cheap and thematic. Keep it restrained.
+
+Now let me code the JS carefully.
+
+Constants:
+- TILE logical = 32 (render scale computed).
+- W=21, H=15 tiles.
+
+Maze generation (seeded):
+```
+function mulberry32(a){...}
+function genMaze(seed){ 
+  const rng = mulberry32(seed);
+  let g = grid of '#', odd cells '.'.
+  // recursive backtracker on cell coords cx 0..9, cy 0..6 → tile (2cx+1, 2cy+1)
+  stack...
+  carve between cells: set wall tile to '.'.
+  // loop removal: pick random interior wall with floor on both sides (opposite axes), remove ~14.
+}
+```
+Then BFS from start cell (find the floor tile closest to (1,1)) to all; place exit at max-distance floor; place cores at 3 spots spread by distance quartile + angular spread. Ensure cores not on start/exit.
+
+Ghost spawn: pick floor tiles far from player start (distance > 8), spaced apart. Count per level: L1:2, L2:3, L3:4. Ghost speeds per level scaling: patrol 2.6+0.3L, chase 5.2+0.4L; sight range 4.2 + small; noise radius 4.5.
+
+Player: speed run 6.5, sneak 3.2.
+
+Ghost pathing: each ghost has `path` (array of tiles), `ti` index; recompute when target changes or every ~0.6s while chasing. Move: advance toward next tile center at speed; upon arrival pop. If no path (shouldn't happen since BFS on same floor), fallback random walk to open neighbor.
+
+BFS path function returns list of tiles from a to b.
+
+Vision LOS: grid DDA between centers:
+```
+function los(x0,y0,x1,y1){ // in tile coords floats; check wall cells crossed
+  step through with sampling: sample every 0.25 along the line, if any sample is in wall cell → blocked. Simple and fine at this scale (max ~6 tiles → 24 samples).
+}
+```
+Simpler than DDA and robust.
+
+Cone check: vector d = playerPos - ghostPos; dist; angle between d and ghost facing dir <= fov/2 && dist <= range && los. Facing = ghost's current move direction (last non-zero); if idle, use lastDir.
+
+Suspicion per ghost: 0..1. While seenSneak: += dt / 1.6s. While seenRun: instant → alerted. Decay: -dt/2.5 when not seen. When reaches 1 → alerted, "!" flash, sting sound. Alerted tracking: store lastSeenPos + time; recompute chase path every 0.5s; if no sight for >4s and BFS distance from lastSeen > ? → suspicious heading to lastSeen; on arrival there and no info for 3s → patrol.
+
+Decoy: entity {pos, ttl}. When thrown (space): place at nearest free tile in desired direction? Place on player's facing tile if floor & not current, else next open neighbor. Alerted/suspicious ghosts within radius 6 retarget to decoy pos with "investigate" state until decoy expires or they reach it (then linger). Decoy visually: glowing pellet with expanding rings; ping sound. Player limited to 3 per level.
+
+Caught check: dist(ghost, player) < 0.55 → game over (state CAUGHT), freeze, overlay after brief 0.6s slow-motion? Keep simple: immediate overlay with "CAUGHT BY W-???" flavor + restart button/R key. Also track stats: time, sectors cleared.
+
+Exit: tile 'E'; when all cores collected → portal opens (sound, visual change). Stepping on exit tile → level clear sequence: state CLEAR, banner, after delay next level or WIN.
+
+Also add a subtle "heartbeat" pulse when any ghost alerted? The alarm beeps cover it.
+
+Rendering order:
+1. Clear with bg (#04050c) + faint background pattern (diagonal grid? distant stars/dust).
+2. Floor tiles: for each floor tile, fill with dark #0b0f1e; dot pellet (dim) at center — these are decorative "data motes". Maybe skip per-tile dots to save perf... 315 tiles fine.
+3. Walls: for each wall tile with any floor neighbor, draw a slab: base rect slightly inset, top face lighter? Flat look: fill #10162b, then stroke edges facing floor with rgba(90,160,255,0.25) line + soft outer glow via shadowBlur? shadowBlur per tile is expensive (315). Precompute wall edge segments into a Path2D once per level → draw once with shadowBlur = 8 cyan — single path stroke, cheap. Also precompute floor dot positions and wall fill path.
+
+Precomputation per level:
+- wallPath (fill), edgePath (stroke), floorDots (array of {x,y}), maybe crack details.
+4. Exit portal (animated swirl when open; dim ring when closed).
+5. Cores (pulsing orbs with glow — radial gradient, few of them so fine).
+6. Decoys + ripple rings (noise ripples from running steps: store array {pos,r,ttl}).
+7. Ghost vision cones (below ghost, on top of floor) — draw per state color; alpha ~0.10-0.18; alerted pulses.
+8. Player shadow + player (pac with mouth animation based on movement & time; sneak = smaller radius, slight desaturation + maybe scarf? skip).
+9. Ghosts: classic ghost body path: round top arc, wavy bottom (3 bumps), eyes (whites + pupils offset in facing direction); color per ghost; alerted → brighter + red aura ring; suspicious → "!" above with suspicion arc.
+10. Lighting overlay (darkness with holes).
+11. Vignette + maybe screen shake when alerted (small).
+
+Lighting holes: player radius = sneak? 3.2 : 4.6 tiles (scale in px), ghosts 1.6, cores 2.0, exit 2.4 (open) / 1.2 closed, decoys 2.0. Base darkness alpha 0.93 → near pitch black outside lights; make sure cones are faintly visible through darkness? Cones drawn under overlay will be darkened — that's fine and actually cool (you see the danger cone dim). But we want alert state readable: draw alert "!" and eye glow above overlay? Draw ghost eyes after overlay with a bit of additive so they're always visible (creepy glowing eyes in the dark!). Yes: after lighting, redraw small glowing eye dots for each ghost (always visible) — strong stealth-game vibe. Also exit/cores already glow; maybe also redraw their glow slightly on top.
+
+Start screen attract mode: run simulation with ghosts patrolling and player frozen at start position? Or hide player during START and just let ghosts wander + lighting from cores only... but then map is mostly dark — that's fine, moody. Actually show the player idle breathing at start position (light pool) so scene looks alive. No detection in START.
+
+HUD DOM:
+- Top left: "SECTOR 01 — THE VAULT" name; core icons ●●○
+- Top right: decoy pips, state label with color-coded badge, time.
+- Bottom: controls hint line (small, dim).
+State labels: HIDDEN (no ghost nearby), SNEAKING, HEARD! (any suspicious), DETECTED (any alerted) — priority displayed.
+
+Level names: 01 "INTAKE VAULT", 02 "COOLANT SPIRES", 03 "CORE SANCTUM".
+
+Win screen: total time, best time (localStorage 'sneakpac_best'), decoys used?, "PLAY AGAIN" button + R.
+
+Game over screen: "SIGNAL LOST — caught by W-0x" with retry (restart level? restart whole run? Let's do: retry restarts current level; also a full-restart option). Simpler: RESTART RUN (R) and RETRY SECTOR (Enter)? Keep it: button "TRY AGAIN" = restart current sector, "RESTART RUN" = from level 1. R key = restart run; Enter/Space? Space is decoy... on game over, any of [Enter/R] works; let's use Enter for try again, R for full restart.
+
+Pause: P or Esc toggles; overlay with controls + resume.
+
+Keyboard handling on window keydown/keyup; preventDefault for arrows/space to avoid scrolling (though no scrollbars but still).
+
+Audio implementation details:
+```
+let AC=null, master, muted=false;
+function audio(){ if(!AC){ AC=new (window.AudioContext||webkitAudioContext)(); master=AC.createGain(); master.gain.value=0.5; master.connect(AC.destination);} if(AC.state==='suspended') AC.resume(); }
+function blip(freq,dur,type,vol,slideTo)...
+noise buffer helper.
+```
+Footsteps: create short noise burst through bandpass; schedule per step event (trigger when player crosses tile center while moving).
+
+Alarm: in update, if anyGhostAlerted && time since last beep > 0.28 → two quick beeps at 980Hz? Let's do a siren feel: alternate 740/980. Volume modest 0.15.
+
+Now sizing/layout: container fills window; canvas centered; compute scale = min(cw/(W*T), ch/(H*T)); but HUD is DOM positioned over the whole container, so canvas can be smaller than window with letterbox — I want to fill the window (no scrollbars) — letterbox bars are fine (bg color matches). Or stretch? No distortion. Centered letterbox with matching bg + subtle ambient pattern on body.
+
+DPR handling: canvas.width = cw*dpr etc, ctx.setTransform(dpr*scale...). Actually simpler: keep canvas CSS size = window; set width/height to device px; compute view transform: translate(offsetX, offsetY) scale(scale*dpr). All drawing in logical tile units * T? Let's use logical pixel units where 1 tile = 32px; then multiply by s = fit.
+
+Coordinates: keep everything in "world units" = tiles (floats). Render: px = world*32. So ctx.setTransform(s*dpr,0,0,s*dpr, ox*dpr, oy*dpr) and draw in world*32 coordinates. Fine.
+
+Resize handler sets canvas size and recomputes s, ox, oy.
+
+Player drawing (pac):
+```
+radius = sneak? 0.34 : 0.42 tile;
+mouth angle: running: chomp = (sin(t*10)+1)/2 * 0.9 rad; sneaking: 0.15; idle: breathe 0.3+...
+draw circle with wedge cut: arc from mouth/2 to 2π - mouth/2, fill yellow; rotate by facing angle.
+Sneak: color #e8c34a slightly darker + smaller; add tiny motion trail? skip.
+```
+Ghosts: radius 0.42. Body path in local coords: arc top (from π to 0), lines down sides, bottom zigzag with 3-4 scallops animated by phase. Eyes: two whites at offset toward facing; pupils further offset. Colors: W-red #ff5964, W-pink #ff7ad9? Classic: red, pink (#ffb8de / use #f9a8d8?), cyan #55e0ff, orange #ffa94d. Alerted aura: shadowBlur red? Per-ghost shadowBlur is okay (≤4 ghosts).
+
+Suspicion indicator: small arc above ghost showing fill fraction, color lerp yellow→red; when ≥1 flash "!" for 0.8s.
+
+Cone drawing: from ghost center, two rays at facing ± fov/2 with length range*stateFactor, plus arc between (use path: moveTo center, lineTo p1, arc? simpler polygon fan with few segments). Fill color per state: patrol rgba(120,170,255,0.10), suspicious rgba(255,200,80,0.14), alerted rgba(255,60,60,0.16+pulse).
+
+Noise ripple: when run step, push ring {x,y,r:0.3,ttl:0.6}; expand; stroke with fading cyan-white.
+
+Decoy: pulsing white-gold pellet + rings like noise but gold; ttl 5s; while active, ghosts investigate.
+
+Timer: level time counts up during PLAYING; total accumulates.
+
+Stats: total time (mm:ss), best saved.
+
+Edge cases:
+- Player stuck at wall with held key — fine.
+- Ghost path recompute cost: BFS on 315 tiles is trivial.
+- Decoy thrown while paused? ignore input in non-PLAYING states (except UI keys).
+- Key repeat: use a set of pressed keys; direction priority = last pressed (track order). Maintain `keyOrder` array.
+
+Restart logic: startRun() → level=0, stats reset, buildLevel(); enterState('play'). retrySector() rebuilds same level with same seed? Same seed per run: store runSeed at run start; levelSeed = hash(runSeed, level). Retry uses same → fair.
+
+Attract mode: on load, buildLevel(0) and state 'start'; simulation updates ghosts only (player idle), no HUD state label change (HUD hidden? show but dim?). Show HUD only in play/pause/over states; hide during start/win.
+
+Let me also add a small "objective" line in HUD: "RECOVER 3 CORES → REACH GATE" that changes to "GATE OPEN — RUN" once collected.
+
+Screen shake: when any alerted, small amplitude 1-2px oscillating; on caught, big flash.
+
+Flash overlay div for damage? Use canvas white/red flash alpha decaying.
+
+OK now let me write the maze generator carefully.
+
+```
+const W=21,H=15,CW=10,CH=7; // cells
+function genMaze(seed){
+ const rnd = mulberry32(seed);
+ const g = []; for(y<H) row of H: Array(W).fill('#');
+ carve: cell (0,0)... standard:
+ const cx=0,cy=0 start; visited grid CWxCH false; stack=[[0,0]]; visited[0][0]=true; setG(1,1,'.');
+ while(stack.length){ [x,y]=stack[top]; neighbors = shuffled cells in 4 dirs that are in bounds & not visited; if none pop; else pick n: carve wall between (tile coords: tx=2*x+1,ty=2*y+1; wall tile = tx + dx, ty + dy) set '.'; mark n visited, push.
+ loop removal: attempts=40: pick random interior wall tile (x in 1..W-2, y in1..H-2) where g=='#' and ((g[x-1]=='.'&&g[x+1]=='.') || (g[y-1]=='.'&&g[y+1]=='.')); remove ~ Math.min( attempts..., target=14).
+```
+Note: removing a wall that connects two floors on the same axis creates a loop. Ensure we don't remove outer border (x 1..W-2 excludes? x=0/W-1 are borders; interior is fine).
+
+BFS:
+```
+function bfs(sx,sy, target?) returns dist map + prev for path.
+```
+Placement: start = floor tile closest to (1,1) → just find first floor scanning from top-left with BFS distance order; simpler: candidate floors sorted by (x+y); pick first that's a floor and has ≥2 open neighbors? Any floor works as start since maze is fully connected. Exit: max BFS distance from start. Cores: pick 3 floors with distances in [0.45,0.95]*maxD spread out: sort floors by dist; take slices at 45%,65%,85% of list with jitter and ensure pairwise Chebyshev ≥4 (else next). Good enough.
+
+Ghost spawn: floors with dist>7 from start, pairwise ≥5 apart; pick N.
+
+Now ghost AI update per frame:
+```
+g.state: 'patrol'|'susp'|'alert'|'invest'
+g.path=[], g.idx=0, g.repathT
+target selection:
+ patrol: every 6-9s or on arrival → new target random floor (weighted far?) just random.
+ susp: target = lastNoisePos (heard) — on arrival & no update for 2.5s → patrol.
+ alert: every 0.5s repath to player tile; if seen, update lastSeen; if unseen > 4s → state susp targeting lastSeen.
+ invest: target decoy pos until decoy dies or arrival → then patrol (or back to prior? just patrol).
+On noise event: ghosts within radius R (Euclidean) and state != alert → become 'susp' targeting noise pos; if already alert, ignore (they know you).
+On detection (vision): sneak seen → suspicion += ; on full → alert + sting. run seen → alert immediately.
+Also bump: dist<0.55 → caught regardless of state? If ghost is patrolling and you're invisible... can't be invisible; collision = caught anyway (you'd have to see them). Yes, always catch on contact.
+```
+Ghost movement speed per state: patrol base, susp base*1.4, alert base*2.05, invest base*1.5.
+
+Repathing while chasing every 0.5s is fine.
+
+Path following: ghost has tile position (gx,gy) and float pos (px,py). Each frame: next = path[idx]; move toward it; if reached (< step), snap & idx++; if idx>=len → at target; handle state transitions. If path empty → idle (facing wobble).
+
+Player update:
+```
+pos (px,py float tile), tile (tx,ty), dir (dx,dy or 0), desiredDir, moving flag.
+speed = sneak? SNEAK:RUN.
+if at center and dir==0: if desired is open → dir=desired.
+else if dir set: move; if crossing center: snap to center; then choose: if desired!=dir && desired open → dir=desired; else if dir not open anymore (shouldn't) dir=0... also allow reversal mid-move: if desired == -dir → set dir = desired, pos continues (just change axis? reversing is same axis so fine).
+When snap at center: step sound (if moving & state play), noise ring if running, check core pickup (tile==core), check exit.
+```
+Turn mid-tile only allow reversal — classic enough.
+
+Desired dir from keys: maintain last-pressed priority: keep array `dirStack`; on keydown push/move to front; on keyup remove. desired = top mapped to vec.
+
+Facing for rendering: dir if moving, else last non-zero (initially facing right? face exit direction? just (1,0)).
+
+Now lighting overlay implementation:
+```
+lightCanvas same size as main (device px). Each frame: lctx.setTransform(1..); fillStyle 'rgba(3,5,12,0.94)'; fillRect; then globalCompositeOperation='destination-out'; for each light: radial gradient at (x,y) r: grad white→transparent (alpha 1→0), fill circle. Then main ctx drawImage(lightCanvas,0,0) — but main ctx has transform set; reset to identity when drawing overlay, then restore.
+```
+Light intensity: use gradient stops for soft falloff.
+
+Ambient dust particles in background too? Add floating specks drifting (drawn under lighting so they only visible near lights — nice). 40 particles slow drift, wrap. Cheap and lively.
+
+Scanline CSS overlay: repeating-linear-gradient rgba(255,255,255,0.015) 1px lines + slight CRT vignette via radial gradient div. Keep subtle (opacity 0.35). pointer-events none.
+
+HUD styling: compact monospace-ish? Use Trebuchet for body; numbers in tabular? Use font-variant-numeric: tabular-nums. State badge colors: hidden #6ee7a8, sneaking #ffd93b, heard #ffb020, detected #ff5964 with pulsing animation.
+
+Title screen: big "SNEAK PAC" in Impact with layered glow (yellow pac + cyan), subtitle "MIDNIGHT PROTOCOL". Controls grid with keycaps (styled kbd). Buttons: START RUN (Enter), plus mute note. Also small lore line: "The vault is dark. The wardens patrol. Collect 3 cores, open the gate, and don't make a sound."
+
+Keycap style: inline-block, border, bottom shadow, monospace font for keys ("Consolas", monospace) — third family okay as functional.
+
+Level banner: DOM center text that animates in/out (CSS class), e.g., "SECTOR 02 — COOLANT SPIRES" + "3 CORES". Show ~1.8s on level start, non-blocking (game running? better to freeze input briefly? Let's have it run but delay player control by 1.2s with banner; simpler: allow immediately, banner is just an overlay).
+
+Game over: red flash, then panel: "W-03 CAUGHT YOU" / "SIGNAL LOST", time survived in sector, buttons TRY SECTOR (Enter) / RESTART RUN (R).
+
+Win: "ALL SECTORS CLEARED", total time, best, PLAY AGAIN.
+
+Now let me code it all. Careful with key handling to not start on Enter during play? Enter only acts in state transitions. M = mute anytime. P/Esc pause toggle (only in play/pause). R restart run (any state except start → to start? R from game over/win/play → new run; from start also ok).
+
+Prevent default for arrows/space/WASD/Shift? Shift is fine. Prevent arrow+space scroll: e.preventDefault() on those codes when game focused (always, since it's a full-page game).
+
+Also mouse click to start (for iframe without focus?) — buttons clickable; also canvas click = start if state start; also audio unlock on any pointerdown/keydown.
+
+Audio unlock: call ensureAudio() on first keydown/pointerdown.
+
+Let me write the sound functions:
+
+```
+function tone({f=440,f2,dur=0.1,type='square',vol=0.2,when=0}){
+  if(!AC||muted)return; const t0=AC.currentTime+when;
+  const o=AC.createOscillator(), g=AC.createGain();
+  o.type=type;o.frequency.setValueAtTime(f,t0); if(f2)o.frequency.exponentialRampToValueAtTime(Math.max(1,f2),t0+dur);
+  g.gain.setValueAtTime(vol,t0); g.gain.exponentialRampToValueAtTime(0.0001,t0+dur);
+  o.connect(g).connect(master); o.start(t0);o.stop(t0+dur+0.02);
+}
+function noiseBurst({dur=0.06,vol=0.15,freq=800,q=1,type='bandpass',when=0}){ shared noise buffer }
+```
+Noise buffer: create once 1s white.
+
+Footsteps: run: noiseBurst freq 900±, vol .12; sneak: freq 320, vol .05, dur .05. Slight random detune per step.
+
+Sting (detection): tone 660→990 square .12 vol .25 + second at when .08? plus a "!" vibe: two quick rising beeps.
+Alarm beep: alternate freqs, sawtooth vol .12 dur .09.
+Core pickup: tones [523,784,1046] each .09 spaced .07 triangle.
+Gate open: tone 180→720 sine .5 vol .3 + shimmer tone 1200 .3 when .2.
+Decoy throw: noiseBurst high sweep? use tone 300→900 .12 triangle .15; landing pop: tone 500→180 .08.
+Caught: tone 400→60 sawtooth .7 vol .35 + big noise lowpass .5.
+Clear jingle: [392,523,659,784] spaced .09 square vol .2.
+Win: longer arpeggio.
+
+Mute: M toggles muted; when muted master.gain=0 (keep state). Show "M" in HUD hint.
+
+Now the big one: writing all code correctly in one pass. Let me draft the JS structure:
+
+```
+// ===== helpers
+const $=s=>document.querySelector(s);
+clamp, lerp, dist, angDiff...
+mulberry32(seed)
+hash for runSeed: (a,b)=>...
+
+// ===== constants
+T=32; W=21;H=15;
+SPEED={run:6.4,sneak:3.1};
+LEVELS=[{name:'INTAKE VAULT',ghosts:2,patrol:2.4,chase:4.9,sight:4.4},{...}]
+
+// ===== state
+let state='start'; // start|play|pause|over|clear|win
+let runSeed, level=0, grid, floorSet, wallInfo(paths), cores[], exitTile, player{}, ghosts[], decoys[], ripples[], particles[];
+let time=0 (global anim), levelTime=0,totalTime=0, best=null;
+let suspicionGlobal? per ghost.
+
+// ===== DOM refs
+canvas, ctx, lcan, lctx; hud elements: elSector, elCores, elDecoys, elState, elObj, elTime; overlays: ovStart, ovPause, ovOver, ovWin, banner.
+
+// ===== maze gen + level build
+buildLevel(lvIdx) { seed = runSeed*31+lvIdx*7919 ... generate grid; precompute paths (wallPath Path2D, edgePath, dots); bfs from start; place cores/exit/spawns; init player at start tile with facing toward open neighbor; init ghosts with random facing and 'patrol'; decoys=[]; ripples=[]; levelTime=0; coresLeft=3; gateOpen=false; }
+
+// ===== input
+keys set; dirStack; keydown: ensureAudio(); handle UI keys per state; else push to dirStack.
+keyup remove.
+
+// throwDecoy()
+
+// ===== update(dt)
+if state play: updatePlayer, noise events (in step), updateGhosts (detection, movement), decoys ttl, ripples, catch check, exit check, hud refresh, alarm sound scheduling.
+if start: updateGhosts only (patrol), player idle anim time.
+clear: timer → next level or win.
+
+// ===== render()
+world → screen transform; draw bg pattern? (bg outside letterbox handled by CSS body gradient). Inside canvas: fill world rect with floor base, dots, walls, portal, cores, decoys, ripples, cones, player, ghosts, lighting overlay, ghost eyes glow, alert "!" above overlay?, vignette, flash.
+```
+
+HUD update: only when changed (or every frame cheap string ops fine).
+
+Careful details:
+
+- Cones drawn under darkness get dark; that's fine (dim hint of danger), but alert state should be felt: also draw red eyes glow above overlay + alarm sound + screen shake + state badge. Good.
+- Ghosts fully visible only in light — spooky and correct.
+- Player light radius sneaking 2.6, running 4.2; ghost own light 1.5 (so you can spot them if close); core light 1.8; exit open 2.6 pulse; decoy 2.0.
+
+Darkness alpha: 0.93 base. In start state maybe 0.8 to show more of the scene? Keep same for consistency; attract shows lights drifting — nice.
+
+- Wall rendering with Path2D precomputed in world px (tile*32). Per level:
+```
+wallPath: for each wall tile adjacent to ≥1 floor: addRect(x*32+1, y*32+1, 30, 30)? Slight inset gives gap lines between walls = good. 
+edgePath: for each such tile, for each of 4 dirs if neighbor is floor (or out-of-bounds? border faces void; skip): add line segment along the shared edge slightly offset outward into wall side: e.g., right neighbor floor → vertical line at x*32+31 from y*32+2 to y*32+30.
+```
+strokeStyle rgba(96,180,255,0.28), lineWidth 1.5, shadowColor cyan shadowBlur 6 — single stroke call. Also inner fill: two-tone? Fill wallPath with '#0d1326'; then a second pass for top highlight: skip.
+
+Floor base: fill world rect '#070b16'; dots: for each floor tile small circle r=1.6 rgba(140,190,255,0.10) — 100+ dots; precompute into a Path2D with arcs? Path2D + fill once = cheap. Yes, dotsPath.
+
+Also faint grid lines on floor? skip (dots suffice).
+
+Portal: at exit tile center: closed: dim dashed circle + lock icon? Just dim ring #3a4a6a; open: rotating double ring + swirl gradient gold/cyan + particles converging (few lines animated). Draw with rotation by time.
+
+Cores: orb r 0.18*32=5.7 pulsing scale, color #ffd93b core + white center, glow via radial gradient fill circle r 14. Plus orbiting spark? small rotating dot — cute. Fine.
+
+Decoy draw: gold pellet r 4 + expanding rings (like noise but gold), ttl bar? just fade last second.
+
+Ripples (noise from run steps): stroke circles rgba(255,255,255,a) expanding 0.3→1.6 tiles over .5s.
+
+Player trail when running: store last positions few, draw fading small arcs — adds life. Simple: keep a trail array of {x,y,t}; draw 4 dots with alpha decay. Cheap.
+
+Ghost bob: y += sin(time*6+phase)*1.5px; bottom scallop animate phase by time*8.
+
+Eyes glow above overlay: for each ghost, draw two small radial-gradient dots (r 3) at eye positions in color #fff core + state-colored halo (patrol cyan, susp amber, alert red). Visible through darkness = perfect "you can hear/see them coming".
+
+Alerted exclamation: draw above ghost (also above overlay so visible): bold "!" font Impact 16px red with glow; shown when alerted or suspicion>0.5? Show "!" only when alerted; show arc meter for suspicion 0..1 while >0.05.
+
+HUD state label logic:
+```
+anyAlert → DETECTED (red, pulse)
+else anySuspicion>0 or anySusp → HEARD (amber)
+else if sneaking → SNEAKING (yellow)
+else → EXPOSED? running with no threat = "RUNNING" cyan? Let's do: running→'EXPOSED' (white/cyan). hidden never happens. Keep 4 states.
+```
+
+Objective text: coresLeft>0 ? `RECOVER CORES ${got}/3` : 'GATE OPEN — REACH THE EXIT'.
+
+Time display mm:ss.d of total run time.
+
+Best time: save on win: key 'sneakpac.best' JSON {t:ms}. Show "BEST 01:23.4" on start & win. try/catch.
+
+Level clear flow: state='clear'; play jingle; banner "SECTOR CLEAR"; after 1.6s: level++; if level>=3 → win (save best) else buildLevel, show sector banner, state='play'.
+Use a timer variable clearT counting in update.
+
+Caught flow: state='over'; caughtBy=ghost.id ('W-01'..); big red flash; play sound; after 0.8s show overlay (or immediately with CSS animation delay). Show stats: sector, time in sector. Buttons: ENTER retry sector (rebuild same), R restart run.
+
+Pause: state='pause'; overlay; P/Esc/Enter resume.
+
+Start: Enter/click start → ensureAudio, startRun().
+
+Edge: keydown Enter during 'clear' ignored.
+
+Now sizing/layout: container fills window; canvas centered; compute scale = min(cw/(W*T), ch/(H*T)); but HUD is DOM positioned over the whole container so canvas can be smaller than window with letterbox — I want to fill the window (no scrollbars) — letterbox bars are fine (bg color matches). Or stretch? No distortion. Centered letterbox with matching bg + subtle ambient pattern on body.
+
+DPR handling: canvas.width = cw*dpr etc, ctx.setTransform(dpr*scale...). Actually simpler: keep canvas CSS size = window; set width/height to device px; compute view transform: translate(offsetX, offsetY) scale(scale*dpr). All drawing in logical tile units * T? Let's use logical pixel units where 1 tile = 32px; then multiply by s = fit.
+
+Coordinates: keep everything in "world units" = tiles (floats). Render: px = world*32. So ctx.setTransform(s*dpr,0,0,s*dpr, ox*dpr, oy*dpr) and draw in world*32 coordinates. Fine.
+
+Resize handler sets canvas size and recomputes s, ox, oy.
+
+Player drawing (pac):
+```
+radius = sneak? 0.34 : 0.42 tile;
+mouth angle: running: chomp = (sin(t*10)+1)/2 * 0.9 rad; sneaking: 0.15; idle: breathe 0.3+...
+draw circle with wedge cut: arc from mouth/2 to 2π - mouth/2, fill yellow; rotate by facing angle.
+Sneak: color #e8c34a slightly darker + smaller; add tiny motion trail? skip.
+```
+Ghosts: radius 0.42. Body path in local coords: arc top (from π to 0), lines down sides, bottom zigzag with 3-4 scallops animated by phase. Eyes: two whites at offset toward facing; pupils further offset. Colors: W-red #ff5964, W-pink #ff7ad9? Classic: red, pink (#ffb8de / use #f9a8d8?), cyan #55e0ff, orange #ffa94d. Alerted aura: shadowBlur red? Per-ghost shadowBlur is okay (≤4 ghosts).
+
+Suspicion indicator: small arc above ghost showing fill fraction, color lerp yellow→red; when ≥1 flash "!" for 0.8s.
+
+Cone drawing: from ghost center, two rays at facing ± fov/2 with length range*stateFactor, plus arc between (use path: moveTo center, lineTo p1, arc? simpler polygon fan with few segments). Fill color per state: patrol rgba(120,170,255,0.10), suspicious rgba(255,200,80,0.14), alerted rgba(255,60,60,0.16+pulse).
+
+Noise ripple: when run step, push ring {x,y,r:0.3,ttl:0.6}; expand; stroke with fading cyan-white.
+
+Decoy: pulsing white-gold pellet + rings like noise but gold; ttl 5s; while active, ghosts investigate.
+
+Timer: level time counts up during PLAYING; total accumulates.
+
+Stats: total time (mm:ss), best saved.
+
+Edge cases:
+- Player stuck at wall with held key — fine.
+- Ghost path recompute cost: BFS on 315 tiles is trivial.
+- Decoy thrown while paused? ignore input in non-PLAYING states (except UI keys).
+- Key repeat: use a set of pressed keys; direction priority = last pressed (track order). Maintain `keyOrder` array.
+
+Restart logic: startRun() → level=0, stats reset, buildLevel(); enterState('play'). retrySector() rebuilds same level with same seed? Same seed per run: store runSeed at run start; levelSeed = hash(runSeed, level). Retry uses same → fair.
+
+Attract mode: on load, buildLevel(0) and state 'start'; simulation updates ghosts only (player idle), no HUD state label change (HUD hidden? show but dim?). Show HUD only in play/pause/over states; hide during start/win.
+
+Let me also add a small "objective" line in HUD: "RECOVER 3 CORES → REACH GATE" that changes to "GATE OPEN — RUN" once collected.
+
+Screen shake: when any alerted, small amplitude 1-2px oscillating; on caught, big flash.
+
+Flash overlay div for damage? Use canvas white/red flash alpha decaying.
+
+Now let me code it all. Careful with key handling to not start on Enter during play? Enter only acts in state transitions. M = mute anytime. P/Esc pause toggle (only in play/pause). R restart run (any state except start → to start? R from game over/win/play → new run; from start also ok).
+
+Prevent default for arrows/space/WASD/Shift? Shift is fine. Prevent arrow+space scroll: e.preventDefault() on those codes when game focused (always, since it's a full-page game).
+
+Also mouse click to start (for iframe without focus?) — buttons clickable; also canvas click = start if state start; also audio unlock on any pointerdown/keydown.
+
+Audio unlock: call ensureAudio() on first keydown/pointerdown.
+
+Let me write the sound functions:
+
+```
+function tone({f=440,f2,dur=0.1,type='square',vol=0.2,when=0}){
+  if(!AC||muted)return; const t0=AC.currentTime+when;
+  const o=AC.createOscillator(), g=AC.createGain();
+  o.type=type;o.frequency.setValueAtTime(f,t0); if(f2)o.frequency.exponentialRampToValueAtTime(Math.max(1,f2),t0+dur);
+  g.gain.setValueAtTime(vol,t0); g.gain.exponentialRampToValueAtTime(0.0001,t0+dur);
+  o.connect(g).connect(master); o.start(t0);o.stop(t0+dur+0.02);
+}
+function noiseBurst({dur=0.06,vol=0.15,freq=800,q=1,type='bandpass',when=0}){ shared noise buffer }
+```
+Noise buffer: create once 1s white.
+
+Footsteps: run: noiseBurst freq 900±, vol .12; sneak: freq 320, vol .05, dur .05. Slight random detune per step.
+
+Sting (detection): tone 660→990 square .12 vol .25 + second at when .08? plus a "!" vibe: two quick rising beeps.
+Alarm beep: alternate freqs, sawtooth vol .12 dur .09.
+Core pickup: tones [523,784,1046] each .09 spaced .07 triangle.
+Gate open: tone 180→720 sine .5 vol .3 + shimmer tone 1200 .3 when .2.
+Decoy throw: noiseBurst high sweep? use tone 300→900 .12 triangle .15; landing pop: tone 500→180 .08.
+Caught: tone 400→60 sawtooth .7 vol .35 + big noise lowpass .5.
+Clear jingle: [392,523,659,784] spaced .09 square vol .2.
+Win: longer arpeggio.
+
+Mute: M toggles muted; when muted master.gain=0 (keep state). Show "M" in HUD hint.
+
+Now the big one: writing all code correctly in one pass. Let me draft the JS structure:
+
+```
+// ===== helpers
+const $=s=>document.querySelector(s);
+clamp, lerp, dist, angDiff...
+mulberry32(seed)
+hash for runSeed: (a,b)=>...
+
+// ===== constants
+T=32; W=21;H=15;
+SPEED={run:6.4,sneak:3.1};
+LEVELS=[{name:'INTAKE VAULT',ghosts:2,patrol:2.4,chase:4.9,sight:4.4},{...}]
+
+// ===== state
+let state='start'; // start|play|pause|over|clear|win
+let runSeed, level=0, grid, floorSet, wallInfo(paths), cores[], exitTile, player{}, ghosts[], decoys[], ripples[], particles[];
+let time=0 (global anim), levelTime=0,totalTime=0, best=null;
+let suspicionGlobal? per ghost.
+
+// ===== DOM refs
+canvas, ctx, lcan, lctx; hud elements: elSector, elCores, elDecoys, elState, elObj, elTime; overlays: ovStart, ovPause, ovOver, ovWin, banner.
+
+// ===== maze gen + level build
+buildLevel(lvIdx) { seed = runSeed*31+lvIdx*7919 ... generate grid; precompute paths (wallPath Path2D, edgePath, dots); bfs from start; place cores/exit/spawns; init player at start tile with facing toward open neighbor; init ghosts with random facing and 'patrol'; decoys=[]; ripples=[]; levelTime=0; coresLeft=3; gateOpen=false; }
+
+// ===== input
+keys set; dirStack; keydown: ensureAudio(); handle UI keys per state; else push to dirStack.
+keyup remove.
+
+// throwDecoy()
+
+// ===== update(dt)
+if state play: updatePlayer, noise events (in step), updateGhosts (detection, movement), decoys ttl, ripples, catch check, exit check, hud refresh, alarm sound scheduling.
+if start: updateGhosts only (patrol), player idle anim time.
+clear: timer → next level or win.
+
+// ===== render()
+world → screen transform; draw bg pattern? (bg outside letterbox handled by CSS body gradient). Inside canvas: fill world rect with floor base, dots, walls, portal, cores, decoys, ripples, cones, player, ghosts, lighting overlay, ghost eyes glow, alert "!" above overlay?, vignette, flash.
+```
+
+HUD update: only when changed (or every frame cheap string ops fine).
+
+Careful details:
+
+- Cones drawn under darkness get dark; that's fine (dim hint of danger), but alert state should be felt: also draw red eyes glow above overlay + alarm sound + screen shake + state badge. Good.
+- Ghosts fully visible only in light — spooky and correct.
+- Player light radius sneaking 2.6, running 4.2; ghost own light 1.5 (so you can spot them if close); core light 1.8; exit open 2.6 pulse; decoy 2.0.
+
+Darkness alpha: 0.93 base. In start state maybe 0.8 to show more of the scene? Keep same for consistency; attract shows lights drifting — nice.
+
+- Wall rendering with Path2D precomputed in world px (tile*32). Per level:
+```
+wallPath: for each wall tile adjacent to ≥1 floor: addRect(x*32+1, y*32+1, 30, 30)? Slight inset gives gap lines between walls = good. 
+edgePath: for each such tile, for each of 4 dirs if neighbor is floor (or out-of-bounds? border faces void; skip): add line segment along the shared edge slightly offset outward into wall side: e.g., right neighbor floor → vertical line at x*32+31 from y*32+2 to y*32+30.
+```
+strokeStyle rgba(96,180,255,0.28), lineWidth 1.5, shadowColor cyan shadowBlur 6 — single stroke call. Also inner fill: two-tone? Fill wallPath with '#0d1326'; then a second pass for top highlight: skip.
+
+Floor base: fill world rect '#070b16'; dots: for each floor tile small circle r=1.6 rgba(140,190,255,0.10) — 100+ dots; precompute into a Path2D with arcs? Path2D + fill once = cheap. Yes, dotsPath.
+
+Also faint grid lines on floor? skip (dots suffice).
+
+Portal: at exit tile center: closed: dim dashed circle + lock icon? Just dim ring #3a4a6a; open: rotating double ring + swirl gradient gold/cyan + particles converging (few lines animated). Draw with rotation by time.
+
+Cores: orb r 0.18*32=5.7 pulsing scale, color #ffd93b core + white center, glow via radial gradient fill circle r 14. Plus orbiting spark? small rotating dot — cute. Fine.
+
+Decoy draw: gold pellet r 4 + expanding rings (like noise but gold), ttl bar? just fade last second.
+
+Ripples (noise from run steps): stroke circles rgba(255,255,255,a) expanding 0.3→1.6 tiles over .5s.
+
+Player trail when running: store last positions few, draw fading small arcs — adds life. Simple: keep a trail array of {x,y,t}; draw 4 dots with alpha decay. Cheap.
+
+Ghost bob: y += sin(time*6+phase)*1.5px; bottom scallop animate phase by time*8.
+
+Eyes glow above overlay: for each ghost, draw two small radial-gradient dots (r 3) at eye positions in color #fff core + state-colored halo (patrol cyan, susp amber, alert red). Visible through darkness = perfect "you can hear/see them coming".
+
+Alerted exclamation: draw above ghost (also above overlay so visible): bold "!" font Impact 16px red with glow; shown when alerted or suspicion>0.5? Show "!" only when alerted; show arc meter for suspicion 0..1 while >0.05.
+
+HUD state label logic:
+```
+anyAlert → DETECTED (red, pulse)
+else anySuspicion>0 or anySusp → HEARD (amber)
+else if sneaking → SNEAKING (yellow)
+else → EXPOSED? running with no threat = "RUNNING" cyan? Let's do: running→'EXPOSED' (white/cyan). hidden never happens. Keep 4 states.
+```
+
+Objective text: coresLeft>0 ? `RECOVER CORES ${got}/3` : 'GATE OPEN — REACH THE EXIT'.
+
+Time display mm:ss.d of total run time.
+
+Best time: save on win: key 'sneakpac.best' JSON {t:ms}. Show "BEST 01:23.4" on start & win. try/catch.
+
+Level clear flow: state='clear'; play jingle; banner "SECTOR CLEAR"; after 1.6s: level++; if level>=3 → win (save best) else buildLevel, show sector banner, state='play'.
+Use a timer variable clearT counting in update.
+
+Caught flow: state='over'; caughtBy=ghost.id ('W-01'..); big red flash; play sound; after 0.8s show overlay (or immediately with CSS animation delay). Show stats: sector, time in sector. Buttons: ENTER retry sector (rebuild same), R restart run.
+
+Pause: state='pause'; overlay; P/Esc/Enter resume.
+
+Start: Enter/click start → ensureAudio, startRun().
+
+Edge: keydown Enter during 'clear' ignored.
+
+Now resize:
+```
+function resize(){ dpr=devicePixelRatio||1; cw=innerWidth, ch=innerHeight; canvas.width=cw*dpr; canvas.height=ch*dpr; canvas.style.width=cw+'px'; ... scale s=Math.min(cw/(W*T), ch/(H*T)); ox=(cw-W*T*s)/2; oy=...; lcan same size. }
+```
+Render: ctx.setTransform(1,0,0,1,0,0) clear whole canvas with bg color (letterbox area = same as body bg → invisible seam). Then set world transform including shake offset.
+
+Shake: if anyAlerted: sh = 2px * sin(time*30)? Use random walk: shakeAmp decays; add small jitter each frame when alerted. Implement: shX=(Math.random()-0.5)*amp etc, amp = anyAlert?1.8:0, plus catchFlash burst 6.
+
+Flash: flashA (alpha) red on catch, gold on core pickup small.
+
+Trail: while moving push {x,y} each frame cap 12; draw with decreasing size/alpha only when running.
+
+Particles (dust): init 50 random within world; drift slow upward-left wrap; drawn as tiny circles alpha .15 under lighting.
+
+Also "motes" on floor are static dots (dotsPath). Dust adds motion. Good layering: bg → dust (under lights) ...
+
+Wait, dust under darkness overlay will be invisible except in light — that's fine and cool.
+
+Cone gradient: solid fill with low alpha is enough; add a brighter line at the edges? skip.
+
+Ghost facing when idle: keep lastDir; cone points there — patrol ghost stops at target briefly (0.5-1s) then picks new → cone sweeps around = lively.
+
+Detection nuance: running player seen → instant alert with sting + "!" — good tension. Sneaking seen → suspicion fills in ~1.4s while continuously seen; if you break LOS it decays. Suspicion>0 shows arc meter above ghost (and badge HEARD? no—HEARD is for noise/susp state). Let me unify: ghost.suspicion drives the arc; ghost.state 'susp' (heard) also counts as heard. Badge: anyAlert→DETECTED; else any (state=='susp'||suspicion>0.15||'invest')? invest means they're chasing a decoy = you're safe-ish → maybe badge "DECOY ACTIVE"? Keep: anySusp state or suspicion>0.2 → 'HEARD!'. Fine.
+
+Noise radius: 4.2 tiles Euclidean (through walls — plausible as sound). On noise, ghosts within radius & !alert become 'susp' with target=noise pos, and if they were patrol just far away... fine. Also play a faint "echo" tick when a ghost reacts? Optional; skip to avoid noise clutter. Actually a subtle low "thud" ping helps feedback: tone 220 sine .1 vol .1 when any ghost newly hears (only if within 3 tiles? or always) — let's do always but quiet.
+
+Decoy effect on alert ghosts: they retarget decoy ('invest'), and suspicion reset? Keep alert until decoy expires → then back to chase (lastSeen stale → susp). Hmm, simpler: decoy overrides target for both susp & alert; on expiry → alert goes back to chasing player (they were never fooled about you — but that makes decoys useless vs alert... design choice: decoy fully resets alert→patrol if ghost reaches it or it expires? Let's do: while decoy alive, alert ghosts go 'invest'; when they arrive at decoy, they "inspect" for 1.2s and return to patrol (reset). If decoy expires before arrival → back to prior state (alert → chase lastSeen). That makes decoys strong but limited (3) — good risk/reward.
+
+Caught check uses player pos vs ghost pos <0.55.
+
+Also prevent ghosts from overlapping each other? They can pass through; classic Pac-Man has priority stacking; skip, overlap fine visually (slight alpha).
+
+Repath frequency: alert: every 0.45s or when player tile changes; susp/patrol/invest: only on target change/arrival.
+
+BFS path function:
+```
+function findPath(sx,sy,tx,ty){ if same return []; queue with prev map using Int16Array? small grid so object fine. Return array of {x,y} excluding start.
+}
+```
+Use arrays for perf clarity: dist=Int32Array(W*H) fill -1; prev=Int32Array; standard.
+
+Ghost step movement:
+```
+if path empty → speed 0, maybe idle turn timer to pick new target (patrol handles).
+next=path[idx]; dx=next.x-g.px... move by sp*dt; if distToNext <= step → set pos=next, idx++, if idx==len → arrived handling (state machine: patrol→schedule new target after 0.4+rand; susp→waitT 2s then patrol; invest→inspectT).
+```
+Ghost px,py floats in tiles.
+
+Facing = normalized move dir this frame (if moving), else keep.
+
+Player step sound on tile snap while moving & state play.
+
+Core pickup: when player tile equals core tile → remove, chime, flash 0.15 gold; if all collected → gateOpen=true + sound + banner mini "GATE OPEN" (reuse banner small) — or just objective text change + portal animation. Let's do a short toast via banner element with class 'small'.
+
+Exit check: player tile == exit && gateOpen → levelClear.
+
+Timing: dt clamp 0.05. Use requestAnimationFrame loop with timestamp; skip updates when document hidden (rAF pauses anyway).
+
+Total time accumulates only during 'play' (not paused/clear? clear is brief — count into total for fairness? Count play+clear? Just play). Fine: totalTime += dt in play.
+
+HUD DOM ids: hudSector, hudCores (3 spans), hudDecoys (3 spans), hudState, hudObj, hudTime. Update each frame minimal: set textContent only when changed (cache strings).
+
+Banner element: big center text with CSS animation 'bannerIn' triggered by re-adding class; auto-hide via JS timeout or animation fill both + pointer-events none. Implement showBanner(main, sub, dur): set text, restart animation via void offsetWidth trick, setTimeout hide (guard state changes? trivial).
+
+Overlay show/hide: helper setOv(el, bool) toggling .on class; CSS transitions opacity/scale.
+
+Start overlay content:
+- Logo: "SNEAK PAC" — maybe two-tone: SNEAK (cyan outline?) PAC (yellow fill with pac-dot eyes?). Let's do styled text: yellow with layered shadows + a small pac icon drawn inline in canvas? Use unicode? Draw a tiny CSS pac: circle with wedge via conic-gradient! `background: conic-gradient(from 30deg, #ffd93b 0 300deg, transparent 300deg 360deg); border-radius:50%` rotated. Cute for logo bullet and decoy pips.
+- Tagline "MIDNIGHT PROTOCOL — a pac-man stealth game"
+- Lore line.
+- Controls list with kbd caps: ↑↓←→ / WASD MOVE · HOLD SHIFT SNEAK (silent, slow) · RELEASE RUN (loud, fast) · SPACE THROW DECOY ×3 · P PAUSE · M MUTE · R RESTART.
+- Mission: "Collect 3 CORES. Open the GATE. Outrun every warden."
+- Best time line.
+- Button [ START RUN — ENTER ].
+
+Panel styling: dark panel with cyan border glow, corner notches? Use clip-path polygon for angled corners (arcade feel). Keep it tasteful.
+
+Game over panel: red theme "SIGNAL LOST", "Warden W-02 tagged you in SECTOR 01", time line, buttons [ RETRY SECTOR — ENTER ] [ RESTART RUN — R ].
+Win panel: gold/cyan "VAULT CLEARED", total time, best (with NEW BEST tag), [ RUN IT BACK — ENTER/R ].
+
+Pause panel: "PAUSED" + controls recap + [ RESUME — P ].
+
+Ensure buttons also work with mouse (click → same action; ensureAudio on click).
+
+Now fonts: display Impact/'Arial Black' fallback stack: `Impact, 'Haettenschweiler', 'Franklin Gothic Bold', 'Arial Black', sans-serif`. Body: `'Trebuchet MS','Segoe UI',system-ui,sans-serif`. Kbd/mono: `'Consolas','Menlo',monospace`.
+
+Colors: bg #04060d; cyan #57e6ff; yellow #ffd93b; red #ff5964; panel rgba(8,12,24,.92); border rgba(87,230,255,.35).
+
+Title glow: text-shadow: 0 0 18px rgba(255,217,59,.55), 0 0 40px rgba(255,217,59,.25); letter-spacing.
+
+Scanlines div: fixed inset 0, background: repeating-linear-gradient(0deg, rgba(255,255,255,.02) 0 1px, transparent 1px 3px), radial-gradient(120% 90% at 50% 40%, transparent 60%, rgba(0,0,0,.5)); pointer-events:none; z-index above canvas below overlays? Above everything except panels? Panels should stay readable — put scanlines z between canvas and HUD/panels: canvas z0, scan z1, hud z2, overlay z3. Slight scanline over HUD ok too... keep under HUD.
+
+Now let me carefully write actual code. I'll write it as one HTML file. Let me mentally draft the trickier functions for correctness.
+
+Maze generation:
+```
+function genMaze(seed){
+  const rnd=mulberry32(seed);
+  const g=Array.from({length:H},()=>Array(W).fill(1)); //1 wall 0 floor
+  const CW2=W>>1, CH2=H>>1; //10,7
+  const vis=Array.from({length:CH2},()=>Array(CW2).false);
+  const st=[[0,0]]; vis[0][0]=true; g[1][1]=0;
+  while(st.length){
+    const [cx,cy]=st[st.length-1];
+    const dirs=shuffle([[1,0],[-1,0],[0,1],[0,-1]],rnd).filter(([dx,dy])=>{const nx=cx+dx,ny=cy+dy;return nx>=0&&nx<CW2&&ny>=0&&ny<CH2&&!vis[ny][nx];});
+    if(!dirs.length){st.pop();continue;}
+    const [dx,dy]=dirs[0];
+    const nx=cx+dx,ny=cy+dy;
+    g[cy*2+1+dy][cx*2+1+dx]=0;
+    vis[ny][nx]=true; st.push([nx,ny]);
+  }
+  // loops
+  let removed=0, guard=0;
+  while(removed<14 && guard++<500){
+    const x=1+((rnd()*(W-2))|0), y=1+((rnd()*(H-2))|0);
+    if(g[y][x]!==1) continue;
+    const h=g[y][x-1]===0&&g[y][x+1]===0, v=g[y-1][x]===0&&g[y+1][x]===0;
+    if(h!==v) continue; // remove only if exactly one axis connects (h xor v)? both true means cross — rare in maze; allow either: require h||v. Use: if(!(h||v))continue; if(h&&v)continue? Removing at a cross would just merge 4 floors → fine too but keep simple: require (h||v)&&!(h&&v).
+    g[y][x]=0; removed++;
+  }
+  return g;
+}
+```
+Wait condition: h and v both true means the wall tile is surrounded by 4 floors — removing it connects all, still fine topologically. Let's allow (h||v).
+
+shuffle helper with rnd.
+
+BFS:
+```
+function bfs(sx,sy){
+ const dist=new Int32Array(W*H).fill(-1), prev=new Int32Array(W*H).fill(-1);
+ const q=[sy*W+sx]; dist[sy*W+sx]=0; let h=0;
+ while(h<q.length){const c=q[h++],cx=c%W,cy=(c/W)|0; for dirs... if g==0 && dist==-1 set, push}
+ return {dist,prev};
+}
+function pathTo(bfsData, tx,ty){ reconstruct via prev from t to s (excluding s). Reverse. }
+```
+
+Placement:
+- start: pick floor closest to corner (1,1): iterate floors sorted by x+y → first floor. (Maze always has (1,1) as floor since carving starts there! g[1][1]=0 guaranteed.) So start=(1,1).
+- dist from start via bfs.
+- exit: floor with max dist.
+- cores: candidates = floors sorted by dist desc, take pool of top 55%; pick 3 maximizing min pairwise distance (greedy): iterate candidates, add if pairDist>=5 to chosen until 3 or exhausted (fallback relax). Also ensure not exit.
+- ghost spawns: floors with dist>8 & !=cores/exit, greedy pairwise >=6, count per level; fallback relax to any floor dist>6.
+
+Player init: tx=1,ty=1, px=py=center? Store center coords as tile+0.5. Let me store pos in units of tile-center coordinates: (x,y) where integer = that tile's center. So worldPx = (x+0.5)*T. Movement toward next tile center is just integer target. Nice simplification.
+
+open(x,y): g[y][x]===0.
+
+Player update:
+```
+const want=desiredDir(); // {x,y} or null from dirStack
+let sp=(sneak?SNEAK:RUN)*dt;
+// reversal mid-tile
+if(want && p.dirx!=0 && (want.x===-p.dirx&&want.y===-p.diry) && !atCenter... allow anytime: set p.dirx=want.x..., keep pos. Actually reversing mid-tile is fine because movement is along axis; but if we're between tiles, reversing will move us back — correct classic behavior.
+if(atCenter(p)){ // |px - tx|<eps etc
+  if(want && open(tx+want.x,ty+want.y)) {p.dirx=want.x;p.diry=want.y;}
+  else {p.dirx=0;p.diry=0; p.face=...keep}
+}
+if(p.dirx||p.diry){
+  const nx=p.px+p.dirx*sp, ny=p.py+p.diry*sp;
+  const txp=Math.round(p.px), typ=Math.round(p.py); // target tile center = current tile + dir (integer)
+  // target center integer: txx=txp+p.dirx...
+  if moving toward target: check crossing: if((p.px<p.dirx? nx>=targetX : nx<=targetX)) snap.
+```
+Simpler: track p.tx,p.ty = current tile; target = tx+dirx, ty+diry (validated open at center choice). Move px toward targetX by sp; if reached or passed → snap px=targetX, tx=targetX (tile advanced), step event, then immediately re-evaluate center logic next frame. If dir was set but no target (shouldn't happen since we only set when open) fine.
+
+atCenter: p.tx===Math.round(p.px)&&p.ty===Math.round(p.py). On snap set exactly.
+
+Initial: px=1,py=1,tx=1,ty=1,dir 0, face toward right if open(2,1) else down.
+
+Step event on tile advance (tile changed): footsteps; if running → ripple + noise broadcast to ghosts.
+
+Sneak is hold shift: sneak = keys.has('ShiftLeft'||'ShiftRight')? use e.key==='Shift'. Track in keydown/keyup via code 'ShiftLeft','ShiftRight'.
+
+Ghost update (dt, active detection only if state play):
+```
+for g of ghosts:
+ // perception
+ const dx=p.px-g.px, dy=p.py-g.py, d=Math.hypot(dx,dy);
+ let seen=false;
+ const sight = sneak? L.sight*0.8 : L.sight;
+ if(d<sight+0.5){
+   const ang=Math.atan2(dy,dx), fa=angDiff(ang,g.faceAng);
+   if(fa<L.fov/2 && los(g.px,g.py,p.px,p.py)) seen=true;
+   else if(d<1.1) seen=true; // bump sight 360 close
+ }
+ if(seen){ g.lastSeen={x:p.px,y:p.py,t:time}; g.seenT=0;
+   if(!sneak){ alert(g); } else { g.suspicion=Math.min(1,g.suspicion+dt/1.5); if(g.suspicion>=1) alert(g);} }
+ else { g.seenT+=dt; g.suspicion=Math.max(0,g.suspicion-dt/2.2); }
+ // state machine transitions (invest/susp expiry)
+ ...
+ // repath
+ ...
+ // move along path at speed by state
+ ...
+```
+alert(g): if g.state!=='alert' {g.state='alert'; g.suspicion=1; sting sound; g.flashT=.8;}
+
+invest handling: g.decoyRef = decoy object; in decoys update, when decoy dies → ghosts with ref: state = (hadAlert? 'alert':'patrol')... store g.prevState before invest. On arrival at decoy: g.inspectT=1.2, then patrol (reset suspicion). If decoy expires first: revert to prevState (alert→chase; susp→keep heading lastKnown; patrol→patrol).
+
+Noise broadcast:
+```
+function noise(x,y,r){ for g: if dist<r && g.state!=='alert' && !g.decoyRef { g.state='susp'; g.target={x,y}; g.repath(); hearSound(d); } }
+```
+Also alert ghosts ignore noise (they know where you were, chasing current).
+
+Alert repath: g.alertT+=dt; if(g.alertT>0.45){g.alertT=0; path to (round p.px, round p.py);} also on seen set target fresh? The 0.45 cadence suffices.
+If no sight for 4s (seenT>4) → state='susp'; target=lastSeen; repath; suspicion=0.6.
+
+Susp arrival at target: wait suspWaitT 2.2s then patrol.
+Patrol: on arrival or every 5+rand*4 s → new random floor target (bias far from player? just any).
+
+Ghost speed: base=L.patrol; mult: patrol1, susp1.35, alert2.05, invest1.5, inspect0.
+
+Ensure ghost doesn't exceed level bounds — paths are only floors so fine.
+
+Catch check each frame in play: min dist < 0.5 → over(g).
+
+LOS sampling:
+```
+function los(x0,y0,x1,y1){ const d=Math.hypot(x1-x0,y1-y0), n=Math.ceil(d*4); for(i=1;i<n;i++){const t=i/n, x=x0+(x1-x0)*t, y=y0+(y1-y0)*t; if(g[y|0][x|0]===1) return false;} return true; }
+```
+Careful: |0 on negatives fine (positions are positive).
+
+Cone draw with range depending on state & sneak? Cone shows ghost's actual sight: patrol/susp = L.sight, alert = L.sight*1.25 (they see further when hunting — good feedback), fov ~1.15 rad (~66°) patrol, 1.5 alert.
+
+Now render function details in world transform; T=32.
+
+Ghost body draw:
+```
+function drawGhost(g){
+ const x=(g.px+.5)*T, y=(g.py+.5)*T + bob;
+ r=0.44*T;
+ ctx.save(); translate(x,y);
+ body path: begin; arc(0,-r*0.1,r,Math.PI,0); lineTo(r, r*0.72); scallops: for i 3: quadratic? classic zigzag: from right to left with 3 bumps: points at bottom y=r*0.72, bump width w=2r/3; animate offset by phase: use lines: for(i=2;i>=0;i--){ const bx=r - (i+0.5)*w... } Let me do it this way: after lineTo(r, r*0.7): for i in 0..2: lineTo(r-(i+.5)*w, r*0.7 - wave); lineTo(r-(i+1)*w, r*0.7); where wave = (phase? maybe static) — animate scallop by shifting x with sin(time*10+g.phase): simpler static zigzag looks fine + bob gives life.
+ fill color; if alert: shadowColor red blur 14.
+ eyes: facing offset fx=cos(faceAng)*2.5, fy=sin...
+ white ellipses at (-r*0.35+fx, -r*0.15+fy) & (r*0.35+fx,...): radius r*0.26/0.34; pupils offset further *0.12 same dir, dark #102.
+ restore.
+}
+```
+
+Player draw:
+```
+x,y center; r=(sneak?0.36:0.44)*T (+ slight scale pulse when running);
+mouth = moving? (running? 0.5+0.5*Math.sin(time*14) : 0.25)*maxAngle : idle breathing.
+rotate(faceAng): path: moveTo(0,0); arc(0,0,r, mouthA/2, TAU-mouthA/2); fill yellow (sneak #e9c93f? keep same but darker via globalAlpha? use color lerp). Also small dark outline? no.
+```
+When sneaking, draw a little "scarf" too? skip.
+
+Draw order in world: floorBase, dotsPath, dust, exitPortal (below entities), cores, decoys, ripples, cones, playerTrail, player, ghosts. Then lighting. Then above-light: ghost eye glow, alert '!' & suspicion arcs, portal open core glow? Portal already glowing — under darkness it's dark; add small bright center dot above light so gate is findable (it has its own light anyway punching a hole). Cores punch light → visible. OK, only eyes + indicators above overlay.
+
+Lighting lights list:
+```
+lights=[{x:playerPx,y:playerPy,r:(sneak?2.7:4.3)*T,a:.95}, for ghosts r=1.5*T a=.85, cores 1.7*T, exit gateOpen? (2.6+sin*.3):1.1 T, decoys 2*T]
+```
+Also small ambient at start tile? no.
+
+Draw overlay: lctx clear with identity transform (fill full canvas), then punch holes using same world transform for coordinates: compute pixel positions manually: sx = ox + (wx)*s etc — easier to apply the same setTransform on lctx as main. Then main ctx: save, setTransform(1,0,0,1,0,0), drawImage(lcan,0,0, cw*dpr? careful: drawImage(canvas) draws at 1:1 device pixels if dest size = canvas size — use drawImage(lcan, 0,0) with identity transform on main ctx scaled by dpr? Main ctx identity = device px (since width=cw*dpr). lcan is same device size → drawImage(lcan,0,0) covers exactly. Good.
+
+Vignette: after overlay, radial gradient in screen space (identity), transparent center → rgba(0,0,10,.55) edges. Plus flash fill.
+
+HUD refresh function with cached values.
+
+Alarm sound scheduling: if anyAlert && AC && !muted: alarmT-=dt; if <=0 {alarmT=0.32; tone alternating 760/980...} also when alert starts big sting (done in alert()).
+
+Also heartbeat? skip.
+
+Now DOM structure:
+
+```
+<body>
+ <div id="stage">
+  <canvas id="cv"></canvas>
+  <div id="scan"></div>
+  <div id="hud"> left: sector+cores ; right: decoys, state, time </div>
+  <div id="hint">…controls mini…</div>
+  <div id="banner"><div id="bMain"></div><div id="bSub"></div></div>
+  overlays: #ovStart .panel ... buttons
+ </div>
+<script>...
+```
+
+HUD layout: absolute top, flex space-between, padding; pointer-events none (except nothing). Cores icons: three spans with class core on/off (css pac-dot gold circle with glow). Decoys: 3 small cyan pellets.
+
+State badge: span#hudState with dynamic class st-hidden/st-sneak/st-heard/st-alert.
+
+Time: #hudTime.
+
+Objective: below sector name? Put objective in center top? Let's do left block: SECTOR 01 · INTAKE VAULT (title), below: objective line small. Right block: state badge + decoys + time row.
+
+Hint bottom center: "SHIFT sneak · SPACE decoy ×3 · P pause · M mute" dim, hidden on start (start screen has full list).
+
+Banner center: big display font with sub; animation: scale/fade in hold out (keyframes 2s), pointer-events none.
+
+Overlays: .ov {position:absolute; inset:0; display:flex; center; opacity/visibility transition}. Panel width min(560px, 92vw). clip-path notch corners: polygon(18px 0, 100% 0, 100% calc(100% - 18px), calc(100% - 18px) 100%, 0 100%, 0 18px). Border via outline? clip-path clips border... use inner box-shadow inset + background; border with same clip on pseudo? Simpler: skip clip-path, use 1px border + corner accent marks (pseudo elements L-shapes) — arcade HUD corners. Let's do ::before/::after for two corner brackets, plus a top strip.
+
+Buttons: .btn display font, letter-spacing, transparent bg, cyan border, hover fill cyan/10 + glow; primary variant yellow. Kbd chips inside button label right side? Put "ENTER" small in mono next to label.
+
+Start logo:
+```
+<div class="logo"><span class="pac"></span> SNEAK PAC</div>
+<pac dot css circle with wedge conic-gradient, size 34px, animation rotate slow? mouth chomp via steps? keep static rotate(-20deg).>
+tag: MIDNIGHT PROTOCOL
+```
+Maybe logo text has per-letter colors alternating yellow/cyan? Use spans. Keep: "SNEAK" cyan outline-ish (color #bff6ff, -webkit-text-stroke 1px #57e6ff?) — text-stroke support fine; fallback color. "PAC" solid yellow with glow.
+
+Lore small italic? Trebuchet italic ok.
+
+Controls grid: two columns of rows: [kbd] label. Rows: MOVE (↑↓←→ / WASD), SNEAK (hold SHIFT), RUN (release — loud), DECOY (SPACE ×3), PAUSE P, MUTE M, RESTART R.
+
+Mission line with core icon inline.
+
+Best time: "BEST CLEAR 01:24.7" or "no record yet".
+
+OK now let me finalize level parameters:
+L1: ghosts 2, patrol 2.3, chaseMult 2.0, sight 4.3, fov 1.15, name INTAKE VAULT
+L2: ghosts 3, patrol 2.6, sight 4.6, name COOLANT SPIRES
+L3: ghosts 4, patrol 2.9, sight 4.9, name CORE SANCTUM
+Player run 6.2 sneak 3.0. Chase speed = patrol*2.0 ≈ 4.6-5.8 < run 6.2 → escapable with skill; tight in L3 (5.8 vs 6.2) good.
+
+Noise radius 4.5; decoy ttl 5s, throw range: place at facing tile if open (or first of up to 2 ahead), else any open neighbor. Decoy count 3 per level, reset each level.
+
+Ghost ids W-01.. for flavor.
+
+Caught message: "WARDEN W-02 TAGGED YOU".
+
+Now let me write the whole file. Also don't forget: put game name in <title> → "Sneak Pac — Midnight Protocol". Reply with only the HTML code block.
+
+Potential pitfalls to double-check while writing:
+1. `g[y][x]` indexing consistency (y row, x col).
+2. Path2D arcs for dots: use ctx-level precompute? Path2D supported widely. Build dotsPath = new Path2D(); for each floor tile: dotsPath.arc((x+.5)*T,(y+.5)*T,1.7,0,TAU); fill once with low alpha.
+3. wallPath rects + edgePath lines as described; also add outer border glow? Border tiles are walls adjacent to floor → included.
+4. Lighting transform reuse: compute view matrix components (s, ox, oy) globally each frame including shake; apply to both ctx and lctx.
+5. rAF loop with last time; dt=min(0.05,(now-last)/1000).
+6. Input: keydown e.code in list → preventDefault. Mapping: ArrowUp/W→(0,-1) etc. dirStack manipulation. Shift keys tracked separately (sneakHeld count). Space → if state play throwDecoy; if over? no. Enter per state. KeyP/Escape toggle pause. KeyM mute. KeyR restart run (from any state: start→ also new run fine... from start just starts a run).
+7. On blur (window blur) auto-pause if playing → nice touch.
+8. Buttons: addEventListener click with ensureAudio.
+9. localStorage try/catch load best at init, save on win.
+10. No external anything. ✓
+
+Let me also compute fov cone polygon: center C, angle A (facing), range R: points along A±fov/2 in steps (say 5 segments) → path moveTo C, lineTo each arc point, closePath fill.
+
+angDiff(a,b): ((a-b+PI*3)%TAU)-PI → absolute.
+
+Ghost faceAng updated when moving: Math.atan2(dy,dx) of move dir; keep initial random.
+
+Idle patrol target pick: random floor from precomputed floors list (store array at build).
+
+One more mechanic for depth: "sprint noise" — already have. Also add ghost separation? skip.
+
+Player light flicker: r *= 1+0.03*sin(time*17)+... subtle.
+
+Alright, let me write the final HTML. I'll aim for clean, organized code with comments. Let me draft it fully.
+
+Also HUD hidden during start & win: toggle 'show' class on #hud and #hint when state in play/pause/over/clear.
+
+Banner helper:
+```
+function banner(main,sub,dur=1900){ bMain.textContent=main; bSub.textContent=sub||''; bannerEl.classList.remove('go'); void bannerEl.offsetWidth; bannerEl.classList.add('go'); }
+```
+CSS .go animation bannerAnim dur both (animation-duration set inline? use fixed 2s).
+
+Level intro: on buildLevel during run: banner(`SECTOR 0${level+1}`, name, ...). On clear: banner('SECTOR CLEAR','gate to next sector unlocked').
+
+Clear state update: clearT-=dt → then progress. During 'clear', keep rendering scene (frozen ghosts? let them idle-patrol for life) — run ghost updates without detection & player frozen. Simplest: in update, if state==='clear' → only time+=, dust, decoys fade; skip entities. Fine visually with lighting static... a little dead 1.6s; acceptable, or keep ghosts patrolling: call updateGhosts(dt, false). Let's do that (detection=false).
+
+Attract (start): updateGhosts(dt,false), player idle breathing.
+
+Over: freeze scene (no updates) but keep time for anim? Freeze everything except dust + flash decay. Ghosts frozen mid-chase = dramatic. ok.
+
+Win/over overlays show; canvas behind darkens via overlay bg rgba(0,0,0,.55).
+
+Let me write CSS carefully with palette and responsive (font sizes with clamp()).
+
+Edge: iframe small sizes — HUD compact, panel scroll? Panel max-height 92vh overflow auto (no page scrollbar but panel internal ok... "no scrollbars" refers to page; panel overflow auto acceptable, though design to fit: controls grid compact).
+
+Let me finalize key list for preventDefault: ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','KeyW','KeyA','KeyS','KeyD'].
+
+Also handle 'Enter' code 'Enter' and 'NumpadEnter'.
+
+Mute persistence? optional; keep session only. Fine.
+
+Let me write the alarm beep: use sawtooth with quick decay alternating base 620/830.
+
+Sting: two square beeps 740→1180 (when 0 and .09, dur .1, vol .28) + noise? good.
+
+Hearing thud: sine 180→120 .18 vol .18.
+
+Footstep run: bandpass 750+rand*300, dur .05, vol .1; sneak: lowpass 300, dur .045, vol .045. Implement noiseBurst with filter type param.
+
+Core chime: triangle notes 660, 880, 1320 spaced .07 vol .22 + sparkle sine 1760 when .2 vol .1.
+
+Gate open: sine 140→560 .6 vol .3; plus square blip 1200 .12 when .45.
+
+Caught: saw 300→50 .8 vol .4 + noise lowpass 400 .5 vol .35 (when 0). Plus a beat at .15? fine.
+
+Clear jingle: square [523,659,784,1046] spaced .1 vol .22.
+Win: [392,523,659,784,1046,1318] spaced .12.
+
+Decoy throw: triangle 320→900 .14 vol .18; pop on land (immediate since instant placement): sine 520→160 .1 when .1 vol .2 + ring sound? plus a "ping" high sine 1400 .2 vol .12 decaying — sells the decoy as an audible beacon.
+
+Now, code writing time. Let me write it out and mentally lint the tricky parts.
+
+```js
+'use strict';
+// ---------- utils
+const TAU=Math.PI*2;
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
+function angDiff(a,b){let d=(a-b)%TAU;if(d>Math.PI)d-=TAU;if(d<-Math.PI)d+=TAU;return d;}
+const fmtT=ms=>{ms=Math.max(0,ms);const s=ms/1000,m=s/60|0,s2=s-m*60;return `${String(m).padStart(2,'0')}:${s2<10?'0':''}${s2.toFixed(1)}`;}
+```
+
+Constants & DOM... then audio, maze, entities, update, render, input, loop.
+
+Ghost object: {id,cx? px,py (center coords), tx,ty tile for pathing, dirx,diry, faceAng, state, suspicion, path:[], idx, target:{x,y}, waitT, alertT, seenT, lastSeen, decoy:null, prevState, phase(rand), color, eyeColor}
+
+Note: ghost px,py floats in center coords; tile = round.
+
+updateGhost(g,dt,detect):
+```
+const L=LEVELS[level];
+if(detect){ perception as above }
+// state timers
+switch(g.state){
+ case 'patrol': if(!g.path.length){ g.waitT-=dt; if(g.waitT<=0) newPatrolTarget(g);} break;
+ case 'susp': if(!g.path.length){ g.waitT-=dt; if(g.waitT<=0){ g.state='patrol'; g.waitT=0.6+Math.random(); } } break;
+ case 'invest': if(g.decoy && !g.decoy.alive){ revert...; } else if(!g.path.length){ inspect: g.waitT-=dt; if waitT<=0 → patrol reset } break;
+ case 'alert': g.alertT+=dt? handled earlier; if no sight for 4s → susp.
+}
+// movement
+const sp = speedFor(g)*dt;
+if(g.path.length){ const n=g.path[g.idx]; let dx=n.x-g.px, dy=n.y-g.py; const d=Math.hypot(dx,dy);
+ if(d<=sp){ g.px=n.x; g.py=n.y; g.idx++; if(g.idx>=g.path.length){g.path.length=0; /* arrival */ handleArrival(g);} }
+ else { g.px+=dx/d*sp; g.py+=dy/d*sp; g.dirx=dx/d; g.diry=dy/d; g.faceAng=Math.atan2(dy,dx); }
+}
+```
+handleArrival: patrol→ waitT=.5+rand*1.6; susp→ waitT=2.0; invest→ if decoy alive waitT=1.3 (inspect) then on next arrival? no — arrival sets waitT; state stays invest until decoy dies or inspect completes: in 'invest' case when path empty and waitT<=0 → g.state='patrol'; g.suspicion=0; g.waitT=.5.
+Alert arrival shouldn't happen (always repath to player) but if reached player tile → catch triggers anyway.
+
+alertT handling in alert perception block: accumulate always in alert state: g.alertT+=dt; if(g.alertT>0.45){g.alertT=0; g.path=pathTo(round p)} — do it before movement.
+
+newPatrolTarget: pick random from floors, ensure dist>2 from current to avoid immediate retarget loop: try few times.
+
+revertInvest: const was=g.prevAlert? Let's store g.wasAlert boolean at invest start. On decoy death: if wasAlert → state 'alert' (they realize), path to player now; else → 'patrol'. suspicion=0.
+
+Decoy throw:
+```
+function throwDecoy(){ if(playerDecoys<=0) {deny sound? small}; find tile: try facing dir 1..2 steps from player tile if open & not player tile; else any open neighbor (pick first). decoys.push({x:tileX,y:tileY,age:0,ttl:5,alive:true}); playerDecoys--; sound; for ghosts within 7 tiles & state!=='alert'... include alert: g.decoy=d; g.prevAlert = g.state==='alert'; g.state='invest'; g.path=pathTo(d.x,d.y); g.suspicion=0; }
+```
+Wait, decoys only lure ghosts nearby (radius ~6) — yes, within 6.5.
+
+Decoy update: age+=dt; if age>ttl → alive=false; ring effects; ghosts with g.decoy===d handled in state check (g.decoy.alive false → revert).
+
+Ripples: {x,y,age}; lifetime .55; draw radius lerp .3→1.7 alpha (1-t)*.5 color white-cyan; decoys have their own ping ring every 1s while alive? Add rings array shared with type color. Let me do ripples entries {x,y,age,life,c} c is css color string or hue. Use {col:[r,g,b]}.
+
+Noise ripple col [160,220,255]; decoy ping col [255,217,59].
+
+Decoy ping: every 1.1s push a ripple at decoy (life .8 larger 2.4).
+
+OK player trail: array of {x,y,a}; each frame if moving push current; cap 10 with a=1, decay a-=dt*3; draw circles r 4*a yellow alpha .25*a only when running (sneak = leave no trail — good stealth feedback!). Actually sneak leaves nothing, run leaves fading dots.
+
+HUD core icons: build spans once (3), toggle .on for collected count (collected shown lit? or remaining? show collected as lit gold). Decoys pips similar.
+
+State badge classes: s-sneak (yellow) s-run (cyan 'EXPOSED') s-heard (amber pulse slow) s-alert (red pulse fast).
+
+Also add a small "sector progress" — skip, objective covers.
+
+Now let me write the render code fully. Also don't forget letterbox fill: clear canvas with '#04060d' full device area first (identity), then world transform for scene; but outside-world within canvas is same bg → seamless with body.
+
+Floor base rect: fillRect(0,0,W*T,H*T) '#080c18'. Subtle checker? Add faint big gradient radial at center? Keep flat + dots; lighting adds depth.
+
+Wall draw:
+```
+ctx.fillStyle='#101731'; ctx.fill(wallPath);
+// top shading: second pass slightly darker inset? skip
+ctx.strokeStyle='rgba(96,178,255,.30)'; ctx.lineWidth=1.4; ctx.shadowColor='rgba(90,190,255,.8)'; ctx.shadowBlur=7; ctx.stroke(edgePath); ctx.shadowBlur=0;
+```
+Also add a second inner stroke for depth: stroke wallPath with 'rgba(0,0,0,.35)' lw 2? gives bevel. ok minor.
+
+Portal draw (exit center):
+```
+if(!gateOpen){ dim dashed ring r .38T stroke #2a3b63; small padlock? draw a tiny 'x' cross in middle. }
+else { rotating: outer ring gold r .45T lw 2 rot dash; inner swirl: 3 arcs cyan rotating opposite; center glow radial gradient white→gold alpha pulse; plus converging streaks: for i<8 lines from random angle inward animated by (time*speed+i)%1 → position. }
+```
+Converging streaks: t=(time*.7+i/8)%1; rad=lerp(.9,.15,t); ang=i/8*TAU+time*.4; line short along radial at that pos alpha (1-t)*.6 gold. Nice.
+
+Cores draw:
+```
+pulse=1+.15*sin(time*3+i*2);
+glow radial grad r 16*pulse rgba(255,217,59,.5→0) fill circle; core circle r 4.5 #ffd93b; inner white r 2; orbit spark: ang=time*2.4+i; point at r 8.
+```
+
+Cones draw before entities (they're on floor): per ghost: color by state: patrol 'rgba(120,180,255,.07)'? a bit more visible: .09; susp 'rgba(255,196,84,.13)'; alert `rgba(255,70,80,${.12+.06*sin(time*10)})`. Range: (alert? L.sight*1.2 : L.sight)*T; fov per state.
+
+Draw player & ghosts as planned.
+
+Lighting: base darkness alpha 0.94; but during 'start' maybe 0.9. Use constant 0.93.
+
+Punch gradient: grad = lctx.createRadialGradient(x,y,0,x,y,r); stops: 0 rgba(0,0,0,1)?? For destination-out we need alpha in the *gradient* to erase: use color white with varying alpha: rgba(255,255,255,a). a=1 center → erases fully; edges 0. Slight softness curve: stops (0,1),(0.55,.85),(1,0) approx — actually stop positions [0:a, .6:.45? , 1:0]. Let me use: addColorStop(0,'rgba(255,255,255,1)'); (0.5,'rgba(255,255,255,.6)'); (1,'rgba(255,255,255,0)').
+
+Ghost own light radius 1.4*T alpha .8 → ghosts visible as silhouettes from ~1.4 tiles in dark — with eyes glow above, they're detectable early. Good stealth balance: you see glowing eyes before body.
+
+Above-light pass:
+```
+for each ghost: eye glow dots (2) r 2.6 white core + halo state color alpha .5; if suspicion>0.03 draw arc meter above: background arc dark, foreground lerp yellow→red by suspicion, radius 10, angle -PI*0.75..+? draw small 90° gauge at top (y-18). If alerted or g.flashT>0: '!' text red bold with glow, bobbing.
+```
+Also above-light for player? Player has own light so visible. ok.
+
+Vignette + flash (flashCol {r,g,b,a}).
+
+Screen shake applied to world transform ox/oy.
+
+Now HUD update:
+```
+function hud(){ const st = anyAlert?'ALERT' : (anyHeard?'HEARD!':(sneakHeld&&moving? 'SNEAKING':'EXPOSED')); ... }
+```
+moving flag from player. If paused show 'PAUSED'. Set class + text; cores pips; decoy pips; time text = fmtT(totalTime); sector label set at build; objective text.
+
+Cache to avoid layout thrash: only write when changed (store last strings).
+
+Now state transitions & overlays helper:
+```
+function show(el){el.classList.add('on')} hide...
+function setState(s){ state=s; toggle overlays per s; hud visibility }
+```
+Overlays: start, pause, over, win. Banner separate.
+
+startRun(): runSeed=(Math.random()*1e9)|0; level=0; totalTime=0; buildLevel(); setState('play'); banner sector intro.
+retrySector(): totalTime -= levelTime (undo this sector's time) then buildLevel() (same seed), state play, banner.
+nextLevel(): level++; if>=3 win else buildLevel, play, banner.
+
+buildLevel uses seed = runSeed ^ level*0x9E3779B9? Use mulberry chain: s=(runSeed + level*1013904223)>>>0.
+
+Win: compute best save; show ovWin with time & best & newBest flag.
+
+Caught: caughtGhost id; fill ovOver text; setState('over'); flash red 1; sound.
+
+Pause toggle only from play/pause.
+
+Also on 'over'/'win', R → startRun(); Enter → retry (over) / startRun (win). On 'start': Enter/click → startRun.
+
+Auto-pause on blur: if state==='play' setState('pause').
+
+Now let me write the HTML/CSS. Let me keep it polished.
+
+CSS sketch:
+```
+*{margin:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;background:#04060d;color:#cfe3ff;font-family:'Trebuchet MS','Segoe UI',system-ui,sans-serif;}
+#cv{position:absolute;inset:0;display:block}
+#scan{position:fixed;inset:0;z-index:2;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(180,220,255,.028) 0 1px,transparent 1px 3px),radial-gradient(140% 120% at 50% 45%,transparent 55%,rgba(2,4,10,.55));mix-blend-mode:normal}
+#hud{position:fixed;top:0;left:0;right:0;z-index:3;display:flex;justify-content:space-between;align-items:flex-start;padding:14px 18px;pointer-events:none;opacity:0;transition:.3s}
+#hud.show{opacity:1}
+.panel bits...
+.dfont{font-family:Impact,'Arial Black',... ;letter-spacing:.06em;text-transform:uppercase}
+kbd{font:600 11px Consolas,monospace;background:#0d1526;border:1px solid #2c3f66;border-bottom-width:2px;padding:2px 7px;border-radius:4px;color:#9fd8ff}
+.badge{...}
+.ov{position:fixed;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;background:rgba(3,5,12,.6);backdrop-filter? avoid heavy; opacity:0;pointer-events:none;transition:opacity .25s}
+.ov.on{opacity:1;pointer-events:auto}
+.card{width:min(600px,92vw);max-height:92vh;overflow:auto;background:linear-gradient(180deg,rgba(10,16,32,.94),rgba(6,10,20,.94));border:1px solid rgba(87,230,255,.28);box-shadow:0 0 40px rgba(20,60,120,.35), inset 0 0 60px rgba(10,30,60,.25);padding:26px 30px;position:relative}
+corner brackets via .card::before/::after with border segments positioned.
+.logo{font-family Impact...; font-size:clamp(40px,8vw,64px); line-height:.95}
+.logo .a{color:#7ff0ff;text-shadow:0 0 22px rgba(87,230,255,.5)}
+.logo .b{color:#ffd93b;text-shadow:0 0 24px rgba(255,217,59,.6), 0 0 60px rgba(255,217,59,.3)}
+.pacdot{width:.8em;height:.8em;border-radius:50%;background:conic-gradient(from 28deg,#ffd93b 0 296deg,transparent 296deg 360deg);display:inline-block;filter:drop-shadow(0 0 10px rgba(255,217,59,.7))}
+.btn{...display font; cursor:pointer; transition; border:1px solid #57e6ff;color:#bfeeff;background:rgba(87,230,255,.06)} .btn:hover{background:rgba(87,230,255,.16);box-shadow:0 0 18px rgba(87,230,255,.35)}
+.btn.gold border #ffd93b etc.
+.ctrls{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;margin:...}
+.corepip{...circle gold dim; .on lit glow}
+#banner{position:fixed;top:20%;left:0;right:0;text-align:center;z-index:4;pointer-events:none;opacity:0}
+#banner.go{animation:bn 2s ease both}
+@keyframes bn{0%{opacity:0;transform:translateY(14px) scale(.96)}12%{opacity:1;transform:none}78%{opacity:1}100%{opacity:0}}
+```
+
+Hint bar bottom: #hint fixed bottom center, dim, mono small.
+
+OK also add a small "level ghost count" flavor? no.
+
+Time to write final code. I'll be extra careful with JS correctness. Let me write it out end-to-end.
+
+Also don't forget: audio starts only after first input — ensureAudio called in keydown/pointerdown handlers; all sound calls guard AC && !muted.
+
+One more check — `sneakHeld`: track via keydown 'ShiftLeft'/'ShiftRight' add to set, keyup remove; sneak = set has either. Also preventDefault not needed for shift.
+
+Desired dir from dirStack: map codes: ArrowUp/KeyW → [0,-1] etc. On keydown if code in map: push (remove existing first), on keyup remove.
+
+Reversal logic: in updatePlayer, before center check:
+```
+const w=want();
+if(w && p.dirx!==0 && (w.x===-p.dirx && w.y===-p.diry)){ // reverse
+  p.dirx=w.x; p.diry=w.y; /* keep target? new target = current tile */ p.ttx=p.tx-w.x; p.tty=p.ty-w.y; }
+```
+Hmm, my movement model: I said we move toward (tx+dirx, ty+diry) with tx,ty = the tile we started from. Let me restructure cleanly:
+
+Player fields: px,py (float center coords), fx,fy (from-tile integers), dirx,diry (0 or ±1), faceAng.
+Target tile = fx+dirx, fy+diry. At snap: px=targetX; fx=targetX... i.e., from-tile becomes the tile we're in; then recompute.
+
+atCenter = (Math.round(px)===fx && Math.round(py)===fy). Since movement is axis-aligned and target is integer, check crossing:
+```
+if(p.dirx!==0){ const tx2=p.fx+p.dirx; if((p.dirx>0&&px>=tx2)||(p.dirx<0&&px<=tx2)){ px=tx2; p.fx=tx2; stepped=true; } }
+similarly y.
+```
+After movement, if atCenter: choose dir from want (open check), else 0. If not at center and reversed: as above set fx = tile we're in? When reversing mid-tile: currently between fx and fx+dirx. New direction -dir: target should be fx (the tile behind). So set p.dirx=-p.dirx; p.fx stays same → target = fx + new dirx = fx - old dir = the tile we came from ✓.
+
+So reversal just flips dirx (target auto becomes previous tile) — elegant, no extra fields.
+
+Initial: px=1,py=1,fx=1,fy=1,dir 0.
+
+At center & want open → set dir; then movement continues next frame (or same frame? do it before movement in same update → smooth).
+
+Order in updatePlayer:
+```
+const w = wantDir();
+if(atCenter){ if(w&&open(fx+w.x,fy+w.y)){p.dirx=w.x;p.diry=w.y;} else {p.dirx=0;p.diry=0;} }
+else if(w && isReverse(w,p)){ p.dirx=-p.dirx; p.diry=-p.diry; } // works since reverse means w == -dir
+const sp=(sneak?SNEAK:RUN)*dt;
+let stepped=false;
+if(p.dirx||p.diry){ move as above; if(stepped){ onStep(); } }
+if moving (dir set) faceAng=atan2(diry,dirx).
+```
+Wait reversal case: w == -dir exactly (w.x===-dirx && w.y===-diry). After flip, target = fx + new dir = the tile we came from ✓.
+
+onStep: footsteps sound; if running → ripple + noise(); check core at (fx,fy)? Actually pickup should trigger when entering a tile: after snap, tile is (px,py) integer — check cores/exit there. Also initial tile check on level start (start won't have core).
+
+Also allow pickup by proximity? Tile-based is fine since we snap exactly.
+
+Exit check only if gateOpen; else maybe play "locked" buzz when touching closed gate? Nice feedback: soft low buzz + small shake of portal. Add: if player tile==exit && !gateOpen → once per entry buzz (guard with p.lockedT cooldown 1s).
+
+Now noise(): ripples.push({...col:[150,210,255],life:.5}); for ghosts within NOISE_R & state!=='alert' & !g.decoy → makeSusp(g, {x:p.px,y:p.py}); hear thud (only if any ghost reacted).
+
+makeSusp: g.state='susp'; g.target=...; g.path=pathTo; g.suspicion=max(.35, ...); g.waitT=2.4.
+
+Alert transition also resets alertT=0 & immediate repath to player tile.
+
+Also when alert starts, if decoy active on that ghost → drop decoy (player is revealed, decoy ignored): g.decoy=null.
+
+Perception code uses p.px etc — during 'start' state detection off anyway.
+
+Catch: in play after updates: for each ghost if hypot<0.52 → caughtBy=g; break.
+
+Also add grace: first 1 second of a level no catch? Ghosts spawn far, fine.
+
+Ghost spawn placement ensure not within 6 tiles of start (dist from BFS >7). Use bfs dist map.
+
+Floors list built at build: array of [x,y].
+
+pathTo uses current-level prev/dist — but target changes over time; need fresh BFS per path request (target-specific). BFS is from ghost to target or player? Pathfinding direction doesn't matter in undirected graph: compute BFS from ghost position each time → 315 cells, trivial. So findPath(sx,sy,tx,ty) runs its own BFS. Fine.
+
+Implement findPath:
+```
+function findPath(sx,sy,tx,ty){ if(sx===tx&&sy===ty)return[]; const prev=new Int32Array(W*H).fill(-1); const seen=new Uint8Array(W*H); let q=[sy*W+sx]; seen[sy*W+sx]=1; let qi=0;
+ while(qi<q.length){const c=q[qi++],cx=c%W,cy=c>>4? no: (c/W)|0. for 4 dirs: nx,ny bounds & grid floor & !seen → seen=1 prev[n]=c; if n===t*W+tx? early exit; q.push(n)}
+ reconstruct from t via prev until -1 or start; reverse; exclude start. If unreachable return [].
+}
+```
+
+OK now let me finalize level L params and write everything. Also `LEVELS` with names & seed offsets.
+
+Ghost colors: ['#ff5964','#ff9de2'?? classic pink #ffb8fc too pale; use '#f07ad8'? Let's do: red #ff5c6c, pink #ff8ce3? hmm pick: W-01 #ff5c6c (red), W-02 #ff9df1 (pink), W-03 #5fe8ff (cyan), W-04 #ffb054 (orange).
+
+Ghost body drawn with slight vertical gradient? Keep flat + shadow for alert.
+
+Also add subtle "scan" line moving across the whole maze? skip — dust & lights enough.
+
+Let me count features to ensure richness: dynamic scene ✓, layered lighting ✓, particles ✓, ghost AI states ✓, cones ✓, eyes in dark ✓, decoys ✓, noise ripples ✓, trails ✓, HUD badges ✓, banners ✓, 4 screens ✓, audio suite ✓, best time persistence ✓, attract mode ✓, shake/flash ✓.
+
+Time to write it all out. I'll aim for correctness over brevity but keep it tight.
+
+One concern: `ctx.fill(wallPath)` with Path2D built in world units — fine since transform applied.
+
+Lighting canvas must be same pixel size; recreate on resize.
+
+Draw order note: cones under player/ghosts ✓.
+
+Ghost "inspect" wobble at decoy: when path empty & state invest → faceAng rotates slowly (looking around): g.faceAng += dt*3 — cute, cone sweeps while inspecting. Similarly patrol idle waiting: slow rotate? Patrol wait: keep facing; only investigate sweep. ok add for both small: when not moving, faceAng += dt*(g.state==='invest'?2.5:0.8)*dirSign. Fine.
+
+Also alert ghost on repath arrival at player's tile but player moved → next repath catches up (0.45s) — acceptable.
+
+Let me double-check cone LOS uses center coords with |0 floor for grid lookup: x is in [0,W), positive ✓.
+
+Edge: ghost at (px,py) float; los sampling from there fine.
+
+Suspicion arc meter draw: above ghost y-20: background arc radius 9 from -PI*0.8 to PI*0.8? small gauge: start -2.4 rad end -0.7 rad (top area). Simpler: horizontal bar 16x3 above head with fill — readable. Let's do a mini bar with border.
+
+'!' draw: font '900 15px Impact'; red; glow shadowBlur 8; bob sin.
+
+Also when suspicion>0 && <1, tint ghost slightly amber? skip.
+
+Player "EXPOSED" while running — badge cyan-white.
+
+I think I'm ready. Let me also include a small footer credit line on start: "a one-file arcade stealth piece". Fine.
+
+Let me write the final file now. Careful with template literals inside code (fine). Also ensure no stray `</script>` in strings.
+
+For win best time compare: store ms number. loadBest(): try{const v=localStorage.getItem('sneakpac.best'); if(v) best=+v||null}catch(e){}
+saveBest similar.
+
+Show best on start (update text on setState start & build).
+
+Also stats: decoys used total? skip; keep time + best.
+
+Now — one more detail: iframe resize listener window 'resize' → resize(). Also handle dpr change via same.
+
+Let me write the code.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sneak Pac — Midnight Protocol</title>
+<style> ... </style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="scan"></div>
+<div id="hud">
+  <div class="hleft">
+    <div class="sector dfont" id="hudSector">SECTOR 01</div>
+    <div class="obj" id="hudObj">RECOVER CORES · 0/3</div>
+    <div class="pips" id="corePips"></div>
+  </div>
+  <div class="hright">
+    <div class="badge s-run" id="hudState">EXPOSED</div>
+    <div class="row2"><span class="lab">DECOYS</span><span class="pips" id="decoyPips"></span></div>
+    <div class="time dfont" id="hudTime">00:00.0</div>
+  </div>
+</div>
+<div id="hint">HOLD <kbd>SHIFT</kbd> SNEAK · <kbd>SPACE</kbd> DECOY · <kbd>P</kbd> PAUSE · <kbd>M</kbd> MUTE · <kbd>R</kbd> RESTART</div>
+<div id="banner"><div class="bm dfont" id="bMain"></div><div class="bs" id="bSub"></div></div>
+
+<div class="ov on" id="ovStart"> card with logo etc + button #btnStart </div>
+<div class="ov" id="ovPause"> ... #btnResume </div>
+<div class="ov" id="ovOver"> ... #btnRetry #btnRestart1 </div>
+<div class="ov" id="ovWin"> ... #btnAgain </div>
+<script> ... </script>
+</body></html>
+```
+
+Pips: core pips = 3 spans .pip.core (lit by collected count); decoy pips = 3 spans .pip.decoy (lit by remaining). Build in JS init.
+
+Start card content:
+```
+<div class="card">
+ <div class="logo dfont"><span class="pacdot"></span> <span class="a">SNEAK</span> <span class="b">PAC</span></div>
+ <div class="tag">MIDNIGHT PROTOCOL · A PAC‑MAN STEALTH GAME</div>
+ <p class="lore">The vault is dark and the wardens never stop patrolling. Slip past their sight cones, keep your footsteps soft, and if you must run — <em>they will hear you</em>.</p>
+ <div class="ctrls"> rows </div>
+ <div class="mission"><span class="pip core on"></span>×3 CORES → OPEN THE GATE · <span class="pip decoy on"></span>×3 DECOYS PER SECTOR</div>
+ <div class="best" id="bestLine">NO RECORD YET</div>
+ <button class="btn gold" id="btnStart">START RUN <span class="key">ENTER</span></button>
+</div>
+```
+
+ctrls rows:
+MOVE — kbd ↑↓←→ / WASD
+SNEAK (silent, slow) — hold SHIFT
+RUN (fast, loud) — release SHIFT
+DECOY (bait wardens) — SPACE
+PAUSE — P · MUTE — M · RESTART — R
+
+Over card:
+```
+<div class="card red">
+ <div class="otitle dfont">SIGNAL LOST</div>
+ <p id="overMsg" class="omsg">WARDEN W‑02 TAGGED YOU IN SECTOR 01.</p>
+ <div class="ostats">SECTOR TIME <b id="overTime"></b></div>
+ <div class="btnrow"><button class="btn gold" id="btnRetry">RETRY SECTOR <span class="key">ENTER</span></button><button class="btn" id="btnRestart1">RESTART RUN <span class="key">R</span></button></div>
+</div>
+```
+
+Win card:
+```
+<div class="card gold">
+ <div class="otitle dfont g2">VAULT CLEARED</div>
+ <p class="omsg">Every warden out‑sneaked. The night is yours.</p>
+ <div class="ostats">TOTAL TIME <b id="winTime"></b></div>
+ <div class="best" id="winBest"></div>
+ <button class="btn gold" id="btnAgain">RUN IT BACK <span class="key">ENTER</span></button>
+</div>
+```
+
+Pause card: title PAUSED, mini controls recap, resume button.
+
+CSS for .omsg etc.
+
+Now the JS full write-up. Let me be disciplined.
+
+```js
+(()=>{ 'use strict';
+// dom
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+const lcan=document.createElement('canvas'), lctx=lcan.getContext('2d');
+const $=id=>document.getElementById(id);
+const hudEl=$('hud'), hintEl=$('hint'), bannerEl=$('banner'), bMain=$('bMain'), bSub=$('bSub');
+const ovStart=$('ovStart'), ovPause=$('ovPause'), ovOver=$('ovOver'), ovWin=$('ovWin');
+const hudSector=$('hudSector'), hudObj=$('hudObj'), hudState=$('hudState'), hudTime=$('hudTime');
+const corePips=$('corePips'), decoyPips=$('decoyPips');
+
+// constants
+const T=32,W=21,H=15,TAU=Math.PI*2;
+const RUN=6.2,SNEAK=3.0,NOISE_R=4.5,DECOY_TTL=5,FOV=1.15,ALERT_FOV=1.5;
+const LEVELS=[
+ {name:'INTAKE VAULT',ghosts:2,patrol:2.3,sight:4.3},
+ {name:'COOLANT SPIRES',ghosts:3,patrol:2.6,sight:4.6},
+ {name:'CORE SANCTUM',ghosts:4,patrol:2.9,sight:4.9}];
+const GCOL=['#ff5c6c','#ff9df1','#5fe8ff','#ffb054'];
+
+// state
+let state='start', runSeed=(Math.random()*1e9)|0, level=0;
+let grid=[], floors=[]; let wallPath,dotsPath,edgePath;
+let cores=[], exitT=null, gateOpen=false, gotCores=0;
+let P=null, ghosts=[], decoys=[], ripples=[], dust=[];
+let totalTime=0, levelTime=0, clearT=0, caughtBy=null, alarmT=0, flash={c:'#fff',a:0};
+let best=null; try{const v=localStorage.getItem('sneakpac.best'); if(v) best=+v;}catch(e){}
+
+// view
+let dpr=1,cw=0,ch=0,S=1,OX=0,OY=0,shakeX=0,shakeY=0;
+function resize(){ dpr=window.devicePixelRatio||1; cw=innerWidth; ch=innerHeight;
+ cv.width=Math.round(cw*dpr); cv.height=Math.round(ch*dpr); lcan.width=cv.width; lcan.height=cv.height;
+ S=Math.min(cw/(W*T), ch/(H*T)); OX=(cw-W*T*S)/2; OY=(ch-H*T*S)/2; }
+addEventListener('resize',resize); resize();
+
+// utils
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function angDiff(a,b){let d=(a-b)%TAU;if(d>Math.PI)d-=TAU;if(d<-Math.PI)d+=TAU;return d}
+const fmtT=ms=>{const s=Math.max(0,ms)/1000,m=s/60|0,r=s-m*60;return (m<10?'0':'')+m+':'+(r<10?'0':'')+r.toFixed(1)};
+```
+
+Audio:
+```js
+let AC=null,master=null,muted=false,noiseBuf=null;
+function ensureAudio(){ if(!AC){ try{ AC=new (window.AudioContext||window.webkitAudioContext)(); master=AC.createGain(); master.gain.value=muted?0:0.5; master.connect(AC.destination); noiseBuf=AC.createBuffer(1,AC.sampleRate,AC.sampleRate); const d=noiseBuf.getChannelData(0); for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1; }catch(e){} } if(AC&&AC.state==='suspended')AC.resume(); }
+function tone(f,f2,dur,type,vol,when=0){ if(!AC||muted)return; const t0=AC.currentTime+when,o=AC.createOscillator(),g=AC.createGain(); o.type=type; o.frequency.setValueAtTime(f,t0); if(f2)o.frequency.exponentialRampToValueAtTime(Math.max(1,f2),t0+dur); g.gain.setValueAtTime(vol,t0); g.gain.exponentialRampToValueAtTime(.0001,t0+dur); o.connect(g);g.connect(master); o.start(t0);o.stop(t0+dur+.03);}
+function noiseBurst(dur,vol,freq,q,type='bandpass',when=0){ if(!AC||muted)return; const t0=AC.currentTime+when,s=AC.createBufferSource();s.buffer=noiseBuf; const f=AC.createBiquadFilter();f.type=type;f.frequency.value=freq;f.Q.value=q; const g=AC.createGain(); g.gain.setValueAtTime(vol,t0);g.gain.exponentialRampToValueAtTime(.0001,t0+dur); s.connect(f);f.connect(g);g.connect(master); s.start(t0);s.stop(t0+dur+.02);}
+const SFX={
+ stepRun:()=>noiseBurst(.05,.1,760+Math.random()*320,1.2),
+ stepSneak:()=>noiseBurst(.045,.045,300,1,'lowpass'),
+ sting:()=>{tone(740,1180,.12,'square',.26);tone(990,1560,.12,'square',.2,.09)},
+ hear:()=>tone(190,120,.16,'sine',.16),
+ buzz:()=>{tone(140,90,.18,'sawtooth',.14);tone(138,92,.18,'sawtooth',.1)},
+ throwD:()=>{tone(320,900,.13,'triangle',.16); tone(1500,1500,.25,'sine',.1,.1); noiseBurst(.12,.08,1200,2)},
+ core:()=>{[660,880,1320].forEach((f,i)=>tone(f,f,.09,'triangle',.2,i*.07)); tone(1760,1760,.18,'sine',.08,.22)},
+ gate:()=>{tone(150,560,.55,'sine',.3); tone(1240,1240,.12,'square',.14,.5)},
+ caught:()=>{tone(300,50,.75,'sawtooth',.4); noiseBurst(.5,.3,420,.7,'lowpass')},
+ clear:()=>{[523,659,784,1046].forEach((f,i)=>tone(f,f,.1,'square',.2,i*.1))},
+ win:()=>{[392,523,659,784,1046,1318].forEach((f,i)=>tone(f,f,.12,'square',.2,i*.12))},
+ alarm:(hi)=>tone(hi?840:620,hi?840:620,.09,'sawtooth',.11)
+};
+```
+
+Maze gen & build:
+
+```js
+function genMaze(seed){ const rnd=mulberry32(seed); const g=Array.from({length:H},()=>new Array(W).fill(1));
+ const CW2=W>>1,CH2=H>>1,vis=Array.from({length:CH2},()=>new Array(CW2).fill(false)),st=[[0,0]]; vis[0][0]=true; g[1][1]=0;
+ const D=[[1,0],[-1,0],[0,1],[0,-1]];
+ while(st.length){ const [cx,cy]=st[st.length-1]; const opts=D.map(d=>[d,cx+d[0],cy+d[1]]).filter(o=>o[2]>=0&&o[2]<CH2&&o[3]>=0&&o[3]<CW2&&!vis[o[2]][o[3]]);
+  if(!opts.length){st.pop();continue} const [dx,dy,nx,ny]=opts[(rnd()*opts.length)|0]; g[cy*2+1+dy][cx*2+1+dx]=0; vis[ny][nx]=true; st.push([nx,ny]); }
+ let rem=0,guard=0; while(rem<14&&guard++<600){ const x=1+((rnd()*(W-2))|0),y=1+((rnd()*(H-2))|0); if(g[y][x]!==1)continue;
+  const h=g[y][x-1]===0&&g[y][x+1]===0, v=g[y-1][x]===0&&g[y+1][x]===0; if(h||v){g[y][x]=0;rem++;} }
+ return g; }
+
+function findPath(sx,sy,tx,ty){ if(sx===tx&&sy===ty)return[]; const prev=new Int32Array(W*H).fill(-1),seen=new Uint8Array(W*H);
+ const q=[sy*W+sx]; seen[sy*W+sx]=1; let qi=0; const tIdx=ty*W+tx;
+ while(qi<q.length){ const c=q[qi++],cx=c%W,cy=(c/W)|0;
+  if(c===tIdx)break;
+  for(const [dx,dy] of DIRS){const nx=cx+dx,ny=cy+dy; if(nx<0||nx>=W||ny<0||ny>=H)continue; const n=ny*W+nx; if(seen[n]||grid[ny][nx]!==0)continue; seen[n]=1;prev[n]=c;q.push(n);} }
+ if(!seen[tIdx])return[]; const out=[]; let c=tIdx; while(c!==sy*W+sx){ out.push([c%W,(c/W)|0]); c=prev[c]; if(c<0)break; } return out.reverse(); }
+const DIRS=[[1,0],[-1,0],[0,1],[0,-1]];
+```
+Note: break on tIdx reached before expansion — fine.
+
+buildLevel:
+```js
+function buildLevel(){ const L=LEVELS[level]; const seed=(runSeed+level*1013904223)>>>0; grid=genMaze(seed);
+ floors=[]; for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(grid[y][x]===0)floors.push([x,y]);
+ // precompute draw paths
+ wallPath=new Path2D(); dotsPath=new Path2D(); edgePath=new Path2D();
+ const isWallVis=(x,y)=>grid[y][x]===1&&DIRS.some(([dx,dy])=>{const nx=x+dx,ny=y+dy;return nx>=0&&nx<W&&ny>=0&&ny<H&&grid[ny][nx]===0});
+ for(let y=0;y<H;y++)for(let x=0;x<W;x++){ if(grid[y][x]===0){ dotsPath.arc((x+.5)*T,(y+.5)*T,1.7,0,TAU); } else if(isWallVis(x,y)){ wallPath.rect(x*T+1.5,y*T+1.5,T-3,T-3);
+   if(grid[y][x+1]===0)edgePath.moveTo((x+1)*T-2,y*T+3),edgePath.lineTo((x+1)*T-2,(y+1)*T-3);
+   ... 4 sides
+ }}
+ // bfs from start for placement
+ const b=bfsDist(1,1);
+ exitT = argmax floor by b; cores: pick via greedy spread among floors with dist>0.35*maxD & !=exit; ensure pairwise >=4 (relax to 3,2).
+ spawns: floors with b>8 & not in {exit,cores} greedy pair>=6 count L.ghosts relax.
+ // entities
+ P={px:1,py:1,fx:1,fy:1,dirx:0,diry:0,faceAng:0,decoys:3,lockedT:0,trail:[],moving:false};
+ if(grid[1][2]===0)P.faceAng=0; else if(grid[2][1]===0)P.faceAng=Math.PI/2; ... compute.
+ ghosts = spawns.map((s,i)=>({id:i+1,px:s[0],py:s[1],dirx:0,diry:0,faceAng:rnd*TAU,state:'patrol',suspicion:0,path:[],idx:0,target:null,waitT:.4+Math.random(),alertT:0,seenT:9,lastSeen:{x:1,y:1},decoy:null,wasAlert:false,phase:Math.random()*TAU,color:GCOL[i%4]}));
+ cores = coreTiles.map(([x,y],i)=>({x,y,i,taken:false})); // store objects; exit separate.
+ decoys=[];ripples=[];gateOpen=false;gotCores=0;levelTime=0;caughtBy=null;
+ // dust
+ dust=[];for(let i=0;i<46;i++)dust.push({x:Math.random()*W*T,y:Math.random()*H*T,vx:(Math.random()-.5)*6,vy:(-2-Math.random()*4),r:.8+Math.random()*1.4,a:.05+Math.random()*.1});
+ hudSector.textContent=`SECTOR 0${level+1} · ${L.name}`; updatePips(); }
+```
+
+Wait, bfsDist returns dist array; placement:
+```js
+function bfsDist(sx,sy){ const d=new Int32Array(W*H).fill(-1); const q=[sy*W+sx]; d[sy*W+sx]=0; let qi=0; while(qi<q.length){const c=q[qi++],cx=c%W,cy=(c/W)|0; for(const[dx,dy]of DIRS){const nx=cx+dx,ny=cy+dy;if(nx<0||nx>=W||ny<0||ny>=H)continue;const n=ny*W+nx;if(d[n]!==-1||grid[ny][nx]!==0)continue;d[n]=d[c]+1;q.push(n);} } return d;}
+```
+
+Placement code:
+```js
+const maxD=Math.max(...b); // careful spread over 315 ints is fine
+let exitT=null,best=-1; for(const[x,y]of floors){if(b[y*W+x]>best){best=b[y*W+x];exitT=[x,y];}}
+// cores greedy
+const pool=floors.filter(([x,y])=>b[y*W+x]>maxD*.3).sort((p,q)=>b[q[1]*W+q[0]]-b[p[1]*W+p[0]]);
+let coreTiles=[]; for(const[x,y]of pool){ if(coreTiles.length>=3)break; if(x===exitT[0]&&y===exitT[1])continue; if(coreTiles.every(c=>Math.abs(c[0]-x)+Math.abs(c[1]-y)>=5))coreTiles.push([x,y]); }
+while(coreTiles.length<3){ const[x,y]=pool[(coreTiles.length*7)%pool.length]; if(!coreTiles.some(c=>c[0]===x&&c[1]===y)&&!(x===exitT[0]&&y===exitT[1]))coreTiles.push([x,y]); }
+// spawns
+const cand=floors.filter(([x,y])=>b[y*W+x]>8).sort((p,q)=>b[q[1]*W+q[0]]-b[p[1]*W+p[0]]);
+let spawns=[]; for(const[x,y]of cand){ if(spawns.length>=L.ghosts)break; if(coreTiles.some(c=>c[0]===x&&c[1]===y))continue; if(x===exitT[0]&&y===exitT[1])continue; if(spawns.every(s=>Math.abs(s[0]-x)+Math.abs(s[1]-y)>=6))spawns.push([x,y]); }
+while(spawns.length<L.ghosts){ const[x,y]=cand[(spawns.length*5+2)%cand.length]||[W-2,1]; if(!spawns.some(s=>s[0]===x&&s[1]===y))spawns.push([x,y]); }
+```
+Relaxation risk: pool might be small; while loops use modulo — could infinite loop if all same? Guard with counter. Add guard breaks (max 50 iters). Realistically fine; add safety.
+
+Actually Math.max(...b) — b is Int32Array, spread on typed array works (iterable), 315 elements fine.
+
+updatePlayer(dt):
+```js
+function updatePlayer(dt){ const w=wantDir(); const atC=Math.round(P.px)===P.fx&&Math.round(P.py)===P.fy;
+ if(atC){ if(w&&(grid[P.fy+w.y]&&grid[P.fy+w.y][P.fx+w.x]===0)){P.dirx=w.x;P.diry=w.y;} else {P.dirx=0;P.diry=0;} }
+ else if(w&&w.x===-P.dirx&&w.y===-P.diry){ P.dirx=-P.dirx;P.diry=-P.diry; }
+ const sp=(sneakHeld?SNEAK:RUN)*dt; let stepped=false;
+ if(P.dirx!==0){const t=P.fx+P.dirx; if((P.dirx>0&&P.px+t? no—
+```
+Careful snap condition: moving toward integer target tile coord `t`: crossed when (dir>0 && P.px>=t) || (dir<0 && P.px<=t):
+```js
+ if(P.dirx!==0){ const t=P.fx+P.dirx; if((P.dirx>0&&P.px>=t)||(P.dirx<0&&P.px<=t)){P.px=t;P.fx=t;stepped=true;} else P.px+=P.dirx*sp; }
+```
+Wait, if crossing, we snap (consume rest) — fine. If not crossed, advance by sp. But note: when at center, dir set this frame, then px===fx and t=fx±1, condition false → advance ✓.
+```js
+ same for y with P.py/P.fy.
+ P.moving=!!(P.dirx||P.diry);
+ if(P.moving)P.faceAng=Math.atan2(P.diry,P.dirx);
+ // trail
+ if(P.moving&&!sneakHeld){P.trail.push({x:P.px,y:P.py,a:1});}
+ for(const t of P.trail)t.a-=dt*2.6; P.trail=P.trail.filter(t=>t.a>0); if(P.trail.length>14)P.trail.shift();
+ if(stepped)onStep();
+ P.lockedT=Math.max(0,P.lockedT-dt);
+}
+function onStep(){ if(sneakHeld)SFX.stepSneak(); else {SFX.stepRun(); noise(P.px,P.py);} 
+ const tx=Math.round(P.px),ty=Math.round(P.py);
+ for(const c of cores){if(!c.taken&&c.x===tx&&c.y===ty){c.taken=true;gotCores++;SFX.core();flash={c:'255,217,59',a:.28};updatePips(); if(gotCores===cores.length){gateOpen=true;SFX.gate();banner('GATE OPEN','HEAD FOR THE EXIT');}}}
+ if(exitT&&tx===exitT[0]&&ty===exitT[1]){ if(gateOpen)levelClear(); else if(P.lockedT<=0){P.lockedT=1;SFX.buzz();} }
+}
+```
+
+noise():
+```js
+function noise(x,y){ ripples.push({x,y,age:0,life:.5,max:1.7,c:'150,214,255'});
+ let heard=false; for(const g of ghosts){ if(g.state==='alert'||g.decoy)continue; const d=Math.hypot(g.px-x,g.py-y); if(d<NOISE_R){ makeSusp(g,x,y); heard=true;} }
+ if(heard)SFX.hear(); }
+function makeSusp(g,x,y){ g.state='susp'; g.suspicion=Math.max(g.suspicion,.4); g.lastSeen={x,y}; g.seenT=0; g.waitT=2.4; g.path=findPath(Math.round(g.px),Math.round(g.py),Math.round(x),Math.round(y)); g.idx=0; }
+```
+
+throwDecoy:
+```js
+function throwDecoy(){ if(P.decoys<=0){SFX.buzz();return;} let tx=null,ty=null;
+ const fa=P.faceAng; // candidate tiles in facing direction up to 2
+ const dx=Math.round(Math.cos(fa)),dy=Math.round(Math.sin(fa));
+ for(let i=1;i<=2&&!tx;i++){const nx=P.fx+dx*i,ny=P.fy+dy*i; if(grid[ny]&&grid[ny][nx]===0){tx=nx;ty=ny;}}
+ if(tx==null)for(const[ddx,ddy]of DIRS){const nx=P.fx+ddx,ny=P.fy+ddy;if(grid[ny]&&grid[ny][nx]===0){tx=nx;ty=ny;break;}}
+ if(tx==null)return; P.decoys--; const d={x:tx,y:ty,age:0,alive:true,ping:0}; decoys.push(d); SFX.throwD(); updatePips();
+ for(const g of ghosts){ const dist=Math.hypot(g.px-d.x,g.py-d.y); if(dist<6.5&&!g.decoy){ g.wasAlert=g.state==='alert'; g.decoy=d; g.state='invest'; g.suspicion=0; g.path=findPath(Math.round(g.px),Math.round(g.py),d.x,d.y); g.idx=0; } } }
+```
+
+updateGhosts(dt, detect):
+```js
+function updateGhosts(dt,detect){ const L=LEVELS[level]; let anyAlert=false,anyHeard=false;
+ for(const g of ghosts){
+  if(detect){
+   const dx=P.px-g.px,dy=P.py-g.py,d=Math.hypot(dx,dy);
+   const range=(g.state==='alert'?L.sight*1.25:(sneakHeld?L.sight*.82:L.sight));
+   let seen=false;
+   if(d<range){ const a=Math.atan2(dy,dx); if(Math.abs(angDiff(a,g.faceAng))<(g.state==='alert'?ALERT_FOV:FOV)/2 && los(g.px,g.py,P.px,P.py))seen=true; }
+   if(d<1.05)seen=true;
+   if(seen){ g.lastSeen={x:P.px,y:P.py}; g.seenT=0;
+     if(!sneakHeld)alertGhost(g); else { g.suspicion=Math.min(1,g.suspicion+dt/1.4); if(g.suspicion>=1)alertGhost(g);} }
+   else { g.seenT+=dt; g.suspicion=Math.max(0,g.suspicion-dt/2.2); }
+  }
+  // state logic
+  if(g.state==='invest'&&g.decoy&&!g.decoy.alive){ const was=g.wasAlert; g.decoy=null; if(was){alertGhost(g);} else {g.state='patrol';g.waitT=.6;} }
+  if(g.state==='alert'){ g.alertT+=dt; if(g.alertT>0.45){g.alertT=0; g.path=findPath(Math.round(g.px),Math.round(g.py),Math.round(P.px),Math.round(P.py)); g.idx=0;} if(detect&&g.seenT>4){ g.state='susp'; g.suspicion=.6; g.waitT=2.2; g.target=g.lastSeen; g.path=findPath(Math.round(g.px),Math.round(g.py),Math.round(g.lastSeen.x),Math.round(g.lastSeen.y)); g.idx=0; } }
+  if(!g.path.length){ g.waitT-=dt;
+   if(g.state==='patrol'&&g.waitT<=0){ const [tx,ty]=floors[(Math.random()*floors.length)|0]; if(Math.abs(tx-g.px)+Math.abs(ty-g.py)>3){g.path=findPath(Math.round(g.px),Math.round(g.py),tx,ty);g.idx=0;} else g.waitT=.5; }
+   else if(g.state==='susp'&&g.waitT<=0){ g.state='patrol'; g.waitT=.6; g.suspicion=Math.max(0,g.suspicion-.5);} 
+   else if(g.state==='invest'&&g.decoy&&g.decoy.alive&&g.waitT<=0){ /* inspecting */ }
+   // investigate arrival: set waitT on arrival below; when done → patrol
+  }
+```
+Hmm, invest arrival flow: on arrival (path emptied), set g.waitT=1.3 (inspect). In state logic above, 'invest' with path empty & waitT<=0 → transition to patrol. Let me restructure the "no path" block:
+
+```js
+ if(!g.path.length){
+  g.waitT-=dt;
+  if(g.waitT<=0){
+   if(g.state==='patrol'){ pick new target (retry loop few times) }
+   else if(g.state==='susp'){ g.state='patrol'; g.suspicion=0; g.waitT=.6; }
+   else if(g.state==='invest'){ g.state='patrol'; g.suspicion=0; g.waitT=.5; }
+  }
+ }
+```
+And on arrival event: set waitT by state: patrol .5+rand*1.4, susp 2.2, invest 1.3.
+
+Also idle face sweep when no path: g.faceAng+=dt*(g.state==='invest'?2.2:.7).
+
+Movement:
+```js
+ const mult = g.state==='alert'?2.05:g.state==='susp'?1.35:g.state==='invest'?1.5:1;
+ const sp=L.patrol*mult*dt;
+ if(g.path.length){ const n=g.path[g.idx]; let dxn=n[0]-g.px,dyn=n[1]-g.py; const dd=Math.hypot(dxn,dyn);
+  if(dd<=sp){ g.px=n[0];g.py=n[1]; g.idx++; if(g.idx>=g.path.length){ g.path.length=0; g.waitT = g.state==='patrol'?.5+Math.random()*1.4 : g.state==='susp'?2.2 : 1.3; } }
+  else { g.px+=dxn/dd*sp; g.py+=dyn/dd*sp; g.faceAng=Math.atan2(dyn,dxn); } }
+ if(g.state==='alert')anyAlert=true; if(g.state!=='patrol')anyHeard=anyHeard|| (g.suspicion>.15);
+```
+Return {anyAlert,anyHeard} for HUD/alarm.
+
+alertGhost(g): if(g.state==='alert')return; g.state='alert'; g.suspicion=1; g.flashT=.9; g.decoy=null; g.alertT=0; SFX.sting(); re-path to player now.
+
+Decoy update:
+```js
+for(const d of decoys){ if(!d.alive)continue; d.age+=dt; d.ping-=dt; if(d.ping<=0){d.ping=1.1; ripples.push({x:d.x,y:d.y,age:0,life:.9,max:2.4,c:'255,217,59'});} if(d.age>=DECOY_TTL)d.alive=false; }
+decoys=decoys.filter(d=>d.alive|| (d.keep? ...)) — ghosts reference decoy for revert check via alive flag; keep objects around until age>ttl+3 then drop. Simpler: don't filter while any ghost references; just filter by age<DECOY_TTL+4.
+```
+
+Ripples update: age+=dt, filter age<life.
+
+los():
+```js
+function los(x0,y0,x1,y1){ const d=Math.hypot(x1-x0,y1-y0); const n=Math.max(2,Math.ceil(d*4)); for(let i=1;i<n;i++){const t=i/n; if(grid[(y0+(y1-y0)*t)|0][(x0+(x1-x0)*t)|0]===1)return false;} return true;}
+```
+
+Catch:
+```js
+for(const g of ghosts){ if(Math.hypot(g.px-P.px,g.py-P.py)<0.52){ caughtBy=g; break; } }
+if(caughtBy)doCaught();
+function doCaught(){ state='over'; SFX.caught(); flash={c:'255,60,80',a:.75}; $('overMsg').textContent=`WARDEN W‑0${caughtBy.id} TAGGED YOU IN SECTOR 0${level+1}.`; $('overTime').textContent=fmtT(levelTime); showOv(ovOver); hudShow(false)? keep hud visible behind? hide. }
+```
+
+levelClear: state='clear'; clearT=1.7; SFX.clear(); banner('SECTOR CLEAR', level===2?'FINAL GATE BREACHED':'NEXT SECTOR UNLOCKED'); in update when clear: clearT-=dt → if<=0 { if(level>=LEVELS.length-1) doWin(); else {level++; buildLevel(); state='play'; banner(`SECTOR 0${level+1}`, LEVELS[level].name);} }
+
+doWin: totalTime final; newBest = !best||totalTime<best → save. Fill win fields; showOv(ovWin); SFX.win().
+
+HUD:
+```js
+function updatePips(){ corePips... set .on for i<gotCores; decoyPips for i<P.decoys; }
+let lastHud='';
+function refreshHud(det){ let st,cls; if(state==='pause'){st='PAUSED';cls='s-pause';} else if(det.anyAlert){st='DETECTED';cls='s-alert';} else if(det.anyHeard){st='HEARD!';cls='s-heard';} else if(sneakHeld&&P.moving){st='SNEAKING';cls='s-sneak';} else {st=P.moving?'EXPOSED':'IDLE';cls=P.moving?'s-run':'s-idle';}
+ hudState.className='badge '+cls; hudState.textContent=st;
+ hudObj.textContent = gateOpen?'GATE OPEN — REACH THE EXIT':`RECOVER CORES · ${gotCores}/${cores.length}`;
+ const t=fmtT(totalTime); if(hudTime.textContent!==t)hudTime.textContent=t; }
+```
+Call refreshHud every frame in play with det from ghost update; in pause call once.
+
+Input:
+```js
+const DIRMAP={ArrowUp:[0,-1],KeyW:[0,-1],ArrowDown:[0,1],KeyS:[0,1],ArrowLeft:[-1,0],KeyA:[-1,0],ArrowRight:[1,0],KeyD:[1,0]};
+const dirStack=[]; let sneakHeld=false;
+function wantDir(){ for(let i=dirStack.length-1;i>=0;i--){const d=DIRMAP[dirStack[i]]; if(d)return{x:d[0],y:d[1]};} return null;}
+addEventListener('keydown',e=>{ ensureAudio();
+ const c=e.code;
+ if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(c))e.preventDefault();
+ if(c==='ShiftLeft'||c==='ShiftRight'){sneakHeld=true;return;}
+ if(c==='KeyM'){toggleMute();return;}
+ if(c==='Enter'||c==='NumpadEnter'){ onConfirm(); return; }
+ if(c==='KeyR'){ startRun(); return; }
+ if(c==='KeyP'||c==='Escape'){ if(state==='play')doPause(); else if(state==='pause')doResume(); return; }
+ if(c==='Space'){ if(state==='play')throwDecoy(); return; }
+ if(DIRMAP[c]){ e.preventDefault(); const i=dirStack.indexOf(c); if(i>=0)dirStack.splice(i,1); dirStack.push(c); }
+});
+addEventListener('keyup',e=>{ const c=e.code; if(c==='ShiftLeft'||c==='ShiftRight'){sneakHeld=false;return;} const i=dirStack.indexOf(c); if(i>=0)dirStack.splice(i,1); });
+addEventListener('blur',()=>{ if(state==='play')doPause(); });
+cv.addEventListener('pointerdown',()=>{ ensureAudio(); if(state==='start')startRun(); });
+```
+onConfirm per state: start→startRun; pause→resume; over→retrySector; win→startRun.
+
+Buttons wired similarly with pointerdown? click fine (ensureAudio inside handler).
+
+Mute toggle: muted=!muted; if(master)master.gain.value=muted?0:.5; update hint? fine.
+
+State management:
+```js
+function showOv(el){ [ovStart,ovPause,ovOver,ovWin].forEach(o=>o.classList.toggle('on',o===el)); }
+function startRun(){ runSeed=(Math.random()*1e9)>>>0; level=0; totalTime=0; buildLevel(); state='play'; showOv(null); hudShow(true); banner(`SECTOR 01`,LEVELS[0].name); }
+```
+showOv(null) hides all: classList.toggle('on', o===el) with el null → false for all ✓.
+
+retrySector(): totalTime-=levelTime; buildLevel(); state='play'; showOv(null); banner(...).
+doPause(){state='pause';showOv(ovPause);} doResume(){state='play';showOv(null);}
+
+Init: buildLevel() (for attract), state='start', showOv(ovStart), update best line, hudShow(false).
+
+Loop:
+```js
+let last=performance.now();
+function frame(now){ requestAnimationFrame(frame); let dt=(now-last)/1000; last=now; if(dt>0.05)dt=0.05; time+=dt;
+ let det={anyAlert:false,anyHeard:false};
+ if(state==='play'){ totalTime+=dt; levelTime+=dt; updatePlayer(dt); updateGhosts(dt,true)... but detection needs to run within ghost update; capture return. decoy/ripple updates; catch check; alarm sound scheduling; refreshHud(det); }
+ else if(state==='start'||state==='clear'||state==='over'){ updateGhosts(dt,false) only for start & clear; over: freeze (skip). decoys/ripples/dust always update.
+   if(state==='clear'){ clearT-=dt; if(clearT<=0)advanceLevel(); } }
+ flash.a=Math.max(0,flash.a-dt*1.2);
+ render();
+}
+```
+Careful: time variable name — I used `time` for global anim; declare let time=0.
+
+Alarm: if det.anyAlert { alarmT-=dt; if(alarmT<=0){alarmT=.34; SFX.alarm(beepFlip^=1);} } else reset alarmT to .25? Just leave.
+
+Shake: const amp = (state==='play'&&det.anyAlert)?1.6:0; shakeX=(Math.random()*2-1)*amp; shakeY=... plus flash burst on catch adds 4? flash decays fast; ok also on caught state keep small shake if flash.a>0: amp=Math.max(amp,flash.a*8).
+
+Render:
+
+```js
+function render(){ const c=ctx; c.setTransform(1,0,0,1,0,0); c.fillStyle='#04060d'; c.fillRect(0,0,cv.width,cv.height);
+ const s=S*dpr, ox=(OX+shakeX)*dpr, oy=(OY+shakeY)*dpr;
+ c.setTransform(s,0,0,s,ox,oy);
+ // floor
+ c.fillStyle='#080d1a'; c.fillRect(0,0,W*T,H*T);
+ c.fillStyle='rgba(120,170,255,.09)'; c.fill(dotsPath);
+ // dust
+ for(const p of dust){ p.x+=p.vx*dt? — dust updated in update section; render just draws: c.fillStyle=`rgba(170,210,255,${p.a})`; c.fillRect(p.x,p.y,p.r,p.r);} 
+```
+Better update dust in the frame update (always): move & wrap.
+
+Walls:
+```js
+ c.fillStyle='#111a33'; c.fill(wallPath);
+ c.strokeStyle='rgba(96,178,255,.3)'; c.lineWidth=1.4; c.shadowColor='rgba(90,190,255,.7)'; c.shadowBlur=7; c.stroke(edgePath); c.shadowBlur=0;
+```
+
+Portal, cores, decoys, ripples, cones, trail, player, ghosts (as planned). Then lighting:
+```js
+ // lighting
+ lctx.setTransform(1,0,0,1,0,0); lctx.globalCompositeOperation='source-over'; lctx.clearRect(0,0,lcan.width,lcan.height); lctx.fillStyle='rgba(3,5,12,.94)'; lctx.fillRect(0,0,lcan.width,lcan.height);
+ lctx.setTransform(s,0,0,s,ox,oy); lctx.globalCompositeOperation='destination-out';
+ const lights=[];
+ const pr=(sneakHeld?2.7:4.3)*T*(1+.03*Math.sin(time*16));
+ lights.push([ (P.px+.5)*T,(P.py+.5)*T,pr ]);
+ for(const g of ghosts)lights.push([(g.px+.5)*T,(g.py+.5)*T,1.5*T]);
+ for(const k of cores)if(!k.taken)lights.push([(k.x+.5)*T,(k.y+.5)*T,1.7*T]);
+ if(gateOpen)lights.push([(exitT[0]+.5)*T,(exitT[1]+.5)*T,(2.4+.3*Math.sin(time*4))*T]); else lights.push([... ,1.0*T]);
+ for(const d of decoys)if(d.alive)lights.push([(d.x+.5)*T,(d.y+.5)*T,2.1*T]);
+ for(const [x,y,r] of lights){ const gr=lctx.createRadialGradient(x,y,0,x,y,r); gr.addColorStop(0,'rgba(255,255,255,1)'); gr.addColorStop(.55,'rgba(255,255,255,.62)'); gr.addColorStop(1,'rgba(255,255,255,0)'); lctx.fillStyle=gr; lctx.beginPath(); lctx.arc(x,y,r,0,TAU); lctx.fill(); }
+ c.setTransform(1,0,0,1,0,0); c.drawImage(lcan,0,0);
+```
+Then above-light pass with world transform again: eyes glow, suspicion bars, '!', plus alert aura ring? Draw eye halos:
+```js
+ c.setTransform(s,0,0,s,ox,oy);
+ for(const g of ghosts){ const x=(g.px+.5)*T,y=(g.py+.5)*T+bob; ... draw 2 glow dots: radial gradient small (r 5): white core .9 → color alpha 0. Colors by state: patrol '120,200,255', susp '255,196,84', alert '255,70,80'.
+  if(g.suspicion>0.04&&g.state!=='alert'){ bar above }
+  if(g.state==='alert'||(g.flashT>0)){ '!' }
+ }
+```
+g.flashT decay in update (always tick: g.flashT=Math.max(0,(g.flashT||0)-dt)).
+
+Vignette & flash (screen space):
+```js
+ c.setTransform(1,0,0,1,0,0);
+ const vg=c.createRadialGradient(cv.width/2,cv.height*.45,Math.min(cv.width,cv.height)*.35, cv.width/2,cv.height/2, Math.max(cv.width,cv.height)*.75); vg.addColorStop(0,'rgba(0,0,0,0)'); vg.addColorStop(1,'rgba(1,2,8,.6)'); c.fillStyle=vg; c.fillRect(0,0,cv.width,cv.height);
+ if(flash.a>0){ c.fillStyle=`rgba(${flash.c},${flash.a})`; c.fillRect(0,0,cv.width,cv.height); }
+```
+
+Ghost draw function (world space): bob=Math.sin(time*5+g.phase)*1.6.
+
+```js
+function drawGhost(c,g){ const x=(g.px+.5)*T,y=(g.py+.5)*T+Math.sin(time*5+g.phase)*1.8; const r=13.5;
+ c.save(); c.translate(x,y);
+ if(g.state==='alert'){c.shadowColor='rgba(255,60,80,.9)';c.shadowBlur=16;}
+ c.fillStyle=g.color; c.beginPath(); c.arc(0,-r*.15,r,Math.PI,0); 
+ const by=r*.75; c.lineTo(r,by); const w=(2*r)/3; for(let i=0;i<3;i++){ c.lineTo(r-(i+.5)*w, by-4+( (time*10+g.phase+i)%2? 0:2)); c.lineTo(r-(i+1)*w, by);} 
+```
+Hmm scallop animation: simpler static zigzag: lineTo(r-(i+.5)*w, by-5); lineTo(r-(i+1)*w, by). Then closePath fill. Add subtle inner shading: after fill, c.fillStyle='rgba(0,0,20,.18)'; fill bottom? skip.
+Eyes: const ex=Math.cos(g.faceAng)*3, ey=Math.sin(g.faceAng)*2.5;
+ White: ellipses at (-4.5+ex,-r*.2+ey) & (4.5+ex,...) rx 4 ry 5. Pupil: offset further +cos*1.8: r 2.2 '#0a1030'.
+ c.restore(); }
+```
+
+Player draw:
+```js
+function drawPlayer(c){ const x=(P.px+.5)*T,y=(P.py+.5)*T; const r=(sneakHeld?11:14)*(1+.02*Math.sin(time*8));
+ // trail first (before body, in render list)
+ c.save(); c.translate(x,y); c.rotate(P.faceAng);
+ let m; if(P.moving)m=sneakHeld?.35:(.45+.55*(.5+.5*Math.sin(time*13)))*0.9? 
+```
+Mouth angle: running chomp between .25 and 1.1 rad: `m = sneak? .3 : .25 + (0.75*(0.5+0.5*Math.sin(time*14)))`. Idle: .3+.1*sin(time*3).
+Path: beginPath(); moveTo(0,0); arc(0,0,r,m/2,TAU-m/2); closePath? arc then auto line back to start (moveTo at 0,0) — fill works: after arc, path ends at angle TAU-m/2; closing returns to (0,0) ✓.
+Fill: sneak '#e6c437' : '#ffd93b'; add slight shadow glow yellow blur 8? Cheap: c.shadowColor='rgba(255,217,59,.5)';shadowBlur=10 before fill; reset after.
+
+Trail draw (before player): for t of P.trail: alpha t.a*.28 radius 3+4*t.a yellow circle.
+
+Cone draw:
+```js
+function drawCones(c){ for(const g of ghosts){ const st=g.state; let col,rng,fov; if(st==='alert'){col=`rgba(255,70,80,${.13+.05*Math.sin(time*10)})`;rng=LEVELS[level].sight*1.25;fov=ALERT_FOV;} else if(st==='susp'||st==='invest'){col='rgba(255,196,84,.12)';rng=LEVELS[level].sight;fov=FOV;} else {col='rgba(130,185,255,.08)';rng=LEVELS[level].sight;fov=FOV;}
+ const x=(g.px+.5)*T,y=(g.py+.5)*T,f=g.faceAng,half=fov/2,n=6;
+ c.fillStyle=col; c.beginPath(); c.moveTo(x,y); for(let i=0;i<=n;i++){const a=f-half+fov*i/n; c.lineTo(x+Math.cos(a)*rng*T, y+Math.sin(a)*rng*T);} c.closePath(); c.fill(); } }
+```
+
+Cores draw:
+```js
+for(const k of cores){ if(k.taken)continue; const x=(k.x+.5)*T,y=(k.y+.5)*T,p=1+.14*Math.sin(time*3+k.i*2.1);
+ const gr=c.createRadialGradient(x,y,0,x,y,16*p); gr.addColorStop(0,'rgba(255,224,120,.85)');gr.addColorStop(.35,'rgba(255,217,59,.35)');gr.addColorStop(1,'rgba(255,217,59,0)'); c.fillStyle=gr; c.beginPath();c.arc(x,y,16*p,0,TAU);c.fill();
+ c.fillStyle='#ffd93b'; c.beginPath();c.arc(x,y,4.6,0,TAU);c.fill(); c.fillStyle='#fff8d8'; c.beginPath();c.arc(x-1,y-1,2,0,TAU);c.fill();
+ const oa=time*2.2+k.i*2; c.fillStyle='rgba(255,240,180,.9)'; c.beginPath();c.arc(x+Math.cos(oa)*8,y+Math.sin(oa)*8,1.6,0,TAU);c.fill(); }
+```
+
+Decoy draw: gold pellet + ttl ring arc around showing remaining.
+Ripple draw: for r of ripples: t=r.age/r.life; rad=lerp(.25,r.max,t)*T; alpha=(1-t)*.5; stroke circle color `rgba(${r.c},${alpha})` lw 1.5.
+
+Portal:
+```js
+const ex=(exitT[0]+.5)*T, ey=(exitT[1]+.5)*T;
+if(!gateOpen){ c.strokeStyle='rgba(90,120,180,.5)'; c.setLineDash([4,5]); c.lineWidth=2; c.beginPath();c.arc(ex,ey,13,time*.3,time*.3+TAU);c.stroke(); c.setLineDash([]);
+ c.strokeStyle='rgba(90,120,180,.6)'; c.lineWidth=2; small x cross: lines.
+} else { const rot=time*1.4;
+ c.save();c.translate(ex,ey);
+ glow radial gold r 20 pulse fill;
+ ring1: rotate(rot): setLineDash([10,7]) strokeStyle 'rgba(255,217,59,.8)' lw 2.5 arc r 13; 
+ ring2 rotate(-rot*1.6) dashed cyan r 8;
+ streaks: for i<8: t2=(time*.8+i/8)%1; rr=lerp(20,4,t2); a=TAU*i/8+time*.5; line from (cos a *rr, sin*rr) outward 3px alpha (1-t2)*.7 gold.
+ c.restore(); }
+```
+
+OK. Also draw "!" & suspicion bar above light:
+```js
+for(const g of ghosts){ const x=(g.px+.5)*T,y=(g.py+.5)*T;
+ // eyes glow already? Draw halos here (above darkness) — small always-visible dots even in pitch dark:
+ const ec = g.state==='alert'?'255,80,90':(g.state!=='patrol'?'255,196,84':'130,200,255');
+ for(const s of[-1,1]){ const gx=x+s*4.5+Math.cos(g.faceAng)*3, gy=y-2.5+Math.sin(g.faceAng)*2.5;
+  const gr=c.createRadialGradient(gx,gy,0,gx,gy,6); gr.addColorStop(0,`rgba(${ec},.9)`); gr.addColorStop(.4,`rgba(${ec},.35)`); gr.addColorStop(1,`rgba(${ec},0)`); c.fillStyle=gr; c.beginPath();c.arc(gx,gy,6,0,TAU);c.fill(); }
+ if(g.state==='alert'||(g.flashT||0)>0){ c.font='900 15px Impact,"Arial Black",sans-serif'; c.textAlign='center'; c.fillStyle='#ff5c6c'; c.shadowColor='rgba(255,60,80,.9)';c.shadowBlur=8; const bob=Math.sin(time*8)*1.5; c.fillText('!',x,y-20+bob); c.shadowBlur=0; }
+ else if(g.suspicion>0.04){ const w=18,h=3,bx=x-w/2,by=y-20; c.fillStyle='rgba(10,16,30,.8)'; c.fillRect(bx-1,by-1,w+2,h+2); c.fillStyle=`rgb(${Math.round(lerp(255,255,g.suspicion))},${Math.round(lerp(220,90,g.suspicion))},60)`; c.fillRect(bx,by,w*g.suspicion,h); }
+}
+```
+
+Dust update in frame (always):
+```js
+for(const p of dust){ p.x+=p.vx*dt; p.y+=p.vy*dt; if(p.y<-4)p.y=H*T+4, p.x=Math.random()*W*T; if(p.x<-4)p.x=W*T+4; if(p.x>W*T+4)p.x=-4; }
+```
+
+updatePips builds spans once at init:
+```js
+for(let i=0;i<3;i++){const s=document.createElement('span');s.className='pip core';corePips.appendChild(s); const d2=document.createElement('span');d2.className='pip decoy';decoyPips.appendChild(d2);} 
+function updatePips(){[...corePips.children].forEach((el,i)=>el.classList.toggle('on',i<gotCores)); [...decoyPips.children].forEach((el,i)=>el.classList.toggle('on',i<(P?P.decoys:0)));}
+```
+
+Best line: function bestTxt(){return best?`BEST CLEAR ${fmtT(best)}`:'NO RECORD YET'} set on ovStart show & init.
+
+advanceLevel(): if(level>=LEVELS.length-1){doWin()} else {level++; buildLevel(); state='play'; banner(`SECTOR 0${level+1}`,LEVELS[level].name);} — but state was 'clear'; during clear we called updateGhosts(dt,false) which uses P etc — after buildLevel fine.
+
+Also on 'clear' we should stop player input effect — updatePlayer not called ✓; ghosts patrol behind banner ✓.
+
+doWin:
+```js
+function doWin(){ state='win'; const t=totalTime; let nb=false; if(!best||t<best){best=t;nb=true;try{localStorage.setItem('sneakpac.best',String(Math.round(t)))}catch(e){}}
+ $('winTime').textContent=fmtT(t); $('winBest').textContent = nb?'★ NEW BEST TIME ★':`BEST ${fmtT(best)}`; showOv(ovWin); SFX.win(); hudShow(false);}
+```
+
+hudShow(b): hudEl.classList.toggle('show',b); hintEl same.
+
+Banner: implement with timeout to remove 'go'? animation 'both' ends at opacity 0 so class can stay; but retrigger needs removal — my banner() removes & re-adds ✓, no timeout needed (animation fill both keeps final state transparent).
+
+Pause during 'clear'? P only acts in play/pause states — clear is brief, fine.
+
+Edge: retrySector when caught mid-level: totalTime-=levelTime could go negative if levelTime counted... totalTime includes previous sectors + this one; subtract levelTime → back to sector start ✓.
+
+Also on over, hudShow(false) hides HUD; behind overlay the canvas still renders frozen scene (state 'over' skips updates but render runs with time progressing → cones/portal animate, ghosts frozen — fine).
+
+One more: in state 'over', updateGhosts not called so g.flashT won't decay — fine.
+
+Also ensure `time` doesn't affect dt-based logic incorrectly — I use both `time` (anim) and dt (sim); time always advances (even paused) → ambient anim continues while paused (nice, scene breathes behind pause overlay). But ghost bob uses time → they breathe while paused: acceptable (paused = world dimmed? overlay covers with .6 alpha; fine).
+
+Wait — during 'pause', frame() skips updates but render still runs with time advancing → cones pulse etc. That's fine and looks alive.
+
+But careful: player trail a decay happens in updatePlayer (skipped) — frozen ok.
+
+Let me also double-check the "at center" desired dir uses grid bounds: grid[P.fy+w.y] could be undefined at border? Border is wall so open check fails, but we access grid[ny] first: `grid[P.fy+w.y]&&grid[P.fy+w.y][P.fx+w.x]===0` — safe.
+
+Ghost findPath uses Math.round(g.px) — g.px always within [0..W-1] ✓.
+
+Invest with decoy null (decoy died and ghost still in path): state logic: `if(g.state==='invest'&&g.decoy&&!g.decoy.alive)` reverts; if g.decoy is null? Only set null on revert. ok. But decoys array filtering: I said keep objects until age>ttl+4 — but ghosts hold reference to object (not index) so filter is safe ✓.
+
+Also alert ghost while a decoy is nearby: alert ignores decoy (decoy only lures non-alert? I included alert in lure: `if(dist<6.5&&!g.decoy)` includes alert → they investigate even when alerted (that's the point of decoys). But then perception: an alerted ghost investigating sees you again → re-alerts (alertGhost called, and sets g.decoy=null) ✓ consistent.
+
+makeSusp on noise for 'invest' ghosts? Guard `if(g.state==='alert'||g.decoy)continue;` — invest has decoy set → skip ✓.
+
+Suspicion decay while seen-sneak: only when not seen ✓.
+
+Also initial ghost suspicion 0, state patrol.
+
+I think the logic is solid. Let me also add tiny "sector time" display? Only total shown; fine.
+
+One more polish: player idle breathing scale done via r pulse ✓.
+
+Now let me finalize CSS details and write it all out. Also make sure `#banner` initial hidden (opacity 0) and .go animation.
+
+Also `.ov` panels animate in: .on .card {transform:translateY(0) scale(1)} base translateY(10px) scale(.98) with transition — nice.
+
+Buttons focus outline visible for a11y: keep default-ish but styled: outline: 2px solid rgba(87,230,255,.6) on :focus-visible.
+
+kbd inside button .key: small mono chip.
+
+Card red/gold variants adjust border/shadow color.
+
+Let me make sure the start card fits ~600px width and short heights (mobile landscape?) — max-height 94vh overflow auto ok.
+
+Font sizes with clamp for responsiveness.
+
+Also `user-select:none` on body; `-webkit-tap-highlight-color: transparent`.
+
+Now let me write the final answer. Careful with apostrophes in text (fine).
+
+Double-check no `alert(`/`confirm(` usage ✓.
+
+Title: "Sneak Pac — Midnight Protocol".
+
+Let me also verify the conic-gradient pac dot orientation: wedge opens right: conic-gradient(from 30deg, yellow 0 300deg, transparent 300deg 360deg) → gap from 300→360 which is bottom-right... visually a pac facing bottom-right; rotate element -30deg? add transform:rotate(-25deg). Fine.
+
+Pips CSS: .pip{width:11px;height:11px;border-radius:50%;background:#1b2740;border:1px solid #2c3f66;display:inline-block;margin-right:5px} .pip.core.on{background:#ffd93b;box-shadow:0 0 8px rgba(255,217,59,.8);border-color:#ffd93b} .pip.decoy.on{background:#5fe8ff;box-shadow:0 0 8px rgba(95,232,255,.7);border-color:#5fe8ff}.
+
+Badge classes:
+.badge{font-family:Impact...;letter-spacing:.12em;font-size:15px;padding:6px 14px;border:1px solid;background:...}
+.s-idle{color:#9fb4d8;border-color:#33436b}
+.s-run{color:#7ff0ff;border-color:#2a6f8f;text-shadow:0 0 10px rgba(87,230,255,.5)}
+.s-sneak{color:#ffd93b;...}
+.s-heard{color:#ffc454;animation:pulse 1s infinite}
+.s-alert{color:#ff5c6c;border-color:#ff5c6c;animation:pulse .45s infinite;background:rgba(255,60,80,.12)}
+@keyframes pulse{50%{opacity:.55}}
+
+HUD layout: hleft/hright flex column gap 4. sector font-size 17px letter-spacing .1em color #cfe3ff; obj 11px color #7f96c2 mono? use body font small caps. time font 18px right aligned color #7ff0ff text-shadow glow. row2: lab small + pips.
+
+hint bottom: font 11px letter-spacing .08em color #5d739e; kbd inline.
+
+Banner: bm font-size clamp(34px,6vw,54px) color #fff? use cyan with glow + sub 13px letterspace #9fb4d8.
+
+Also add a subtle top HUD gradient bar for legibility: #hud::before? Use background linear-gradient on hud? pointer-events none; add ::before absolute -inset covering top 90px gradient rgba(4,6,13,.7)→transparent. ok.
+
+Now let me write the final file text. I'll keep the JS in an IIFE with 'use strict'. Let me make sure every referenced element id exists.
+
+IDs: cv, scan, hud, hint, banner, bMain, bSub, ovStart, ovPause, ovOver, ovWin, hudSector, hudObj, hudState, hudTime, corePips, decoyPips, btnStart, btnResume, btnRetry, btnRestart1, btnAgain, overMsg, overTime, winTime, winBest, bestLine.
+
+Button wiring:
+```js
+$('btnStart').onclick=()=>{ensureAudio();startRun();};
+$('btnResume').onclick=()=>{ensureAudio();doResume();};
+$('btnRetry').onclick=()=>{ensureAudio();retrySector();};
+$('btnRestart1').onclick=()=>{ensureAudio();startRun();};
+$('btnAgain').onclick=()=>{ensureAudio();startRun();};
+```
+
+onConfirm():
+```js
+function onConfirm(){ ensureAudio(); if(state==='start')startRun(); else if(state==='pause')doResume(); else if(state==='over')retrySector(); else if(state==='win')startRun(); }
+```
+
+Init sequence at end: buildPips(); buildLevel(); showOv(ovStart); $('bestLine').textContent=bestTxt(); requestAnimationFrame(frame).
+
+Note: buildLevel before P exists — updatePips guards with P?.decoys (optional chaining fine in modern browsers/iframe). Use (P?P.decoys:0) ✓.
+
+In render, P & ghosts must exist — buildLevel called first ✓.
+
+During 'start' state, refreshHud not called; hud hidden ✓.
+
+Also during start, sneakHeld irrelevant.
+
+Potential bug: in updateGhosts for state 'clear' detect=false, but alertT/seenT logic guarded by detect? seenT only used in detect branch (alert→susp demote) — I put `if(detect&&g.seenT>4)` ✓. alert repath uses P position — during clear player frozen; fine but state stays alert with path to frozen player... during 'clear' that's ok visually.
+
+Actually after levelClear, ghosts keep chasing the exit where you stood — cool cinematic behind banner.
+
+Also on buildLevel, fresh ghosts patrol only ✓.
+
+Edge: findPath target equals start → [] ✓ (guarded at top).
+
+Ghost arrival sets g.waitT but my state logic for no-path also decrements waitT and acts when <=0 — for 'patrol' new target pick with retry; ensure not infinite: if random target within 3 tiles, set waitT=.5 again (loop ok).
+
+Also 'invest' arrival & decoy alive → waitT=1.3 inspect; after waitT<=0 → patrol ✓. If decoy dies during inspect: top revert handles (g.decoy && !alive) → wasAlert? alert : patrol — during inspect, wasAlert may be true → re-alerts even though they found the decoy... design: if they reached it (arrived & inspected), we shouldn't re-alert. Track g.inspected=true when waitT set on invest arrival; in revert, if g.inspected → always patrol. Let me add: on arrival in invest: g.waitT=1.3; g.inspected=true. Revert condition: `if(g.state==='invest'&&g.decoy&&!g.decoy.alive){ const was=g.wasAlert&&!g.inspected; ...}` and reset inspected=false when new decoy taken / state changes to patrol. Add g.inspected=false in makeSusp/alertGhost/patrol transitions... simpler: set false whenever state becomes invest (in throwDecoy lure) and in patrol branch. ok.
+
+Also alertGhost sets g.decoy=null so revert check skipped ✓.
+
+Alright — also confirm `sneakHeld` variable declared with let at top-level of IIFE ✓ (I wrote it in input section; move up).
+
+Time to write it all out. Length will be substantial (~700-800 lines) but that's fine given the scope.
+
+One last render-order check: cones before player/ghosts so bodies are on top of their own cones ✓. Ripples under ghosts ✓ (noise rings from player). Trail under player ✓.
+
+Also draw a faint "start pad" marker at (1,1)? skip.
+
+Let me confirm no usage of `structuredClone` or other modern-only — fine for modern browsers; Path2D is standard.
+
+Writing the final HTML now.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sneak Pac — Midnight Protocol</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden;background:#04060d;color:#cfe3ff;
+    font-family:'Trebuchet MS','Segoe UI',system-ui,sans-serif;user-select:none;-webkit-tap-highlight-color:transparent}
+  #cv{position:absolute;inset:0;display:block;z-index:1}
+  #scan{position:fixed;inset:0;z-index:2;pointer-events:none;
+    background:repeating-linear-gradient(0deg,rgba(180,220,255,.026) 0 1px,transparent 1px 3px),
+    radial-gradient(140% 120% at 50% 45%,transparent 55%,rgba(2,4,10,.5))}
+  .dfont{font-family:Impact,'Haettenschweiler','Franklin Gothic Bold','Arial Black',sans-serif;letter-spacing:.06em;text-transform:uppercase;font-weight:400}
+  kbd{font:600 10px Consolas,Menlo,monospace;background:#0d1526;border:1px solid #2c3f66;border-bottom-width:2px;
+    padding:2px 7px;border-radius:4px;color:#9fd8ff;white-space:nowrap}
+
+  /* ---------- HUD ---------- */
+  #hud{position:fixed;top:0;left:0;right:0;z-index:3;display:flex;justify-content:space-between;align-items:flex-start;
+    padding:16px 20px 26px;pointer-events:none;opacity:0;transition:opacity .35s}
+  #hud::before{content:'';position:absolute;top:-16px;left:0;right:0;height:90px;
+    background:linear-gradient(180deg,rgba(4,6,13,.75),transparent)}
+  #hud.show{opacity:1}
+  .hleft{display:flex;flex-direction:column;gap:5px}
+  .sector{font-size:17px;color:#e7f2ff;text-shadow:0 0 12px rgba(87,230,255,.35)}
+  .obj{font-size:11px;letter-spacing:.14em;color:#7f96c2}
+  .hright{display:flex;flex-direction:column;align-items:flex-end;gap:7px}
+  .row2{display:flex;align-items:center;gap:8px}
+  .lab{font-size:10px;letter-spacing:.2em;color:#5d739e}
+  .time{font-size:19px;color:#7ff0ff;text-shadow:0 0 12px rgba(87,230,255,.45);font-variant-numeric:tabular-nums}
+  .pip{width:11px;height:11px;border-radius:50%;background:#1b2740;border:1px solid #2c3f66;display:inline-block;margin-left:5px;transition:.25s}
+  .pips{display:flex}
+  .pip.core.on{background:#ffd93b;border-color:#ffd93b;box-shadow:0 0 9px rgba(255,217,59,.85)}
+  .pip.decoy.on{background:#5fe8ff;border-color:#5fe8ff;box-shadow:0 0 9px rgba(95,232,255,.75)}
+  .badge{font-family:Impact,'Arial Black',sans-serif;font-size:14px;letter-spacing:.16em;padding:6px 15px;border:1px solid #33436b;color:#9fb4d8}
+  .s-run{color:#7ff0ff;border-color:#2a6f8f;text-shadow:0 0 10px rgba(87,230,255,.5)}
+  .s-sneak{color:#ffd93b;border-color:#7a6420;text-shadow:0 0 10px rgba(255,217,59,.5)}
+  .s-heard{color:#ffc454;border-color:#8a5c14;animation:pulse 1s infinite}
+  .s-alert{color:#ff5c6c;border-color:#ff5c6c;background:rgba(255,60,80,.14);animation:pulse .45s infinite}
+  .s-pause{color:#9fb4d8}
+  @keyframes pulse{50%{opacity:.5}}
+
+  #hint{position:fixed;bottom:12px;left:0;right:0;z-index:3;text-align:center;font-size:11px;letter-spacing:.1em;
+    color:#54688f;pointer-events:none;opacity:0;transition:opacity .35s}
+  #hint.show{opacity:1}
+
+  /* ---------- banner ---------- */
+  #banner{position:fixed;top:17%;left:0;right:0;z-index:4;text-align:center;pointer-events:none;opacity:0}
+  #banner.go{animation:bn 2.1s ease both}
+  @keyframes bn{0%{opacity:0;transform:translateY(16px) scale(.95)}12%{opacity:1;transform:none}78%{opacity:1}100%{opacity:0}}
+  .bm{font-size:clamp(34px,6vw,56px);color:#eaf6ff;text-shadow:0 0 22px rgba(87,230,255,.6),0 0 60px rgba(87,230,255,.3)}
+  .bs{margin-top:6px;font-size:13px;letter-spacing:.4em;color:#8fa9d6;text-transform:uppercase}
+
+  /* ---------- overlays ---------- */
+  .ov{position:fixed;inset:0;z-index:5;display:flex;align-items:center;justify-content:center;padding:14px;
+    background:rgba(3,5,12,.62);opacity:0;pointer-events:none;transition:opacity .28s}
+  .ov.on{opacity:1;pointer-events:auto}
+  .card{width:min(600px,94vw);max-height:94vh;overflow-y:auto;position:relative;padding:30px 34px;
+    background:linear-gradient(180deg,rgba(10,16,32,.95),rgba(6,10,20,.95));
+    border:1px solid rgba(87,230,255,.3);box-shadow:0 0 44px rgba(20,60,120,.4),inset 0 0 70px rgba(10,30,60,.28);
+    transform:translateY(12px) scale(.97);transition:transform .3s}
+  .ov.on .card{transform:none}
+  .card::before,.card::after{content:'';position:absolute;width:22px;height:22px;border:2px solid #57e6ff;pointer-events:none}
+  .card::before{top:-2px;left:-2px;border-right:0;border-bottom:0}
+  .card::after{bottom:-2px;right:-2px;border-left:0;border-top:0}
+  .card.red{border-color:rgba(255,92,108,.45);box-shadow:0 0 44px rgba(120,20,30,.45),inset 0 0 70px rgba(60,10,20,.3)}
+  .card.red::before,.card.red::after{border-color:#ff5c6c}
+  .card.gold{border-color:rgba(255,217,59,.45);box-shadow:0 0 48px rgba(120,95,20,.4),inset 0 0 70px rgba(60,45,10,.3)}
+  .card.gold::before,.card.gold::after{border-color:#ffd93b}
+
+  .logo{font-size:clamp(42px,8vw,64px);line-height:.95;margin-bottom:4px;display:flex;align-items:center;gap:.18em}
+  .logo .a{color:#7ff0ff;text-shadow:0 0 22px rgba(87,230,255,.55)}
+  .logo .b{color:#ffd93b;text-shadow:0 0 24px rgba(255,217,59,.6),0 0 60px rgba(255,217,59,.3)}
+  .pacdot{width:.72em;height:.72em;border-radius:50%;flex:none;transform:rotate(-24deg);
+    background:conic-gradient(from 30deg,#ffd93b 0 300deg,transparent 300deg 360deg);
+    filter:drop-shadow(0 0 10px rgba(255,217,59,.75));animation:chomp 1.4s ease-in-out infinite}
+  @keyframes chomp{0%,100%{transform:rotate(-24deg) scale(1)}50%{transform:rotate(-38deg) scale(.9)}}
+  .tag{font-size:11px;letter-spacing:.34em;color:#7f96c2;margin-bottom:16px;text-transform:uppercase}
+  .lore{font-size:14px;line-height:1.55;color:#a8bce0;margin-bottom:18px}
+  .lore em{color:#ffd93b;font-style:normal}
+  .ctrls{display:grid;grid-template-columns:auto 1fr;gap:8px 16px;align-items:center;
+    background:rgba(8,14,28,.55);border:1px solid #1d2a49;padding:14px 16px;margin-bottom:16px}
+  .ctrls .k{display:flex;gap:4px;flex-wrap:wrap}
+  .ctrls .v{font-size:12px;letter-spacing:.1em;color:#cfe3ff;text-transform:uppercase}
+  .mission{font-size:11.5px;letter-spacing:.12em;color:#8fa9d6;margin-bottom:10px;display:flex;align-items:center;flex-wrap:wrap;gap:2px}
+  .mission .pip{margin-left:0;margin-right:3px}
+  .best{font-size:12px;letter-spacing:.2em;color:#ffd93b;margin-bottom:20px;text-shadow:0 0 10px rgba(255,217,59,.4)}
+  .btnrow{display:flex;gap:12px;flex-wrap:wrap}
+  .btn{font-family:Impact,'Arial Black',sans-serif;font-size:16px;letter-spacing:.14em;text-transform:uppercase;cursor:pointer;
+    color:#bfeeff;background:rgba(87,230,255,.06);border:1px solid #3a7d9c;padding:12px 22px;display:inline-flex;align-items:center;gap:12px;
+    transition:.18s}
+  .btn:hover{background:rgba(87,230,255,.16);box-shadow:0 0 20px rgba(87,230,255,.35);transform:translateY(-1px)}
+  .btn:focus-visible{outline:2px solid rgba(87,230,255,.7);outline-offset:3px}
+  .btn.gold{color:#ffe9a0;border-color:#a8842c;background:rgba(255,217,59,.07)}
+  .btn.gold:hover{background:rgba(255,217,59,.16);box-shadow:0 0 20px rgba(255,217,59,.35)}
+  .key{font-family:Consolas,monospace;font-size:10px;letter-spacing:.1em;color:#7f96c2;border:1px solid #2c3f66;padding:2px 8px}
+  .otitle{font-size:clamp(34px,6vw,48px);margin-bottom:10px;color:#ff5c6c;text-shadow:0 0 24px rgba(255,60,80,.5)}
+  .otitle.g2{color:#ffd93b;text-shadow:0 0 24px rgba(255,217,59,.5)}
+  .omsg{font-size:14px;color:#a8bce0;line-height:1.5;margin-bottom:16px}
+  .ostats{font-size:12px;letter-spacing:.2em;color:#8fa9d6;margin-bottom:8px}
+  .ostats b{color:#eaf6ff;font-family:Consolas,monospace;letter-spacing:.05em;margin-left:8px}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="scan"></div>
+
+<div id="hud">
+  <div class="hleft">
+    <div class="sector dfont" id="hudSector">SECTOR 01</div>
+    <div class="obj" id="hudObj">RECOVER CORES · 0/3</div>
+    <div class="pips" id="corePips"></div>
+  </div>
+  <div class="hright">
+    <div class="badge" id="hudState">IDLE</div>
+    <div class="row2"><span class="lab">DECOYS</span><span class="pips" id="decoyPips"></span></div>
+    <div class="time dfont" id="hudTime">00:00.0</div>
+  </div>
+</div>
+
+<div id="hint">HOLD <kbd>SHIFT</kbd> SNEAK &nbsp;·&nbsp; <kbd>SPACE</kbd> DECOY &nbsp;·&nbsp; <kbd>P</kbd> PAUSE &nbsp;·&nbsp; <kbd>M</kbd> MUTE &nbsp;·&nbsp; <kbd>R</kbd> RESTART</div>
+
+<div id="banner"><div class="bm dfont" id="bMain"></div><div class="bs" id="bSub"></div></div>
+
+<div class="ov on" id="ovStart">
+  <div class="card">
+    <div class="logo dfont"><span class="pacdot"></span><span class="a">SNEAK</span>&nbsp;<span class="b">PAC</span></div>
+    <div class="tag">Midnight Protocol · A Pac‑Man Stealth Game</div>
+    <p class="lore">The vault is dark and the wardens never stop patrolling. Slip past their sight cones, keep your footsteps soft — and if you must run, <em>they will hear you.</em></p>
+    <div class="ctrls">
+      <span class="k"><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd><kbd>/ WASD</kbd></span><span class="v">Move</span>
+      <span class="k"><kbd>HOLD SHIFT</kbd></span><span class="v">Sneak — silent, slow</span>
+      <span class="k"><kbd>RELEASE</kbd></span><span class="v">Run — fast, loud (noise alerts wardens)</span>
+      <span class="k"><kbd>SPACE</kbd></span><span class="v">Throw decoy ×3 per sector</span>
+      <span class="k"><kbd>P</kbd><kbd>M</kbd><kbd>R</kbd></span><span class="v">Pause · Mute · Restart</span>
+    </div>
+    <div class="mission"><span class="pip core on"></span>×3 CORES → OPEN THE GATE&nbsp;&nbsp;·&nbsp;&nbsp;<span class="pip decoy on"></span>×3 DECOYS</div>
+    <div class="best" id="bestLine">NO RECORD YET</div>
+    <button class="btn gold" id="btnStart">START RUN <span class="key">ENTER</span></button>
+  </div>
+</div>
+
+<div class="ov" id="ovPause">
+  <div class="card">
+    <div class="otitle dfont" style="color:#7ff0ff;text-shadow:0 0 24px rgba(87,230,255,.5)">PAUSED</div>
+    <p class="omsg">The wardens hold their breath. <kbd>HOLD SHIFT</kbd> to sneak · <kbd>SPACE</kbd> decoy · <kbd>R</kbd> restart run</p>
+    <button class="btn" id="btnResume">RESUME <span class="key">P</span></button>
+  </div>
+</div>
+
+<div class="ov" id="ovOver">
+  <div class="card red">
+    <div class="otitle dfont">SIGNAL LOST</div>
+    <p class="omsg" id="overMsg">A warden tagged you.</p>
+    <div class="ostats">SECTOR TIME<b id="overTime">00:00.0</b></div>
+    <div class="btnrow" style="margin-top:18px">
+      <button class="btn gold" id="btnRetry">RETRY SECTOR <span class="key">ENTER</span></button>
+      <button class="btn" id="btnRestart1">RESTART RUN <span class="key">R</span></button>
+    </div>
+  </div>
+</div>
+
+<div class="ov" id="ovWin">
+  <div class="card gold">
+    <div class="otitle dfont g2">VAULT CLEARED</div>
+    <p class="omsg">Every warden out‑sneaked. The night is yours.</p>
+    <div class="ostats">TOTAL TIME<b id="winTime">00:00.0</b></div>
+    <div class="best" id="winBest"></div>
+    <button class="btn gold" id="btnAgain">RUN IT BACK <span class="key">ENTER</span></button>
+  </div>
+</div>
+
+<script>
+(()=>{ 'use strict';
+/* ================= DOM ================= */
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+const lcan=document.createElement('canvas'),lctx=lcan.getContext('2d');
+const $=id=>document.getElementById(id);
+const hudEl=$('hud'),hintEl=$('hint'),bannerEl=$('banner'),bMain=$('bMain'),bSub=$('bSub');
+const ovStart=$('ovStart'),ovPause=$('ovPause'),ovOver=$('ovOver'),ovWin=$('ovWin');
+const hudSector=$('hudSector'),hudObj=$('hudObj'),hudState=$('hudState'),hudTime=$('hudTime');
+const corePips=$('corePips'),decoyPips=$('decoyPips');
+
+/* ================= CONSTANTS ================= */
+const T=32,W=21,H=15,TAU=Math.PI*2;
+const RUN=6.2,SNEAK=3.0,NOISE_R=4.5,DECOY_TTL=5,FOV=1.15,ALERT_FOV=1.5;
+const DIRS=[[1,0],[-1,0],[0,1],[0,-1]];
+const LEVELS=[
+  {name:'INTAKE VAULT',   ghosts:2,patrol:2.3,sight:4.3},
+  {name:'COOLANT SPIRES', ghosts:3,patrol:2.6,sight:4.6},
+  {name:'CORE SANCTUM',   ghosts:4,patrol:2.9,sight:4.9}];
+const GCOL=['#ff5c6c','#ff9df1','#5fe8ff','#ffb054'];
+
+/* ================= STATE ================= */
+let state='start',runSeed=(Math.random()*1e9)>>>0,level=0;
+let grid=[],floors=[],wallPath,dotsPath,edgePath;
+let cores=[],exitT=null,gateOpen=false,gotCores=0;
+let P=null,ghosts=[],decoys=[],ripples=[],dust=[];
+let totalTime=0,levelTime=0,clearT=0,caughtBy=null,alarmT=.3,beepFlip=0;
+let flash={c:'255,255,255',a:0},time=0,sneakHeld=false;
+let best=null;try{const v=localStorage.getItem('sneakpac.best');if(v)best=+v;}catch(e){}
+
+/* ================= VIEW ================= */
+let dpr=1,cw=0,ch=0,S=1,OX=0,OY=0,shakeX=0,shakeY=0;
+function resize(){dpr=window.devicePixelRatio||1;cw=innerWidth;ch=innerHeight;
+  cv.width=Math.round(cw*dpr);cv.height=Math.round(ch*dpr);lcan.width=cv.width;lcan.height=cv.height;
+  S=Math.min(cw/(W*T),ch/(H*T));OX=(cw-W*T*S)/2;OY=(ch-H*T*S)/2;}
+addEventListener('resize',resize);resize();
+
+/* ================= UTILS ================= */
+const clamp=(v,a,b)=>v<a?a:v>b?b:v,lerp=(a,b,t)=>a+(b-a)*t;
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function angDiff(a,b){let d=(a-b)%TAU;if(d>Math.PI)d-=TAU;if(d<-Math.PI)d+=TAU;return d}
+const fmtT=ms=>{const s=Math.max(0,ms)/1000,m=s/60|0,r=s-m*60;return (m<10?'0':'')+m+':'+(r<10?'0':'')+r.toFixed(1)};
+
+/* ================= AUDIO ================= */
+let AC=null,master=null,muted=false,noiseBuf=null;
+function ensureAudio(){ if(!AC){try{AC=new (window.AudioContext||window.webkitAudioContext)();
+  master=AC.createGain();master.gain.value=muted?0:.5;master.connect(AC.destination);
+  noiseBuf=AC.createBuffer(1,AC.sampleRate,AC.sampleRate);const d=noiseBuf.getChannelData(0);
+  for(let i=0;i<d.length;i++)d[i]=Math.random()*2-1;}catch(e){}}
+  if(AC&&AC.state==='suspended')AC.resume(); }
+function tone(f,f2,dur,type,vol,when=0){if(!AC||muted)return;const t0=AC.currentTime+when,o=AC.createOscillator(),g=AC.createGain();
+  o.type=type;o.frequency.setValueAtTime(f,t0);if(f2)o.frequency.exponentialRampToValueAtTime(Math.max(1,f2),t0+dur);
+  g.gain.setValueAtTime(vol,t0);g.gain.exponentialRampToValueAtTime(.0001,t0+dur);
+  o.connect(g);g.connect(master);o.start(t0);o.stop(t0+dur+.03);}
+function noiseBurst(dur,vol,freq,q,type='bandpass',when=0){if(!AC||muted)return;const t0=AC.currentTime+when,s=AC.createBufferSource();s.buffer=noiseBuf;
+  const f=AC.createBiquadFilter();f.type=type;f.frequency.value=freq;f.Q.value=q;
+  const g=AC.createGain();g.gain.setValueAtTime(vol,t0);g.gain.exponentialRampToValueAtTime(.0001,t0+dur);
+  s.connect(f);f.connect(g);g.connect(master);s.start(t0);s.stop(t0+dur+.02);}
+const SFX={
+  stepRun:()=>noiseBurst(.05,.1,760+Math.random()*320,1.2),
+  stepSneak:()=>noiseBurst(.045,.045,300,1,'lowpass'),
+  sting:()=>{tone(740,1180,.12,'square',.26);tone(990,1560,.12,'square',.2,.09)},
+  hear:()=>tone(190,120,.16,'sine',.16),
+  buzz:()=>{tone(140,90,.18,'sawtooth',.13);tone(138,92,.18,'sawtooth',.1)},
+  throwD:()=>{tone(320,900,.13,'triangle',.16);tone(1500,1500,.25,'sine',.1,.1);noiseBurst(.12,.08,1200,2)},
+  core:()=>{[660,880,1320].forEach((f,i)=>tone(f,f,.09,'triangle',.2,i*.07));tone(1760,1760,.18,'sine',.08,.22)},
+  gate:()=>{tone(150,560,.55,'sine',.3);tone(1240,1240,.12,'square',.14,.5)},
+  caught:()=>{tone(300,50,.75,'sawtooth',.4);noiseBurst(.5,.3,420,.7,'lowpass')},
+  clear:()=>{[523,659,784,1046].forEach((f,i)=>tone(f,f,.1,'square',.2,i*.1))},
+  win:()=>{[392,523,659,784,1046,1318].forEach((f,i)=>tone(f,f,.12,'square',.2,i*.12))},
+  alarm:h=>tone(h?840:620,h?840:620,.09,'sawtooth',.1)
+};
+
+/* ================= MAZE GEN ================= */
+function genMaze(seed){const rnd=mulberry32(seed);const g=Array.from({length:H},()=>new Array(W).fill(1));
+  const CW2=W>>1,CH2=H>>1,vis=Array.from({length:CH2},()=>new Array(CW2).fill(false)),st=[[0,0]];
+  vis[0][0]=true;g[1][1]=0;
+  while(st.length){const[cx,cy]=st[st.length-1];
+    const opts=DIRS.map(d=>[d[0],d[1],cx+d[0],cy+d[1]]).filter(o=>o[2]>=0&&o[2]<CH2&&o[3]>=0&&o[3]<CW2&&!vis[o[2]][o[3]]);
+    if(!opts.length){st.pop();continue}
+    const[dx,dy,nx,ny]=opts[(rnd()*opts.length)|0];
+    g[cy*2+1+dy][cx*2+1+dx]=0;vis[ny][nx]=true;st.push([nx,ny]);}
+  let rem=0,guard=0;
+  while(rem<14&&guard++<600){const x=1+((rnd()*(W-2))|0),y=1+((rnd()*(H-2))|0);if(g[y][x]!==1)continue;
+    const h=g[y][x-1]===0&&g[y][x+1]===0,v=g[y-1][x]===0&&g[y+1][x]===0;if(h||v){g[y][x]=0;rem++;}}
+  return g;}
+
+function bfsDist(sx,sy){const d=new Int32Array(W*H).fill(-1);const q=[sy*W+sx];d[sy*W+sx]=0;let qi=0;
+  while(qi<q.length){const c=q[qi++],cx=c%W,cy=(c/W)|0;
+    for(const[dx,dy]of DIRS){const nx=cx+dx,ny=cy+dy;if(nx<0||nx>=W||ny<0||ny>=H)continue;
+      const n=ny*W+nx;if(d[n]!==-1||grid[ny][nx]!==0)continue;d[n]=d[c]+1;q.push(n);}}
+  return d;}
+
+function findPath(sx,sy,tx,ty){if(sx===tx&&sy===ty)return[];
+  const prev=new Int32Array(W*H).fill(-1),seen=new Uint8Array(W*H);
+  const q=[sy*W+sx];seen[sy*W+sx]=1;let qi=0;const tIdx=ty*W+tx;
+  while(qi<q.length){const c=q[qi++],cx=c%W,cy=(c/W)|0;if(c===tIdx)break;
+    for(const[dx,dy]of DIRS){const nx=cx+dx,ny=cy+dy;if(nx<0||nx>=W||ny<0||ny>=H)continue;
+      const n=ny*W+nx;if(seen[n]||grid[ny][nx]!==0)continue;seen[n]=1;prev[n]=c;q.push(n);}}
+  if(!seen[tIdx])return[];const out=[];let c=tIdx,guard=0;
+  while(c!==sy*W+sx&&guard++<400){out.push([c%W,(c/W)|0]);c=prev[c];if(c<0)break;}
+  return out.reverse();}
+
+function los(x0,y0,x1,y1){const d=Math.hypot(x1-x0,y1-y0),n=Math.max(2,Math.ceil(d*4));
+  for(let i=1;i<n;i++){const t=i/n;if(grid[(y0+(y1-y0)*t)|0][(x0+(x1-x0)*t)|0]===1)return false;}return true;}
+
+/* ================= LEVEL BUILD ================= */
+function buildLevel(){const L=LEVELS[level];const seed=(runSeed+level*1013904223)>>>0;grid=genMaze(seed);
+  floors=[];for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(grid[y][x]===0)floors.push([x,y]);
+
+  wallPath=new Path2D();dotsPath=new Path2D();edgePath=new Path2D();
+  const visWall=(x,y)=>{for(const[dx,dy]of DIRS){const nx=x+dx,ny=y+dy;
+    if(nx>=0&&nx<W&&ny>=0&&ny<H&&grid[ny][nx]===0)return true;}return false;};
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){
+    if(grid[y][x]===0){dotsPath.arc((x+.5)*T,(y+.5)*T,1.7,0,TAU);}
+    else if(visWall(x,y)){wallPath.rect(x*T+1.5,y*T+1.5,T-3,T-3);
+      if(grid[y][x+1]===0){edgePath.moveTo((x+1)*T-2,y*T+3);edgePath.lineTo((x+1)*T-2,(y+1)*T-3);}
+      if(grid[y][x-1]===0){edgePath.moveTo(x*T+2,y*T+3);edgePath.lineTo(x*T+2,(y+1)*T-3);}
+      if(grid[y+1]&&grid[y+1][x]===0){edgePath.moveTo(x*T+3,(y+1)*T-2);edgePath.lineTo((x+1)*T-3,(y+1)*T-2);}
+      if(grid[y-1]&&grid[y-1][x]===0){edgePath.moveTo(x*T+3,y*T+2);edgePath.lineTo((x+1)*T-3,y*T+2);}}}
+
+  const b=bfsDist(1,1);let maxD=0;for(const[x,y]of floors)maxD=Math.max(maxD,b[y*W+x]);
+  let best=-1;exitT=null;for(const[x,y]of floors){if(b[y*W+x]>best){best=b[y*W+x];exitT=[x,y];}}
+
+  const pool=floors.filter(([x,y])=>b[y*W+x]>maxD*.3).sort((p,q)=>b[q[1]*W+q[0]]-b[p[1]*W+p[0]]);
+  let coreTiles=[];
+  for(const[x,y]of pool){if(coreTiles.length>=3)break;
+    if(x===exitT[0]&&y===exitT[1])continue;
+    if(coreTiles.every(c=>Math.abs(c[0]-x)+Math.abs(c[1]-y)>=5))coreTiles.push([x,y]);}
+  let guard=0;
+  while(coreTiles.length<3&&guard++<60){const[x,y]=pool[(coreTiles.length*7+guard)%pool.length];
+    if(!coreTiles.some(c=>c[0]===x&&c[1]===y)&&!(x===exitT[0]&&y===exitT[1]))coreTiles.push([x,y]);}
+
+  const cand=floors.filter(([x,y])=>b[y*W+x]>8).sort((p,q)=>b[q[1]*W+q[0]]-b[p[1]*W+p[0]]);
+  let spawns=[];
+  for(const[x,y]of cand){if(spawns.length>=L.ghosts)break;
+    if(coreTiles.some(c=>c[0]===x&&c[1]===y)||(x===exitT[0]&&y===exitT[1]))continue;
+    if(spawns.every(s=>Math.abs(s[0]-x)+Math.abs(s[1]-y)>=6))spawns.push([x,y]);}
+  guard=0;
+  while(spawns.length<L.ghosts&&guard++<60){const[x,y]=cand[(spawns.length*5+2+guard)%cand.length]||[W-2,1];
+    if(!spawns.some(s=>s[0]===x&&s[1]===y))spawns.push([x,y]);}
+
+  P={px:1,py:1,fx:1,fy:1,dirx:0,diry:0,faceAng:0,decoys:3,lockedT:0,trail:[],moving:false};
+  if(grid[1][2]===0)P.faceAng=0;else if(grid[2][1]===0)P.faceAng=Math.PI/2;
+
+  ghosts=spawns.map((s,i)=>({id:i+1,px:s[0],py:s[1],faceAng:Math.random()*TAU,state:'patrol',
+    suspicion:0,flashT:0,path:[],idx:0,waitT:.4+Math.random(),alertT:0,seenT:9,
+    lastSeen:{x:1,y:1},decoy:null,wasAlert:false,inspected:false,phase:Math.random()*TAU,color:GCOL[i%4]}));
+
+  cores=coreTiles.map(([x,y],i)=>({x,y,i,taken:false}));
+  decoys=[];ripples=[];gateOpen=false;gotCores=0;levelTime=0;caughtBy=null;
+
+  dust=[];for(let i=0;i<46;i++)dust.push({x:Math.random()*W*T,y:Math.random()*H*T,
+    vx:(Math.random()-.5)*6,vy:-2-Math.random()*4,r:.8+Math.random()*1.4,a:.05+Math.random()*.1});
+
+  hudSector.textContent=`SECTOR 0${level+1} · ${L.name}`;
+  updatePips();hudObj.textContent=`RECOVER CORES · 0/${cores.length}`;}
+
+/* ================= PLAYER ================= */
+function wantDir(){for(let i=dirStack.length-1;i>=0;i--){const d=DIRMAP[dirStack[i]];if(d)return{x:d[0],y:d[1]};}return null;}
+
+function updatePlayer(dt){const w=wantDir();
+  const atC=Math.round(P.px)===P.fx&&Math.round(P.py)===P.fy;
+  if(atC){if(w&&grid[P.fy+w.y]&&grid[P.fy+w.y][P.fx+w.x]===0){P.dirx=w.x;P.diry=w.y;}else{P.dirx=0;P.diry=0;}}
+  else if(w&&w.x===-P.dirx&&w.y===-P.diry){P.dirx=-P.dirx;P.diry=-P.diry;}
+  const sp=(sneakHeld?SNEAK:RUN)*dt;let stepped=false;
+  if(P.dirx!==0){const t=P.fx+P.dirx;
+    if((P.dirx>0&&P.px>=t)||(P.dirx<0&&P.px<=t)){P.px=t;P.fx=t;stepped=true;}else P.px+=P.dirx*sp;}
+  if(P.diry!==0){const t=P.fy+P.diry;
+    if((P.diry>0&&P.py>=t)||(P.diry<0&&P.py<=t)){P.py=t;P.fy=t;stepped=true;}else P.py+=P.diry*sp;}
+  P.moving=!!(P.dirx||P.diry);
+  if(P.moving)P.faceAng=Math.atan2(P.diry,P.dirx);
+  if(P.moving&&!sneakHeld)P.trail.push({x:P.px,y:P.py,a:1});
+  for(const t of P.trail)t.a-=dt*2.6;
+  P.trail=P.trail.filter(t=>t.a>0);if(P.trail.length>14)P.trail.shift();
+  if(stepped)onStep();
+  P.lockedT=Math.max(0,P.lockedT-dt);}
+
+function onStep(){if(sneakHeld)SFX.stepSneak();else{SFX.stepRun();noise(P.px,P.py);}
+  const tx=Math.round(P.px),ty=Math.round(P.py);
+  for(const c of cores){if(!c.taken&&c.x===tx&&c.y===ty){c.taken=true;gotCores++;SFX.core();
+    flash={c:'255,217,59',a:.26};updatePips();
+    if(gotCores===cores.length){gateOpen=true;SFX.gate();banner('GATE OPEN','HEAD FOR THE EXIT');}}}
+  if(exitT&&tx===exitT[0]&&ty===exitT[1]){
+    if(gateOpen)levelClear();else if(P.lockedT<=0){P.lockedT=1;SFX.buzz();}}}
+
+function noise(x,y){ripples.push({x,y,age:0,life:.5,max:1.7,c:'150,214,255'});
+  let heard=false;
+  for(const g of ghosts){if(g.state==='alert'||g.decoy)continue;
+    if(Math.hypot(g.px-x,g.py-y)<NOISE_R){makeSusp(g,x,y);heard=true;}}
+  if(heard)SFX.hear();}
+
+function makeSusp(g,x,y){g.state='susp';g.suspicion=Math.max(g.suspicion,.4);
+  g.lastSeen={x,y};g.seenT=0;g.waitT=2.4;g.inspected=false;
+  g.path=findPath(Math.round(g.px),Math.round(g.py),Math.round(x),Math.round(y));g.idx=0;}
+
+function alertGhost(g){if(g.state==='alert')return;
+  g.state='alert';g.suspicion=1;g.flashT=.9;g.decoy=null;g.inspected=false;g.alertT=0;
+  SFX.sting();
+  g.path=findPath(Math.round(g.px),Math.round(g.py),Math.round(P.px),Math.round(P.py));g.idx=0;}
+
+function throwDecoy(){if(!P)return;if(P.decoys<=0){SFX.buzz();return;}
+  let tx=null,ty=null;
+  const dx=Math.round(Math.cos(P.faceAng)),dy=Math.round(Math.sin(P.faceAng));
+  for(let i=1;i<=2&&tx==null;i++){const nx=P.fx+dx*i,ny=P.fy+dy*i;
+    if(grid[ny]&&grid[ny][nx]===0){tx=nx;ty=ny;}}
+  if(tx==null)for(const[ddx,ddy]of DIRS){const nx=P.fx+ddx,ny=P.fy+ddy;
+    if(grid[ny]&&grid[ny][nx]===0){tx=nx;ty=ny;break;}}
+  if(tx==null)return;
+  P.decoys--;const d={x:tx,y:ty,age:0,alive:true,ping:0};decoys.push(d);SFX.throwD();updatePips();
+  for(const g of ghosts){if(g.decoy)continue;
+    if(Math.hypot(g.px-d.x,g.py-d.y)<6.5){g.wasAlert=g.state==='alert';g.decoy=d;g.state='invest';
+      g.suspicion=0;g.inspected=false;
+      g.path=findPath(Math.round(g.px),Math.round(g.py),d.x,d.y);g.idx=0;}}}
+
+/* ================= GHOSTS ================= */
+function updateGhosts(dt,detect){const L=LEVELS[level];let anyAlert=false,anyHeard=false;
+  for(const g of ghosts){
+    if(detect){
+      const dx=P.px-g.px,dy=P.py-g.py,d=Math.hypot(dx,dy);
+      const range=(g.state==='alert'?L.sight*1.25:(sneakHeld?L.sight*.82:L.sight));
+      let seen=false;
+      if(d<range){const a=Math.atan2(dy,dx);
+        if(Math.abs(angDiff(a,g.faceAng))<(g.state==='alert'?ALERT_FOV:FOV)/2&&los(g.px,g.py,P.px,P.py))seen=true;}
+      if(d<1.05)seen=true;
+      if(seen){g.lastSeen={x:P.px,y:P.py};g.seenT=0;
+        if(!sneakHeld)alertGhost(g);
+        else{g.suspicion=Math.min(1,g.suspicion+dt/1.4);if(g.suspicion>=1)alertGhost(g);}}
+      else{g.seenT+=dt;g.suspicion=Math.max(0,g.suspicion-dt/2.2);}}
+    g.flashT=Math.max(0,(g.flashT||0)-dt);
+
+    if(g.state==='invest'&&g.decoy&&!g.decoy.alive){
+      const was=g.wasAlert&&!g.inspected;g.decoy=null;
+      if(was)alertGhost(g);else{g.state='patrol';g.waitT=.6;g.suspicion=0;}}
+
+    if(g.state==='alert'){
+      g.alertT+=dt;
+      if(g.alertT>0.45){g.alertT=0;
+        g.path=findPath(Math.round(g.px),Math.round(g.py),Math.round(P.px),Math.round(P.py));g.idx=0;}
+      if(detect&&g.seenT>4){g.state='susp';g.suspicion=.6;g.waitT=2.2;
+        g.path=findPath(Math.round(g.px),Math.round(g.py),Math.round(g.lastSeen.x),Math.round(g.lastSeen.y));g.idx=0;}}
+
+    if(!g.path.length){
+      g.faceAng+=dt*(g.state==='invest'?2.2:.7);
+      g.waitT-=dt;
+      if(g.waitT<=0){
+        if(g.state==='patrol'){const[tx,ty]=floors[(Math.random()*floors.length)|0];
+          if(Math.abs(tx-g.px)+Math.abs(ty-g.py)>3){g.path=findPath(Math.round(g.px),Math.round(g.py),tx,ty);g.idx=0;}else g.waitT=.5;}
+        else if(g.state==='susp'){g.state='patrol';g.suspicion=0;g.waitT=.6;}
+        else if(g.state==='invest'){g.state='patrol';g.suspicion=0;g.waitT=.5;}}}
+
+    const mult=g.state==='alert'?2.05:g.state==='susp'?1.35:g.state==='invest'?1.5:1;
+    const sp=L.patrol*mult*dt;
+    if(g.path.length){const n=g.path[g.idx];let dxn=n[0]-g.px,dyn=n[1]-g.py;const dd=Math.hypot(dxn,dyn);
+      if(dd<=sp){g.px=n[0];g.py=n[1];g.idx++;
+        if(g.idx>=g.path.length){g.path.length=0;g.inspected=(g.state==='invest');
+          g.waitT=g.state==='patrol'?.5+Math.random()*1.4:g.state==='susp'?2.2:1.3;}}
+      else{g.px+=dxn/dd*sp;g.py+=dyn/dd*sp;g.faceAng=Math.atan2(dyn,dxn);}}
+    if(g.state==='alert')anyAlert=true;
+    if((g.state!=='patrol'||g.suspicion>.15)&&g.state!=='invest')anyHeard=true;}
+  return{anyAlert,anyHeard};}
+
+/* ================= FLOW ================= */
+function showOv(el){[ovStart,ovPause,ovOver,ovWin].forEach(o=>o.classList.toggle('on',o===el));}
+function hudShow(b){hudEl.classList.toggle('show',b);hintEl.classList.toggle('show',b);}
+function banner(main,sub){bMain.textContent=main;bSub.textContent=sub||'';
+  bannerEl.classList.remove('go');void bannerEl.offsetWidth;bannerEl.classList.add('go');}
+function bestTxt(){return best?`BEST CLEAR ${fmtT(best)}`:'NO RECORD YET';}
+
+function startRun(){runSeed=(Math.random()*1e9)>>>0;level=0;totalTime=0;
+  buildLevel();state='play';showOv(null);hudShow(true);banner('SECTOR 01',LEVELS[0].name);}
+function retrySector(){totalTime=Math.max(0,totalTime-levelTime);
+  buildLevel();state='play';showOv(null);hudShow(true);banner(`SECTOR 0${level+1}`,LEVELS[level].name);}
+function doPause(){if(state!=='play')return;state='pause';showOv(ovPause);}
+function doResume(){if(state!=='pause')return;state='play';showOv(null);}
+function levelClear(){state='clear';clearT=1.7;SFX.clear();
+  banner('SECTOR CLEAR',level===LEVELS.length-1?'FINAL GATE BREACHED':'NEXT SECTOR UNLOCKED');}
+function advanceLevel(){if(level>=LEVELS.length-1)doWin();
+  else{level++;buildLevel();state='play';banner(`SECTOR 0${level+1}`,LEVELS[level].name);}}
+function doCaught(){state='over';SFX.caught();flash={c:'255,60,80',a:.75};
+  $('overMsg').textContent=`WARDEN W‑0${caughtBy.id} TAGGED YOU IN SECTOR 0${level+1}.`;
+  $('overTime').textContent=fmtT(levelTime);showOv(ovOver);}
+function doWin(){state='win';const t=totalTime;let nb=false;
+  if(!best||t<best){best=t;nb=true;try{localStorage.setItem('sneakpac.best',String(Math.round(t)))}catch(e){}}
+  $('winTime').textContent=fmtT(t);
+  $('winBest').textContent=nb?'★ NEW BEST TIME ★':`BEST ${fmtT(best)}`;
+  showOv(ovWin);SFX.win();hudShow(false);}
+
+/* ================= HUD / PIPS ================= */
+for(let i=0;i<3;i++){const s=document.createElement('span');s.className='pip core';corePips.appendChild(s);
+  const d2=document.createElement('span');d2.className='pip decoy';decoyPips.appendChild(d2);}
+function updatePips(){[...corePips.children].forEach((el,i)=>el.classList.toggle('on',i<gotCores));
+  [...decoyPips.children].forEach((el,i)=>el.classList.toggle('on',i<(P?P.decoys:0)));}
+
+function refreshHud(det){let st,cls;
+  if(state==='pause'){st='PAUSED';cls='s-pause';}
+  else if(det.anyAlert){st='DETECTED';cls='s-alert';}
+  else if(det.anyHeard){st='HEARD!';cls='s-heard';}
+  else if(sneakHeld&&P.moving){st='SNEAKING';cls='s-sneak';}
+  else{st=P.moving?'EXPOSED':'IDLE';cls=P.moving?'s-run':'';}
+  hudState.className='badge '+cls;hudState.textContent=st;
+  hudObj.textContent=gateOpen?'GATE OPEN — REACH THE EXIT':`RECOVER CORES · ${gotCores}/${cores.length}`;
+  const t=fmtT(totalTime);if(hudTime.textContent!==t)hudTime.textContent=t;}
+
+/* ================= INPUT ================= */
+const DIRMAP={ArrowUp:[0,-1],KeyW:[0,-1],ArrowDown:[0,1],KeyS:[0,1],ArrowLeft:[-1,0],KeyA:[-1,0],ArrowRight:[1,0],KeyD:[1,0]};
+const dirStack=[];
+function onConfirm(){ensureAudio();
+  if(state==='start')startRun();else if(state==='pause')doResume();
+  else if(state==='over')retrySector();else if(state==='win')startRun();}
+
+addEventListener('keydown',e=>{ensureAudio();const c=e.code;
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(c))e.preventDefault();
+  if(c==='ShiftLeft'||c==='ShiftRight'){sneakHeld=true;return;}
+  if(c==='KeyM'){muted=!muted;if(master)master.gain.value=muted?0:.5;return;}
+  if(c==='Enter'||c==='NumpadEnter'){onConfirm();return;}
+  if(c==='KeyR'){startRun();return;}
+  if(c==='KeyP'||c==='Escape'){if(state==='play')doPause();else if(state==='pause')doResume();return;}
+  if(c==='Space'){if(state==='play')throwDecoy();return;}
+  if(DIRMAP[c]){const i=dirStack.indexOf(c);if(i>=0)dirStack.splice(i,1);dirStack.push(c);}});
+addEventListener('keyup',e=>{const c=e.code;
+  if(c==='ShiftLeft'||c==='ShiftRight'){sneakHeld=false;return;}
+  const i=dirStack.indexOf(c);if(i>=0)dirStack.splice(i,1);});
+addEventListener('blur',()=>{if(state==='play')doPause();});
+cv.addEventListener('pointerdown',()=>{ensureAudio();if(state==='start')startRun();});
+$('btnStart').onclick=()=>{ensureAudio();startRun();};
+$('btnResume').onclick=()=>{ensureAudio();doResume();};
+$('btnRetry').onclick=()=>{ensureAudio();retrySector();};
+$('btnRestart1').onclick=()=>{ensureAudio();startRun();};
+$('btnAgain').onclick=()=>{ensureAudio();startRun();};
+
+/* ================= RENDER ================= */
+function drawCones(c){for(const g of ghosts){const L=LEVELS[level];let col,rng,fov;
+    if(g.state==='alert'){col=`rgba(255,70,80,${.13+.05*Math.sin(time*10)})`;rng=L.sight*1.25;fov=ALERT_FOV;}
+    else if(g.state!=='patrol'){col='rgba(255,196,84,.12)';rng=L.sight;fov=FOV;}
+    else{col='rgba(130,185,255,.08)';rng=L.sight;fov=FOV;}
+    const x=(g.px+.5)*T,y=(g.py+.5)*T,f=g.faceAng,half=fov/2,n=6;
+    c.fillStyle=col;c.beginPath();c.moveTo(x,y);
+    for(let i=0;i<=n;i++){const a=f-half+fov*i/n;c.lineTo(x+Math.cos(a)*rng*T,y+Math.sin(a)*rng*T);}
+    c.closePath();c.fill();}}
+
+function drawGhost(c,g){const x=(g.px+.5)*T,y=(g.py+.5)*T+Math.sin(time*5+g.phase)*1.8,r=13.5;
+  c.save();c.translate(x,y);
+  if(g.state==='alert'){c.shadowColor='rgba(255,60,80,.9)';c.shadowBlur=16;}
+  c.fillStyle=g.color;c.beginPath();c.arc(0,-r*.15,r,Math.PI,0);
+  const by=r*.75,w=(2*r)/3;c.lineTo(r,by);
+  for(let i=0;i<3;i++){c.lineTo(r-(i+.5)*w,by-5);c.lineTo(r-(i+1)*w,by);}
+  c.closePath();c.fill();c.shadowBlur=0;
+  const ex=Math.cos(g.faceAng)*3,ey=Math.sin(g.faceAng)*2.5;
+  c.fillStyle='#f4f8ff';
+  c.beginPath();c.ellipse(-4.5+ex,-r*.2+ey,4,5,0,0,TAU);c.fill();
+  c.beginPath();c.ellipse(4.5+ex,-r*.2+ey,4,5,0,0,TAU);c.fill();
+  c.fillStyle='#0a1030';
+  c.beginPath();c.arc(-4.5+ex*1.7,-r*.2+ey*1.7,2.1,0,TAU);c.fill();
+  c.beginPath();c.arc(4.5+ex*1.7,-r*.2+ey*1.7,2.1,0,TAU);c.fill();
+  c.restore();}
+
+function drawPlayer(c){for(const t of P.trail){
+    c.fillStyle=`rgba(255,217,59,${t.a*.28})`;
+    c.beginPath();c.arc((t.x+.5)*T,(t.y+.5)*T,3+4*t.a,0,TAU);c.fill();}
+  const x=(P.px+.5)*T,y=(P.py+.5)*T,r=(sneakHeld?11:14)*(1+.02*Math.sin(time*8));
+  let m;if(P.moving)m=sneakHeld?.3:.25+.75*(.5+.5*Math.sin(time*14));else m=.3+.1*Math.sin(time*3);
+  c.save();c.translate(x,y);c.rotate(P.faceAng);
+  c.shadowColor='rgba(255,217,59,.5)';c.shadowBlur=10;
+  c.fillStyle=sneakHeld?'#e6c437':'#ffd93b';
+  c.beginPath();c.moveTo(0,0);c.arc(0,0,r,m/2,TAU-m/2);c.closePath();c.fill();
+  c.restore();c.shadowBlur=0;}
+
+function render(){const c=ctx;
+  c.setTransform(1,0,0,1,0,0);c.fillStyle='#04060d';c.fillRect(0,0,cv.width,cv.height);
+  const s=S*dpr,ox=(OX+shakeX)*dpr,oy=(OY+shakeY)*dpr;
+  c.setTransform(s,0,0,s,ox,oy);
+
+  c.fillStyle='#080d1a';c.fillRect(0,0,W*T,H*T);
+  c.fillStyle='rgba(120,170,255,.09)';c.fill(dotsPath);
+  for(const p of dust){c.fillStyle=`rgba(170,210,255,${p.a})`;c.fillRect(p.x,p.y,p.r,p.r);}
+
+  c.fillStyle='#111a33';c.fill(wallPath);
+  c.strokeStyle='rgba(96,178,255,.3)';c.lineWidth=1.4;
+  c.shadowColor='rgba(90,190,255,.7)';c.shadowBlur=7;c.stroke(edgePath);c.shadowBlur=0;
+
+  /* exit portal */
+  const ex=(exitT[0]+.5)*T,ey=(exitT[1]+.5)*T;
+  if(!gateOpen){c.strokeStyle='rgba(90,120,180,.5)';c.setLineDash([4,5]);c.lineWidth=2;
+    c.beginPath();c.arc(ex,ey,13,time*.3,time*.3+TAU);c.stroke();c.setLineDash([]);
+    c.strokeStyle='rgba(90,120,180,.6)';c.lineWidth=2;
+    c.beginPath();c.moveTo(ex-4,ey-4);c.lineTo(ex+4,ey+4);c.moveTo(ex+4,ey-4);c.lineTo(ex-4,ey+4);c.stroke();}
+  else{c.save();c.translate(ex,ey);
+    const gr=c.createRadialGradient(0,0,0,0,0,22);gr.addColorStop(0,'rgba(255,236,160,.9)');
+    gr.addColorStop(.4,'rgba(255,217,59,.4)');gr.addColorStop(1,'rgba(255,217,59,0)');
+    c.fillStyle=gr;c.beginPath();c.arc(0,0,22,0,TAU);c.fill();
+    c.rotate(time*1.4);c.strokeStyle='rgba(255,217,59,.85)';c.setLineDash([10,7]);c.lineWidth=2.5;
+    c.beginPath();c.arc(0,0,13,0,TAU);c.stroke();
+    c.rotate(-time*2.6);c.strokeStyle='rgba(95,232,255,.8)';c.setLineDash([6,6]);c.lineWidth=2;
+    c.beginPath();c.arc(0,0,7.5,0,TAU);c.stroke();c.setLineDash([]);
+    for(let i=0;i<8;i++){const t2=(time*.8+i/8)%1,rr=lerp(20,4,t2),a=TAU*i/8+time*.5;
+      c.strokeStyle=`rgba(255,236,160,${(1-t2)*.7})`;c.lineWidth=1.5;
+      c.beginPath();c.moveTo(Math.cos(a)*rr,Math.sin(a)*rr);
+      c.lineTo(Math.cos(a)*(rr+4),Math.sin(a)*(rr+4));c.stroke();}
+    c.restore();}
+
+  /* cores */
+  for(const k of cores){if(k.taken)continue;const x=(k.x+.5)*T,y=(k.y+.5)*T,p=1+.14*Math.sin(time*3+k.i*2.1);
+    const g2=c.createRadialGradient(x,y,0,x,y,16*p);g2.addColorStop(0,'rgba(255,224,120,.85)');
+    g2.addColorStop(.35,'rgba(255,217,59,.35)');g2.addColorStop(1,'rgba(255,217,59,0)');
+    c.fillStyle=g2;c.beginPath();c.arc(x,y,16*p,0,TAU);c.fill();
+    c.fillStyle='#ffd93b';c.beginPath();c.arc(x,y,4.6,0,TAU);c.fill();
+    c.fillStyle='#fff8d8';c.beginPath();c.arc(x-1,y-1,2,0,TAU);c.fill();
+    const oa=time*2.2+k.i*2;c.fillStyle='rgba(255,240,180,.9)';
+    c.beginPath();c.arc(x+Math.cos(oa)*8,y+Math.sin(oa)*8,1.6,0,TAU);c.fill();}
+
+  /* decoys */
+  for(const d of decoys){if(!d.alive)continue;const x=(d.x+.5)*T,y=(d.y+.5)*T,p=1+.2*Math.sin(time*7);
+    c.fillStyle='#ffe9a0';c.beginPath();c.arc(x,y,4.5*p,0,TAU);c.fill();
+    c.strokeStyle='rgba(255,217,59,.6)';c.lineWidth=2;
+    c.beginPath();c.arc(x,y,8,-Math.PI/2,-Math.PI/2+TAU*(1-d.age/DECOY_TTL));c.stroke();}
+
+  /* ripples */
+  for(const r of ripples){const t=r.age/r.life,rad=lerp(.25,r.max,t)*T;
+    c.strokeStyle=`rgba(${r.c},${(1-t)*.5})`;c.lineWidth=1.5;
+    c.beginPath();c.arc((r.x+.5)*T,(r.y+.5)*T,rad,0,TAU);c.stroke();}
+
+  drawCones(c);
+  drawPlayer(c);
+  for(const g of ghosts)drawGhost(c,g);
+
+  /* lighting */
+  lctx.setTransform(1,0,0,1,0,0);lctx.globalCompositeOperation='source-over';
+  lctx.clearRect(0,0,lcan.width,lcan.height);
+  lctx.fillStyle='rgba(3,5,12,.94)';lctx.fillRect(0,0,lcan.width,lcan.height);
+  lctx.setTransform(s,0,0,s,ox,oy);lctx.globalCompositeOperation='destination-out';
+  const lights=[[(P.px+.5)*T,(P.py+.5)*T,(sneakHeld?2.7:4.3)*T*(1+.03*Math.sin(time*16))]];
+  for(const g of ghosts)lights.push([(g.px+.5)*T,(g.py+.5)*T,1.5*T]);
+  for(const k of cores)if(!k.taken)lights.push([(k.x+.5)*T,(k.y+.5)*T,1.7*T]);
+  lights.push([ex,ey,gateOpen?(2.4+.3*Math.sin(time*4))*T:1.0*T]);
+  for(const d of decoys)if(d.alive)lights.push([(d.x+.5)*T,(d.y+.5)*T,2.1*T]);
+  for(const[x,y,r]of lights){const g3=lctx.createRadialGradient(x,y,0,x,y,r);
+    g3.addColorStop(0,'rgba(255,255,255,1)');g3.addColorStop(.55,'rgba(255,255,255,.62)');g3.addColorStop(1,'rgba(255,255,255,0)');
+    lctx.fillStyle=g3;lctx.beginPath();lctx.arc(x,y,r,0,TAU);lctx.fill();}
+  c.setTransform(1,0,0,1,0,0);c.drawImage(lcan,0,0);
+
+  /* above-light pass: eyes glow + indicators */
+  c.setTransform(s,0,0,s,ox,oy);c.textAlign='center';
+  for(const g of ghosts){const x=(g.px+.5)*T,y=(g.py+.5)*T;
+    const ec=g.state==='alert'?'255,80,90':(g.state!=='patrol'?'255,196,84':'130,200,255');
+    for(const sd of[-1,1]){const gx=x+sd*4.5+Math.cos(g.faceAng)*3,gy=y-2.5+Math.sin(g.faceAng)*2.5;
+      const g4=c.createRadialGradient(gx,gy,0,gx,gy,6);
+      g4.addColorStop(0,`rgba(${ec},.9)`);g4.addColorStop(.4,`rgba(${ec},.35)`);g4.addColorStop(1,`rgba(${ec},0)`);
+      c.fillStyle=g4;c.beginPath();c.arc(gx,gy,6,0,TAU);c.fill();}
+    if(g.state==='alert'||(g.flashT||0)>0){
+      c.font='900 15px Impact,"Arial Black",sans-serif';c.fillStyle='#ff5c6c';
+      c.shadowColor='rgba(255,60,80,.9)';c.shadowBlur=8;
+      c.fillText('!',x,y-20+Math.sin(time*8)*1.5);c.shadowBlur=0;}
+    else if(g.suspicion>0.04){const w=18,h=3,bx=x-w/2,by=y-21;
+      c.fillStyle='rgba(10,16,30,.8)';c.fillRect(bx-1,by-1,w+2,h+2);
+      c.fillStyle=`rgb(255,${Math.round(lerp(220,90,g.suspicion))},60)`;
+      c.fillRect(bx,by,w*g.suspicion,h);}}
+
+  /* vignette + flash */
+  c.setTransform(1,0,0,1,0,0);
+  const vg=c.createRadialGradient(cv.width/2,cv.height*.45,Math.min(cv.width,cv.height)*.35,
+    cv.width/2,cv.height/2,Math.max(cv.width,cv.height)*.75);
+  vg.addColorStop(0,'rgba(0,0,0,0)');vg.addColorStop(1,'rgba(1,2,8,.6)');
+  c.fillStyle=vg;c.fillRect(0,0,cv.width,cv.height);
+  if(flash.a>0){c.fillStyle=`rgba(${flash.c},${flash.a})`;c.fillRect(0,0,cv.width,cv.height);}}
+
+/* ================= MAIN LOOP ================= */
+let last=performance.now();
+function frame(now){requestAnimationFrame(frame);
+  let dt=(now-last)/1000;last=now;if(dt>0.05)dt=0.05;time+=dt;
+  for(const p of dust){p.x+=p.vx*dt;p.y+=p.vy*dt;
+    if(p.y<-4){p.y=H*T+4;p.x=Math.random()*W*T;}if(p.x<-4)p.x=W*T+4;if(p.x>W*T+4)p.x=-4;}
+  for(const d of decoys)if(d.alive){d.age+=dt;d.ping-=dt;
+    if(d.ping<=0){d.ping=1.1;ripples.push({x:d.x,y:d.y,age:0,life:.9,max:2.4,c:'255,217,59'});}
+    if(d.age>=DECOY_TTL)d.alive=false;}
+  decoys=decoys.filter(d=>d.age<DECOY_TTL+4);
+  for(const r of ripples)r.age+=dt;ripples=ripples.filter(r=>r.age<r.life);
+
+  let det={anyAlert:false,anyHeard:false};
+  if(state==='play'){totalTime+=dt;levelTime+=dt;
+    updatePlayer(dt);
+    det=updateGhosts(dt,true);
+    for(const g of ghosts){if(Math.hypot(g.px-P.px,g.py-P.py)<0.52){caughtBy=g;break;}}
+    if(caughtBy)doCaught();
+    else{if(det.anyAlert){alarmT-=dt;if(alarmT<=0){alarmT=.34;SFX.alarm(beepFlip^=1);}}}
+    refreshHud(det);}
+  else if(state==='start'||state==='clear'){det=updateGhosts(dt,false);
+    if(state==='clear'){clearT-=dt;if(clearT<=0)advanceLevel();}}
+  flash.a=Math.max(0,flash.a-dt*1.2);
+  const amp=(state==='play'&&det.anyAlert)?1.6:0;
+  shakeX=(Math.random()*2-1)*amp;shakeY=(Math.random()*2-1)*amp;
+
+  render();}
+
+/* ================= INIT ================= */
+buildLevel();showOv(ovStart);hudShow(false);
+$('bestLine').textContent=bestTxt();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+```
