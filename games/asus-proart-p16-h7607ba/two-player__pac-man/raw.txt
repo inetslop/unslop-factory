@@ -1,0 +1,1367 @@
+<think>
+The user wants a 2-player Pac-Man style game in a single HTML file. Let me design it:
+
+- 2 players on the same maze? Or split screen? Simplest is: both players control characters (e.g., yellow and blue) on the same maze, competing to eat all pellets first, with ghosts chasing both.
+- Controls: Player 1 uses WASD, Player 2 uses arrow keys.
+- Ghosts move around, occasionally become vulnerable when a player eats a power pellet.
+- Start screen with title and control instructions, restart button / R key.
+- Canvas-based maze, scaling to fit window.
+- Web Audio API for sound after first input.
+
+Design:
+Maze grid, e.g., 19x21 like the classic but simplified. Use a string map. Walls '#', pellets '.', power pellets 'o', empty ' '.
+
+Movement: grid-based with smooth interpolation, or tile-by-tile movement with direction buffering. Keep it simple: continuous pixel movement along corridors, only turn at intersections. Actually even simpler: move in steps — each player has a position (tile coords) and moves fractionally toward the next tile; can change direction when on a tile center if next is open.
+
+Implement classic-style: position in pixels, velocity, check alignment at tile centers.
+
+Simpler approach: tick-based movement — every N ms each player advances 1 tile (if possible). Interpolate for smoothness. Direction queue. This is robust.
+
+Player state: tileX, tileY, dir {x,y}, wantDir, progress (0..1 between tiles), moving flag. Each frame, if on a tile center and the direction is open, start moving along dir; else stop. Progress += speed*dt; when >= 1, arrive at new tile.
+
+Ghosts: similar tick movement, choose direction at intersections: not reverse, random or chase nearest player. Speed slightly slower than players. When power pellet eaten, ghosts become frightened (blue) for a few seconds, and if a player touches them they get eaten (+ score), otherwise the player loses one life / respawns.
+
+Lives: 3 each. Touching ghost while not frightened → lose life, respawn at start position, short invulnerability. If lives run out... maybe just reset the player to zero? Or that player is eliminated and the other can keep playing; if both are dead, game over.
+
+Win: first player to collect all their pellets? But they share the same maze — pellets are shared, whoever eats them counts for that player. Whoever collects more when the maze is cleared wins. Or first to reach X points. Let's do this: last player standing / most pellets at end of maze wins; if both dead → draw or whoever has more score.
+
+Rendering: scale canvas to fit window preserving aspect ratio, letterbox. Draw maze tiles, pellets, players as circles with mouth animation, ghosts with classic shape.
+
+Sound: simple beeps via oscillator — waka sound when eating pellet (alternating), power pellet sound, ghost death, life lost. AudioContext created on first input.
+
+HUD: score, lives above canvas or drawn inside. Draw top/bottom bars in the canvas.
+
+Maze layout (19 cols x 21 rows?). Let me make it symmetric. Use 19x21.
+
+Let me write the map:
+
+Row strings, each 19 chars. '.' pellet, 'o' power, '#' wall, ' ' empty.
+
+Classic-ish design:
+
+```
+###################
+#........#........#
+#o##.###.#.###.##o#
+#.................#
+#.##.#.#####.#.##.#
+#....#...#...#....#
+####.### # ###.####
+   #.#       #.#
+####.# ##=## #.####
+    .  #GG#  .
+####.# ##### #.####
+   #.#       #.#
+####.# ###### #.####
+#........#........#
+#.##.###.#.###.##.#
+#o.#.....P.....#.o#
+##.#.#.#####.#.#.##
+#....#...#...#....#
+#.######.#.######.#
+#.................#
+###################
+```
+
+Hmm, need to be careful with widths. Let me count carefully. I'll build a 19-wide maze.
+
+Actually let me just do it systematically. Width 19, height 21.
+
+Row0:  "###################" (19)
+Row1:  "#........#........#"
+Row2:  "#o##.###.#.###.##o#"
+Row3:  "#.................#"
+Row4:  "#.##.#.#####.#.##.#"
+Row5:  "#....#...#...#....#"
+Row6:  "####.### # ###.####" — has space in middle; width 19? ####(4). (5) ###(8) space(9) ###(12) .(13) ####(17)? That's 17. Let me count: "####.###" =8, " " =1 →9, "###" →12, "." →13, "####" →17. Need 19. Fix: "####.### # ###.####" no wait.
+
+Let me redo row6 to be symmetric with 19 chars: cols 0-18.
+"#":0? Actually let me design like this: 
+
+Row6: "#####.##...##.#####" → count: 5+1+2+3+2+1+5 = 19. Symmetric? ##### . ## ... ## . ##### — yes symmetric.
+
+Let me do a cleaner maze. I'll write out and verify each row is 19 chars.
+
+R0:  "###################" 19 ✓
+R1:  "#........#........#" → 1+8+1+8+1=19 ✓
+R2:  "#o##.###.#.###.##o#" → 1+1+2+1+3+1+1+1+3+1+2+1+1 = let me count chars: # o # # . # # # . # . # # # . # # o # = 19 ✓
+R3:  "#.................#" 19 ✓
+R4:  "#.##.#.#####.#.##.#" → # . # # . # . # # # # # . # . # # . # = 19 ✓
+R5:  "#....#...#...#....#" → 1+4+1+3+1+3+1+4+1=19 ✓
+R6:  "#####.##.#.##.#####" → 5+1+2+1+1+1+2+1+5 = 19 ✓ (chars: ##### . ## . # . ## . #####)
+R7:  "    .     #     .   " hmm, the tunnel row. Let me use row with gaps on sides: "#  ..#.....#..  #" → count: # ..(2) #(4)... no let me just: "#  ..#....#..  #"? Chars: #,space,space,.,.,#,.,.,.,.,#,.,.,space,space,# = 15. No.
+
+Let me use a simpler approach without side tunnels: full walls on sides.
+
+R7:  "#..#...##.#...#..#" → count: # . . # . . . # # . # . . . # . . # = 16. Ugh, counting by hand is error prone. Let me build each row as exactly 19 chars programmatically in my head carefully, using groups of 5.
+
+Better approach: define rows with segments that sum to 19 and verify.
+
+Let me design a maze with height 21, width 19, symmetric horizontally (mirror left-right), which helps correctness.
+
+Half-width = 10 cols (cols 0-9, center col 9, mirror to 10-18).
+
+Define left half (10 chars per row) and mirror:
+
+R0:  "##########" → full 19 '#'s
+R1:  "#........#" wait that's already 10 for the whole thing. Hmm, half = 10 chars covering cols 0..9; mirror cols 10..18 = reverse of cols 8..0? For odd width 19 with center col 9: row = left(10) + reverse(left[0:9]). So I only need 10-char strings and the total is 10+9=19.
+
+Let me define L (10 chars):
+
+R0: "##########" → row: ########## + ######### = 19 #s ✓
+R1: "#........#" → no wait, that's a full width pattern. Let me think in terms of halves:
+
+Actually simpler: I'll just write out the full 19-char rows and count each char one at a time carefully. Or even better — let me generate the maze programmatically in code from the half-row strings! That guarantees correctness. In JS:
+
+```js
+const HALF = [
+"##########",
+"#........#",  // no...
+```
+
+Hmm, half of R1 "#........#": cols 0..9 = "#........#" is 10 chars? # + 8 dots + ... that's 10 chars but then mirror would be weird (col 9 is '#', col 10 = col 8 = '.'). Result: "#........#. ........." hmm no.
+
+Mirror rule: row[i] for i>=10 = row[18-i]. So col10 = col8, ..., col18=col0. With L="#........#" (cols 0-9): col8='.', col9='#'. Row = "#........#" + reverse(L without last char) = "#........#" + "........#" wait reverse of cols 8..0 = ".","."..."#": col8..0 = '.','.','.','.','.','.','.','.','#' reversed... row[10]=row[8]='.', row[11]=row[7]='.', ..., row[17]=row[1]='.', row[18]=row[0]='#'. So row = "#........#" + "........#" hmm that gives 10+9=19: "#........#........#" wait no: cols 10-18 = row[8..0] in order? No: row[10]=row[8], row[11]=row[7], ..., row[18]=row[0]. So sequence = row[8],row[7],...,row[0] = '.','.','.','.','.','.','.','.','#'. So full row = "#........#" + "........#"? That's 8 dots then '#'? No: sequence is 8 dots (cols 8,7,6,5,4,3,2,1) then row[0]='#'. So cols 10-17 are dots, col18 is '#'. Full: "#........#" + "........" + "#" = "#........#........#" ✓ that's correct! Great, so the mirror works naturally.
+
+So I just need to define 10-char left halves and construct rows. Let me design the maze (21 rows):
+
+Row halves (10 chars each):
+0:  "##########"
+1:  "#........#" → wait L must be cols 0-9; col9 is center. R1 = "#........#........#": cols 0-9 = "#........#" (col9='#'), mirror gives the rest ✓.
+
+Hmm but that puts a wall at the center of row 1 — like classic. OK.
+
+2:  "#o##.###.#" → L: # o # # . # # # . # ; full: "#o##.###.#" + reverse(cols8..0)=".#.###.##o#" wait cols 8..0 = '.','#','#','#','.','#','#','o','#' no: col8='.',col7='#',col6='#',col5='#',col4='.',col3='#',col2='#',col1='o',col0='#' → ".###.#.## o#"... sequence: '.' '#' '#' '#' '.' '#' '#' 'o' '#'. So full row = "#o##.###." + "#" (col9) ... let me just trust the code to do it. Full row would be "#o##.###.#.###.##o#" ✓ matches classic.
+
+3:  "#........." → col9='.', mirror gives all dots inside: "#.................#" ✓
+4:  "#.##.#.##." hmm I want "#.##.#.#####.#.##.#": cols 0-9 = "#.##.#.###", wait that's # . # # . # . # # # = 10 chars, col9='#'. Mirror: full row = "#.##.#.###" + "#" + reverse(cols8..0): cols8,7,6,5,4,3,2,1,0 = '#' '#' '#' '.' '#' '.' '#' '#' '.' → hmm that gives "#####.#.##." then #? Full: "#.##.#.#####" no wait.
+
+Full row = L + [col9] already in L... L is cols 0-9 (10 chars). Row = L + reverse(L[0..8]) i.e., add L[8],L[7],...,L[0].
+L = "#.##.#.###" → wait I need the full row to be "#.##.#.#####.#.##.#". Cols 0-9: # . # # . # . # # # (that's "#.##.#.###"), col10 should be '#' (=col8 ✓), col11='.'(=col7? col7='#' ✗). Hmm mismatch.
+
+Let me recompute the target row4 = "#.##.#.#####.#.##.#": positions:
+0:# 1:. 2:# 3:# 4:. 5:# 6:. 7:# 8:# 9:# 10:# 11:. 12:# 13:# 14:. 15:# 16:# 17:. 18:#
+Check mirror: col10=col8 ✓ (#), col11=col7: '.' vs '#' ✗. Not symmetric! Fix target: make it symmetric: cols 11-18 should be reverse of 0-7 = ". # . # # # # # ."? Reverse of cols0..7 (".#.#.###" no)...
+
+This is getting tedious. Let me just carefully design the maze as a full grid directly, counting each row exactly 19 chars using a fixed template approach: I'll write out rows and count in groups of 5.
+
+Row templates (write as 5+5+5+4 or similar):
+
+R0 : "#####" "#####" "#####" "###" = 19
+R1 : "#...." "....." "....." ".#" → wait that's 4+... let me use: "#........#........#" = groups: "#...."(5) "....#"(10) "......"(16) ".#"(18)? No, 19 needed.
+
+OK new plan — I'll just count each row very carefully one char at a time and keep them as literal strings in the code; then also add a runtime check that pads/truncates if any row is wrong (defensive). Actually let me add a helper that asserts lengths and logs... no, silent fallback: pad with '#' if short. That's safe for gameplay? Padding with wall might block corridor; better to pad with '.'? If a row is too long, extra chars are ignored — could break the right border. I'll be careful to make them correct, plus add a normalization function that forces the outer border to walls and truncates/pads interior.
+
+Let me carefully write out each row, counting:
+
+Width 19, columns 0..18.
+
+R0:  ################### (19 #s) ✓
+R1:  #........#........# → 1+8=9, +1=10, +8=18, +1=19 ✓
+R2:  #o##.###.#.###.##o# → count: #(1)o(2)#(3)#(4).(5)#(6)#(7)#(8).(9)#(10).(11)#(12)#(13)#(14).(15)#(16)#(17)o(18)#(19) ✓
+R3:  #.................# → 1+17+1=19 ✓
+R4:  #.##.#.#####.#.##.# → #(1).(2)#(3)#(4).(5)#(6).(7)#(8)#(9)#(10)#(11)#(12).(13)#(14).(15)#(16)#(17).(18)#(19) ✓
+R5:  #....#...#...#....# → 1+4=5,+1=6,+3=9,+1=10,+3=13,+1=14,+4=18,+1=19 ✓
+R6:  ####.##.#.#.##.#### → #(×4)=4,(5),(6)##→7,8 wait: #(1)#(2)#(3)#(4).(5)#(6)#(7).(8)#(9).(10)#(11)#(12).(13)#(14)#(15)#(16)#(17)#(18)#(19) ✓ — that's "####.##.#.#.##.####" hmm let me recount: I wrote 4 #s, ., ##, ., #, ., ##, ., #### = 4+1+2+1+1+1+2+1+4=17. ✗!
+
+Let me redo R6 with target pattern "####.###.#.###.####": 4+1+3+1+1+1+3+1+4 = 19 ✓. Chars: #### . ### . # . ### . #### → #(1)#(2)#(3)#(4).(5)#(6)#(7)#(8).(9)#(10).(11)#(12)#(13)#(14).(15)#(16)#(17)#(18)#(19) ✓
+
+R7:  "#..#.....#.....#..#" → 1+2+1+5+1+5+1+2+1 = 19 ✓. Chars: # . . # . . . . . # . . . . . # . . # → count: #(1).(2).(3)#(4).(5).(6).(7).(8).(9)#(10).(11).(12).(13).(14).(15)#(16).(17).(18)#(19) ✓
+
+R8:  "#####.#.###.#.#####" → 5+1+1+1+1+3+1+1+1+1+5 = hmm: ##### . # . ### . # . ##### = 5+1+1+1+3+1+1+1+5=20 ✗. Try "#####.#.##.#.#####" → 5+1+1+1+2+1+1+1+5 = 19 ✓. Chars: #(×5).(6)#(7).(8)#(9)#(10).(11)#(12).(13)#####(14-18) → wait that's 13+5=18. Recount: "#####"(5)+"."(6)+"#"(7)+"."(8)+"##"(9,10)+"."(11)+"#"(12)+"."(13)+"#####"(14..18). That's 18! Because 5+1+1+1+2+1+1+1+5: 5+1=6,+1=7,+1=8,+2=10,+1=11,+1=12,+1=13,+5=18. ✗ Argh.
+
+Let me do it by summing segments precisely to 19 for R8. Want: wall, corridor, ghost-house-ish area. Let's do: "#####" + "." + "#" + "." + "###" + "." + "#" + "." + "####" = 5+1+1+1+3+1+1+1+4 = 18. Need one more: make last "#####" → 19, but then row is "#...#####" wait that makes right side 5-wide wall vs left 5 — actually symmetric! "#####.#.###.#.#####" = 5+1+1+1+3+1+1+1+5 = 19? 5+1=6,+1=7,+1=8,+3=11,+1=12,+1=13,+1=14,+5=19 ✓. Earlier I miscounted (I said 20, but it's actually: segments are #,.,#,.,###,.,#,.,# = 5+1+1+1+3+1+1+1+5). Yes! "#####.#.###.#.#####" is 19. ✓ I made arithmetic error before.
+
+R8 = "#####.#.###.#.#####" — hmm col4='.',col6='#',col8='.',col10='.',col12='.',col14='#'. So corridors at 4, 8,10, 14. OK.
+
+R9 (ghost row / tunnel): "    .   # ###   .   " — let me do: "    ..#     #..    " no. Let's make R9: open sides? To keep it simple, keep walls at edges:
+R9 = "#.....# ##### #....#" → 1+5+1+1+5+1+1+4+1 = hmm: #(1).....(2-6)#(7)space(8)#####(9-13)space(14)#(15)? Messy.
+
+Simpler classic-ish center:
+R9 : "###..#   #   #..###" → 3+2+1+3+1+3+1+2+3 = 19? 3+2=5,+1=6,+3=9,+1=10,+3=13,+1=14,+2=16,+3=19 ✓. Chars: ### .. # (space)###(space)# .. ### → that's "###..#   #   #..###". Hmm cols 6,7,8 are spaces? Let me recount: #(1)#(2)#(3).(4).(5)#(6)sp(7)sp(8)sp(9)#(10)sp(11)sp(12)sp(13)#(14).(15).(16)#(17)#(18)#(19). So corridor at 4,5 and 15,16; a gap of open space (no pellets) in middle cols 7-13 with walls at 6,10,14. That's like the ghost house area. Ghosts can move through spaces. OK.
+
+R10: "#.....#.###.#.....#" → 1+5+1+1+3+1+1+5+1 = 19? 1+5=6,+1=7,+1=8,+3=11,+1=12,+1=13,+5=18,+1=19 ✓. Chars: # ..... # . ### . # ..... # → col1-5 dots, col7 '.', col11 '.', col13-17 dots. Good corridors.
+
+R11: "###..#      #..###" → 3+2+1+6+1+2+3 = 18 ✗. Add one space: "###..#       #..###" = 3+2+1+7+1+2+3=19 ✓. Chars: ###..# (7 spaces) #..### → cols: ###(1-3)..(4,5)#(6)sp(7-13)#(14)..(15,16)###(17-19). Hmm col6 is wall but R9 col6 was also wall, OK. But R10 col6='#', R11 col6='#' — vertical wall at col 6 spanning rows 9-11? R9 col6='#' ✓. And col14: R9 '#', R10 '#', R11 '#' ✓. Fine — forms a corridor structure.
+
+Wait, do I need connectivity check? Let me roughly ensure maze is connected. This is risky. Alternative: skip the complex middle and make a simpler, verifiably-connected maze. Honestly, let me design a simpler maze with big open rooms:
+
+New maze (19x21), simple but playable:
+
+R0 : ###################
+R1 : #........#........#
+R2 : #o##.###.#.###.##o#
+R3 : #.................#
+R4 : #.##.#.#####.#.##.#
+R5 : #....#...#...#....#
+R6 : ####.###.#.###.####
+R7 : #..#.....#.....#..#
+R8 : #####.#.###.#.#####
+R9 : ###..#     #..###   → 3+2+1+5+1+2+3 = 17 ✗
+
+Ugh. Let me stop hand-tweaking and instead take a different approach: build the maze in code from a compact, verifiable design that I can reason about as a graph. Or: use a known small Pac-Man-style map that I'll verify tile-by-tile.
+
+Let me commit to this 19x21 map and carefully write each row with an index ruler (0-8 | 9 | 10-18):
+
+Ruler: 0123456789 | 012345678
+      cols:    0..9  then 10..18
+
+R0 : "###########" + "#####" → "###################" ✓ (19)
+R1 : "#........#" + ".#........"? no wait, R1 = "#........#........#": left half (cols0-9)="#........#", right (10-18)="........#" → 9+... cols10-18 is 9 chars "........#" ✓. Total: "#........#"+"........#" = 19 ✓
+R2 : "#o##.###." + "#" + ".###.##o#"? Let me just write full: positions 0-18: #,o,#,#,.,#,#,#,.,#,.,#,#,#,.,#,#,o,# → string: "#o##.###.#.###.##o#" — count chars in that literal: #(1) o(2) #(3) #(4) .(5) #(6) #(7) #(8) .(9) #(10) .(11) #(12) #(13) #(14) .(15) #(16) #(17) o(18) #(19) ✓
+R3 : "#.................#" → 1+17 dots+1 = 19 ✓
+R4 : positions: #,.,#,#,.,#,.,#,#,#,#,#,.,#,.,#,#,.,# → "#.##.#.#####.#.##.#" count: #(1).(2)#(3)#(4).(5)#(6).(7)#(8)#(9)#(10)#(11)#(12).(13)#(14).(15)#(16)#(17).(18)#(19) ✓
+R5 : #,.,.,.,.,#,.,.,.,#,.,.,.,#,.,.,.,.,# → "#....#...#...#....#" count: 1+4=5, #(6), 3 dots=9, #(10), 3 dots=13, #(14), 4 dots=18, #(19) ✓
+R6 : #,#,#,#,.,#,#,#,.,#,.,#,#,#,.,#,#,#,#,# → "####.###.#.###.####" count: 4+1=5, ###=8, .=9, #=10, .=11, ###=14, .=15, #####=19 ✓
+R7 : #,.,.,#,.,.,.,.,.,#,.,.,.,.,.,#,.,.,# → "#..#.....#.....#..#" count: 1+2=3,#=4,5 dots=9,#=10,5 dots=15,#=16,2 dots=18,#=19 ✓
+R8 : #,#,#,#,#,.,#,.,#,.,#,.,#,#,#,#,#,#,#,# → "#####.#.#.#.#####" count: 5+1=6,#=7,.=8,#=9,.=10,#=11,.=12,######... wait remaining cols 13-18 = 6 chars "######"? I listed # at positions 13,14,15,16,17,18 → 6 #'s. Total: 5+1+1+1+1+1+1+1+6 = let me just count the literal: "#####.#.#.#.#####" → #(1)#(2)#(3)#(4)#(5).(6)#(7).(8)#(9).(10)#(11).(12)#(13)#(14)#(15)#(16)#(17)#(18)#(19) ✓ 19!
+
+So R8 = "#####.#.#.#.#####" — corridor at cols 5,7,9,11,12? col12='.', so corridors at 5,7,9,11,12. Hmm col12 and col11 both open: "##" no positions 11='#',12='.'. OK fine.
+
+Wait is R8 symmetric? Doesn't matter much.
+
+R9 : ghost house row: #,#,#,.,.,#,space,space,space,#,space,space,space,#,.,.,#,#,# → "###..#   #   #..###" count: 3+2=5,#=6,3 spaces=9,#=10,3 spaces=13,#=14,2 dots=16,###=19 ✓
+R10 : #,.,.,.,.,#,.,#,#,#,.,#,.,.,.,.,# → "#....#.#.##.? " let me just write: positions: 0:#,1:.,2:.,3:.,4:.,5:#,6:.,7:#,8:#,9:#,10:.,11:#,12:.,13:.,14:.,15:.,16:#? that's 17. Need 19. Let me define: "#....#.###.#....#" → #(1)4dots(5)#(6).(7)###(8-10)... count: 1+4=5, #=6, .=7, ###=10, .=11, #=12, ....=16, #=17. That's 17 ✗.
+
+R10 target: "#....#.##.#....#"? 1+4+1+1+2+1+1+4+1 = 17. Ugh, I keep getting 17 because I'm shortening the dot runs.
+
+Let me be very systematic for R10 (19 chars). I want something like: wall, corridor area with vertical stubs. Let's do:
+col: 0:# 1:. 2:. 3:. 4:. 5:# 6:. 7:# 8:# 9:# 10:. 11:# 12:. 13:. 14:. 15:. 16:. 17:. 18:#
+That's "#....#.####......#" → count: #(1), dots 1-4 (2-5), #(6), dot(7)?? wait col6='.' so chars: # . . . . # . # # # . # . . . . . . # = literal "#....#.####......#": #(1).(2).(3).(4).(5)#(6).(7)#(8)#(9)#(10).(11)#(12).(13).(14).(15).(16).(17).(18)#(19) ✓ 19!
+
+Hmm but col7-9 = "###" and col11='#' with a dot at 10 — so corridors: cols1-4, col6, col10, cols12-17. Vertical connectivity to R9 (corridors at 4,5 and 15,16): col4 ✓ (R9 col4='.', R10 col4='.'), col5: R9 '.', R10 '#' — blocked! R9's corridor at cols 4-5 is dead-ended except via col4. And col15,16: R10 both dots ✓. OK acceptable but let me instead make R9 corridors align: change R9 to "###..#     #..###"? That was 17. Let me set R9 as:
+col: 0-2:#, 3:.? Hmm.
+
+Honestly, I'm spending too much effort on the map. New strategy: verify maze connectivity in my head with a simpler design — a maze where the "rooms" are large open areas connected by obvious wide corridors. Let me design something chunky:
+
+19x21:
+R0 : ###################
+R1 : #........#........#
+R2 : #o##.###.#.###.##o#
+R3 : #.................#
+R4 : #.##.#.#####.#.##.#
+R5 : #....#...#...#....#
+R6 : ####.###.#.###.####
+R7 : #..#.....#.....#..#
+R8 : #####.#.#.#.#####
+R9 : ###..#.##.#..####   (19? 3+2+1+1+2+1+1+2+4=17 ✗)
+
+I keep failing at the middle rows. Let me define the middle rows with exact 19-char strings using segment math:
+
+R8 : "#####.#.#.#.#####" (verified 19 ✓)
+R9 : "###..#  ###  #..###"? segments: ###(3) ..(2) ##... let me count literal "###..#  ###  #..###": #(1)#(2)#(3).(4).(5)#(6)sp(7)sp(8)#(9)#(10)#(11)sp(12)sp(13)#(14).(15).(16)#(17)#(18)#(19) ✓ 19!
+
+So R9 = "###..#  ###  #..###": corridors at cols 4-5, gap (space) at 7-8, wall block at 9-11? no: col9='#',col10='#',col11='#'? positions: 9,10,11 = '#','#','#'. Wait I listed sp(7),sp(8)? Let me recount: after #(6): sp(7), sp(8), #(9), #(10), #(11), sp(12), sp(13), #(14). Hmm but the literal "###..#  ###  #..###" — between first '#' (col6) and '###' there are 2 spaces, then 2 spaces, then '#'. So: col7=' ',col8=' ',col9='#',col10='#',col11='#',col12=' ',col13=' ',col14='#'. Yes.
+
+R10 : "#....#.##.#..####"? count: #(1)....(2-5)#(6).(7)##(8,9)... literal "#....#.##.#..####": #(1).(2).(3).(4).(5)#(6).(7)#(8)#(9).(10)#(11).(12).(13)####(14-17)= 17 ✗.
+
+Ugh. Let me do R10 with segments: "#" + "...." + "#" + "." + "##" + "." + "#." ... I need exact total. Target pattern idea: mirror-ish of R8.
+R10 = "#....#.####......#" — verified 19 above ✓. Corridors: 1-4, 6, 10, 12-17.
+
+Check vertical connections:
+R9 corridors (walkable, non-wall): cols 3? R9: col3='.',col4='.',col5='.', wait recount R9 "###..#  ###  #..###": col0#,1#,2#,3.,4.,5#,6sp,7sp,8#,9#,10#,11sp,12sp,13#,14.,15.,16#,17#,18#. So R9 walkable: cols 3,4 (dots), 6,7 (spaces), 11,12 (spaces), 14,15 (dots).
+R10 walkable: cols 1-4, 6, 10, 12-17.
+Vertical R9→R10 connections at common cols: col3 ✓, col4 ✓, col6 ✓, col11? R10 col11='#' ✗; col12 ✓ (R9 sp, R10 '.'), col14 ✓, col15 ✓. Good — connected on both sides.
+
+R8 walkable: "#####.#.#.#.#####": col5.,col7.,col9.,col11.,col12..
+R9 vs R8: common cols: col7 (R8 '.', R9 sp) ✓, col9? R9 col9='#' ✗, col11: R9 sp, R8 '.' ✓, col12: R9 sp, R8 '.' ✓. So R8's corridors at 5 and 9 need to connect down another way... R8 col5='.' — what's above (R7)? R7 walkable: cols 1,2,4-8,10-14,16,17. R7 col5='.' ✓ so R8col5 connects up. R8 col9: R7 col9='#' ✗; down R9 col9='#'. Dead-end single cell! Remove it: change R8 to "#####.#..#.#####" → count: #(1)#(2)#(3)#(4)#(5).(6)#(7).(8).(9)#(10).(11)####(12-15)... let me count literal: 5+1+1+2+1+1+... "#####"(5)+"."(6)+"#"(7)+".."(8,9)+"#"(10)+"."(11)+"#####"?? that's 11+5=16 ✗.
+
+Alternative R8 = "#####.#.#..#.####"? getting silly. Let me instead design R8 as: "###.#...#...#.###" → count: ###(3).(4)#(5)...(6,7,8)#(9)...(10,11,12)#(13).(14)###(15,16,17)= 17 ✗. Add walls at edges: "####.#...#...#.####" → 4+1+1+3+1+3+1+1+4 = 19 ✓! Literal: #(×4).(5)#(6).(7).(8).(9)#(10).(11).(12).(13)#(14).(15)####(16-19)? wait that's 4+1=5,#=6,3dots=9,#=10,3dots=13,#=14,dot=15,####=19. Hmm I put 5 at end but pattern "####.#...#...#.####" = 4+1+1+3+1+3+1+1+4: segments are #### . # ... # ... # . #### → so col0-3 wall, col4 '.', col5 '#', col6-8 '...', col9 '#', col10-12 '...', col13 '#', col14 '.', col15-18 wall. Verify literal count: #(1)#(2)#(3)#(4).(5)#(6).(7).(8).(9)#(10).(11).(12).(13)#(14).(15)#(16)#(17)#(18)#(19) ✓
+
+R8 = "####.#...#...#.####": walkable cols 4, 6-8, 10-12, 14.
+R8 vs R9 (cols 3,4,6,7,11,12,14,15): common: col4 ✓, col6 ✓, col7 ✓, col11 ✓, col12 ✓, col14 ✓. 
+R8 vs R7: R7 walkable cols 1,2,4,5,6,7,8,10,11,12,13,14,16,17. Common with R8: col4 ✓, 6,7,8 ✓, 10,11,12 ✓, 14 ✓. Great, all connected.
+
+R9 vs R10 done ✓.
+R10 walkable: 1-4, 6, 10, 12-17.
+R11 design: "####.#...#...#.####"? that's same as R8 — would make a long vertical corridor at col 4, 6-8, etc. Actually let me vary: R11 = "#....#.##.#..###"? no, keep it valid: use "#....#.###.#....#" → count: #(1)....(2-5)#(6).(7)###(8-10)... literal: 1+4+1+1+3+1+1+4+1=17 ✗. Argh, always 17 because of that pattern. The issue: I keep making dot runs one short.
+
+R11 target (mirroring R5-ish): "#....#...#...#....#" is 19 ✓ (verified for R5). Let me reuse! R11 = R5 = "#....#...#...#....#". Walkable: 1-4, 6-8, 10-12, 14-17.
+R10 vs R11: common cols: 1-4 ✓, 6 ✓ (R10 col6 '.', R11 col6 '.'), wait R11 col5='#',col6-8='...'. R10 col6='.': ✓. R10 col10='.', R11 col10='.'? R11: cols10-12 dots ✓. R10 12-17, R11 14-17 ✓. Connected!
+
+R12 = "####.###.#.###.####" (like R6, verified 19) walkable: col4, col8? R6/R12: ####(0-3).(4)###(5-7).(8)#(9).(10)###(11-13).(14)####(15-18). Walkable: 4, 8, 10, 14.
+R11 vs R12: common: col4 ✓ (R11 1-4), col8 ✓ (R11 6-8), col10 ✓ (R11 10-12), col14 ✓ (R11 14-17). 
+
+R13 design: "#..#.....#.....#..#" = R7 (verified) walkable: 1,2,4-8,10-14,16,17.
+R12 vs R13: col4 ✓, col8 ✓, col10 ✓, col14 ✓. Connected.
+
+R14 = "#####.#.###.#.#####" (verified 19) walkable: cols5,7,9,11,12? count literal again: #(1-5)... wait "#####.#.###.#.#####": #(1)#(2)#(3)#(4)#(5).(6)#(7).(8)#(9)#(10)#(11).(12)#(13).(14)####(15-18)? that's 18. Recount: segments ##### . # . ### . # . ##### = 5+1+1+1+3+1+1+1+5 = 19 ✓. Chars by position: col0-4 '#####', col5 '.', col6 '#', col7 '.', col8-10 '###', col11 '.', col12 '#', col13 '.', col14-18 '#####'. Walkable: 5, 7, 11, 13.
+R13 vs R14: common cols: col5 ✓ (R13 has 4-8), col7 ✓, col11 ✓ (R13 10-14), col13 ✓. Connected!
+
+R15 = "#....#...#...#....#" walkable 1-4,6-8,10-12,14-17.
+R14 vs R15: col5? R15 col5='#' ✗. col7 ✓ (R15 6-8), col11 ✓ (R15 10-12), col13 ✓ (R15 14-17)? R15 col13='#'. Hmm: R15 = #....#...#...#....# : col0#,1-4 dots,5#,6-8 dots,9#,10-12 dots,13#,14-17 dots,18#. So common with R14 (5,7,11,13): col7 ✓, col11 ✓. Connected on both sides. 
+
+R16 = "#.##.#.#####.#.##.#" (=R4, verified) walkable: 1,4,6,12,14,17? R4: #,.,#,#,.,#,.,#×5,.,#,.,#,#,.,# → col0#,1.,2#,3#,4.,5#,6.,7-11#####?? wait "#####": col7,8,9,10,11 = '#'. Then col12 '.', col13 '#', col14 '.', col15 '#', col16 '#', col17 '.', col18 '#'. Walkable: 1,4,6,12,14,17.
+R15 vs R16: common: col1 ✓ (R15 1-4), col4 ✓, col6 ✓, col12 ✓, col14 ✓, col17 ✓.
+
+R17 = "#.................#" all open inside. Connected to R16 trivially ✓.
+R18 = "#o##.###.#.###.##o#" (=R2) walkable: 1(o),4,8,10,14,17(o).
+R17 vs R18: col1 ✓, 4 ✓, 8 ✓, 10 ✓, 14 ✓, 17 ✓. Connected.
+R19 = "#........#........#" walkable 1-8, 10-17.
+R18 vs R19: col1 ✓, col4 ✓ (R19 1-8), col8 ✓, col10 ✓, col14 ✓, col17 ✓. Connected!
+R20 = "###################".
+
+Now check the top rows similarly:
+R1 walkable 1-8,10-17. R2 walkable: 1(o),4,8,10,14,17(o). Common: 1,4,8,10,14,17 ✓.
+R2 vs R3 (all open): ✓.
+R3 vs R4: R4 walkable 1,4,6,12,14,17 all in R3 ✓.
+R4 vs R5: R5 walkable 1-4,6-8,10-12,14-17. Common with R4 (1,4,6,12,14,17): col1 ✓,4 ✓,6 ✓,12 ✓,14 ✓,17 ✓.
+R5 vs R6: R6 walkable 4,8,10,14. All in R5? col4 ✓ (1-4), col8 ✓ (6-8), col10 ✓ (10-12), col14 ✓ (14-17). ✓
+R6 vs R7: R7 walkable 1,2,4,5,6,7,8,10,11,12,13,14,16,17. Common with R6 (4,8,10,14): all ✓.
+R7 vs R8: common: col4 ✓, 6,7,8 ✓, 10-12 ✓, 14 ✓.
+
+Full maze connected! All rows verified as 19 chars:
+R0 : "###################"
+R1 : "#........#........#"
+R2 : "#o##.###.#.###.##o#"
+R3 : "#.................#"
+R4 : "#.##.#.#####.#.##.#"
+R5 : "#....#...#...#....#"
+R6 : "####.###.#.###.####"
+R7 : "#..#.....#.....#..#"
+R8 : "####.#...#...#.####"
+R9 : "###..#  ###  #..###"
+R10: "#....#.####......#"
+R11: "#....#...#...#....#"
+R12: "####.###.#.###.####"
+R13: "#..#.....#.....#..#"
+R14: "#####.#.###.#.#####"
+R15: "#....#...#...#....#"
+R16: "#.##.#.#####.#.##.#"
+R17: "#.................#"
+R18: "#o##.###.#.###.##o#"
+R19: "#........#........#"
+R20: "###################"
+
+Re-verify R10 = "#....#.####......#": #(1) .(2).(3).(4).(5) #(6) .(7) #(8)#(9)#(10) .(11) #(12) .(13)... wait that doesn't match what I intended. Literal "#....#.####......#": chars: #,.,.,.,.,#,.,#,#,#,#,.,.,.,.,.,.,.,# → count: 19 ✓. Positions: col0#,col1-4 dots,col5#,col6.,col7#,col8#,col9#,col10#,col11.,col12-17 dots,col18#.
+
+Uh oh! Earlier I said R10 walkable = 1-4, 6, 10, 12-17 (with col7-9 '###'). But this literal has col5='#', col6='.', col7-10='####'. Let me recheck my intended design: I wanted "#....#.####......#" with the "####" at cols... let me recount segments: "#"+"...."+"#"+". "+"####"+"......"+"#" = 1+4+1+1+4+6+1 = 18 ✗!! So this literal is only 18 chars? Let me count literal char by char: "#"(1) "."(2) "."(3) "."(4) "."(5) "#"(6) "."(7) "#"(8) "#"(9) "#"(10) "#"(11) "."(12) "."(13) "."(14) "."(15) "."(16) "."(17) "."(18) "#"(19). OK it's 19: # . . . . # . # # # # . . . . . . . # → positions: col0#,col1.,col2.,col3.,col4.,col5#,col6.,col7#,col8#,col9#,col10#,col11.,col12.,col13.,col14.,col15.,col16.,col17.,col18#.
+
+So walkable: 1-4, 6, 11-17. Now redo R9 vs R10 connectivity: R9 walkable cols: 3,4,6,7(sp),11(sp),12(sp),14,15. Common with R10 (1-4,6,11-17): col3 ✓,col4 ✓,col6 ✓,col11 ✓,col12 ✓,col14 ✓,col15 ✓. Still connected!
+
+R8 vs R9: R8 walkable 4,6-8,10-12,14. Common with R9 (3,4,6,7,11,12,14,15): col4 ✓,col6 ✓,col7 ✓,col11 ✓,col12 ✓,col14 ✓. Connected!
+
+R10 vs R11: R11 walkable 1-4,6-8,10-12,14-17. Common with R10 (1-4,6,11-17): col1-4 ✓,col6 ✓,col11 ✓,col12 ✓,col14-17 ✓. Connected!
+
+Also check R9 spaces: cols 6,7 and 11,12 are walkable open areas (no pellets). Col5 and col13 in R9 are '#'? R9 = "###..#  ###  #..###": positions: col0#,1#,2#,3.,4.,5#,6sp,7sp,8#,9#,10#,11sp,12sp,13#,14.,15.,16#,17#,18#. Wait that's "###"+".."+"#"+"  "+"###"+"  "+"#"+".."+"###" = 3+2+1+2+3+2+1+2+3 = 19 ✓. So col5='#',col13='#'. R8 col6-8 walkable includes col6,7; R9 col6,7 spaces — vertical connection at cols 6,7: R8 col6='.',R9 col6=sp ✓; R8 col7 '.', R9 sp ✓. And R8 col10-12 vs R9 col11,12: R8 col10 '.', R9 col10 '#' ✗; R8 col11 '.', R9 sp ✓; R8 col12 '.', R9 sp ✓. Good.
+
+Maze is solid. Ghost house: I could place ghosts in open areas of rows 8-10, e.g., at (9,9)... col9 row9 is '#'. Place ghosts at walkable tiles: (7,9)? Let me put them at (6,9), (8,9)?? col8 row9 = '#'. Hmm. Ghost start positions: let me pick (4,9),(14,9) no wait those have dots (will eat). Whatever — just place ghosts on walkable tiles; if there's a pellet they'll... actually pellets are eaten by players only, ghosts ignore them. Let me use (7,9) and (11,9) (spaces, no pellets), plus 2 more at (9,3)? row3 is open corridor. Or all 4 in middle: (6,9),(7,9),(11,9),(12,9). Good — they're in a pocket area connected to rest of maze.
+
+Player starts: P1 at (9,15)?? Let me put them symmetrically: P1 at (4,15), P2 at (14,15)? Row 15 is open there. Or classic bottom-center: P1 (8,15), P2 (10,15). Both walkable (row15 col6-8 and 10-12 dots... wait row15 = R15 "#....#...#...#....#": col1-4,6-8,10-12,14-17. So (8,15) ✓ and (10,15) ✓.
+
+Power pellets at 4 corners: (1,2),(17,2),(1,18),(17,18) ✓ all 'o'.
+
+Now gameplay mechanics:
+
+Constants: TILE = 32 px base; canvas logical size = 19*32 x (21*32 + HUD). Let me make canvas 608 x 744 (with HUD top ~64 and bottom ~56): mazeH = 21*32=672, total H = 672+64+56=792? Let me do HUD top 60, bottom 52 → 784. Canvas logical: W=608, H=784. Scale via CSS to fit window (letterbox with flex centering, background black).
+
+Movement system:
+- Each entity: x,y in tile coords (float), dir {x,y}, wantDir, speed in tiles/sec, moving.
+- Update: if not at exact integer position, continue along dir until reaching next tile center; clamp overshoot. When at a tile center: check wantDir (if walkable) → dir=wantDir; then if dir is walkable from current tile → keep moving, else stop.
+
+Implementation detail: represent position as (tx, ty, px, py)? Simpler: store float x,y in tile units; movement toward target = current integer tile + dir. Each frame:
+```
+if (!moving) { try start } 
+```
+Let me write a function step(entity, dt):
+- if entity.dir == (0,0): tryTurn: if wantDir open from current tile → set dir to wantDir. Then return (start moving next frame) — or just move directly; fine.
+- else: target = round(x)+dir.x, round(y)+dir.y... need current tile: cx=Math.round(entity.x), cy=... since we always snap to integer at centers. distance-to-center along dir = 1 - progress. Compute maxMove = speed*dt; if distToCenter <= maxMove: overshoot = maxMove - distToCenter; set x,y = center+dir; then check: if wantDir open from new tile → dir=wantDir (keep moving); else if dir not open ahead → dir=(0,0) stop. Then optionally continue with overshoot? Skip (simpler, small hitch acceptable at these speeds). Else: x+=dir.x*maxMove etc.
+
+Speed: player 7 tiles/sec? Classic is ~10px/... let me use player speed = 6 tiles/s, ghost = 4.5 tiles/s normal, 3.5 frightened? Actually frightened ghosts slower: 3.2; and maybe no reverse on fear toggle to keep it simple (or do reverse — one tile flip, easy: just set dir=-dir; they're at center when that happens... not necessarily). Skip reversing.
+
+Ghost AI: at each tile center (when we arrive), choose direction from open directions excluding reverse (unless only option): with probability p chase nearest player (minimize distance to any living player, prefer P2? whatever, min of both), otherwise random. Frightened: pick random among non-reverse. Ghosts can't... let me allow them everywhere walkable including spaces.
+
+Collision: if ghost and player within 0.5 tile (same tile or close) and not frightened → player loses life, respawn after brief pause with 2s invulnerable blink. If frightened → ghost "dies": +50 pts for that player? Give points to nearest player, remove ghost, respawn it at center after 3s (with brief invuln).
+
+Power pellet: sets all living ghosts frightened for 6s (timer), ghosts slow down, color blue flashing white when about to expire.
+
+Score: pellet=10, power=50, ghost=200. First to eat... win condition: all pellets gone → higher score wins; tie = draw. If a player runs out of lives (3) they're eliminated; if both eliminated → whoever has higher score wins? Or game over with scores. Let me do: eliminated players can't move; when maze cleared or both eliminated → game over screen showing winner, press R to restart.
+
+Lives display: little icons.
+
+Sound: WebAudio beeps:
+- waka: short square wave alternating freqs on each pellet eaten (throttled).
+- power: rising sweep.
+- ghostEaten: descending sweep? or arpeggio.
+- death: descending saw.
+- start jingle: a few notes.
+Master gain low (0.15). Create AudioContext lazily on first keydown/click.
+
+Input: window keydown/keyup, track set of pressed keys. P1 WASD, P2 arrows. Also preventDefault for arrows/space to avoid scrolling (iframe may not scroll but still). Start screen: press Enter or click "Start". R to restart anytime. M mute maybe — skip, keep simple but mention? Add M mute since it's easy.
+
+Rendering:
+- Background black.
+- Walls: draw as rounded blue lines? Simplest good look: for each wall tile, fill with dark blue (#1a1a4e?) and stroke border... classic is double-line walls. Simpler approach that looks decent: draw walls as filled tiles in #223 (dark) with a 2px inset glow? Let me do: fill wall tiles with '#0d0d2b', then stroke inner rectangle '#3b46ff' lineWidth 2 for each wall tile — creates grid-like neon look. To reduce the blocky feel, maybe draw walls with rounded joins: for each wall tile, if neighbor is also wall, skip that edge's line... simpler: just fill all wall tiles with a color and stroke inner rectangle; overlapping strokes OK since same color → looks like continuous maze walls (grid lines visible but acceptable, actually classic Pac-Man has grid-like interior). Fine.
+
+Better look trick: draw wall tiles as filled #10103a; then for each wall tile, draw a brighter line on edges adjacent to non-wall tiles (outer boundary glow). That gives clean corridors. Let me do that: color '#3d5afe' lines... let's do both: fill + edge glow lines.
+
+- Pellets: small dot #ffd87a, radius 3. Power pellets: radius 7, pulsing (scale with sin), color #ffb1c1? classic is pinkish; use #ffcf6e.
+- Player: circle with mouth wedge animated by angle based on x movement. P1 yellow (#ffe23f), P2 cyan (#4dd8ff). Eyes? Keep simple: draw circle, cut mouth using arc from a0 to 2π-a0 where a0 = 0.25+0.25*sin(t*10) rotated toward dir.
+- Ghosts: classic shape: top semicircle + body rect + wavy bottom (3 bumps), eyes white with pupils oriented by dir. Normal color per ghost (#ff4d4d, #ffb8de? let me use red, pink, orange, green). Frightened: #2136ff body, white face; last 1.5s flash to white.
+- HUD: top bar: "P1 score" left with yellow icon, "P2 score" right cyan; center: lives + power timer? Bottom bar: message (e.g., "READY!", winner text), hint of controls small.
+
+States: 'menu', 'ready' (brief 1.5s countdown after start/restart), 'play', 'over'. Pause maybe P key — add, cheap.
+
+Ready state: reset positions, show "READY!" for ~1.2s before movement.
+
+Respawn: on death, player respawns at their start position with invuln timer 2s (blink). Brief freeze of ghosts? Just respawn; fine.
+
+Edge case: when a player dies and loses all lives → eliminated flag, don't draw them (or draw as X). If both eliminated or pellets==0 → 'over'.
+
+Check pellet count: total pellets computed at init; decrement on eat.
+
+Eat: check tile under player each frame: if grid has '.' or 'o' at round(x),round(y) → eat when we're near center? Better: eat as we pass through — check the tile at current rounded position every frame; will be eaten within a few frames of entering, fine.
+
+Ghost respawn: keep ghost objects with alive flag and respawnTimer. On eaten: alive=false, timer=3, score to nearest player, play sound. When timer hits 0 → place at center spawn (7,9) or (11,9), frightened=false, brief invuln? Not needed since players have distance.
+
+Ghost AI target: for each ghost pick target = one of the living players (min euclidean). At decision point, evaluate each candidate dir (non-reverse): score = dist(nextTile, target); pick min; with 25% chance random among open dirs (to prevent lock). Frightened → random.
+
+Now code structure:
+
+```html
+<!DOCTYPE html><html><head><meta charset=utf-8><title>Two Player Pac-Man</title>
+<style> html,body{margin:0;height:100%;background:#000;overflow:hidden} #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center} canvas{image-rendering:auto; box-shadow...}</style>
+```
+
+Resize: compute scale = min(innerW/W, innerH/H), set canvas.style.width/height.
+
+Main loop with requestAnimationFrame and dt clamp (<= 0.05).
+
+Let me write it all out now.
+
+Key handling: keys = {}; keydown: if state menu && (Enter or Space) start; R → restart (to ready); P for pause toggle in play; M mute. preventDefault on arrows/space.
+
+Audio functions:
+```js
+let AC=null, muted=false;
+function audio(){ if(!AC){ try{AC=new (window.AudioContext||window.webkitAudioContext)()}catch(e){} } if(AC&&AC.state==='suspended')AC.resume(); return AC;}
+function beep(freq,dur,type='square',vol=0.12,slide=0){...}
+```
+Waka: alternate 440/600.
+
+Draw loop details — let me write the code.
+
+Maze data structure: grid[r][c] = '#' wall, ' ' empty, '.' pellet, 'o' power. walkable(c,r) = in bounds && grid!=='#'. Note: R9 has spaces at cols 6-7 and 11-12 — fine.
+
+Wait, one more check on R9: "###..#  ###  #..###" — col5='#', but R8 col5? R8 = "####.#...#...#.####": col0-3 ####, col4 '.', col5 '#'. OK no conflict. And R10 col5='#' ✓ consistent vertical wall at col5 rows 8-10? R8 col5='#',R9 col5='#',R10 col5='#' — solid pillar. Good.
+
+Also check that R9 col3,4 dots connect to R8 (col4 '.') and R10 (cols 3,4 dots) ✓; and horizontally col3-col4 → col5 '#' blocks rightward; left is col2 '#'. So cols 3-4 in row 9 form a vertical corridor between R8? wait R8 col3='#',R8 col4='.'. So the pocket: cells (3,9),(4,9) connect down to (3,10)? R10 col3='.',col4='.' ✓. And (4,9) up to (4,8) '.' ✓. Fine, it's a corridor segment.
+
+Ghost spawns at (7,9) and (11,9): surrounded by spaces; exits: (7,9) up? R8 col7='.' ✓; down R10 col7='#'; left (6,9) sp → (6,8)? R8 col6 '.' ✓. OK ghosts can exit.
+
+Players start at (8,15) and (10,15), facing left/right? Let me set wantDir = up? Facing away from center: P1 dir=(-1,0), P2 dir=(1,0). Check walkable: R15 col7 '.', col9 '#'... wait P1 at (8,15) wants to move left → (7,15): R15 col7='.' ✓. P2 at (10,15) right → (11,15) '.' ✓.
+
+Now let me write the full code. Aim for clean and complete.
+
+HUD text: use ctx.font 'bold 16px monospace' etc.
+
+Ready timer: state 'ready', readyT counting down from 1.5; when <=0 → 'play'. Show "READY!" text on canvas bottom bar or center of maze.
+
+Death pause: when a player dies, set deathTimer=1.0 during which ghosts freeze and dying player not drawn (or shrinking). Simple: freeze both players? Only the dead one respawns; other keeps moving — that's unfair but OK. Let me freeze all entities for 0.8s on death (deathPause timer), then respawn dead player with invuln.
+
+Game over winner text: "PLAYER 1 WINS!" / "PLAYER 2 WINS!" / "DRAW!"; show final scores; "Press R to play again".
+
+Menu: title "TWO PLAYER PAC-MAN", controls list, "Press ENTER to start". Draw on canvas (so it scales). Also click handler for start/restart.
+
+Let me write the player/ghost objects:
+
+```js
+function makePlayer(id,color,startX,startY,dir){...}
+players = [ {id:0,name:'P1',color:'#ffe23f',x,y,dir:{x:-1,y:0},want:{x:-1,y:0},score:0,lives:3,invuln:0,alive:true,dead:false,mouthT:0} , {...dir (1,0)} ]
+```
+
+Ghost colors: ['#ff5252','#ff9ecf','#ffa726','#8affc1']? 4 ghosts.
+
+Update player per frame (dt): if state!=='play' or deathPause>0 → skip (still update invuln decrement). If !alive (eliminated) skip.
+
+stepEntity(e,dt,speed):
+```js
+const cx=Math.round(e.x), cy=Math.round(e.y);
+if(e.dir.x===0&&e.dir.y===0){
+  if(walkable(cx+e.want.x,cy+e.want.y)) e.dir={...e.want};
+  else return;
+}
+// moving
+let remaining=speed*dt;
+const dx=1-Math.abs(e.x-cx)... 
+```
+Hmm careful: position is float with target = cx+dir. distToCenter = Math.hypot((cx+e.dir.x)-e.x, (cy+e.dir.y)-e.y). If distToCenter <= remaining: overshoot; e.x=cx+e.dir.x; e.y=cy+e.dir.y; then decision at center: if wantDir walkable from new tile → dir=want; else if dir not walkable ahead → dir=(0,0) & want stays. Then optionally continue with overshoot? Skip (simpler, small hitch acceptable at these speeds). Else: e.x+=e.dir.x*remaining...
+
+Wait but when stopped at center and dir is set in same frame, we don't move this frame — that's fine.
+
+Edge case: if player wants to reverse (want = -dir): allow mid-corridor reversal? Classic allows reversing only... actually classic Pac-Man can reverse direction anytime? No — can only change at intersections, but reversing works because the previous tile is open? In classic, pressing opposite key while moving does work (instantly reverses). Let me support: if want == -dir, set dir=want immediately (mid-tile), fine since path was just traversed. Implement in step before movement:
+
+```js
+if(e.want.x===-e.dir.x && e.want.y===-e.dir.y && !(e.dir.x==0&&e.dir.y==0)) { e.dir={...e.want}; }
+```
+And the "at center" check for turns uses want. Also allow turning only when at center: my step handles that because I compute cx,cy from round — but if not at center (mid-tile), cx+want is wrong tile. Fix: only attempt turn when at exact center: check Math.abs(e.x-Math.round(e.x))<0.001 etc. Let me restructure:
+
+```js
+function stepEntity(e,dt,speed,decideFn){
+  if(e.dir.x||e.dir.y){
+    const cx=Math.round(e.x),cy=Math.round(e.y);
+    const tx=cx+e.dir.x,ty=cy+e.dir.y;
+    const dist=Math.hypot(tx-e.x,ty-e.y);
+    let rem=speed*dt;
+    if(dist<=rem){
+      e.x=tx;e.y=ty;
+      // at center: decide next dir
+      if(decideFn) decideFn(e,cx2=e.x... 
+```
+
+Hmm decide fn takes entity. And mid-tile reversal handled before:
+
+```js
+function stepEntity(e,dt,speed,decide){
+  const cx=Math.round(e.x),cy=Math.round(e.y);
+  const atCenter=Math.abs(e.x-cx)<1e-6&&Math.abs(e.y-cy)<1e-6;
+  if(!atCenter && e.dir.x===-e.want.x&&e.dir.y===-e.want.y&&(e.dir.x||e.dir.y)) e.dir={x:e.want.x,y:e.want.y};
+  if(!(e.dir.x||e.dir.y)){ // stopped at center
+    if(walkable(cx+e.want.x,cy+e.want.y)) e.dir={x:e.want.x,y:e.want.y}; else return;
+  }
+  const tx=cx+e.dir.x,ty=cy+e.dir.y;
+  const dist=Math.hypot(tx-e.x,ty-e.y);
+  const rem=speed*dt;
+  if(dist<=rem){ e.x=tx;e.y=ty; decide&&decide(e); }
+  else { e.x+=(tx-e.x)/dist*rem; e.y+=(ty-e.y)/dist*rem; }
+}
+```
+
+Wait: when stopped (dir 0) and want opens up, we set dir but tx=cx+dir → dist=1 → move rem this frame. Good. But bug: if atCenter is false (mid-tile) and want != reverse, we skip turn — correct. If mid-tile and decide... fine.
+
+Ghost decide(e): choose new dir:
+```js
+function ghostDecide(g){
+  const cx=Math.round(g.x),cy=Math.round(g.y);
+  const opts=[{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}].filter(d=>walkable(cx+d.x,cy+d.y)&&!(d.x===-g.dir.x&&d.y===-g.dir.y));
+  if(!opts.length){ g.dir={x:-g.dir.x,y:-g.dir.y}; return; } // dead end, reverse
+  let pick;
+  const target=nearestPlayer(g);
+  if(g.fright||Math.random()<0.25||!target) pick=opts[(Math.random()*opts.length)|0];
+  else { opts.sort((a,b)=>d2(cx+a.x,cy+a.y,target)-d2(cx+b.x,cy+b.y,target)); pick=opts[0]; }
+  g.dir={...pick};
+}
+```
+
+Player decide(p): nothing needed (want-driven). Actually for player, when at center: if want walkable → dir=want; else keep current dir if walkable ahead? In my stepEntity, after arriving at center with decide undefined, we just stop next frame if no dir... issue: player moving right, reaches center, want is still right (walkable) → in the "stopped" branch? No — they're not stopped, dir is still set. After arrival, dir remains {1,0}; next frame cx updated, tx = new ahead tile; move continues. Only stops if at center with dir 0. But when does dir become 0? Never for player! We need: at center, if want not walkable and current dir's ahead not walkable → stop. Add player decide:
+
+```js
+function playerDecide(p){ const cx=p.x|0... use Math.round; if(walkable(cx+p.want.x,cy+p.want.y)) p.dir={...p.want}; else if(!walkable(cx+p.dir.x,cy+p.dir.y)) p.dir={x:0,y:0}; }
+```
+
+Good.
+
+Collision & eating in update after movement:
+For each alive player: tile=round; ch=grid[r][c]; if '.' → score+=10, pellets--, grid=' ', waka sound (throttle via lastWaka time). If 'o' → score+=50, pellets--, frightT=6, all ghosts frightened=true, power sound.
+
+Fright timer global: frightT-=dt; when <=0 → clear frightened flags.
+
+Ghost-player collision: if dist < 0.45:
+- ghost.fright → eat: ghost.alive=false, respawnT=2.5, score+=200 to nearest player (or the one collided), sound.
+- else if player.invuln<=0 → killPlayer(p): lives--; deathPause=0.9; dyingPlayer=p; sound. If lives<=0 → p.alive=false (eliminated). Check end conditions.
+
+Respawn: after deathPause ends, set p.x=startX etc, dir/want per start, invuln=2.5.
+
+End check: pellets===0 or (!p1.alive&&!p2.alive) and state==='play' → 'over', winner by score (if one eliminated and other not but pellets remain... game continues until pellets done? If one is eliminated, other keeps playing to finish; when pellets done → higher score wins. But if the remaining player is stuck without access... maze connected so fine).
+
+Also both eliminated → over immediately.
+
+Draw order: walls, pellets, ghosts, players, HUD, overlays (menu/ready/pause/over text).
+
+Mouth animation: p.mouth += dt*10; mouthAngle = 0.35+0.25*Math.sin(p.mouth). Draw: save, translate to px, rotate by dir angle (atan2(dir.y,dir.x)), path: arc(0,0,r, ma, 2π-ma) → fill. That draws circle missing wedge facing +x direction after rotation.
+
+Ghost draw: body: arc top half (r), line down sides, wavy bottom with 3 arcs of radius r/3? Use:
+```js
+ctx.beginPath();
+ctx.arc(x,y-1,r,Math.PI,0); // top dome (canvas y-down; PI to 0 goes through top? angle 0 is +x, PI is -x; arc from PI to 0 counterclockwise=false passes through PI/2 which is down. Hmm canvas angles: 0=+x, π/2=+y(down). So top semicircle = from π to 2π (or π to 0 with anticlockwise=true). Let me do ctx.arc(x,y,r,Math.PI,0,false)? that's PI→2PI? No: arc(x,y,r,start,end) with default clockwise (in canvas, increasing angle is clockwise visually since y down). From π to 0... let me just use ctx.arc(x,y,r,Math.PI,Math.PI*2) which goes through 3π/2 = up. Yes: start π, end 2π, passes 1.5π (top). Good.
+Then lineTo(x+r, y+h), then bottom bumps: for i in 0..2: arc of small radius going up... simpler: zigzag: lineTo(x+r - r/3*? ...). Let me do: bottom edge from right to left with 3 semicircle notches:
+for(let i=0;i<3;i++){ const bx=x+r - (i+0.5)*(2r/3); ctx.arc(bx, y+h, r/3, 0, Math.PI, false);} 
+arc from 0 to π passes through π/2 = down — that's a bump downward, wrong direction; I want notches upward: use anticlockwise? arc(bx,y+h,r/3,0,Math.PI,true) goes from 0 to -π through 1.5π (up) → notch up ✓. Hmm but chaining arcs auto lineTo is fine.
+Then closePath and fill.
+Eyes: two white circles at offset by dir, pupils blue.
+```
+
+Frightened face: body #2136ff; eyes white squares? classic: white dot eyes + wavy mouth. Let me just draw a simpler face: white eyes (small) and zigzag mouth line. Flashing when frightT<1.5: alternate color to white every 0.15s.
+
+Invuln blink: skip drawing on alternating 0.1s.
+
+HUD top (y 0..60): 
+- Left: yellow circle icon + "P1" + score; lives as small circles below? Let me do: "P1 [score]" and lives dots.
+- Right mirror for P2.
+- Center: fright indicator maybe skip.
+
+Bottom bar (H-52..H): message text center: state messages / controls hint.
+
+Canvas layout: W=608, maze offset y=64, bottom bar at 64+672=736, H=736+48=784.
+
+Now let me write the final code. Also handle click: canvas click → if menu, start; if over, restart. Add mouse support too.
+
+Menu overlay: dim maze + big title. Draw on canvas so it scales.
+
+Let me also add a small "M" mute indicator in bottom bar when muted.
+
+Let me write the JS carefully to avoid bugs:
+
+```js
+const COLS=19, ROWS=21, TILE=32;
+const MAP=[...strings...];
+let grid=[]; // mutable
+function initGrid(){ grid=MAP.map(r=>r.split('')); totalPellets=count... }
+function walkable(c,r){ if(c<0||c>=COLS||r<0||r>=ROWS)return false; return grid[r][c]!=='#'; }
+```
+
+Wait: outer border is all '#' so out-of-bounds never needed but keep guard.
+
+Entity speed: PSPEED=6, GSPEED=4.2, FRIGHT_SPEED=3.
+
+Update loop:
+
+```js
+function update(dt){
+ if(state==='menu')return;
+ if(state==='ready'){ readyT-=dt; if(readyT<=0)state='play'; return; }
+ if(state!=='play'||paused)return;
+ if(deathPause>0){ deathPause-=dt; if(deathPause<=0&&dyingPlayer){ respawn(dyingPlayer); dyingPlayer=null;} return; }
+ if(frightT>0){ frightT-=dt; if(frightT<=0) ghosts.forEach(g=>g.fright=false); }
+ players.forEach(p=>{ if(!p.alive)return; p.invuln=Math.max(0,p.invuln-dt); stepEntity(p,dt,PSPEED,playerDecide); eatAt(p); });
+ // ghost updates
+ let anyFright=... 
+ ghosts.forEach(g=>{ if(!g.alive){ g.t-=dt; if(g.t<=0){ g.alive=true; g.fright=false; const s=g.ghostSpawn%2? [7,9]:[11,9]; g.x=s[0];g.y=s[1]; g.dir={x:0,y:0}; g.want={x:-1,y:0}; } return;} stepEntity(g,dt,g.fright?FSGSPEED:GSPEED,ghostDecide); });
+ // collisions
+ for(const g of ghosts){ if(!g.alive)continue; for(const p of players){ if(!p.alive||p.invuln>0&&false)... 
+```
+
+Collision logic:
+```js
+for(const g of ghosts){ if(!g.alive)continue;
+ for(const p of players){ if(!p.alive)continue;
+   const d=Math.hypot(g.x-p.x,g.y-p.y);
+   if(d<0.45){
+     if(g.fright){ g.alive=false; g.t=2.5; addScore(p,200); sGhost(); }
+     else if(p.invuln<=0){ killPlayer(p); }
+   }}}
+```
+
+killPlayer: p.lives--; deathPause=0.9; dyingPlayer=p; sDeath(); if(p.lives<=0) p.alive=false... but then respawn should not happen if eliminated. In respawn: only if p.alive. Check end after: if(!players[0].alive&&!players[1].alive || totalPellets===0) → gameOver().
+
+eatAt(p): c=round(p.x),r=round(p.y); ch; if '.' {grid=' ',total--;p.score+=10; waka()} else if 'o' {.., frightT=6, ghosts.forEach(f=>f.fright=true); sPower()}.
+
+waka throttle: track lastWaka and alternate pitch: if(now-last>0.08){...}. Use performance.now or accumulate in game time. Fine with simple counter using frame time.
+
+gameOver(): state='over'; winner = compare scores; sWin().
+
+restart(): initGrid(); reset players (score 0, lives 3, alive true, positions), ghosts, frightT=0, totalPellets=count, state='ready', readyT=1.6, deathPause=0, paused=false.
+
+start() from menu → restart().
+
+Draw:
+
+```js
+function draw(){
+ ctx.clearRect... fill black entire W,H.
+ const ox=0, oy=64;
+ // walls
+ for r,c: ch=grid[r][c]; if '#': fill rect dark; edge glow: if !wallAt(c+1,r) stroke line on right edge, etc. 
+```
+
+Simplify wall draw: first pass fill all wall tiles with '#0a0a2e'; second pass: for each wall tile, for each of 4 neighbors that is walkable (or out-of-bounds? at boundary outside — skip), draw a rounded glow line along the edge: strokeStyle '#3b5bff', lineWidth 3, plus maybe outer softer. Let me do single crisp line: color '#4169ff'.
+
+Actually to look nicer: draw lines with lineWidth 2 and shadowBlur? Shadow is slow but maze is small (a few hundred segments) — fine at 60fps? shadowBlur on many strokes can be costly; skip or minimal. Let me do two passes: wide semi-transparent blue (lineWidth 5, rgba(70,110,255,0.35)) then thin bright (2px #6c8cff). Should look neon-ish.
+
+Pellets: for each tile '.', dot radius 3 at center of tile; 'o': pulsing radius 5+2*sin(t*6), color '#ffd166' vs dots '#ffe9b0'? classic pellets are pinkish-orange (#ffb897). Use '#ffcf9e'.
+
+Ghost/player drawing as planned.
+
+HUD:
+```js
+// top bar bg slightly
+ctx.fillStyle='#05050f'; fillRect(0,0,W,64)? canvas already black; add a divider line at y=62.
+P1: yellow circle icon at (24,24) r8; text "P1  "+score at (40,30) font bold 18 monospace fill #ffe23f; lives dots below at y=46.
+P2 right aligned: use textAlign right at W-40 etc, icon at W-24.
+Center: maybe show "MUTED" if muted.
+```
+
+Bottom bar: line at y=736; text center at y=762: 
+- menu: (overlays instead)
+- ready: "READY!" big at maze center + bottom hint.
+- play: controls hint small: "P1 WASD   P2 ARROWS   R RESTART   P PAUSE".
+- over: winner text bigger (also drawn centered on maze).
+
+Menu overlay: dim maze with rgba(0,0,0,0.75) rect; title "TWO PLAYER PAC-MAN" big 40px center #ffe23f at y~250; subtitle lines with controls (#fff, 16px): "PLAYER 1 — WASD", "PLAYER 2 — ARROW KEYS", "Eat all the pellets. Don't get caught!", "First press ENTER to start" pulsing. Also draw two player icons + ghost for flair (optional, skip or simple).
+
+Pause overlay: "PAUSED".
+
+OK let me write it all now. Also handle visibilitychange? Not necessary.
+
+One more consideration: iframe key events — listen on window as instructed ✓.
+
+preventDefault: on arrows and space to stop page scrolling: in keydown if code is in list → e.preventDefault().
+
+Let me write the HTML file now, being careful with syntax.
+
+Also ghost initial state: 4 ghosts at (7,9),(8? no) — positions: (6,9),(7,9),(11,9),(12,9)? All spaces (no pellets), walkable ✓. Give them random initial dirs. Actually let me stagger spawns to avoid stacking: they'll separate via decisions. Fine.
+
+Ghost decide when g.dir is 0 at spawn: opts exclude reverse of zero dir... -0===0 so the "!(d.x===-g.dir.x&&d.y===-g.dir.y)" would exclude all since -0===0 and d.y===0 both... condition: d.x===-g.dir.x && d.y===-g.dir.y → for g.dir (0,0): true only if d=(0,0), which is not in opts. OK safe. But decide is called on arrival at center; at spawn they're at center with dir 0 — stepEntity's stopped branch will set dir=want if walkable. Set want to a random open dir at spawn. Fine.
+
+nearestPlayer: among alive players, min distance; return player object (use its x,y).
+
+Also make sure ghosts don't overlap each other badly — acceptable.
+
+Sound implementation:
+
+```js
+function tone(f0,f1,dur,type,vol){ const ac=audio(); if(!ac||muted)return; const t=ac.currentTime; const o=ac.createOscillator(),g=ac.createGain(); o.type=type; o.frequency.setValueAtTime(f0,t); if(f1)o.frequency.exponentialRampToValueAtTime(f1,t+dur); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.001,t+dur); o.connect(g).connect(ac.destination); o.start(t); o.stop(t+dur+0.02); }
+sWaka: tone(wakaFlip? 380:520, wakaFlip?520:640, .09,'square',.10); flip=!flip;
+sPower: tone(200,700,.4,'sawtooth',.12)
+sGhost: tone(600,1200? ...) arpeggio: 3 quick tones — just do tone(500,900,.25,'triangle',.15)
+sDeath: tone(400,60,.7,'sawtooth',.18)
+sWin: sequence via setTimeout? avoid; use start offset times: write toneAt with start time param. Simpler: use ac.currentTime offsets — let me add a 'when' param.
+```
+
+Let me make tone(f0,f1,dur,type,vol,when=0). Win jingle: 4 notes scheduled.
+
+Audio init on first input: call audio() in keydown/click handlers (create context there after user gesture ✓).
+
+OK let me write the final file. Estimated ~450 lines. Here we go.
+
+Double check stepEntity reversal logic once more: condition `!atCenter && e.dir.x===-e.want.x && e.dir.y===-e.want.y` — when dir=(1,0), want=(-1,0): -want... e.dir.x===-e.want.x → 1===1 ✓ and e.dir.y===-e.want.y → 0===0 ✓. Reverses. When dir=(1,0), want=(0,1) (turn mid-tile): 1===0? no → skip ✓. Good. But careful when dir=(0,0) stopped: first branch guarded by atCenter false? if stopped we're at center so atCenter true → branch skipped; second branch handles start.
+
+Edge case: entity exactly at center with dir set and want is a valid turn — decide() runs on arrival frame (sets dir to new value). Then subsequent frames continue. But consider: player moving right, arrive at center, decide sets dir=want (up). Next frame: cx,cy = that tile; tx=cx+dir... ✓.
+
+Subtle bug: in stepEntity, after `if(!(e.dir.x||e.dir.y))` we may set dir then continue to movement code — but I wrote `else return` inside? Let me restructure cleanly:
+
+```js
+function stepEntity(e,dt,speed,decide){
+  const cx=Math.round(e.x),cy=Math.round(e.y);
+  const atC=Math.abs(e.x-cx)<1e-6&&Math.abs(e.y-cy)<1e-6;
+  if(!atC&&e.dir.x===-e.want.x&&e.dir.y===-e.want.y){e.dir={x:e.want.x,y:e.want.y};}
+  if(!(e.dir.x||e.dir.y)){
+    if(walkable(cx+e.want.x,cy+e.want.y)) e.dir={x:e.want.x,y:e.want.y};
+    else return;
+  }
+  const tx=cx+e.dir.x,ty=cy+e.dir.y;
+  const dist=Math.hypot(tx-e.x,ty-e.y);
+  const rem=speed*dt;
+  if(dist<=rem){ e.x=tx;e.y=ty; if(decide)decide(e); }
+  else { const s=rem/dist; e.x+=(tx-e.x)*s; e.y+=(ty-e.y)*s; }
+}
+```
+
+playerDecide(p): 
+```js
+const cx=Math.round(p.x),cy=Math.round(p.y);
+if(walkable(cx+p.want.x,cy+p.want.y)) p.dir={x:p.want.x,y:p.want.y};
+else if(!walkable(cx+p.dir.x,cy+p.dir.y)) p.dir={x:0,y:0};
+```
+
+Good.
+
+Respawn positions: P1 (8,15) want (-1,0); P2 (10,15) want (1,0).
+
+Now let me write it all out. Also draw a small "READY!" in center of maze during ready state, and entities visible at start positions.
+
+Bottom bar height: H=784, maze bottom edge 736, bottom bar 736..784 (48px). Top bar 0..64 with maze starting y=64. Total 64+672+48=784 ✓.
+
+Draw code for walls:
+
+```js
+function isWall(c,r){ return c<0||c>=COLS||r<0||r>=ROWS || grid[r][c]==='#'; }
+for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){ if(grid[r][c]!=='#')continue; const x=c*TILE,y=oy+r*TILE; ctx.fillStyle='#0b0b26'; ctx.fillRect(x,y,TILE,TILE); }
+ctx.lineCap='round';
+for(const [lw,col] of [[6,'rgba(80,120,255,0.25)'],[2.5,'#5f7cff']]){
+  ctx.lineWidth=lw; ctx.strokeStyle=col; ctx.beginPath();
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){ if(grid[r][c]!=='#')continue; const x=c*TILE,y=oy+r*TILE;
+    if(!isWall(c-1,r)){ ctx.moveTo(x,y);ctx.lineTo(x,y+TILE);} 
+    if(!isWall(c+1,r)){ ctx.moveTo(x+TILE,y);ctx.lineTo(x+TILE,y+TILE);}
+    if(!isWall(c,r-1)){ ctx.moveTo(x,y);ctx.lineTo(x+TILE,y);}
+    if(!isWall(c,r+1)){ ctx.moveTo(x,y+TILE);ctx.lineTo(x+TILE,y+TILE);}
+  }
+  ctx.stroke();
+}
+```
+
+isWall treats out-of-bounds as wall → boundary edges won't be drawn (maze sits at canvas edge anyway; canvas W=608 exactly = 19*32 so maze fills width). Good.
+
+Player draw:
+
+```js
+function drawPac(p){
+ const x=p.x*TILE+TILE/2, y=(oy+p.y*TILE)+TILE/2;
+ if(p.invuln>0 && Math.floor(performance.now()/120)%2===0) return; // blink
+ const ang=Math.atan2(p.dir.y,p.dir.x);
+ const m=0.3+0.28*Math.abs(Math.sin(p.mouth));
+ ctx.fillStyle=p.color; ctx.beginPath();
+ ctx.moveTo(x,y); ctx.arc(x,y,TILE*0.42,ang+m,ang-m+Math.PI*2); ctx.closePath(); ctx.fill();
+}
+```
+
+Wait arc from ang+m to ang-m+2π: that's the circle with wedge removed facing ang ✓ (wedge spans ang-m..ang+m). moveTo(x,y) then arc — arc draws line from current point to arc start; that makes a pie-slice-ish shape which is fine as mouth cutout.
+
+Ghost draw:
+
+```js
+function drawGhost(g,t){
+ if(!g.alive)return;
+ const x=g.x*TILE+TILE/2,y=oy+g.y*TILE+TILE/2;
+ const r=TILE*0.45, h=TILE*0.28;
+ let body;
+ if(g.fright){ body = (frightT<1.6 && Math.floor(t*8)%2===0) ? '#fff' : '#2743ff'; }
+ else body=g.color;
+ ctx.fillStyle=body;
+ ctx.beginPath();
+ ctx.arc(x,y-2,r,Math.PI,Math.PI*2);
+ const by=y-2+h;
+ ctx.lineTo(x+r,by);
+ for(let i=0;i<3;i++){ const bx=x+r-(i+0.5)*(2*r/3); ctx.arc(bx,by,r/3,0,Math.PI,true); }
+ ctx.closePath(); ctx.fill();
+ // eyes
+ if(g.fright){ small white dots + zigzag mouth } else { white eyes with pupils offset by g.dir }
+}
+```
+
+Arc anticlockwise from 0 to π: starts at (bx+r,by) and goes through top? Anticlockwise means decreasing angle: 0 → -π/2 (up) → -π. So passes through up ✓ notch upward. Good.
+
+Eyes:
+```js
+const ex=g.dir.x*3, ey=g.dir.y*3;
+ctx.fillStyle='#fff'; two circles at x±r*0.42, y-6 radius 4; pupils '#123' radius 2 offset by (ex,ey).
+```
+
+Fright face: white eyes radius 2.5 and a zigzag mouth:
+```js
+ctx.strokeStyle='#fff'; lineWidth 1.5; beginPath; for i 0..4: lineTo(x-r*0.6+i*(r*0.3), y+4+(i%2? -3:1)); stroke;
+```
+
+Good enough.
+
+HUD lives: small pac icons: draw a mini arc at positions below score text.
+
+Menu drawing: after drawing maze (draw maze always, then overlay). In menu state players/ghosts also drawn at initial positions — fine under dim.
+
+Timing: let last=performance.now(); loop(ts): dt=min(0.05,(ts-last)/1000); update(dt); draw(ts/1000); rAF.
+
+Pulse animation for power pellets and title uses t param.
+
+Mute key M: toggles muted; indicator in bottom bar.
+
+Pause P only during play.
+
+Enter handling: if state==='menu' start; if 'over' restart. R: if state!=='menu' restart (or anytime → restart). Space also starts? Let me allow Enter/Space/click.
+
+Note: keydown for movement should not preventDefault WASD (harmless anyway); arrows+space do preventDefault.
+
+Total pellets count: computed by scanning grid.
+
+Also make sure ghosts don't spawn on top of player start positions — they don't (rows 9 vs 15).
+
+Let me write the winner logic in gameOver:
+```js
+const [a,b]=players; let w;
+if(a.score>b.score)w='PLAYER 1 WINS!'; else if(b.score>a.score)w='PLAYER 2 WINS!'; else w='DRAW!';
+winnerColor accordingly.
+```
+
+Draw over screen: dim, "GAME OVER", winner text colored, scores, "Press R or ENTER to play again".
+
+Let me write the final answer now. Keep code tidy.
+
+One more: canvas sizing — set canvas.width=608,height=784 fixed; CSS scale via style width/height on resize. Use devicePixelRatio? Could multiply for sharpness; keep simple but let's do DPR scaling for crisp text: canvas.width = W*dpr etc., ctx.scale(dpr,dpr). Let me include it — cheap.
+
+Actually simpler: keep logical 608x784 and set style size to fit; if window is larger than 608, upscaling will blur slightly but acceptable. I'll add DPR handling anyway for quality:
+
+```js
+function resize(){ const s=Math.min(innerWidth/W, innerHeight/H); cv.style.width=(W*s)+'px'; cv.style.height=(H*s)+'px'; }
+```
+And on init set canvas width=W*dpr height=H*dpr with ctx.setTransform(dpr,0,0,dpr,0,0). Do it once (dpr rarely changes; recompute on resize for safety).
+
+OK let me write it.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Two Player Pac-Man</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#000;overflow:hidden}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000}
+  canvas{display:block;background:#050510}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<script>
+(function(){
+"use strict";
+
+/* ---------- maze (19 x 21) ---------- */
+const COLS=19, ROWS=21, TILE=32;
+const MAP=[
+"###################",
+"#........#........#",
+"#o##.###.#.###.##o#",
+"#.................#",
+"#.##.#.#####.#.##.#",
+"#....#...#...#....#",
+"####.###.#.###.####",
+"#..#.....#.....#..#",
+"####.#...#...#.####",
+"###..#  ###  #..###",
+"#....#.####......#",
+"#....#...#...#....#",
+"####.###.#.###.####",
+"#..#.....#.....#..#",
+"#####.#.###.#.#####",
+"#....#...#...#....#",
+"#.##.#.#####.#.##.#",
+"#.................#",
+"#o##.###.#.###.##o#",
+"#........#........#",
+"###################"
+];
+
+const W=COLS*TILE, HUD_TOP=64, HUD_BOT=48;
+const H=HUD_TOP+ROWS*TILE+HUD_BOT; // 784
+const OY=HUD_TOP;
+
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+function fit(){
+  const dpr=Math.max(1,window.devicePixelRatio||1);
+  cv.width=W*dpr; cv.height=H*dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  const s=Math.min(window.innerWidth/W, window.innerHeight/H);
+  cv.style.width=(W*s)+'px'; cv.style.height=(H*s)+'px';
+}
+window.addEventListener('resize',fit); fit();
+
+/* ---------- audio (created on first input) ---------- */
+let AC=null, muted=false, wakaFlip=false;
+function audio(){
+  if(!AC){ try{ AC=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+  if(AC && AC.state==='suspended'){ AC.resume(); }
+  return AC;
+}
+function tone(f0,f1,dur,type,vol,when){
+  const ac=audio(); if(!ac||muted)return;
+  when=when||0;
+  try{
+    const t=ac.currentTime+when;
+    const o=ac.createOscillator(), g=ac.createGain();
+    o.type=type; o.frequency.setValueAtTime(f0,t);
+    if(f1) o.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+dur);
+    g.gain.setValueAtTime(vol,t);
+    g.gain.exponentialRampToValueAtTime(0.001,t+dur);
+    o.connect(g); g.connect(ac.destination);
+    o.start(t); o.stop(t+dur+0.03);
+  }catch(e){}
+}
+const sWaka =()=>{ wakaFlip=!wakaFlip; tone(wakaFlip?380:540, wakaFlip?540:700, .09,'square',.08); };
+const sPower=()=>tone(180,720,.45,'sawtooth',.12);
+const sGhost=()=>{ tone(420,880,.18,'triangle',.16); tone(880,1400,.18,'triangle',.13,.12); };
+const sDeath=()=>tone(500,55,.8,'sawtooth',.18);
+const sWin  =()=>{ [523,659,784,1046].forEach((f,i)=>tone(f,f,.22,'square',.12,i*.16)); };
+
+/* ---------- state ---------- */
+let grid=[], totalPellets=0;
+let state='menu';           // menu | ready | play | over
+let readyT=0, deathPause=0, dyingPlayer=null, frightT=0, paused=false;
+let players=[], ghosts=[], winnerText='', winnerColor='#fff';
+
+const DIRS=[{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
+
+function countPellets(){ let n=0; for(const row of grid) for(const ch of row) if(ch==='.'||ch==='o')n++; return n; }
+function walkable(c,r){ if(c<0||c>=COLS||r<0||r>=ROWS)return false; return grid[r][c]!=='#'; }
+
+function makePlayer(i){
+  const p1=i===0;
+  return {
+    i:i, name:p1?'P1':'P2', color:p1?'#ffe23f':'#4dd8ff',
+    sx:p1?8:10, sy:15, sdir:{x:p1?-1:1,y:0},
+    x:p1?8:10, y:15, dir:{x:p1?-1:1,y:0}, want:{x:p1?-1:1,y:0},
+    score:0, lives:3, alive:true, invuln:0, mouth:Math.random()*6
+  };
+}
+const GHOST_COLORS=['#ff5252','#ff9ecf','#ffa726','#8affc1'];
+function makeGhosts(){
+  const spots=[[6,9],[7,9],[11,9],[12,9]];
+  return spots.map((s,i)=>({
+    x:s[0], y:s[1], dir:{x:0,y:0}, want:{x:(Math.random()<.5?-1:1),y:0},
+    color:GHOST_COLORS[i], fright:false, alive:true, t:0
+  }));
+}
+
+function restart(){
+  grid=MAP.map(r=>r.split(''));
+  totalPellets=countPellets();
+  players=[makePlayer(0),makePlayer(1)];
+  ghosts=makeGhosts();
+  frightT=0; deathPause=0; dyingPlayer=null; paused=false;
+  state='ready'; readyT=1.6;
+}
+
+/* ---------- movement ---------- */
+function stepEntity(e,dt,speed,decide){
+  const cx=Math.round(e.x), cy=Math.round(e.y);
+  const atC=Math.abs(e.x-cx)<1e-6 && Math.abs(e.y-cy)<1e-6;
+  if(!atC && e.dir.x===-e.want.x && e.dir.y===-e.want.y){ e.dir={x:e.want.x,y:e.want.y}; }
+  if(!(e.dir.x||e.dir.y)){
+    if(walkable(cx+e.want.x,cy+e.want.y)) e.dir={x:e.want.x,y:e.want.y};
+    else return;
+  }
+  const tx=cx+e.dir.x, ty=cy+e.dir.y;
+  const dist=Math.hypot(tx-e.x,ty-e.y);
+  const rem=speed*dt;
+  if(dist<=rem){ e.x=tx; e.y=ty; if(decide)decide(e); }
+  else { const s=rem/dist; e.x+=(tx-e.x)*s; e.y+=(ty-e.y)*s; }
+}
+function playerDecide(p){
+  const cx=Math.round(p.x), cy=Math.read?Math.round(p.y):Math.round(p.y);
+  if(walkable(cx+p.want.x,cy+p.want.y)) p.dir={x:p.want.x,y:p.want.y};
+  else if(!walkable(cx+p.dir.x,cy+p.dir.y)) p.dir={x:0,y:0};
+}
+function nearestPlayer(g){
+  let best=null,bd=1e9;
+  for(const p of players){ if(!p.alive)continue;
+    const d=(g.x-p.x)*(g.x-p.x)+(g.y-p.y)*(g.y-p.y);
+    if(d<bd){bd=d;best=p;} }
+  return best;
+}
+function ghostDecide(g){
+  const cx=Math.round(g.x), cy=Math.round(g.y);
+  let opts=DIRS.filter(d=>walkable(cx+d.x,cy+d.y) && !(d.x===-g.dir.x&&d.y===-g.dir.y));
+  if(!opts.length){ g.dir={x:-g.dir.x,y:-g.dir.y}; return; }
+  const target=nearestPlayer(g);
+  let pick;
+  if(g.fright || !target || Math.random()<0.25){
+    pick=opts[(Math.random()*opts.length)|0];
+  }else{
+    opts=opts.slice().sort((a,b)=>{
+      return ((cx+a.x-target.x)**2+(cy+a.y-target.y)**2)-((cx+b.x-target.x)**2+(cy+b.y-target.y)**2);
+    });
+    pick=opts[0];
+  }
+  g.dir={x:pick.x,y:pick.y};
+}
+
+/* ---------- gameplay ---------- */
+function eatAt(p){
+  const c=Math.round(p.x), r=Math.round(p.y);
+  if(c<0||c>=COLS||r<0||r>=ROWS)return;
+  const ch=grid[r][c];
+  if(ch==='.'){ grid[r][c]=' '; totalPellets--; p.score+=10; sWaka(); }
+  else if(ch==='o'){
+    grid[r][c]=' '; totalPellets--; p.score+=50;
+    frightT=6; ghosts.forEach(g=>{ if(g.alive) g.fright=true; });
+    sPower();
+  }
+}
+function killPlayer(p){
+  p.lives--;
+  deathPause=0.9; dyingPlayer=p; sDeath();
+  if(p.lives<=0) p.alive=false;
+}
+function respawn(p){
+  if(!p.alive)return;
+  p.x=p.sx; p.y=p.sy;
+  p.dir={x:p.sdir.x,y:p.sdir.y};
+  p.want={x:p.sdir.x,y:p.sdir.y};
+  p.invuln=2.5;
+}
+function gameOver(){
+  state='over';
+  const a=players[0], b=players[1];
+  if(a.score>b.score){ winnerText='PLAYER 1 WINS!'; winnerColor=a.color; }
+  else if(b.score>a.score){ winnerText='PLAYER 2 WINS!'; winnerColor=b.color; }
+  else { winnerText="IT'S A DRAW!"; winnerColor='#fff'; }
+  sWin();
+}
+
+const PSPEED=6, GSPEED=4.3, FGSPEED=3.0;
+let lastWaka=0, gameT=0;
+
+function update(dt){
+  if(state==='menu')return;
+  if(state==='ready'){ readyT-=dt; if(readyT<=0)state='play'; return; }
+  if(state!=='play'||paused)return;
+  gameT+=dt;
+
+  if(deathPause>0){
+    deathPause-=dt;
+    if(deathPause<=0 && dyingPlayer){ respawn(dyingPlayer); dyingPlayer=null; }
+    return;
+  }
+  if(frightT>0){ frightT-=dt; if(frightT<=0) ghosts.forEach(g=>g.fright=false); }
+
+  for(const p of players){
+    if(!p.alive)continue;
+    p.invuln=Math.max(0,p.invuln-dt);
+    p.mouth+=dt*10;
+    stepEntity(p,dt,PSPEED,playerDecide);
+    eatAt(p);
+  }
+  for(const g of ghosts){
+    if(!g.alive){
+      g.t-=dt;
+      if(g.t<=0){
+        g.alive=true; g.fright=false;
+        const s=(Math.random()<.5)?[7,9]:[11,9];
+        g.x=s[0]; g.y=s[1]; g.dir={x:0,y:0};
+        g.want={x:(Math.random()<.5?-1:1),y:0};
+      }
+      continue;
+    }
+    stepEntity(g,dt,g.fright?FGSPEED:GSPEED,ghostDecide);
+  }
+  for(const g of ghosts){
+    if(!g.alive)continue;
+    for(const p of players){
+      if(!p.alive)continue;
+      if(Math.hypot(g.x-p.x,g.y-p.y)<0.45){
+        if(g.fright){
+          g.alive=false; g.t=2.5; p.score+=200; sGhost();
+        }else if(p.invuln<=0){
+          killPlayer(p);
+        }
+      }
+    }
+  }
+  lastWaka=gameT;
+  if(totalPellets===0 || (!players[0].alive && !players[1].alive)) gameOver();
+}
+
+/* ---------- drawing ---------- */
+function isWall(c,r){ return c<0||c>=COLS||r<0||r>=ROWS || grid[r][c]==='#'; }
+
+function drawMaze(t){
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    if(grid[r][c]!=='#')continue;
+    ctx.fillStyle='#0b0b26';
+    ctx.fillRect(c*TILE, OY+r*TILE, TILE, TILE);
+  }
+  ctx.lineCap='round';
+  const passes=[[6,'rgba(80,120,255,0.22)'],[2.5,'#5f7cff']];
+  for(const [lw,col] of passes){
+    ctx.lineWidth=lw; ctx.strokeStyle=col; ctx.beginPath();
+    for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+      if(grid[r][c]!=='#')continue;
+      const x=c*TILE, y=OY+r*TILE;
+      if(!isWall(c-1,r)){ ctx.moveTo(x,y); ctx.lineTo(x,y+TILE); }
+      if(!isWall(c+1,r)){ ctx.moveTo(x+TILE,y); ctx.lineTo(x+TILE,y+TILE); }
+      if(!isWall(c,r-1)){ ctx.moveTo(x,y); ctx.lineTo(x+TILE,y); }
+      if(!isWall(c,r+1)){ ctx.moveTo(x,y+TILE); ctx.lineTo(x+TILE,y+TILE); }
+    }
+    ctx.stroke();
+  }
+}
+function drawPellets(t){
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    const ch=grid[r][c];
+    if(ch!== '.' && ch!=='o')continue;
+    const x=c*TILE+TILE/2, y=OY+r*TILE+TILE/2;
+    if(ch==='.'){
+      ctx.fillStyle='#ffcf9e';
+      ctx.beginPath(); ctx.arc(x,y,3,0,7); ctx.fill();
+    }else{
+      const rr=5+2*Math.sin(t*6);
+      ctx.fillStyle='#ffd166';
+      ctx.shadowColor='#ffd166'; ctx.shadowBlur=10;
+      ctx.beginPath(); ctx.arc(x,y,rr,0,7); ctx.fill();
+      ctx.shadowBlur=0;
+    }
+  }
+}
+function drawPac(p,t){
+  if(!p.alive)return;
+  if(p===dyingPlayer && deathPause>0)return;
+  if(p.invuln>0 && Math.floor(t*9)%2===0)return;
+  const x=p.x*TILE+TILE/2, y=OY+p.y*TILE+TILE/2;
+  const ang=Math.atan2(p.dir.y,p.dir.x);
+  const m=0.35+0.3*Math.abs(Math.sin(p.mouth));
+  ctx.fillStyle=p.color;
+  ctx.beginPath();
+  ctx.moveTo(x,y);
+  ctx.arc(x,y,TILE*0.42, ang+m, ang-m+Math.PI*2);
+  ctx.closePath(); ctx.fill();
+}
+function drawGhost(g,t){
+  if(!g.alive)return;
+  const x=g.x*TILE+TILE/2, y=OY+g.y*TILE+TILE/2;
+  const r=TILE*0.45, by=y-2+TILE*0.28;
+  let body;
+  if(g.fright) body=(frightT<1.6 && Math.floor(t*8)%2===0)?'#ffffff':'#2743ff';
+  else body=g.color;
+  ctx.fillStyle=body;
+  ctx.beginPath();
+  ctx.arc(x,y-2,r,Math.PI,Math.PI*2);
+  ctx.lineTo(x+r,by);
+  for(let i=0;i<3;i++){ const bx=x+r-(i+0.5)*(2*r/3); ctx.arc(bx,by,r/3,0,Math.PI,true); }
+  ctx.closePath(); ctx.fill();
+  if(g.fright){
+    ctx.fillStyle='#fff';
+    ctx.beginPath(); ctx.arc(x-r*0.38,y-6,2.4,0,7); ctx.arc(x+r*0.38,y-6,2.4,0,7); ctx.fill();
+    ctx.strokeStyle='#fff'; ctx.lineWidth=1.5; ctx.beginPath();
+    for(let i=0;i<5;i++){ const mx=x-r*0.55+i*(r*0.27); if(i===0)ctx.moveTo(mx,y+4+(i%2?-3:1)); else ctx.lineTo(mx,y+4+(i%2?-3:1)); }
+    ctx.stroke();
+  }else{
+    const ex=g.dir.x*2.5, ey=g.dir.y*2.5;
+    ctx.fillStyle='#fff';
+    ctx.beginPath(); ctx.arc(x-r*0.4,y-7,4.2,0,7); ctx.fill();
+    ctx.beginPath(); ctx.arc(x+r*0.4,y-7,4.2,0,7); ctx.fill();
+    ctx.fillStyle='#1a237e';
+    ctx.beginPath(); ctx.arc(x-r*0.4+ex,y-7+ey,2.1,0,7); ctx.fill();
+    ctx.beginPath(); ctx.arc(x+r*0.4+ex,y-7+ey,2.1,0,7); ctx.fill();
+  }
+}
+function miniPac(x,y,r,color){
+  ctx.fillStyle=color;
+  ctx.beginPath(); ctx.moveTo(x,y); ctx.arc(x,y,r,-0.5*Math.PI+0.6, 0.5*Math.PI-0.6+Math.PI*2);
+  ctx.closePath(); ctx.fill();
+}
+function drawHUD(){
+  ctx.strokeStyle='#2a2a55'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(0,HUD_TOP-1); ctx.lineTo(W,HUD_TOP-1);
+  ctx.moveTo(0,OY+ROWS*TILE+1); ctx.lineTo(W,OY+ROWS*TILE+1); ctx.stroke();
+
+  const a=players[0], b=players[1];
+  if(a){
+    miniPac(26,30,10,a.color);
+    ctx.fillStyle=a.color; ctx.font='bold 20px monospace'; ctx.textAlign='left'; ctx.textBaseline='middle';
+    ctx.fillText('P1  '+a.score, 46, 28);
+    for(let i=0;i<a.lives;i++) miniPac(50+i*18, 48, 6, a.alive?a.color:'#555');
+    if(!a.alive){ ctx.fillStyle='#ff5252'; ctx.font='bold 12px monospace'; ctx.fillText('OUT',50,48); }
+
+    miniPac(W-26,30,10,b.color);
+    ctx.fillStyle=b.color; ctx.textAlign='right';
+    ctx.fillText(b.score+'  P2', W-46, 28);
+    for(let i=0;i<b.lives;i++) miniPac(W-50-i*18, 48, 6, b.alive?b.color:'#555');
+    if(!b.alive){ ctx.fillStyle='#ff5252'; ctx.font='bold 12px monospace'; ctx.fillText('OUT',W-50,48); }
+
+    ctx.textAlign='center'; ctx.fillStyle='#8a93d6'; ctx.font='12px monospace';
+    let mid='';
+    if(frightT>0) mid='POWER! '+Math.ceil(frightT)+'s';
+    else if(muted) mid='[MUTED]';
+    else mid='PELLETS LEFT: '+totalPellets;
+    ctx.fillText(mid, W/2, 32);
+  }
+
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  const by=OY+ROWS*TILE+(HUD_BOT/2)+2;
+  if(state==='play' && !paused){
+    ctx.fillStyle='#5a62a0'; ctx.font='12px monospace';
+    ctx.fillText('P1: W A S D      P2: ARROW KEYS      R: RESTART   P: PAUSE   M: SOUND', W/2, by);
+  }else if(state==='play' && paused){
+    ctx.fillStyle='#fff'; ctx.font='bold 18px monospace';
+    ctx.fillText('PAUSED — press P to resume', W/2, by);
+  }
+}
+
+function centerText(txt,y,size,color,font){
+  ctx.fillStyle=color;
+  ctx.font=(font||'bold ')+size+'px monospace';
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(txt, W/2, y);
+}
+
+function drawMenu(t){
+  ctx.fillStyle='rgba(0,0,10,0.82)';
+  ctx.fillRect(0,0,W,H);
+  const cy=OY+ROWS*TILE/2;
+  centerText('TWO PLAYER', cy-96, 34, '#ffe23f');
+  centerText('PAC-MAN', cy-52, 52, '#ffcf00');
+
+  miniPac(W/2-190, cy+8, 16, players.length?players[0].color:'#ffe23f');
+  ctx.fillStyle='#ff5252';
+  ctx.beginPath(); ctx.arc(W/2+190, cy, 14, Math.PI, 0);
+  ctx.lineTo(W/2+204, cy+16);
+  for(let i=0;i<3;i++){ const bx=W/2+190+14-(i+0.5)*(28/3); ctx.arc(bx,cy+16,28/6,0,Math.PI,true); }
+  ctx.closePath(); ctx.fill();
+
+  ctx.fillStyle='#cfd6ff'; ctx.font='16px monospace';
+  ctx.fillText('PLAYER 1  —  W A S D', W/2, cy+58);
+  ctx.fillText('PLAYER 2  —  ARROW KEYS', W/2, cy+84);
+  ctx.fillStyle='#8a93d6'; ctx.font='14px monospace';
+  ctx.fillText('Eat every pellet. Power pellets turn ghosts blue.', W/2, cy+118);
+  ctx.fillText('Highest score when the maze is clear wins!', W/2, cy+140);
+
+  if(Math.floor(t*2)%2===0) centerText('PRESS ENTER OR CLICK TO START', cy+190, 20, '#fff');
+}
+function drawOver(){
+  ctx.fillStyle='rgba(0,0,10,0.8)';
+  ctx.fillRect(0,0,W,H);
+  const cy=OY+ROWS*TILE/2;
+  centerText('GAME OVER', cy-70, 40, '#ff5252');
+  centerText(winnerText, cy-10, 34, winnerColor);
+  ctx.fillStyle='#cfd6ff'; ctx.font='18px monospace';
+  ctx.fillText('P1: '+players[0].score+'      P2: '+players[1].score, W/2, cy+34);
+  if(Math.floor(performance.now()/500)%2===0) centerText('PRESS R OR ENTER TO PLAY AGAIN', cy+86, 18, '#fff');
+}
+
+function draw(t){
+  ctx.fillStyle='#050510';
+  ctx.fillRect(0,0,W,H);
+  if(!grid.length) grid=MAP.map(r=>r.split('')); // safety for very first frame
+  drawMaze(t);
+  drawPellets(t);
+  for(const g of ghosts) drawGhost(g,t);
+  for(const p of players) drawPac(p,t);
+  drawHUD();
+
+  if(state==='menu') drawMenu(t);
+  else if(state==='ready'){
+    centerText('READY!', OY+ROWS*TILE/2, 40, '#ffe23f');
+  }
+  else if(state==='over') drawOver();
+}
+
+/* ---------- input ---------- */
+const keys={};
+function setDir(p,dx,dy){
+  if(!p)return;
+  p.want={x:dx,y:dy};
+  if(dx===-p.dir.x && dy===-p.dir.y) p.dir={x:dx,y:dy}; // instant reverse
+}
+window.addEventListener('keydown',e=>{
+  audio();
+  const k=e.key.toLowerCase();
+  if(['arrowup','arrowdown','arrowleft','arrowright',' '].includes(k)) e.preventDefault();
+  keys[k]=true;
+  if(state==='menu'){
+    if(k==='enter'||k===' ') restart();
+    return;
+  }
+  if(k==='r'){ restart(); return; }
+  if(state==='over'){ if(k==='enter') restart(); return; }
+  if(k==='m'){ muted=!muted; return; }
+  if(k==='p' && state==='play'){ paused=!paused; return; }
+  const p1=players[0], p2=players[1];
+  if(k==='w') setDir(p1,0,-1);
+  else if(k==='s') setDir(p1,0,1);
+  else if(k==='a') setDir(p1,-1,0);
+  else if(k==='d') setDir(p1,1,0);
+  else if(k==='arrowup') setDir(p2,0,-1);
+  else if(k==='arrowdown') setDir(p2,0,1);
+  else if(k==='arrowleft') setDir(p2,-1,0);
+  else if(k==='arrowright') setDir(p2,1,0);
+});
+window.addEventListener('keyup',e=>{ keys[e.key.toLowerCase()]=false; });
+cv.addEventListener('click',()=>{
+  audio();
+  if(state==='menu'||state==='over') restart();
+});
+
+/* ---------- main loop ---------- */
+let last=performance.now();
+function loop(ts){
+  const dt=Math.min(0.05,(ts-last)/1000); last=ts;
+  update(dt);
+  draw(ts/1000);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
+```
