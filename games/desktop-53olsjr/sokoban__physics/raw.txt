@@ -1,0 +1,2248 @@
+<think>
+The user wants a "Sokoban Physics Game" — a Sokoban where boxes are affected by physics (inertia, sliding, momentum). Let me design this:
+
+- Grid-based Sokoban, but boxes slide with momentum/friction until they stop (physics feel)
+- The player moves smoothly with velocity/inertia? Or does the player walk and push boxes, and boxes have physical inertia — when pushed, they accelerate and keep sliding, colliding with walls/boxes, chain reactions.
+
+Key design: "Sokoban physics" — I'm thinking of a game where pushing a box gives it momentum, and it slides across the floor, decelerating from friction, collides elastically with other boxes (transferring momentum), and stops. The level is complete when all boxes rest on target squares. Classic Sokoban rules are preserved: one box at a time… actually in a physics version, chain reactions make it more fun — you can knock multiple boxes out of the way at once. But classic Sokoban requires pushing boxes onto targets; sliding might overshoot.
+
+Design decisions:
+- Grid-based world (walls as solid geometry), continuous-position physics for the player and boxes.
+- Player: WASD/arrow keys, with acceleration and friction — smooth movement, slight inertia.
+- Boxes: square rigid bodies, pushed when the player touches them; they slide with low friction, bounce slightly off walls (low restitution), box-to-box collisions transfer momentum (impulse-based). When a box's velocity drops below a threshold, it snaps to the nearest grid cell center (or just stops). Level complete when all boxes are within epsilon of target cells and at rest.
+- Walls: axis-aligned rectangles aligned to the grid; collision resolution is AABB push-out + impulse.
+
+Physics engine: simple 2D rigid bodies, square vs square (AABB), circle vs square for player? Simplest: treat everything as AABBs with mass, velocity, impulse resolution along the minimum-penetration axis. That's enough and stable for a sokoban feel.
+
+Better approach: swept collision or substeps to prevent tunneling at high speed. Use fixed timestep substeps (e.g., 4-8 substeps per frame).
+
+Mechanics details:
+- Player acceleration is in the key direction, friction dampening. Max speed.
+- Boxes have a "push" from the player via collision impulse — if the player moves into a box, momentum transfer makes the box slide. Box-box collisions can chain: knocking one into another pushes the second one. That's fun!
+- Friction on boxes: linear damping so they stop in about 0.5–1 cell.
+- Snap: when |v| < threshold and near a cell center? Not necessarily snap to grid — just stop wherever it stops. Check win condition based on whether box centers are within the target cell (grid tolerance) and velocity ~0. Actually, for satisfying gameplay, when boxes come to rest, gently magnetize them to the nearest cell center (only if there's room / no overlap?). Magnetization to the nearest legal cell center might be weird mid-corridor. Hmm.
+
+Alternative: keep it fully physical — boxes stop wherever friction brings them to a halt. Win condition: each target has a box at rest with its center inside the target rectangle. This is more forgiving than classic sokoban (no need for grid alignment), but you can still push a box into a wall and it stays there.
+
+But "Sokoban" implies grid feel. Compromise: when a box's speed drops below a small threshold, apply a gentle spring to the nearest cell center (only if that center is free — no wall overlap). This gives a satisfying click-snap while keeping the physics. If the nearest center overlaps a wall… in an open corridor the nearest center is always legal. Edge cases are fine.
+
+Actually simpler and more robust: snap to the closest cell among the 4 adjacent + current cell that is fully inside the floor (not overlapping walls). Compute candidate centers, pick the valid one with minimum distance, apply spring force toward it while speed < threshold; when very close and slow, zero the velocity. This gives a satisfying "click."
+
+Sound: WebAudio — footstep ticks? Sounds of box sliding on/off, wall thuds with volume proportional to impulse, box-box clacks, target chime on snap-to-target, victory jingle, restart blips. Start after first input (audio context resume on keydown/click).
+
+Visuals: canvas, layered background (subtle grid, vignette), boxes with wood/metal texture drawn procedurally, glowing targets, player as a little robot/blob with squash & stretch and orientation, dust particles when boxes slide or walls thud, screen shake on hard impacts, trails. HUD: level number, moves/pushes, timer, best time from localStorage (try/catch). Start overlay with title and controls; game-over/win overlay with stats and next-level button; restart key R. Pause P too? Let's do it: R to restart the level, N for next on win, Esc/Space to start.
+
+Levels: define multiple classic-style layouts as strings. Use a physics-friendly layout (open enough that sliding is fun). Create 5–6 levels of increasing difficulty. Grid legend:
+- `#` wall
+- `.` floor
+- `@` player
+- `$` box
+- `*` box on target
+- `%` target
+- `+` player on target
+
+Physics walls: draw each wall cell as a solid rectangle, but merge for collision (per-cell AABB is fine; with substeps, corner collisions are OK). Box sliding along a merged wall — per-cell AABBs can cause slight catching at seams? With continuous resolution and small substeps it's acceptable. Better: build wall rectangles by merging adjacent wall cells into the minimum set of AABBs to avoid seams. Implement simple horizontal-run merging (merge consecutive runs in each row), plus vertical merging for T-junctions? Row-run merging is standard and works well; a run along a corridor edge is one long AABB — smooth sliding. Corner cases are fine.
+
+Collision model:
+- Player: circle of radius r vs wall AABB, box AABB (circle-AABB). Circle-based player feels smoother.
+- Box: AABB vs wall AABB, AABB vs AABB (box-box), and circle (player) handled from the player side? For symmetric impulse handling, handle pairs: for each pair compute overlap; resolve position + impulse along axis with mass and restitution.
+
+Masses: player m=1, box m=2 (heavier — pushing feels weighty). Restitution: box-wall 0.25, box-box 0.35 (bouncy clack), player-wall 0.1. Friction: exponential damping on boxes; ground friction along the tangent too? Simplify: velocity *= exp(-k*dt) with k different for player (higher, controlled) and box (low, slides far). Plus a tiny tangential friction on contact is optional — skip; damping suffices.
+
+Pushing feel: when the player walks into a box at speed v, impulse transfer: relative velocity along normal, e=0.2 → box gets about (1+e)*mP/(mP+mB)*v… with mP=1, mB=3: coefficient ≈ 1.2/4=0.3 → box starts slowly; player bounces slightly back. Then the box slides. To make pushing feel like a "push" rather than a "bounce," during contact, if the player keeps holding toward the box, apply continuous force — since the player keeps accelerating, they keep shoving. That naturally works: player pushes, box accelerates, player is also pushed back (mass ratio). Feels physical and good.
+
+Substeps: dt fixed 1/60, substeps 6 → step ~2.8ms; max speed about 7 cells/sec * cell(40px)=280 px/s → per-substep motion <1px. No tunneling.
+
+Also box spin? Boxes are squares; adding rotation complicates AABB collision (OBB). Skip rotation; instead fake it with a slight visual wobble when sliding fast, and "rolling" texture offset. Actually a little rotation looks great — can I render boxes rotated by accumulated angular velocity from tangential friction? Physical OBB vs AABB is doable but heavy. Fake spin: box.spin += v.x * dt / r (like rolling), draw inner pattern rotated by that angle. Cute and cheap.
+
+Win check: all targets covered by a box with center inside target rect, AND box speed < 5 px/s (nearly at rest). Show victory overlay after a short delay; play jingle; confetti particles.
+
+Levels — design them to be physics-friendly (boxes can slide onto targets, chain reactions possible). Keep them small enough. Let's make:
+
+Level 1 "First Nudge": simple corridor: player on left, one box in the middle, target on right. Teach pushing.
+```
+########
+#......#
+#.@$%..#
+#......#
+########
+```
+Wait, target '%' is at position… `#.@$%..#` — 8 wide. Box slides right and stops on target? Friction will stop it somewhere; the player can walk around (open corridor) and nudge it onto the target. Nice tutorial.
+
+Level 2 "The Stash": two boxes, two targets in a corner-ish pocket, but with open space to maneuver.
+```
+#########
+#@.....##
+#.###$..#
+#.#%#$.##
+#.#%#...#
+#.#.....#
+###$#####
+#########
+```
+Hmm, careful — must be solvable. Let me design more carefully with simple shapes and verify mentally.
+
+Design levels as strings, each row the same length. Write and reason about them.
+
+L1 (tutorial):
+```
+##########
+#........#
+#..@$$%..#
+#...%%...#
+#........#
+##########
+```
+Two boxes adjacent, two targets. Slide right: pushing left box pushes both? Boxes are adjacent: push left → chain reaction pushes both to the right. Targets at columns 6-7 and 5-6… let me count: row `#..@$$%..#` cols: 0#,1.,2.,3@,4$,5$,6%,7.,8.,9#. Row 3: `#...%%...#` targets at cols 4,5. So the boxes at 4,5 are already on top… no wait, row 2 is y=2, targets at (6,2),(4,3),(5,3). Three targets? `$` count = 2, `%` count = 3 → mismatch. Fix: use `*` for box-on-target or adjust.
+
+Let me be careful. I'll write levels and validate counts in my head.
+
+L1:
+```
+#########
+#.......#
+#..@$$..#
+#...%%..#
+#.......#
+#########
+```
+Boxes at (4,2),(5,2). Targets (4,3),(5,3). Player at (3,2). Push right? Boxes are to the right of the player; pushing right sends them toward the right wall — not onto targets. Push down: stand above boxes at (4,1) and (5,1), push down → boxes slide down 1 cell into targets. Nice tutorial: "push down."
+
+L2 "Corner Pocket":
+```
+##########
+#........#
+#@....$..#
+#...###..#
+#.%.*%...#
+#...###..#
+#.$......#
+#........#
+##########
+```
+Hmm, getting complex; verify counts: boxes: `$` at (6,2), `*` at (5,4) [box on target], `$` at (3,6) → 3 boxes. Targets: `%` at (3,4), `*`, `%` at (6,4) → 3 targets. OK. Solvable? Box already on target can be pushed off but that's fine. This might be OK; physics version is more forgiving.
+
+Actually, for a physics game I should make levels where sliding helps. Let me keep them modest and testable in my head. I'll do 5 levels:
+
+L1 (above) — push down onto targets.
+
+L2 "The Corridor":
+```
+###########
+#....#....#
+#.$..#.%.##
+#.....$...#
+#@.#.#.#..#
+#.........#
+###########
+```
+Count boxes: `$` (3,2), `$`(7,3) → 2. Targets `%` (8,2) → only 1. Mismatch. Let me redo.
+
+Simpler approach: reuse known simple sokoban layouts and adapt. Classic "Microban" level 1:
+```
+####
+# .#
+#  ###
+#*@  #
+#  $ #
+#  ###
+####
+```
+This is a real Microban #1 (simplified). With physics, boxes slide — might overshoot. But snapping + low friction is OK.
+
+Rather than risk unsolvable levels, I'll design my own with generous open space and verify each:
+
+Level list (I'll verify each):
+
+L1 "Warm-up" (push down):
+```
+#########
+#.......#
+#..@$$..#
+#...%%..#
+#.......#
+#########
+```
+✓ 2 boxes, 2 targets. Solution: move to (4,1) & (5,1), push each box down one. Easy.
+
+L2 "Side Step":
+```
+##########
+#........#
+#.$@....#
+#...%%..#
+#.......#
+##########
+```
+Wait, need consistent width 10: row `#.$@....#` is 10 chars? # . $ @ . . . . # = 10 ✓. Row `#...%%..#` = 10 ✓. Boxes (2,2); targets (4,3),(5,3). Player (3,2) to the right of box. Push left → box slides to wall at x=1… overshoot? Box is at col 2; push left, stops near col 1 (wall). Then go around below and push up? Target row is y=3, box after pushing left is at (1,2). To get box onto (4,3): need box to be at (4,?) and pushed down from above — box needs to be at (4,2) or (4,0)… hmm. Alternative: push box right? Player is already on the right of box; player can't pass through box, but corridor y=1 is open: go around top, stand at (3,1)? That's above the player start… let me re-think: put targets to the left:
+```
+##########
+#........#
+#...@$..#
+#.%%....#
+#.......#
+##########
+```
+Boxes (4,2), targets (2,3),(3,3). Push box left from right side: player at (5,2) pushes left → box slides along y=2 toward wall; where does it stop? Friction + snap to nearest cell — will stop somewhere around col 1–2. Then need to push down onto target: stand above the box at (x,1), push down one. If box stops at (2,2): push down → (2,3) ✓ on target. Second target (3,3): need a second box… only one box but two targets — mismatch! Add box:
+```
+##########
+#........#
+#...@$$.#
+#.%%....#
+#.......#
+##########
+```
+Boxes (4,2),(5,2); targets (2,3),(3,3). Push left: chain reaction pushes both boxes left together; they stop around cols 1-2 and 2-3? With snap to nearest cell, if spacing preserved the left box stops at col 1 or 2, right one adjacent. Then push each down from above. If they stop at (1,2),(2,2): push down → (1,3),(2,3) — only (2,3) is a target; (1,3) is floor. Hmm. Player can nudge the box at (1,2) right and then down? Push right from left: stand at col 0? Wall at x=0… box at (1,2), push right → slides to right wall or stops; snap to nearest cell — ambiguous.
+
+Physics sokoban with overshoot makes precise level design tricky. Mitigation: make targets be "zones" that are forgiving — the win check uses whether box center is inside target cell; friction + snap mostly keeps things in order; player can always micro-nudge (tap a key) to fine-tune position because boxes come to rest and can be re-pushed with small impulses. So even if a box overshoots, the player walks around it and nudges it back. As long as the layout is open enough to reach all sides of every box, levels stay solvable. Key: keep layouts open (no tight 1-wide dead ends where you can't get behind).
+
+So my design rule: open rooms, targets in pockets with ≥2-cell approach space. Good.
+
+Let me finalize 5 levels with this in mind:
+
+L1 "Warm-up":
+```
+#########
+#.......#
+#..@$$..#
+#...%%..#
+#.......#
+#########
+```
+Push down ✓.
+
+L2 "The Slide" (horizontal slide into pocket):
+```
+###########
+#....#....#
+#.$...%.##  → width issue
+```
+Let me write it cleanly, width 11:
+row0 `###########` (11)
+row1 `#.........#`
+row2 `#.@$..%..#` — count: # . @ $ . . % . . # = 10. Need 11. Ugh. Let me just pick width 9 for simplicity.
+
+L2, width 9:
+```
+#########
+#.......#
+#.@$.%..#
+#.......#
+#.......#
+#########
+```
+row2: # . @ $ . % . . # = 9 ✓. Box (3,2), target (5,2). Player (2,2) left of box → push right; box slides toward wall at col 8, passes through target (5)… might overshoot to col 7/8. Then player walks around (rows 1 or 3 are open) and pushes back left onto target. Doable, teaches correction. ✓ 1 box, 1 target.
+
+L3 "Two Rooms":
+```
+###########
+#........##
+#@.$..$.%.#
+#....#...##
+#.*%.......#
+```
+Getting messy. Let me carefully craft each level with fixed width and verify counts. I'll write a small table.
+
+Level 3 "Crossroads" (width 11, height 8):
+```
+###########
+#.....#..##
+#.$...#..%.#
+#..$..#....#
+#####.#####
+#........#.
+#@.%%....#.
+###########
+```
+Too complex to verify in my head. Let me simplify:
+
+L3 "The Pocket" (width 10, height 8):
+```
+##########
+#.......##
+#.$...%.##
+#..$.....#
+#........#
+#..@.....#
+#........#
+##########
+```
+row0: 10 #'s ✓. row1 `#.......##` = 10 ✓ (wall at col8,9). row2 `#.$...%.##`: # . $ . . . % . # # = 10 ✓ box(2,2) target(6,2). row3 `#..$.....#`: 10 ✓ box(3,3). row4 `#........#` ✓. row5 `#..@.....#` player (3,5). row6 floor. row7 walls.
+Boxes: 2; Targets: 1 → mismatch! Need 2 targets. Change row2 target to two: `#.$...%%.#`? = # . $ . . . % % . # = 10 ✓ targets (6,2),(7,2). Boxes (2,2),(3,3).
+Solve: Box A at (2,2): push right from left (stand at (1,2)) → slides along row 2 to the right; target at (6,2) or (7,2); overshoot possible; correct by pushing back from right side (row is open up to col 8… walls at col 9? row2 has ## at 8,9 so box can slide to col 7 and stop near wall; fine — it's on the target zone!). Actually wall at col 8 means box will stop at col 7 → exactly target (7,2) ✓ nice: "slide until you hit the wall" design.
+Box B at (3,3): need a second target… I placed both targets on row 2. Put one target elsewhere: row3 `#..$...%.#`? = # . . $ . . . % . # =10 ✓ target (7,3). Then box B pushed right from (2,3) → slides to wall at col 8 → stops at (7,3) ✓. Both boxes slide right and hit wall on targets! Great physics design — "flick them into the pocket." Player can reach left of both boxes: (1,2) via row 1 or column 1; (2,3) open.
+So L3 rows:
+```
+##########
+#.......##
+#.$...%%.#
+#..$...%.#
+#........#
+#..@.....#
+#........#
+##########
+```
+Wait now row 2 has two targets and box A slides to col 7 (target (7,2)); target (6,2) is spare. Box B → (7,3) ✓. One target unused — that's fine (Sokoban requires all boxes on targets, not all targets filled). Actually classic: win when all boxes are on targets; extra targets OK. But cleaner to match counts. Let me remove one: row2 `#.$...%.##`? then box A stops at col 7 but target is at 6 — mismatch again (box will be at wall col 7). Hmm, wall at col 8 in row 2 means the rest spot is col 7. So put single target at (7,2): `#.$....%.#`? = # . $ . . . . % . # =10 ✓ target(7,2), and row3 target (7,3).
+L3 final:
+```
+##########
+#.......##
+#.$....%.#
+#..$...%.#
+#........#
+#..@.....#
+#........#
+##########
+```
+Boxes (2,2),(3,3); targets (7,2),(7,3). Both slide right → wall at col 8. Player pushes box A from (1,2): reachable? Path: player (3,5) → up column 3? Box B is at (3,3)… path via col 1: (3,5)→(2,5)? open, (1,5),(1,4),(1,3),(1,2) ✓. Push right → box A slides to (7,2) ✓ chime. Then stand at (2,3): from (1,2) go down (1,3),(2,3) ✓ push right → box B → (7,3) ✓ win.
+
+L4 "The Shuffle" — introduce box-box chain:
+Width 10, height 9:
+```
+##########
+#........#
+#.###..$.#
+#.#%#....#
+#.#...@$.#
+#.#%%#...#
+#.###....#
+#........#
+##########
+```
+Verify widths: r0 10 ✓. r1 `#........#` ✓. r2 `#.###..$.#`: # . # # # . . $ . # =10 ✓ box(7,2). r3 `#.#%#....#`: # . # % # . . . . # =10 ✓ target(2,3), walls (2? ) cols: 0#,1.,2#,3%,4#,5-8 floor,9#. Wait `%` at col 3 but surrounded by walls at 2 and 4 → pocket opening from below? Row 4 col 3: r4 `#.#...@$.#`: # . # . . . @ $ . # =10 ✓ (3,4) is '.', so pocket cell (3,3) opens downward to (3,4). Good — target in a notch accessible from below.
+r5 `#.#%%#...#`: # . # % % # . . . # =10 ✓ targets (3,5),(4,5); wall at col 2? cols: 0#,1.,2#,3%,4%,5#,6.,7.,8.,9#. So a pocket row with two targets opening upward to row 4 (cols 3,4 are '.' in r4) ✓.
+r6 `#.###....#`: # . # # # . . . . # =10 ✓.
+Boxes: 1 at (7,2). Targets: (3,3),(3,5),(4,5) = 3. Mismatch! Need 3 boxes. Add boxes in r4: `#.#...@$.#` has `$` at (7,4) → that's box #2. And add another: r1 `#......$.#`? box(7,1). Now boxes: (7,1),(7,2),(7,4)? wait r2 box is at (7,2), r4 box at (7,4). 3 boxes ✓, 3 targets ✓.
+Solvability: right column has 3 vertically stacked-ish boxes with gaps at (7,0?)? r0 wall. Box (7,1),(7,2) adjacent, (7,4) with gap at (7,3). Push them left along their rows into the pocket area… pocket targets are in cols 3-4, rows 3-5; approach: row 3 target (3,3) reachable from below (3,4); row 5 targets reachable from above (3,4),(4,4).
+Plan: push box (7,2) left along row 2? Row 2 has walls at cols 2,3,4 (`###`), so box can only slide to col 5 and stop. Not useful. Push box down instead? Player stands above box (7,1)? Then pushes down → box (7,1) slides down into box (7,2) → chain: both slide down rows… (7,3) gap, (7,4) box → collision cascade; they'd stack at bottom near row 7? Bottom wall r8. They'd end up around (7,5),(7,6)… then push left along row 5/6 into the pocket? Row 5 has walls at col 2 and 5: `#.#%%#...#` — cols 3,4 are targets with walls flanking; a box pushed left along row 5 from col 7 hits wall at col 5 → stops at (5,5)? That's right of the `%` at 4? Wait col 5 is '#', so box would stop at col 6. Hmm not on target.
+
+This is getting complicated. Let me simplify L4 to focus on chain-push fun rather than a strict puzzle:
+
+L4 "Chain Reaction":
+```
+##########
+#........#
+#.$$$....#
+#........#
+#..%...%.#
+#@.......#
+#........#
+##########
+```
+Boxes (2,2),(3,2),(4,2); targets (3,4),(7,4). 3 boxes vs 2 targets — mismatch again. Ugh, I keep miscounting. Rule: box count must equal target count for cleanliness (Sokoban standard: each target gets a box; extra boxes = unwinnable).
+
+Let me do this systematically. For each level, list coords.
+
+L1: 9x6. Boxes: (4,2),(5,2). Targets: (4,3),(5,3). Player (3,2). ✓
+Rows:
+r0 `#########`
+r1 `#.......#`
+r2 `#..@$$..#`
+r3 `#...%%..#`
+r4 `#.......#`
+r5 `#########`
+✓ widths all 9.
+
+L2 "The Flick": 9x6. Box (3,2). Target (7,2). Player (1,2). Wall at col 8 so box slides right and stops near (7,2)?? Box center at col 7 = x=7.5c; wall face at x=8c → box right edge touches 8 → center 7.5 → col 7 ✓ exactly on target!
+Rows:
+r0 `#########`
+r1 `#.......#`
+r2 `#@.$...%.#`? count: @ . $ . . . % . = # @ . $ . . . % . # =9 ✓ wait that's box at col 3, target col 7 ✓. But player is at (1,2) and box at (3,2): push right → box slides to wall, stops with right edge touching col 8 → center col 7 → target ✓. One-shot solve!
+r3 `#.......#`
+r4 `#.......#`
+r5 `#########`
+
+L3 "Two Slides": the one designed above (10x8):
+r0 `##########`
+r1 `#.......##`
+r2 `#.$....%.#`
+r3 `#..$...%.#`
+r4 `#........#`
+r5 `#..@.....#`
+r6 `#........#`
+r7 `##########`
+Boxes (2,2),(3,3); targets (7,2),(7,3) ✓.
+
+L4 "Cascade" — chain push: 11x8.
+Boxes: (5,2),(6,2),(7,2) in a row; targets: (5,5),(6,5),(7,5)? Push down from above: player at top pushes each box down one… but physics: pushing down, boxes slide down to bottom wall (row 7?) and stop with center at col 5.5? No — sliding vertically down column 5: stops near bottom wall; bottom row is r7 → box center at row 6, not row 5. So put targets at row 6: (5,6),(6,6),(7,6)? Then just push each down and it lands on target at the wall ✓. But that's trivially similar to L1. Add spice: put a bump/wall in one column mid-slide so box stops earlier? If column 6 has a floor obstacle… walls are grid cells; place a wall at (6,4)? Then box pushed down col 6 from row 2 hits top of wall at row 4 → box stops with center at row 3 — not on target. Hmm that breaks it.
+
+Alternative L4: "The Corner" requiring maneuvering:
+11x8:
+r0 `###########`
+r1 `#.........#`
+r2 `#.$.......#`
+r3 `#.##..@...#`
+r4 `#.%.#.....#`
+r5 `#...#..$..#`
+r6 `#.%........#` → width 10, bad.
+
+I'm spending too much time. Let me pick a simpler verified design:
+
+L4 "Around the Block" (10x8): one box must be looped around. Box (5,3), target (2,5). Player (5,1).
+r0 `##########`
+r1 `#....@...#` → 10? # . . . . @ . . . # =10 ✓ player (5,1)
+r2 `#........#`
+r3 `#....$...#` box (5,3)
+r4 `#........#`
+r5 `#.%......#` target (2,5)
+r6 `#........#`
+r7 `##########`
+Solve: push box down from above → slides to bottom, stops at row 6, center? Bottom wall r7 → box center at row 6. Then push left along row 6 → slides toward wall col 0 → stops with center at col 1?? Target is (2,5) — wrong row. Player can nudge: after box rests at (1,6)… target (2,5) needs box pushed up from below? Box at (2,6), push up → (2,5) ✓. So: push down to bottom, push left until near col 1-2, then stand below and push up one cell onto target. All doable in open space ✓. Counts: 1/1 ✓.
+
+L5 "The Vault" (finale, 3 boxes): 11x9.
+r0 `###########`
+r1 `#.........#`
+r2 `#.$.....$.#` → boxes (2,2),(8,2)
+r3 `#.##..@.##.`? width: # . # # . . @ . # # . = 11 ✓ walls (2,3),(3,3),(9,3)? cols 2,3 and 9 are '#'. Hmm let me keep it open: r3 `#.........#`
+r4 `#..$......#` box (3,4) → 3 boxes
+r5 `#.........#`
+r6 `#..%%%....#` targets (3,6),(4,6),(5,6)
+r7 `#.........#`
+r8 `###########`
+Player (5,3).
+Solve: box (3,4) is above target zone; push down from (3,3) → slides down to bottom wall r8 → center row 7 — overshoots target row 6! Need to stop at row 6. Player can nudge: after it rests near (x,7), push up from below? Bottom is wall, no room below. Hmm. Instead put targets in a pocket with wall behind at row 7: r7 `#..###...#`? then box pushed down col 3 lands on row 6 and hits top of wall ✓. Let me build the pocket:
+r0 `###########`
+r1 `#.........#`
+r2 `#.$.....$.#` boxes (2,2),(8,2)
+r3 `#.........#` player? put @ at (5,3): r3 `#....@....#` ✓ 11
+r4 `#..$......#` box (3,4)
+r5 `#.........#`
+r6 `#.%%%.....#` targets (2,6),(3,6),(4,6) — pocket on left with wall at col 0 behind… boxes pushed down columns 2,3,4 would slide to row 7 (above bottom r8). Not stopped by a wall. Add a back wall: make rows 6-7 a pocket area with walls around? E.g.:
+r5 `#.........#`
+r6 `#.%%%.....#`
+r7 `#..###....#` → walls at cols 3,4,5? then columns 2,3,4 of row 6: box pushed down col 2 → passes r7? (2,7) is '.' so continues to r8 wall → stops at row 7. Col 3: (3,7) is '#' → box stops at row 6 ✓ on target (3,6). Col 4: (4,7) is '#' → stops at row 6 ✓ (4,6). Col 2: no backstop ✗.
+Make r7 `#..###....#` covers cols 3,4,5 — col 2 open. Change targets to (3,6),(4,6) + one elsewhere. Boxes: I have 3 boxes (2,2),(8,2),(3,4). Third target somewhere else, e.g., right side wall pocket: put target at (9,3)? with wall behind at col 10 (boundary) — box pushed right along row 3 stops at (9,3) ✓.
+So targets: (3,6),(4,6),(9,3).
+Final L5 rows (11x9):
+r0 `###########`
+r1 `#.........#`
+r2 `#.$.....$.#` → 11? # . $ . . . . . $ . # = 11 ✓ boxes (2,2),(8,2)
+r3 `#....@....%`? no — target at (9,3): r3 `#....@...%#` = # . . . . @ . . . % # = 11 ✓
+r4 `#..$......#` box (3,4) ✓
+r5 `#.........#`
+r6 `#...%%....#` targets (4,6),(5,6)? wait I said (3,6),(4,6): r6 `#..%%.....#` = # . . % % . . . . . # =11 ✓ targets (3,6),(4,6)
+r7 `#..###....#` walls (3,7),(4,7),(5,7) ✓ 11
+r8 `###########`
+Now solve: box (3,4): push down from (3,3) → col 3 has wall at (3,7) → box stops at row 6 ✓ on target (3,6). Box (2,2): needs to get to (4,6)? or… targets are (3,6),(4,6),(9,3). Boxes: (2,2),(8,2),(3,4).
+- Box (8,2) → push right from (7,2) → slides to wall col 10 → stops at (9,2). Target is (9,3) — off by one row. Then push down from above (9,1) → box at (9,2) pushed down: column 9 rows 3-7 open? r3 (9,3) '%', r4 '.', r5 '.', r6 (9,6)? r6 col 9 = '.', r7 (9,7) '.' → slides to bottom → stops at (9,7). ✗ wrong.
+Fix: put target at (9,2): r3 becomes plain `#....@....#`, and r2: `#.$.....%.#`? then box (8,2) is… I had box at (8,2); if target at (9,2), remove that box: r2 `#.$......#` wait 11: `#.$.......#` = # . $ . . . . . . . # = 11 ✓ only one box in row 2. Then boxes: (2,2),(3,4) + need third elsewhere. Add box at (8,4)? r4 `#..$....$.#`? = # . . $ . . . . $ . # =11 ✓ boxes (3,4),(8,4).
+Targets: (9,2) [r2], (3,6),(4,6) [r6]. Count 3/3 ✓.
+Solve: box (8,4): push right from (7,4) → slides to wall → stops at (9,4). Then need to get it up to (9,2): stand below at (9,5), push up → column 9 rows 3,2 open? r3 col 9 '.', r2 col 9 '.'? r2 = `#.$......%#`? wait I set target (9,2): r2 `#.$......%#` = # . $ . . . . . . % # =11 ✓. So box at (9,4) pushed up from (9,5): slides up col 9 → stops near top wall r0 → center row 1! Overshoots (target is row 2). Hmm. Player nudges down from above: stand at (9,0)? wall. Can't push down from above since box is at row 1 against top wall… player can stand at (8,1) and push right? Box would slide right and stop at (9,1), still row 1 ✗.
+Fix: give column 9 a backstop at row 3: make r3 col 9 a wall? then box pushed up from below stops at row 2 ✓ on target! Set r3 `#....@...##`? = # . . . . @ . . . # # → 11 ✓ walls (9,3),(10,3). Then: box (8,4) push right → (9,4); push up from (9,5) → slides up, hits wall below at (9,3) → stops at (9,2) ✓ chime.
+- Box (2,2): need to get it to (3,6) or (4,6). Push down: stand above at (2,1), push down → col 2 rows 3-7: r7 col 2 '.' → slides to bottom → stops at (2,7) ✗. Push right first? Stand at (1,2) push right → row 2 cols 3-8 open until target cell (9,2)… box would slide all the way to (8,2)? It'd stop near wall col 10 → passes through… but (9,2) is a target and another box might be there. Box would end up at (9,2) area — collides with the other box if it's already parked. Order matters: first park box (3,4) down to (3,6)? Let me check box (3,4): push down from (3,3) → col 3 wall at r7 → stops at (3,6) ✓. Then box (2,2): push right from (1,2): slides along row 2; will it stop at target (9,2)? Another box is parked at (9,2) — collision: box would slide and bump, stopping around (8,2)… not on a target. Hmm.
+Alternative order: first send box (2,2) right → stops at (9,2) ✓ (empty then). Then box (3,4) down → (3,6) ✓. Then box (8,4): push right → (9,4); push up → would collide with box parked at (9,2)? Box at (9,4) pushed up: slides up col 9, hits wall below at (9,3) → stops at (9,2)… but occupied! Collision chain: pushes the parked box into…? Parked box at (9,2) is against top wall; gets shoved upward slightly and stays — both off target. ✗.
+So parking order conflict. Redesign L5 more carefully, or accept a looser puzzle. Given time, let me make L5 simpler but satisfying: 3 boxes each slide into their own backstopped pocket in the same row — pure cascade satisfaction:
+
+L5 "Triple Drop" (11x9):
+r0 `###########`
+r1 `#.........#`
+r2 `#.$.....$.#`? Let me do: three boxes in row 2 at cols 2,5,8; below each a column with backstop at row 6 → targets at (2,5),(5,5),(8,5)? Backstops at (2,6),(5,6),(8,6).
+r0 `###########`
+r1 `#.........#`
+r2 `#.$...$..$.#`? count: # . $ . . . $ . . $ . # =12 ✗. Use width 11: boxes at cols 2,5,8: r2 `#.$...$..$.#` that's 12. For width 11: `#.$..$..$.#`? count 11: # . $ . . $ . . $ . # → boxes (2,2),(5,2),(8,2) ✓
+r3 `#.........#` player at (1,1)? r1: `#@........#` ✓
+r4 `#.........#`
+r5 `#.%%%...%%.`? 11: # . % % % . . . % % . # = 12 ✗. Targets under each box column: (2,5),(5,5),(8,5): r5 `#.%..%...%.#`? count: # . % . . % . . . % . # = 11 ✓ targets (2,5),(5,5),(9,5)? cols: 0#,1.,2%,3.,4.,5%,6.,7.,8.,9%,10# → target at col 9 not 8. Adjust: I want (2,5),(5,5),(8,5): r5 `#.%..%...%.` no… let me index properly for width 11 cols 0-10. Want % at 2,5,8: string: idx0 '#',1'.',2'%',3'.',4'.',5'%',6'.',7'.',8'%',9'.',10'#' → `#.%...%..%.#`? count that: # . % . . . % . . % . # = 12. Argh. Let me write it out: chars = ['#','.','%','.','.','%','.','.','.','%','?','#']. Wait I want % at 5 and 8 with dots elsewhere: idx0 '#',1 '.',2 '%',3 '.',4 '.',5 '%',6 '.',7 '.',8 '%',9 '.',10 '#' → "#.%...%..%.#"? Let me count that string: # (1) . (2) % (3) . (4) . (5) % (6) . (7) . (8) % (9) . (10) # (11) — that's % at positions 3,6,9 in 1-based = idx 2,5,8 ✓✓. String: "#.%...%..%.#" → let me spell: '#','.','%','.','.','%','.','.','?'. Hmm positions: 0:'#',1:'.',2:'%',3:'.',4:'.',5:'%',6:'.',7:'.',8:'%',9:'.',10:'#' → joining: "#." + "%" + ".." + "%" + ".." + "%" + "." + "#" = "#.%..%..%.#" count chars: #,.,%,.,.,%,.,.,%,.,# = 11 ✓. So r5 = `#.%..%..%.#` targets (2,5),(5,5),(8,5) ✓.
+r6 backstops at (2,6),(5,6),(8,6): idx: 0'#',1'.',2'#',3'.',4'.',5'#',6'.',7'.',8'#',9'.',10'#' → "#.##..#.#."? join: '#','.','#','.','.','#','.','.','#','.','#' = `#.##..#..##`? chars: 0#,1.,2#,3.,4.,5#,6.,7.,8#,9.,10# → "#.##..#..##" count: #(1).(2)#(3).(4).(5)#(6).(7).(8)#(9).(10)#(11) = 11 ✓ string `#.##..#..##`. Wait that's # at idx 0,2,5,8,10 → yes.
+r7 `#.........#`
+r8 `###########`
+Solve: player walks to row 1 above each box, pushes down: box col 2 slides down → hits backstop at (2,6) → stops at (2,5) ✓; same for cols 5 and 8. But wait — pushing box down from (col,1): box at (col,2), player above at (col,1), push down — box slides, passes target row 5, hits wall top at row 6 → rests centered on row 5 ✓ exactly on target! One-shot ×3, satisfying cascade. But all three are trivially identical… fine as a finale celebration? Maybe add spice: put one backstop offset so one box needs two pushes. E.g., shift the middle backstop: make (5,6) open and instead (4,6)? then middle box slides to bottom row 7, player nudges left/right+up? Getting fiddly. Let me keep the finale clean but add a fourth twist: start boxes at different rows so pushes vary. Box positions: (2,1)? no—player needs room above.
+
+Actually, let me make L5 slightly harder by offsetting two targets sideways from the boxes, requiring a push then slide+corner:
+Keep the "Triple Drop" but shift middle target to (6,5) and backstop accordingly… then middle box pushed down col 5 lands at (5,7) bottom; then push right along row 7 → slides to wall → (9,7)? ✗.
+
+OK final decision: L5 = Triple Drop as designed (satisfying, guaranteed solvable). Total 5 levels with escalating "physics flavor": nudge, flick-to-wall, two slides, loop-around, triple cascade. Good enough; physics forgiveness keeps them all clearable. Maybe add a 6th "The Gauntlet" with chain-reaction fun:
+
+L6 "Chain Reaction" (13x7):
+r0 `#############`
+r1 `#...........#`
+r2 `#.$$$...$$$.#`? boxes: (2,2),(3,2),(4,2) and (8,2),(9,2),(10,2) → 6 boxes; targets at row 5 below middle cols…
+Let me do: 3 boxes on left, 3 targets on right same row — push chain across? Pushing the left group right sends them cascading into the right group. Targets: (8,4),(9,4),(10,4)? Getting long. I'll stop at 5 levels; that's a solid set. Actually let me do 6 with a simple "chain" one:
+
+L6 "Cascade Row" (12x7):
+r0 `############`
+r1 `#..........#`? 12: # + 10 dots + # = 12 ✓
+r2 `#.$$...$$..#` → idx: 0#,1.,2$,3$,4-6...,7$,8$,9.,10.,11# → boxes (2,2),(3,2),(7,2),(8,2) = 4
+r3 `#..........#` player r1? put @ at r3 idx 5: `#....@.....#` = #+4dots+@+5dots+# = 12 ✓
+r4 `#..........#`
+r5 `#...%%%%...#` → % at idx 4,5,6,7 = 4 targets ✓ count matches (4 boxes).
+Backstop r6: wall below each target column? cols 4-7: r6 `#....####..#`? = #+4dots+####(idx4-7)+2dots+# = 12 ✓.
+Solve: push box group left pair down-left? Boxes (2,2),(3,2) need targets (4,5)… path: push right along row 2 to cols 4-7, then down? Box at (4,2): stand above (4,1), push down → hits backstop (4,6) → rests at (4,5) ✓. So: nudge left pair right until they're at roughly (4,2),(5,2) — free placement via taps (physics forgiveness!), then drop each. Right pair (7,2),(8,2): push down from above → (7,5),(8,5) ✓ direct. Nice: mixed direct + nudged. Player start (5,3).
+Verify r6 backstop cols 4-7 aligns with targets cols 4-7 ✓.
+
+All 6 levels verified for counts.
+
+Now engine details:
+
+Canvas scaling: fill window, handle devicePixelRatio, resize listener. Grid → pixel scale: compute cell size so level fits with padding; center. Keep a `view` {offsetX, offsetY, cell}. On resize, recompute.
+
+Physics constants (in pixels, but define in cells and multiply):
+- cell = computed px (say base 48).
+- Player: radius 0.32*cell? Box size 0.78*cell (with gap so it looks tile-like when snapped, center at cell center). Actually box = 0.8*cell square, centered on cell center; wall cells are full squares. Circle-AABB collision between player and box: fine.
+- Player accel 900 px/s²? Use relative-to-cell units: define everything in "cells" space! Simpler: physics in grid units (1 = one cell), render scales by view.cell. Speeds: player max ~6 cells/sec, accel 40 c/s², friction exp decay 8/s. Box damping 2.5/s (slides far). Substeps 8.
+
+Impulse resolution for pair overlap:
+- Compute MTV axis (minimum penetration); separate proportionally by inverse mass; relative velocity along normal vn = dot(vB-vA, n); if vn < 0 apply impulse j = -(1+e)*vn / (1/mA + 1/mB); vA -= j*n/mA… standard.
+- Also tangential friction on contact: reduce tangent vel slightly for boxes (rolling feel) — optional small.
+
+Player vs box: circle center c, box AABB → closest point, penetration = r - dist. Normal from closest point to center (or if center inside, use MTV). Impulse with masses.
+
+Rest & snap: for each box, if speed < 0.15 c/s: find nearest cell center among the 3x3 around current cell that is fully legal (box square of size .8 fits in floor: center's cell and no wall overlap — check the box AABB at candidate center against walls). If found and distance < 0.4: apply spring accel toward it (k=30, damping) and when dist<0.01 and speed<0.05 → snap exact, v=0. This yields clicky settling.
+
+Also anti-jitter: if box is slow and pressed into a wall, zero tiny normal velocity.
+
+Win: all boxes "parked" (speed < 0.2) and each target has a parked box whose center is within that target cell (|bx - tx|<0.5 && |by-ty|<0.5). On win: state=won, record time+pushes, jingle, confetti, show overlay with stats + "Next level" (N / Enter) and best stats.
+
+Push counter: count a push when the player starts applying sustained impulse to a box? Simpler: track per-frame player-box contact; increment pushes on contact start. OK.
+
+Sound design (WebAudio):
+- master gain, simple synth helper: osc + gain envelope, noise buffer for thuds/slides.
+- slideOn: filtered noise loop while box speed > threshold (bandpass ~400Hz), gain ∝ speed. One shared node with per-frame gain update.
+- thud: low sine 70Hz decay + noise burst, volume by impulse.
+- clack (box-box): square/tri short 180→90 Hz.
+- chime (target snap): two-note pluck (sine 660→990).
+- step: tiny tick when player changes direction? Maybe soft footstep on velocity oscillation — skip; add "scuff" noise for player while moving, low gain.
+- win jingle: arpeggio C E G C.
+- ui blip.
+Audio context created/resumed on first keydown or pointerdown (flag).
+
+Particles: dust puffs at box-wall impact and when sliding (emit along bottom edge), confetti on win (colored rects with gravity, spin). Screen shake magnitude decays; applied to canvas translate.
+
+Visual style: let's go for a "workshop/mechanic" vibe: dark slate-blue background with faint blueprint grid? Sokoban = warehouse. Palette: deep teal-charcoal bg (#0d1b24?), floor tiles warm concrete, walls stone blocks with bevel, boxes wooden crates with metal corners + glow when on target, targets as glowing pads (pulsing ring), player a little round robot with eyes and antenna, squash-stretch by velocity. Add soft shadows (ellipses) under entities. Vignette via radial gradient overlay drawn once to an offscreen? Just draw each frame — fine.
+
+Background layers: body CSS has subtle animated gradient? Canvas covers everything; add slow-moving ambient dust motes in background + parallax grid. Keep performance fine.
+
+HUD: top-left: level name + number; top-right: time, pushes; bottom: hint text. Style with system font stack — I want a distinctive display face paired with a legible body. No external fonts allowed… use font stacks: display: "Impact / Haettenschweiler / Arial Narrow Bold"? For a game title, `font-family: 'Arial Black', 'Avenir Next Heavy'...` hmm. Use monospace for HUD numbers ('ui-monospace') and chunky sans (system-ui heavy weight, letterspacing) for title. That's a reasonable pairing without external fonts. Title screen: big name "CRATE & KINETICS"? Name the game: "SOKOBAN KINETICS" or "KINETOBOX"? Let me call it "SLIDEWORKS — a sokoban physics game". Or "PUSHER'S PARADOX". I like "SLIDEWORKS". Title: big stacked letters with crate icons, controls list, "Press Enter / Click to start", level select? Keep: start → play. Restart R anytime; on win N for next.
+
+Overlays: DOM (div) over canvas for crisp text and buttons — allowed (inline). Buttons: Start/Next/Restart. Keyboard too: Enter/Space to confirm, R restart, arrow/WASD move, P pause? Add M mute toggle. Show a key legend.
+
+State machine: 'menu' | 'playing' | 'won' | (paused via flag). Level index; on last level → "You cleared all levels" + replay.
+
+localStorage: best time+pushes per level, try/catch wrapper `store.get/set`.
+
+Input: keydown/keyup sets keys map; preventDefault for arrows/space to avoid scroll. Window listener. Also touch: simple — tap to set goal? Add a virtual joystick? Keep scope: on-screen note "keyboard required" + basic pointer hold = move toward pointer? Cheap win: while pointer down, accelerate player toward pointer position. Easy and fun with mouse/touch. Let's include.
+
+Render order: bg (bg gradient, motes), floor tiles (two-tone checker + subtle noise dots), targets (pulsing), wall blocks (with top face bevel — pseudo-3D: draw wall cell as extruded block: offset darker base + lighter top), box shadows, boxes (rotated inner pattern by spin, metal corner brackets, glow if on target and slow), player shadow, player (body, eyes looking toward velocity, antenna with sway), particles, dust overlay, vignette, shake transform around all world draws.
+
+Wall extrusion: for each wall cell, draw a rect of height cell*1.05? Simple pseudo-3D: walls have a "top" face at y - 6px and front face on the south side… classic technique: draw floor, then walls as blocks: fill top face (lighter) offset up by h=8, fill front face (darker) between. Overlap order: draw walls sorted by y so lower rows overlap upper? For a uniform look, just per cell: front rect (wall color) full cell, top strip lighter 6px inside top edge, left/right subtle shading. Keep it flat-ish with beveled edges — clean.
+
+Let me also add "goal glow" beams: targets emit a soft radial pulse; when a box is parked on target, the pad turns golden and emits small sparkle particles.
+
+Timer: starts on first input in level; stops on win. Display mm:ss.d.
+
+Now code structure (single file):
+- <style>: reset, canvas full, overlay styling, HUD, buttons, title animation (CSS keyframes float), scanline? subtle.
+- <body>: #wrap > canvas + hud divs + overlays (menu, win, pause hint).
+- <script>:
+  - const LEVELS = [{name, map:[...]}...]
+  - Audio module (lazy ctx)
+  - Particles array
+  - Game object: loadLevel(i), reset, update(dt), collide helpers, render()
+  - Main loop rAF with fixed-step accumulator (step 1/240? use substeps inside 60hz step: acc += dt; while(acc>=STEP){ physics(8 substeps) }) — simpler: each rAF, clamp dt to 1/30, run N=6 substeps of dt/N. Good enough.
+  - resize handler with dpr.
+  - input handlers.
+  - UI updates (DOM text), overlay show/hide via classList.
+
+Collision implementation specifics (grid units):
+walls: array of AABBs {x,y,w,h} merged by row runs (also merge vertically? just runs is fine; but a long vertical wall becomes many stacked run AABBs → sliding along it hits seams. To avoid seam catching, also do column-run merging and keep both sets? Overlapping duplicate AABBs would cause double impulse! Instead build an occupancy grid and for collision use "closest point on solid" approach: for circle vs walls, do per-cell checks but resolve against the union by computing penetration to the nearest wall cell only (max overlap along axis)? Simpler robust approach: treat walls as a set of cells; for AABB (box) vs walls: iterate overlapping wall cells, compute overlap with that cell, track min-penetration axis across all cells, apply once. Since wall cells are contiguous full squares, min-penetration over the union approximates union MTV well — seams won't catch because we take a single resolution per frame against the aggregated MTV. Implementation: for body AABB (x,y,w,h center-based), for each wall cell in bounding box range: compute overlapX = (min(right,cellR)-max(left,cellL)) etc; if both >0 candidate; track best axis by smaller penetration and accumulate? Take a single best (smallest penetration). Apply that. For smooth sliding along a wall line: when moving horizontally along a wall row, penetration vertical is small constant → consistent push-out ✓ no seam issue since we pick min each substep.
+
+Circle vs walls similarly: for each nearby wall cell, compute closest point on cell rect to circle center; if dist < r, candidate normal (from closest point) or if inside use axis of min distance; pick the deepest penetration (r - dist max). Apply one resolution. Good.
+
+Box-box: pairwise AABB MTV + impulse, e=0.3, plus small tangential friction.
+
+Player vs box: circle-AABB.
+
+Masses: player 1, box 2.5? Heavier boxes → push is slower but momentum feels weighty. With continuous accel from player (player keeps pushing), equilibrium: box accelerates until friction balances; player gets shoved back a bit. Let me tune: playerAccel=30 c/s², playerMaxSpeed=7, playerDamp=10 (strong control), boxDamp=2.2, e(player-box)=0.15, e(box-wall)=0.28, e(box-box)=0.4.
+
+Wait — with damping model v *= exp(-d*dt): box d=2.2 → slides from 6 c/s to 0.1 in ln(60)/2.2 ≈ 1.6s → distance ≈ v0*(1-e^-dt)/d ≈ 6*0.45≈2.7 cells. Decent slide. Flicking (running fast) might get 4-5 cells. OK.
+
+Snap: threshold speed<0.3; spring k=40 c/s² * dist, damping high; snap when <0.02 & v<0.1 → exact. Also only start snapping if candidate cell exists & free. Legal check for box at center (cx,cy) size s=0.8: no wall cell overlap with [cx-s/2,cx+s/2]×[cy-s/2,cy+s/2], and inside map bounds. Candidate: round(cx),round(cy) plus 4 neighbors; pick min dist that is legal. Note: box center at cell center (integer+0.5 in pixel coords… let me define cell centers at (i+0.5, j+0.5).
+
+Coordinate system: grid units, x right, y down. Cell (i,j) spans [i,i+1]×[j,j+1]. Center = (i+.5,j+.5).
+
+Win check per frame (only when state playing): for each target t: covered if any box with |bx-(tx+.5)|<0.45 && |by-(ty+.5)|<0.45 && speed<0.3. All targets… no — all boxes on targets: for each box, it's on some target cell and slow. Equivalent here since counts match; use box-based check.
+
+Edge: two boxes on one target & another target empty → not all boxes covered → no win ✓ correct.
+
+Confetti on win + pad sparkles.
+
+Menu design (make the opening distinctive rather than a plain centered hero): The start screen should feel like the game itself — show an animated demo in canvas behind? Simplest: render the actual level 1 scene dimmed, with floating crates and title overlaid left-aligned panel? Let me do: on menu state, run an idle "attract" physics scene (level 1 with a ghost auto-pushing?) — heavy. Alternative: render level 1 static + ambient dust motes, overlay a big title block top-left with a crate logo bouncing (CSS), controls in a card bottom-right. A start screen with game name + controls is fine; let's make it distinctive: angled "wooden sign" panel? Keep DOM: left-side vertical layout: giant stacked wordmark "SLIDE / WORKS" with different weights, tagline, control grid, best times list (from storage), blinking "PRESS ENTER". Background: canvas showing level 1 with a slow camera drift + motes.
+
+Also handle: R restart works in playing & won; Esc back to menu? Add: M mute. On win Enter = next.
+
+Pause when tab hidden: rAF auto-stops; dt clamp handles it.
+
+Let me write the HUD: top bar: left "LV 3 — TWO SLIDES", center maybe nothing, right: TIME 00:12.4 · PUSHES 8 · BEST 00:09.1 (or --). Bottom-left small hint: "R restart · M sound".
+
+Font pairing: display: `Impact, 'Haettenschweiler', 'Arial Narrow', sans-serif` uppercase with letterspacing; body/HUD numbers: `ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`; body text: system-ui. Good contrast in sizes: title 64-96px vs 12px labels.
+
+Colors:
+- bg deep: #0b1420 → but let me avoid a near-black + single neon look. Use a rich warm-cool combo: deep petrol blue background (#0e2233?), floor concrete light warm gray-blue (#c9d4dc alternating #becad3), walls dark slate with amber top? Boxes: wood orange-brown (#c8813f, shade #9a5a26) with steel corner brackets (#dfe7ee), targets: glowing cyan-teal pads (#39e6c8) → gold when filled (#ffd166). Player: coral-red robot (#ff5d4d) with cream face. Accent UI: amber #ffb02e + teal. This is multi-hue, not single-neon.
+
+Canvas floor: draw checker of two grays + faint grid lines + occasional darker speckle (deterministic by hash of cell coords).
+
+Motes: 40 dots drifting slowly with parallax, alpha 0.15.
+
+Vignette: radial gradient each frame (cheap enough) or pre-render to offscreen on resize — pre-render.
+
+Screen shake: shake.mag decays *= exp(-6dt); offset = rand*mag.
+
+Impact FX: on wall collision with impulse j>threshold: thud sound vol ∝ j, dust particles at contact point, shake += min(j*k, cap).
+
+Box spin visual: box.spin += (vx / 0.4) * dt (roll angle), draw pattern rotated by spin around center; clamp wobble too.
+
+Player render: circle body with squash: scaleX = 1 + min(|v|*0.02, .25) along motion? Simpler: stretch along velocity direction: rotate ctx to atan2(vy,vx), scale (1+s, 1-s). Eyes offset toward look direction; antenna line with ball, sways by sin(t + vx).
+
+Target pad: rounded square inset 0.18, pulsing ring stroke alpha = .5+.3sin(t*3+j), inner dot. Filled state: gold fill glow + sparkles spawn occasionally.
+
+Box on target (slow): outline glows gold; else steel.
+
+Now the code size — it'll be long but that's fine. Let me write it carefully with correctness in mind.
+
+Key functions:
+
+```js
+function buildLevel(idx){ parse map → walls cells, wallAABBs? (use cell grid occupancy), boxes[{x,y,vx,vy,spin,angle}], targets[], player{x,y,vx,vy}, compute bounds for view }
+```
+
+Wall storage: `wallSet = new Set(i + j*W)` plus function isWall(i,j). Collision loops over nearby cells.
+
+Circle vs walls:
+```js
+function collideCircleWalls(c){ // c {x,y,r, vx,vy, mass}
+ let resolved=0;
+ for(let j=floor(y-r); j<=floor(y+r); j++) for(let i=floor(x-r); i<=floor(x+r); i++){
+   if(!isWall(i,j)) continue;
+   const cx = clamp(x, i, i+1), cy = clamp(y, j, j+1);
+   let dx=x-cx, dy=y-cy, d2=dx*dx+dy*dy;
+   if(d2 < r*r){
+     let d=sqrt(d2), nx,ny,pen;
+     if(d>1e-6){nx=dx/d; ny=dy/d; pen=r-d;} else { // center inside cell: push out along min axis
+       const l=x-i, rr=i+1-x, t=y-j, b=j+1-y; const m=Math.min(l,rr,t,b);
+       if(m===l){nx=-1;ny=0;pen=l+r;} else if(m===rr){nx=1;ny=0;pen=rr+r;} else if(m===t){nx=0;ny=-1;pen=t+r;} else {nx=0;ny=1;pen=b+r;}
+     }
+     c.x+=nx*pen; c.y+=ny*pen;
+     const vn=c.vx*nx+c.vy*ny;
+     if(vn<0){ const jimp = -(1+REST_PLAYER_WALL)*vn; c.vx-=jimp*nx; c.vy-=jimp*ny; impact(nx,ny,jimp,c); }
+     resolved++;
+   }
+ }
+}
+```
+Applying multiple corrections in one substep is fine (substeps small).
+
+Box vs walls (AABB): aggregate best MTV:
+```js
+function collideBoxWalls(b){
+ let bn=null; // {nx,ny,pen}
+ for cells overlapping bbox:
+   const ox = Math.min(b.x+b.half, i+1) - Math.max(b.x-b.half, i);
+   const oy = ...;
+   if(ox>0&&oy>0){
+     // choose axis by smaller penetration
+     if(ox<oy){ nx = b.x < i ? -1 : 1; cand pen ox } else { ny = b.y<j?-1:1; pen oy }
+     keep candidate with smallest pen (tie → prefer previous? just min)
+   }
+ if(bn){ push out; impulse like above with REST_BOX_WALL; impact fx }
+}
+```
+Note: picking a single min-pen across all overlapping cells — when sliding along a wall, overlap cells in the moving direction have small ox… consider box touching wall row below, moving right: cells below overlap oy=small (say 0.01), ox large → candidate vertical pen .01; corner cell to lower-right overlaps both but oy same .01? If aligned, fine. Should be smooth.
+
+Box-box:
+```js
+for i<j boxes: AABB overlap; if overlap: axis min pen; separate half each (equal mass); relative vel along n; if approaching: impulse with e=REST_BB; clack sound ∝ j; small friction: tangent vel *= 0.98? skip or minor.
+```
+
+Player-box circle-AABB:
+```js
+for each box: closest point cp on box rect to player center; d2; if < r2: normal from cp to center (handle inside case like above with axis min); push player out by pen (box also pushed slightly? use mass ratio: move player by pen * mB/(mP+mB)? For stability, push player fully and give impulse both:
+ vn_rel = dot((pv - bv), n) where n points from box to player? Let me define n from box center → closest… standard: n = (pc - cp)/d (from box surface to player). Relative vel along n: vrel = dot(pv, n) - dot(bv, n); if vrel < 0: j = -(1+e)*vrel / (1/mp + 1/mb); pv += j*n/mp; bv -= j*n/mb.
+ Position: move player by pen* (mb/(mp+mb)) along n, box by -n * pen*(mp/(mp+mb)).
+```
+Push counting: track contact flag per box for player; if now contacting && !was → pushes++ (only if vrel was < 0? any contact counts). Also trigger a subtle "push" sound on contact start.
+
+Player acceleration: input dir normalized * ACC; damp: pv *= exp(-PDAMP*dt) then add accel — order: dv = (input*ACC - 0)*dt? Use semi-implicit: pv += inx*ACC*dt; pv *= Math.exp(-PDAMP*dt); clamp speed to MAX. With PDAMP=10, ACC=34: terminal ≈ ACC/PDAMP = 3.4?? too slow. Terminal v = a/k → want ~6: with k=8, a=50 → 6.25 ✓. Set ACC=55, PDAMP=9 → 6.1 c/s. Box damping KB=2.0; slide distance from 6 ≈ 3 cells ✓.
+
+Substeps: N=6 per frame step (frame dt clamped ≤ 1/30). Per substep: input accel (player), integrate all, collide walls (boxes, player), box-box, player-box, damping applied via exp(-k*dt_sub)? Damping in same integration as accel is fine.
+
+Order per substep:
+1. Player: apply control accel & clamp; damp.
+2. Integrate positions for all bodies (x+=vx*dt).
+3. Box vs walls; box vs box (iterate 2 passes); player vs walls; player vs boxes.
+4. Snap logic (only when frame-level, not substep — run after substeps: if slow → spring force next frame? implement snap as direct position lerp + velocity adjust each frame when condition met; simpler: in post-step, for each slow box: find target center tc; if dist<0.35: b.x += (tc.x-b.x)*min(1, 20*dt); same y; v *= 0.6; if dist<0.02 && |v|<0.15 → exact snap & parked flag).
+   But spring vs collision: after snapping position, might overlap wall? tc is legal by construction ✓. Overlap with other box possible — rare; collide pass next frame fixes (they push apart; slow so fine).
+
+Parked/covered check for win uses center inside target cell ±0.45 and speed<0.3.
+
+Timer: level.time accumulates dt while playing && started (started=true on first move input or pointer). Display.
+
+Best times: key `sideworks.best.v1` JSON {levelIndex:{t,pushes}}.
+
+Audio implementation:
+```js
+const AudioSys = { ctx:null, master, muted:false, init(){ if(this.ctx) return; this.ctx=new (window.AudioContext||webkitAudioContext)(); this.master=ctx.createGain(); gain .5 → destination; build noise buffer; start slide noise loop nodes }, blip(freq,dur,type,vol), thud(vol), clack(vol), chime(), jingle() }
+```
+Slide noise: bufferSource (looping) → bandpass(500,Q1) → gain(0) → master. Update per frame: target gain = sum over boxes of clamp(speed/8,0,1)*0.25 + player moving 0.05; lerp gain for smoothness.
+Noise buffer: 1s random.
+thud: osc sine 90→45 Hz 0.12s gain vol + noise burst lowpass 300 vol*0.7.
+clack: triangle 220→120 0.06s + short highpass noise tick.
+chime: two sines 740 & 1108, staggered 90ms, decay .35.
+jingle: notes [523,659,784,1047] each .12s apart, triangle + echo? keep simple.
+step: skip.
+ui: blip 440 sq .05.
+
+Mute toggle M: master.gain 0/0.5; show in HUD.
+
+Pointer control: pointerdown/move on canvas → store world target (convert via view); while held, input dir = normalize(target - player) if dist>0.3. Also counts as first input for audio init. Prevent context menu? fine.
+
+View computation:
+```js
+function computeView(){ margin = 48px; avail w,h; cell = min((W-2m)/lw, (H-2m)/lh); also cap cell at maybe 96; ox = (W - lw*cell)/2; oy = (H - lh*cell)/2; }
+```
+Also store for pointer→world: (px-ox)/cell.
+
+Render world with ctx.save(); translate(ox+shakeX, oy+shakeY); scale(cell,cell)?? Scaling context makes line widths scale too — that's OK, or draw in pixel coords: px = x*cell. I'll use a transform: translate + scale for simplicity; set lineWidth in grid units (e.g., 0.02). Font rendering for in-world text? none in world. Fine.
+
+Floor tiles: iterate cells; fill base color alternating; speckle: hash(i,j)%7==0 → small dot. Also inner shadow at floor edges adjacent to wall? Draw a subtle darker line on floor cell north edge if wall above — gives depth. Cheap loop OK (levels ≤ 13x9=117 cells).
+
+Walls: for each wall cell: face color; top bevel: lighter strip h=0.14 at top; left bevel lighter thin; bottom/right darker. Also drop shadow onto floor below (if cell below is floor): dark translucent rect under the front edge? Draw a shadow rect extending 0.18 down from wall bottom with alpha .25 gradient — just a flat alpha rect.
+
+Draw order: floor → target pads → wall shadows + walls (walls after boxes? Boxes never overlap wall cells; draw walls after floor, before entities is fine; but pseudo-3D top bevel overlaps the floor above? Bevel is inside cell. OK) → box shadows → boxes → player shadow → player → particles → motes front? Motes behind (draw right after bg). Vignette last (screen space).
+
+Menu attract: state 'menu' still renders level 1 scene (loaded at start) with motes + gentle time pulse; overlay DOM covers.
+
+Win overlay: "LEVEL CLEARED" big, stats row (time, pushes, best), buttons: NEXT (Enter), REPLAY (R). Final level → "ALL LEVELS CLEARED" + PLAY AGAIN (reset to 1? show total?). Keep simple: on last, next button says "REPLAY ALL".
+
+Also add subtle CSS animations: title letters bob, blink for prompt, overlay fade/slide-in. Buttons hover states with transform. No external fonts.
+
+Accessibility-ish: focus outline on buttons; not critical.
+
+Prevent scrollbars: html,body {margin:0;height:100%;overflow:hidden}. Canvas absolute full. Handle resize + dpr.
+
+Also "restart without reloading" ✓ R key + button.
+
+Edge cases: level bounds — walls surround everything so no escape. Player radius 0.34, box half 0.4 (size .8). Gaps between boxes and wall = 0.1 total on each side… box in cell center: edges at ±0.4, wall face at 0.5 from center → gap 0.1 ✓ visible.
+
+Player circle r=0.32 → fits in 1-wide corridor (gap .18 each side) ✓. Box (half .4) in 1-wide corridor: gap .1 each side ✓ slides smoothly? Circle vs box corners fine.
+
+Chain push L6: pushing a pair — left box pushes right box, both slide; my pairwise resolution handles it.
+
+Potential issue: player pushing box into wall — box against wall, player keeps pressing: impulse each substep small, player gets pushed back slightly, stable jitter? With e=0.15 and position correction, should be OK at 6 substeps.
+
+Snap interference with push: only when speed<0.3; if player pushes box slowly (speed <0.3), snap might fight the push (magnet to center while being pushed). Mitigate: disable snap for a box while player is in contact (contact flag) ✓.
+
+Win check should require no active contact? Speed<0.3 covers it mostly; also require !box.contactPlayer.
+
+Now DOM structure:
+
+```html
+<div id="stage">
+  <canvas id="cv"></canvas>
+  <div id="hud" class="hidden">
+    <div id="hudL"><span id="lvNum"></span><span id="lvName"></span></div>
+    <div id="hudR"><span id="timeEl"></span><span id="pushEl"></span><span id="bestEl"></span></div>
+  </div>
+  <div id="hint">…keys…</div>
+  <div id="menu" class="overlay"> title, controls, best list, start btn/prompt </div>
+  <div id="win" class="overlay hidden"> … </div>
+</div>
+```
+
+Styling: overlay is a full absolute flex; menu content aligned left with padding, big display type. Use clip-path angled panel? Add a "crate" motif: title inside a bordered box styled like a crate (border + corner brackets via pseudo-elements). Nice.
+
+Let me write CSS palette variables:
+--ink:#0d1a26; --panel:#12283a; --line:#2b4a63; --amber:#ffb02e; --teal:#35e0c2; --cream:#f4ead8; --red:#ff5d4d.
+
+Background behind canvas: canvas paints everything anyway.
+
+HUD font: monospace; labels tiny uppercase letterspaced; numbers big.
+
+Title screen layout (left-aligned, distinctive):
+- top-left corner tag "PHYSICS PUZZLE // 6 LEVELS"
+- giant wordmark: "SLIDE" (cream) "WORKS" (amber outline?) stacked, slight rotate -2deg, with a small crate square as the 'O'? Keep text + CSS crate icon.
+- one-line description: "Push crates with real momentum — flick, chain, and park them on the glowing pads."
+- Controls card: grid of key→action rows (WASD/←↑→↓ move · mouse hold steer · R restart · M sound · Enter next)
+- Best times strip.
+- Bottom prompt: "PRESS ENTER OR CLICK TO START" blinking.
+
+Win overlay: centered small panel is fine (it's a game-over screen, distinctive enough with stats table + big "CLEARED!" stamp rotated).
+
+Now let me write the JS carefully. Draft key constants:
+
+```js
+const P_ACC=55, P_DAMP=9, P_MAX=6.4, P_R=0.32;
+const B_HALF=0.4, B_DAMP=2.1, M_PLAYER=1, M_BOX=2.6;
+const E_PW=0.12, E_BW=0.3, E_BB=0.45, E_PB=0.18;
+```
+
+Player max speed clamp after accel+damp.
+
+Box damping: v*=exp(-B_DAMP*dt). Also add slight extra tangential friction when in contact? Skip.
+
+Impact FX thresholds: impulse j (units c/s) — wall thud if j>0.6, vol=min(1,j/4). Shake += min(0.5, j*0.06). Clack j>0.5.
+
+Slide sound gain: g = clamp(maxBoxSpeed/7,0,1)*0.35 + (playerMoving? 0.06:0); lerp current→target with 0.2 factor per frame.
+
+Particles: {x,y,vx,vy,life,maxLife,size,color,type:'dust'|'spark'|'confetti',rot,vr}. Dust: gray-brown, low alpha, drag, no gravity (slight up). Spark: gold small fast fade. Confetti: colored rects, gravity 8, spin, bounce on floor? just fall off bottom of screen.
+
+Emit dust when box speed>1.5: rate-limited per box (accumulator) spawn at random edge point of box, vel opposite motion + random, life .4.
+
+Motes: separate array persistent across levels: {x,y,r,spd,phase} in screen space; drift up-left slowly, wrap.
+
+Vignette pre-render: offscreen canvas resized with main; radial gradient transparent→rgba(4,10,16,.5) at edges + slight top light? Draw once per resize.
+
+Hash for speckles: (i*73856093 ^ j*19349663) >>> 0 % something.
+
+Time formatting: mm:ss.t.
+
+Level names: 1 "Warm-up", 2 "The Flick", 3 "Two Slides", 4 "Around the Block", 5 "Triple Drop", 6 "Cascade Row".
+
+Wait L4 (around the block) — let me re-verify its geometry:
+```
+##########
+#....@...#
+#........#
+#....$...#
+#........#
+#.%......#
+#........#
+##########
+```
+10x8 ✓ box (5,3), target (2,5). Player (5,1) above box. Solve: push down → box slides to bottom row 6 (center? bottom wall r7 → center at row 6… wait rows 0-7; bottom wall row 7; floor rows 1-6; box sliding down stops with center at y=6.5 (row 6)). Then push left along row 6: stand right of box, push left → slides to left wall → center x=1.5 (col 1). Target is (2,5): need box at col 2 row 5. From (1,6): can't easily… player stands below? no floor below (row 7 wall). Stand at (1,5)? that's left of box? Box at (1,6)… hmm target (2,5) is upper-right of final position. Push right from left: stand at (0,6)? col 0 is wall. ✗!
+Fix: put target at (2,6)? Then after sliding left to (1,6) or so, nudge right? Can't push right (player would need to be at col 0). Hmm. Make the box stop near col 2 by design? Friction stops it wherever; can't guarantee.
+Better L4: target in a bottom-left pocket with backstop:
+```
+##########
+#....@...#
+#........#
+#.....$..#
+#........#
+#.%%.....#
+#.#......#  → wall at (1,6) backstop under targets?
+##########
+```
+Hmm. Let me redesign L4 as "the corner pocket" — box must be pushed down then left into a pocket that opens from the right with a floor below:
+Target cell (2,5), pocket: walls at (2,4)? no…
+
+Simplest robust L4: an L-shaped path where you push down then push left, with target at end of leftward run against the bottom wall? Box pushed left along row 6 stops at (1,6) with left edge at wall → target (1,6)! And second maneuver for spice: two boxes.
+```
+##########
+#........#
+#...@....#
+#........#
+#..$...$.#
+#........#
+#.%%%....#  targets (2,6),(3,6),(4,6)?
+##########
+```
+Boxes (3,4),(7,4); targets 3 vs boxes 2 ✗. Argh counts again. Let me do: boxes (3,4) & (7,4); targets (2,6) & (6,6):
+r5? let me lay rows (10x8):
+r0 `##########`
+r1 `#........#`
+r2 `#...@....#` player (4,2)
+r3 `#........#`
+r4 `#..$...$.#` boxes (3,4),(7,4)
+r5 `#........#`
+r6 `#.%.....%#` targets (2,6),(8,6) → count: # . % . . . . . % # = 10 ✓
+r7 `##########`
+Solve box A (3,4): push down from (3,3) → slides to row 6 center (3.5? no—center y=6.5), x stays ~3.5 → col 3. Target is (2,6). Then nudge left: stand at (4,6)? right of box… player can walk along row 5 down to row 6? Row 6 is open; stand right of box (box at ~(3.x,6.5)) at (5,6) → push left → slides toward wall → stops near col 1-2 → snap nearest legal cell: if it stopped around x=1.9 → snaps to (2,6) ✓ if friction lets player stop it near there — player walks slowly pushing = slow push = box creeps; with contact disabling snap until release, then it settles at nearest cell… might settle at (2,6) or (3,6)/ (4,6). Player can nudge again. Forgiving ✓.
+Box B (7,4): push down → row 6 col ~7; target (8,6): nudge right from left side → creep to (8,6) ✓.
+Good enough — teaches correction nudges.
+
+Also make sure player can reach below boxes: rows 5 open, rows 1-3 open ✓.
+
+Now L2 verify again: box slides right and stops at col 7 exactly? Box half .4; wall left face at x=8 (col 8). Box right edge = 8 → center 7.6?? Wait: wall cell col 8 spans [8,9]. Box must stop with right edge ≤ 8 → center ≤ 7.6. Target (7,2) center is 7.5; win tolerance |bx-7.5|<0.45 → 7.6 is inside ✓. Snap: nearest legal center: 7.5 (cell 7) vs 6.5 — box at 7.6 nearest is 7.5, legal? Box at center 7.5 spans [7.1,7.9], wall face 8 → no overlap ✓ → snaps to exactly 7.5 → on target ✓ chime + win.
+
+L1: push down one cell; box from (4,2) pushed down: player above at (4,1) pushes down slowly → box creeps to row 3 → release → snap (4,3) ✓ target (4,3)? targets are (4,3),(5,3) — wait L1 map r3 `#...%%..#`: cols: 0#,1.,2.,3.,4%,5%,6.,7.,8# → targets (4,3),(5,3) ✓ boxes (4,2),(5,2) in r2 `#..@$$..#`: cols 3@,4$,5$ ✓. Player pushes box at col 4 from above; but player start is left of boxes — path up to row 1 open ✓.
+
+L3 verify: r2 `#.$....%.#` cols: 0#,1.,2$,3-6 dots(4),7%,8.,9# → target (7,2) ✓ box (2,2). r3 `#..$...%.#`: 0#,1.,2.,3$,4-6 dots,7%,8.,9# → box (3,3), target (7,3) ✓. Push right: row 2 wall at col 9? r2 col 9 is '#' and col 8 '.', so box slides until right edge hits x=9? Wall cell col 9 spans [9,10] → face at 9 → center ≤8.6 → snaps to 7.5? Nearest legal: 7.5 (cell 7) vs 8.5 (cell 8): if stops at 8.5 area… box can't go past 8.6; nearest cell center is 7.5 or 8.5 — 8.5 legal? Box at 8.5 spans [8.1,8.9] <9 ✓ legal! If it settles at x≈8.4 → snaps to 8.5 → NOT on target (target 7.5). Player then nudges left from right side: stand at (9,2)? that's floor '.'; push left → creep to 7.5 ✓. OK solvable with correction — fine, adds skill. Actually friction: slide from ~6 c/s starting at x=2.5 travels ~3 cells → lands ~5.5-6.5 → snaps to cell 6 (6.5) or 5.5… then nudge right one more? Player is already left of it after push… walk around top/bottom to right side, push left/right as needed. Open room, fine ✓.
+
+L5 verify rows:
+r0 `###########` (11)
+r1 `#@........#` player (1,1)
+r2 `#.$...$..$.#`? I decided boxes (2,2),(5,2),(8,2): string idx 0#,1.,2$,3.,4.,5$,6.,7.,8$,9.,10# → "#.$..$..$.#" ✓ 11 chars.
+r3 `#....@...##`? wait I moved player to r1. r3: walls (9,3),(10,3)? r3 = `#........##` idx 9#,10# ✓ 11. But col 8 open at r3 needed for box path up col 9? Box pushed up col 9: cells (9,2),(9,1) need to be floor: r2 idx 9 '.' ✓, r1 idx 9 '.' ✓. And backstop wall at (9,3) ✓ stops box centered at row 2 → target (9,2)?? but I changed design — final L5 is "Triple Drop" with targets (2,5),(5,5),(8,5), backstops r6 `#.##..#..##`? wait that's walls idx 0,2,5,8,10: hmm wall at col 0 already boundary. Let me re-derive Triple Drop rows (11x9):
+r0 `###########`
+r1 `#@........#`
+r2 `#.$..$..$.#` boxes (2,2),(5,2),(8,2)
+r3 `#.........#`
+r4 `#.........#`
+r5 `#.%..%..%.#` targets (2,5),(5,5),(8,5)
+r6 `#.##..#..##`? idx: 0#,1.,2#,3.,4.,5#,6.,7.,8#,9.,10# → backstops under cols 2,5,8 ✓
+r7 `#.........#`
+r8 `###########`
+Solve: push each box down from row 1 (stand at (col,1)): box slides down, hits top of wall cell (col,6) whose top face is y=6 → box bottom edge = 6 → center 5.6?? Box half .4 → center = 6-0.4=5.6; target center 5.5; tolerance .45 ✓ inside! Snap: nearest legal center: 5.5 (cell 5) vs 6.5 (cell 6 is wall ✗ illegal) → 5.5 ✓ exact on target, chime ×3.
+But wait — player pushing down at col 2: player at (2,1), box at (2,2): push straight down ✓. All three similar; player starts (1,1) adjacent to first ✓ nice flow left→right.
+
+L6 verify (12x7):
+r0 `############` (12)
+r1 `#..........#` 12 ✓
+r2 `#.$$...$$..#`: idx 0#,1.,2$,3$,4.,5.,6.,7$,8$,9.,10.,11# → boxes (2,2),(3,2),(7,2),(8,2) ✓
+r3 `#....@.....#`: idx 5 @ ✓ 12
+r4 `#..........#`
+r5 `#...%%%%...#`: idx 4,5,6,7 % ✓ 12
+r6 `#....####..#`: idx 4,5,6,7 # ✓ 12
+Solve: right pair (7,2),(8,2): push down from above → land on (7,5),(8,5)? Backstops at cols 4-7: col 7 has backstop ✓ box at col 7 → center y 5.6 → target (7,5) ✓; box at col 8: no backstop at col 8! Slides to bottom row 6… center y 6.6? Floor rows 1-6? r6 is walls idx 4-7 only; col 8 row 6 is '.' so floor goes to r7 wall → box stops center 6.6 ✗. Fix: extend backstop to include col 8? Then targets should be at cols… right pair lands on (7,5) & (8,?) — target list is 4-7. Redo L6 targets/backstops to match boxes' columns after maneuvering.
+Simpler: make all 4 boxes land via downward push in their own columns: boxes (2,2),(3,2),(7,2),(8,2) → targets (2,5),(3,5),(7,5),(8,5), backstops at those cols r6:
+r5 `#..%%..%%..#`? idx: 0#,1.,2%,3%,4.,5.,6.,7%,8%,9.,10.,11# → `#..%%..%%..#` count 12 ✓ targets (2,5),(3,5),(7,5),(8,5)
+r6 `#.##..##...#`? idx 2#,3#,7#,8#: chars: 0#,1.,2#,3#,4.,5.,6.,7#,8#,9.,10.,11# → `#.##..##...#` count: #(1).(2)#(3)#(4).(5).(6).(7)#(8)#(9).(10).(11).(12) = 12 ✓
+But then it's just 4 identical drops — less interesting than the mixed plan. Mixed plan: left pair needs a right-nudge first (they start at cols 2,3 but targets… let me set targets at cols 4,5 for left pair and 7,8 for right pair):
+- Right pair (7,2),(8,2) → drop straight down to (7,5),(8,5) ✓ direct.
+- Left pair (2,2),(3,2): push right along row 2 until they're at cols ~4,5 (player creeps behind them — chain push!), then drop each from above onto (4,5),(5,5). Chain: pushing left box pushes right box too; both shift together ✓ fun.
+Targets r5: (4,5),(5,5),(7,5),(8,5): idx 4%,5%,7%,8% → `#...%%%%..##`? no: chars 0#,1.,2.,3.,4%,5%,6.,7%,8%,9.,10.,11# → `#....%%.%%..#` count: #(1).(2).(3).(4).(5)%(6)%(7).(8)%(9)%(10).(11).(12) = 12 ✓ string "#....%%.%%.." + "#" hmm let me just spell: ["#",".",".",".","%","%",".", "%","%",".",".","#"] → `#...%%%%..##`? no that has ## at end. Joining the array: # . . . % % . % % . . # = "#...%%.%%..#" ✓ 12.
+Backstops r6 cols 4,5,7,8: ["#",".",".",".","#","#",".", "#","#",".",".","#"] → `#...##.##..#` ✓ 12.
+Player start (5,3)? that's directly below target zone… fine, open floor at (5,3): r3 = `#....@.....#`? idx 5 '@' — but wait (5,3) is under backstop col 5 area, floor ✓. Player needs to get above boxes: row 1 open ✓; left of left pair: (1,2) ✓ reachable via rows 1/3/4 cols 1-… ✓ all good.
+L6 solved design ✓.
+
+Level array final:
+1: 9x6 warmup
+2: 9x6 flick
+3: 10x8 two slides
+4: 10x8 around (correction nudges)
+5: 11x9 triple drop
+6: 12x7 cascade row
+
+Let me write them as string arrays. L2 rows:
+```
+#########
+#.......#
+#@.$...%.#
+```
+Wait width 9: `#@.$...%.#` = @ . $ . . . % . → #,@,.,$,.,.,.,%,.,# = 10 ✗! Box at col 3, target at col 7, width 9 → cols 0-8, wall at col 8. String: idx0#,1@,2.,3$,4.,5.,6.,7%,8# → `#@.$...%.#`? chars count: #,@,.,$,.,.,.,%,# = 9 ✓ (I miscounted before). Verify target col 7 center 7.5; wall face x=8; box stops center ≤7.6 ✓ snaps to 7.5 ✓.
+r1 `#.......#` ✓ r3,r4 `#.......#`, r5 `#########`.
+
+L4 rows final:
+```
+##########
+#........#
+#...@....#
+#........#
+#..$...$.#
+#........#
+#.%.....%#
+##########
+```
+r6: # . % . . . . . % # = 10 ✓ targets (2,6),(8,6). Box A (3,4) → push down → row 6 col ~3 → nudge left to (2,6); box B (7,4) → down → nudge right to (8,6)? wait target (8,6): box at col 7 pushed down lands at (7,6)-ish; nudge right from left side: stand at (6,6), push right → creep to (8,6) ✓. But careful: pushing right along row 6 toward wall col 9 face x=9 → stops center ≤8.6 → snaps to 8.5 ✓ on target!
+Similarly box A nudge left → stops ≥1.4 (wall face x=0… wait left wall col 0 spans [0,1], face at x=1) → stops center ≥1.4 → snaps to 1.5?? Cell 1 center 1.5 — but target is (2,6)! Nearest legal from ~1.9: cell 1.5 or 2.5? If it creeps slowly and player releases at x≈2.0 → nearest = 1.5 or 2.5 tie-ish… risky. But snap threshold: only snaps if dist<0.35 to candidate; if box rests at 2.0, dist to 2.5=0.5 >0.35 → no snap, stays at 2.0 → win check |2.0-2.5|=0.5 >0.45 ✗ fail! Hmm. Player can tap-right then tap-left micro corrections; eventually settles within tolerance (win tolerance .45 is generous: any center in [2.05,2.95] wins… wait target 2.5 → |bx-2.5|<0.45 → bx ∈ (2.05,2.95)). At x=2.0 it's just outside; one small right nudge fixes ✓. Forgiving enough.
+
+OK. Also make sure boxes don't start overlapping targets in a way that trivially wins on load — none do.
+
+Now let me write the code fully and carefully. I'll aim for clean, complete, tested-in-head code.
+
+Structure:
+
+```html
+<!DOCTYPE html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>SLIDEWORKS — Sokoban Physics</title><style>…</style></head>
+<body>
+<canvas id=cv></canvas>
+<div id=hud class=hidden>…</div>
+<div id=hint class=hidden>…</div>
+<div id=menu class=overlay>…</div>
+<div id=win class="overlay hidden">…</div>
+<script>…</script>
+```
+
+CSS highlights:
+- :root palette.
+- body overflow hidden, background #0a141d.
+- canvas block full.
+- .overlay {position:fixed;inset:0;display:flex;...;background: rgba(8,16,24,.55) + backdrop? avoid blur-heavy; use gradient scrim}
+- menu content left aligned with max-width 640, padding 6vh 6vw.
+- wordmark: font-family Impact…; font-size clamp(64px, 13vw, 150px); line-height .85; two lines; second line amber with text-shadow offset (chunky retro print). Add slight rotate(-2deg). Letter-spacing.
+- crate icon: div with border + corner brackets via linear-gradient? Use a span styled as a crate: background wood gradient, border 3px #0006, box-shadow inset for bevel, ::before/::after for diagonal cross? Keep simple: square with X made of two rotated bars (pseudo elements).
+- controls: kbd styling: monospace, bordered, padding.
+- blink animation for prompt.
+- win overlay panel: centered card with big "CLEARED" stamp rotated -6deg amber border 4px, stats table mono, buttons.
+- buttons: chunky, uppercase mono/display, hover translateY(-2px) + shadow, active press. focus-visible outline.
+- HUD: fixed top, flex space-between, pointer-events none; elements with text-shadow for legibility; big number font-size 28px vs label 10px.
+- media small screens: shrink title, controls wrap.
+
+JS plan (order):
+1. utils: clamp, lerp, rand, fmtTime, hash.
+2. storage wrapper.
+3. LEVELS data.
+4. audio object.
+5. canvas setup + resize (dpr, view compute).
+6. game state vars; loadLevel(i); resetBodies.
+7. input: keys map, pointer.
+8. physics step(dt): substeps.
+9. fx: particles, shake, motes init.
+10. update(frame dt): if playing → physics, snap, win check, timer, slide sound gain; always → particles, motes, shake decay, pulse t.
+11. render(): all drawing.
+12. UI wiring: buttons, state transitions (toMenu, startGame(level), onWin).
+13. main loop.
+14. init: loadLevel(0) for attract bg; show menu.
+
+Let me write the physics code concretely.
+
+```js
+const G = {
+  state:'menu', level:0, time:0, started:false, pushes:0,
+  W:0,H:0, walls:Set, boxes:[], targets:[], player:null, won:false, winTimer:0
+};
+function loadLevel(i){
+  const L=LEVELS[i]; G.level=i; G.W=L.map[0].length; G.H=L.map.length;
+  G.walls=new Set(); G.targets=[]; G.boxes=[]; G.player=null;
+  L.map.forEach((row,j)=>{ for(let k=0;k<row.length;k++){ const c=row[k];
+    if(c==='#') G.walls.add(k+j*G.W);
+    else if(c==='%'||c==='*'||c==='+') G.targets.push({i:k,j});
+    else if(c==='$'||c==='*'){ G.boxes.push(mkBox(k,j)); }
+    else if(c==='@'||c==='+'){ G.player=mkPlayer(k,j); }
+  }});
+  G.time=0;G.started=false;G.pushes=0;G.won=false;G.winTimer=0;
+  computeView();
+}
+function mkBox(i,j){return {x:i+.5,y:j+.5,vx:0,vy:0,half:B_HALF,spin:0,contact:false,pushPrev:false};}
+```
+
+isWall(i,j): i<0||j<0||i>=W||j>=H → true (safety), else set.has.
+
+Substep physics:
+
+```js
+function physStep(dt){
+ const p=G.player;
+ // input dir
+ let ix=0,iy=0;
+ if(keys['arrowleft']||keys['a'])ix--; … etc
+ if(pointer.active){ const dx=pointer.x-p.x, dy=pointer.y-p.y, d=Math.hypot(dx,dy); if(d>0.25){ix+=dx/d;iy+=dy/d;} }
+ const il=Math.hypot(ix,iy); if(il>1){ix/=il;iy/=il;}
+ p.vx += ix*P_ACC*dt; p.vy += iy*P_ACC*dt;
+ // damp
+ const pd=Math.exp(-P_DAMP*dt); p.vx*=pd;p.vy*=pd;
+ const sp=Math.hypot(p.vx,p.vy); if(sp>P_MAX){p.vx*=P_MAX/sp;p.vy*=P_MAX/sp;}
+ // integrate
+ p.x+=p.vx*dt; p.y+=p.vy*dt;
+ for(const b of G.boxes){ b.vx*=Math.exp(-B_DAMP*dt); b.vy*=…; b.x+=b.vx*dt;b.y+=b.vy*dt; b.spin += (b.vx*0.9 + b.vy*0.5)*dt*2.2? }
+ // collisions: boxes vs walls, box-box pairs (2 iters), player vs walls, player vs boxes
+ for(const b of G.boxes) collideBoxWalls(b);
+ for(let it=0;it<2;it++) for(i<j) collideBoxes(…);
+ collideCircleWalls(p);
+ for(const b of G.boxes) collidePlayerBox(p,b);
+}
+```
+
+collidePlayerBox with contact tracking & push count:
+
+```js
+function collidePlayerBox(p,b){
+ const nx0 = clamp(p.x, b.x-b.half, b.x+b.half), ny0=clamp(p.y, b.y-b.half, b.y+b.half);
+ let dx=p.x-nx0, dy=p.y-ny0; const d2=dx*dx+dy*dy;
+ if(d2 >= P_R*P_R){ b.contact=false; return; }
+ let nx,ny,pen;
+ const d=Math.sqrt(d2);
+ if(d>1e-7){nx=dx/d;ny=dy/d;pen=P_R-d;} else { // inside box: push along min axis (n points from box to player)
+   const l=p.x-(b.x-b.half), r=(b.x+b.half)-p.x, t=p.y-(b.y-b.half), bo=(b.y+b.half)-p.y; const m=Math.min(l,r,t,bo);
+   if(m===l){nx=-1;ny=0;pen=l+P_R;} else if(m===r){nx=1;ny=0;pen=r+P_R;} else if(m===t){nx=0;ny=-1;pen=t+P_R;} else {nx=0;ny=1;pen=bo+P_R;}
+ }
+ // n points from box to player. Separate:
+ const tot=M_PLAYER+M_BOX, wP=M_BOX/tot, wB=M_PLAYER/tot;
+ p.x+=nx*pen*wP; p.y+=ny*pen*wP; b.x-=nx*pen*wB; b.y-=ny*pen*wB;
+ const rvx=p.vx-b.vx, rvy=p.vy-b.vy, vn=rvx*nx+rvy*ny;
+ if(vn<0){ const j=-(1+E_PB)*vn/(1/M_PLAYER+1/M_BOX); p.vx+=j*nx/M_PLAYER; p.vy+=j*ny/M_PLAYER; b.vx-=j*nx/M_BOX; b.vy-=j*ny/M_BOX; }
+ if(!b.pushPrev) { G.pushes++; }  // hmm count on contact start
+ b.pushPrev=true; b.contact=true;
+}
+```
+Push counting: only when player is moving toward box? Contact starts while idle against a box would count. Add condition vn<0 at first frame… simplest: if !b.pushPrev && (vn<0 || Math.hypot(p.vx,p.vy)>0.5) → pushes++. And reset pushPrev in the no-contact branch ✓ (set false there).
+
+collideBoxWalls aggregated MTV:
+
+```js
+function collideBoxWalls(b){
+ let best=null;
+ const x0=Math.floor(b.x-b.half), x1=Math.floor(b.x+b.half), y0=…, y1=…;
+ for(j=y0..y1)for(i=x0..x1){ if(!isWall(i,j))continue;
+   const ox=Math.min(b.x+b.half, i+1)-Math.max(b.x-b.half,i);
+   const oy=Math.min(b.y+b.half, j+1)-Math.max(b.y-b.half,j);
+   if(ox<=0||oy<=0) continue;
+   let nx,ny,pen;
+   if(ox<oy){nx=(b.x<i+0.5)?-1:1; pen=ox;} else {ny=(b.y<j+0.5)?-1:1; pen=oy;}
+   if(!best||pen<best.pen) best={nx,ny,pen};
+ }
+ if(best){ b.x+=best.nx*best.pen; b.y+=best.ny*best.pen;
+   const vn=b.vx*best.nx+b.vy*best.ny;
+   if(vn<0){ const j=-(1+E_BW)*vn; b.vx-=j*best.nx; b.vy-=j*best.ny; onImpact(best, j, b); }
+ }
+}
+```
+
+collideBoxes:
+
+```js
+function collideBoxes(a,b){
+ const dx=b.x-a.x, dy=b.y-a.y;
+ const ox=(a.half+b.half)-Math.abs(dx), oy=(a.half+b.half)-Math.abs(dy);
+ if(ox<=0||oy<=0)return;
+ let nx,ny,pen;
+ if(ox<oy){nx=dx<0?-1:1; pen=ox;} else {ny=dy<0?-1:1; pen=oy;}
+ // n points from a to b
+ const w=0.5; a.x-=nx*pen*w; a.y-=ny*pen*w; b.x+=nx*pen*w; b.y+=ny*pen*w;
+ const rvx=b.vx-a.vx, rvy=b.vy-a.vy, vn=rvx*nx+rvy*ny;
+ if(vn<0){ const j=-(1+E_BB)*vn/(2/M_BOX); a.vx-=j*nx/M_BOX; … b.vx+=j*nx/M_BOX; …; if(j>0.4) clack(Math.min(1,j/3)); }
+}
+```
+
+onImpact: throttle per box (b.lastFx time), threshold j>0.5 → thud(vol), dust at contact point (box edge midpoint along -n), shake += min(.6, j*.05).
+
+Snap pass (per frame after substeps):
+
+```js
+for(const b of G.boxes){
+ const sp=Math.hypot(b.vx,b.vy);
+ if(sp<0.3 && !b.contact){
+   // find nearest legal center
+   let best=null,bd=1e9;
+   for(dj=-1..1)for(di=-1..1){ cx=Math.round(b.x)+di, cy=Math.round(b.y)+dj; wait centers are integers? Centers at (i+.5). Nearest candidate centers: i=floor(b.x), test i and i+1 → use Math.floor(b.x-0.5)… simpler: ic=Math.round(b.x-0.5) gives nearest cell index. Candidate cells (ic+di, jc+dj) di,dj∈{-1,0,1} with |di|+|dj|<=1? include diag too fine.
+     const cx=icx+0.5… check legal: box at center doesn't overlap any wall & within bounds:
+       for cells overlapping [cx-.4,cx+.4]×[cy-.4,cy+.4] → if any isWall → illegal.
+     d=hypot(cx-b.x, cy-b.y); if(d<bd){bd=d;best={cx,cy}}
+   }
+   if(best && bd<0.38){
+     const k=Math.min(1, 26*dtF); b.x+=(best.cx-b.x)*k; …; b.vx*=0.5;b.vy*=0.5;
+     if(bd<0.02 && sp<0.12){ b.x=best.cx;b.y=best.cy;b.vx=b.vy=0; onPark(b); }
+   }
+ } else { /* nothing */ }
+}
+```
+onPark: if box center inside a target → chime + gold sparkle burst (track already-chimed per box to avoid repeat: b.onTarget flag; fire when it becomes true and parked).
+
+Win check each frame:
+```js
+if(!G.won && G.started){
+ const all = G.boxes.every(b=>{ const sp=Math.hypot(b.vx,b.vy); if(sp>0.25||b.contact)return false; return G.targets.some(t=>Math.abs(b.x-t.i-0.5)<0.45&&Math.abs(b.y-t.j-0.5)<0.45); });
+ if(all){ G.won=true; G.winTimer=0.9; } // delay for chime/particles before overlay
+}
+if(G.won){ G.winTimer-=dtF; if(G.winTimer<=0) showWin(); }
+```
+showWin: jingle, confetti burst, save best, populate DOM, state='won', show overlay (with small delay? fine).
+
+Confetti spawn: 80 particles from top area / or from each target.
+
+Render specifics — I'll write drawing code with view transform:
+
+```js
+function render(){
+ ctx.setTransform(dpr,0,0,dpr,0,0);
+ // bg
+ drawBg(); // gradient + motes (screen space)
+ const shx=(Math.random()*2-1)*shake, shy=…;
+ ctx.save(); ctx.translate(v.ox+shx*cell? shake in px: v.ox+shx, v.oy+shy); ctx.scale(cell,cell);
+ drawFloor(); drawTargets(); drawWalls(); drawBoxes(); drawPlayer(); drawParticlesWorld();
+ ctx.restore();
+ drawVignette();
+}
+```
+Shake in pixel units: shx = mag*rand* (mag is px). Keep shakeMag in px (e.g., up to 14), decay.
+
+Wall drawing with slight pseudo-3D: for each wall cell (i,j):
+```js
+const x=i,y=j;
+// shadow on floor below if not wall below
+if(!isWall(i,j+1)) { ctx.fillStyle='rgba(6,12,18,.35)'; ctx.fillRect(x, y+1-0.14, 1, 0.14); } → draw before walls? Draw all shadows first then walls.
+face: fill '#1d3a4f'? let me pick wall palette: base #24455c, top bevel #3a6b8a? and inner border. Add subtle per-cell variation via hash (±4 lightness) → use two alternating tones.
+bevels: top strip h .16 lighter; left strip w .06 lighter-ish; bottom .12 darker; right .06 darker.
+outline: stroke dark rgba(0,0,0,.35) 0.02.
+```
+Also wall cells' "top face" could be a lighter square inset for a tile look. Good enough.
+
+Floor: base '#cfd8de'? slightly cool concrete; alt cell '#c6d1d8'. Speckle dots darker alpha .15. Also faint grid line rgba(0,0,0,.05). And targets drawn on top.
+
+Target pad: at (i+.5,j+.5): outer ring: rounded rect inset .16 size .68; stroke teal width .05 alpha pulse; fill rgba(teal, .12 + .08*pulse); center dot r .1 filled teal glow (shadowBlur? use radial gradient circle). Filled (parked box on it) → gold.
+Check "filled" per frame: any parked box within .45 & slow — compute during update into pad.fill flag with smoothing (pad.glow lerp).
+
+Box: shadow ellipse offset (0.06, 0.1) alpha .25. Body: rounded rect size .8 r=.09; wood gradient fill (#d18a45 top → #a9632b bottom); plank lines: two horizontal darker lines; diagonal cross? Classic crate: border frame + X. Draw: outer frame stroke #7c4a1e width .08 inset .02; corner brackets: 4 L-shapes in steel '#dfe9f0' with slight shadow; inner panel slightly darker. Rotate by b.spin*0.35 for subtle rolling pattern? Rotating the whole box by spin makes it look like tumbling — too much. Instead rotate only the inner plank pattern? Simpler: skip rotation, add "wobble": rotate entire box by sin(time*13+phase)*min(.06, speed*.02) — subtle jiggle while sliding ✓ plus dust. I'll do wobble not spin (drop spin or keep for pattern offset: plankOffset = (b.spin % 1)*? skip). Keep wobble.
+On target & slow: gold glow stroke around + shadowBlur amber.
+
+Player: shadow ellipse; body circle r .32 gradient (#ff7a5c → #e0492f); rim stroke dark; face: two eyes (white circles with dark pupils offset toward look dir), blink every ~3s (eye scaleY); antenna: line up + ball, swaying by sin(t*6+vx) & velocity tilt; squash: scale along velocity: s=min(.18, speed*.045); rotate to velAngle, scale(1+s,1-s).
+Idle bob: r *= 1+sin(t*3)*.02.
+
+Particles world-space drawn within transform (size in grid units). Confetti on win maybe screen space for full-screen — draw in world but spawn across level width; fine.
+
+Motes screen space: 36 dots, drift, wrap; alpha .05-.18 white-blue. Draw before world? Behind world → draw after bg, before world ✓.
+
+Vignette offscreen canvas: create on resize; radial gradient centered slightly above middle: inner transparent (radius .55*max) → outer rgba(5,10,16,.55). Also add subtle top glow amber? Keep neutral.
+
+HUD update per frame (cheap textContent set only when changed — just set each frame, fine).
+
+Best storage:
+```js
+const store={ get(){try{return JSON.parse(localStorage.getItem(KEY)||'{}')}catch(e){return{}}}, set(v){try{localStorage.setItem(KEY,JSON.stringify(v))}catch(e){}} };
+bestFor(i): obj → {t,pushes}|null. On win: if !b || t<b.t → save (keep best time; show pushes at that time? just track best time & its push count).
+```
+
+Menu shows per-level best times list (small mono table). Update when menu shown.
+
+Buttons/keys:
+- Enter or Space: menu→start(level 0 or selected?) start level 0… maybe keep "continue" = first uncompleted level? Nice touch: track progress count in store; Start button says "START" and begins at first level without a best time (or 1). Plus small level select dots on menu? Keep scope: add clickable level chips 1-6 on menu! Easy: buttons with numbers, disabled if previous not cleared? Physics game is forgiving — allow free selection. Add row of 6 chips; clicking selects and starts. Chips show ✓ if best exists.
+- In playing: R restart, M mute, Esc → menu.
+- On win: Enter/N next (or replay-all on last), R replay, Esc menu.
+
+Keydown handler must init audio (ctx resume) — any key.
+
+Prevent default for arrows/space to stop page scroll (no scrollbars but iframe may still). Also prevent space from activating focused button double-trigger — blur buttons after click.
+
+Pointer: canvas pointerdown → active=true, set pos; pointermove update; pointerup/leave → false. Convert client coords to world: (e.clientX - rect.left) etc / cell + view offset… note shake is excluded ✓ use v.ox without shake.
+
+Also first pointer/key initializes audio & starts level timer if playing.
+
+State transitions:
+```js
+function setState(s){G.state=s; toggle overlay/hud classes}
+startGame(i): loadLevel(i); state='playing'; started=false; hide menu/win; show hud.
+onWin(): compute, save, populate win DOM (level name, time, pushes, best, isNewBest), jingle+confetti, state='won', show overlay after short delay? show immediately but canvas keeps animating behind ✓.
+nextLevel(): i+1 < LEVELS.length ? startGame(i+1) : startGame(0)? Label handled.
+toMenu(): state='menu'; loadLevel(G.level) to keep bg; refresh best list; show menu.
+```
+
+Attract mode: when state 'menu', still run a light simulation? Boxes sitting still is boring — add idle: occasionally nudge? Skip physics in menu but animate targets pulse + motes + player bob (render uses time). Enough. Actually let me run physics in menu too with no input — boxes are at rest, fine.
+
+One more polish: "combo" text popup when a box parks on target: floating "+PARKED" small? Add floating text particle type 'text' rising and fading. Nice juice ✓. Also show "PERFECT!" when all park in one chain? Skip.
+
+Also add subtle floor shadow under player & boxes (done) and light sweep? enough.
+
+Now — writing the final code. Careful with:
+- ctx.roundRect availability: implement helper rr(x,y,w,h,r) manually for safety.
+- performance: fine.
+
+Let me also double check the L3 map strings again since I revised:
+L3 (10 wide, 8 tall):
+r0 "##########"
+r1 "#.......##"  → cols 8,9 walls; 10 chars ✓
+r2 "#.$....%.#"  → # . $ . . . . % . # = 10 ✓ box(2,2), target(7,2)
+r3 "#..$...%.#"  → # . . $ . . . % . # = 10 ✓ box(3,3), target(7,3)
+r4 "#........#"
+r5 "#..@.....#"  player (3,5)
+r6 "#........#"
+r7 "##########"
+Reachability to left of boxes: col 1 open rows 1-6? r1 col 1 '.' ✓. Push box A right from (1,2): player path (3,5)→(2,5)? '.' ✓ →(1,5),(1,4),(1,3),(1,2) ✓. Box B from (2,3): (1,3)→(2,3) ✓.
+
+L5 map (11 wide 9 tall):
+r0 "###########"
+r1 "#@........#"  → 11 ✓ player(1,1)
+r2 "#.$..$..$.#"  → # . $ . . $ . . $ . # = 11 ✓ boxes (2,2),(5,2),(8,2)
+r3 "#.........#"
+r4 "#.........#"
+r5 "#.%..%..%.#"  → # . % . . % . . % . # = 11 ✓ targets (2,5),(5,5),(8,5)
+r6 "#.##..#..##"  → chars: #,.,#,#,.,.,#,.,.,#,# = 11 ✓ walls (2,6),(3,6)? wait idx2='#',idx3='#' → wall at col 3 too! I wanted backstops only at cols 2,5,8. Let me recount desired: walls at idx 0,2,5,8,10 → string: idx0'#',1'.',2'#',3'.',4'.',5'#',6'.',7'.',8'#',9'.',10'#' → "#.##..#..##"? let me join: '#'+'.'+'#'+'.'+'.'+'#'+'.'+'.'+'#'+'.'+'#' = "#.##..#..##" — count that string's chars: #,.,#,#? no! Joining sequentially: pos0 '#', pos1 '.', pos2 '#', pos3 '.', pos4 '.', pos5 '#', pos6 '.', pos7 '.', pos8 '#', pos9 '.', pos10 '#' → written out: "#." + "#" + ".." + "#" + ".." + "#" + "." + "#" = "#.##..#..##"? Let me literally concatenate: ['#','.','#','.','.','#','.','.','#','.','#'].join('') = "#.##..#..##". Hmm: # . # . . # . . # . # → as a string: "#.##..#..##" — let me count that literal: #(1) .(2) #(3) .(4) .(5) #(6) .(7) .(8) #(9) .(10) #(11) = 11 chars, positions of # at 1,3,6,9,11 (1-based) = idx 0,2,5,8,10 ✓✓. So r6 = "#.##..#..##" is correct as literal (I misread it as col 3 wall earlier — the literal has # at chars 1,3,6,9,11 → idx 0,2,5,8,10 ✓).
+
+Phew. Similarly L6 r6 "#...##.##..#": chars: #(1).(2).(3).(4)#(5)#(6).(7)#(8)#(9).(10).(11)#(12) → # at idx 0,4,5,7,8,11 ✓ backstops cols 4,5,7,8 ✓.
+L6 r5 "#...%%.%%..#": #(1).(2).(3).(4)%(5)%(6).(7)%(8)%(9).(10).(11)#(12) → targets idx 4,5,7,8 ✓ matches backstops ✓.
+L6 r2 "#.$$...$$..#": #(1).(2)$(3)$(4).(5).(6).(7)$(8)$(9).(10).(11)#(12) → boxes idx 2,3,7,8 ✓.
+
+All good. Now the win overlay "next" on last level: label "PLAY AGAIN ↻" → startGame(0). Also show total best times? Skip.
+
+Level chips on menu: generate divs; each shows number + tiny check if best exists. Click → startGame(i). Selected highlight not needed (starts immediately).
+
+Now audio code concretely:
+
+```js
+const AU={ctx:null,on:true,slideG:null,noise:null,
+ init(){ if(this.ctx)return; const C=window.AudioContext||window.webkitAudioContext; if(!C)return;
+  this.ctx=new C(); const m=this.master=this.ctx.createGain(); m.gain.value=.55; m.connect(this.ctx.destination);
+  // noise buffer
+  const len=this.ctx.sampleRate|0, buf=this.ctx.createBuffer(1,len,this.ctx.sampleRate), d=buf.getChannelData(0);
+  for(let i=0;i<len;i++)d[i]=Math.random()*2-1; this.noise=buf;
+  // slide loop
+  const src=this.ctx.createBufferSource(); src.buffer=buf; src.loop=true;
+  const bp=this.ctx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=420; bp.Q.value=.8;
+  this.slideG=this.ctx.createGain(); this.slideG.gain.value=0;
+  src.connect(bp).connect(this.slideG).connect(m); src.start();
+ },
+ resume(){ if(this.ctx&&this.ctx.state==='suspended') this.ctx.resume(); },
+ env(type,f0,f1,t,vol,dur){ if(!this.ctx)return; const o=this.ctx.createOscillator(),g=this.ctx.createGain(); o.type=type; o.frequency.setValueAtTime(f0,this.ctx.currentTime); if(f1)o.frequency.exponentialRampToValueAtTime(Math.max(1,f1),this.ctx.currentTime+dur); g.gain.setValueAtTime(vol,this.ctx.currentTime); g.gain.exponentialRampToValueAtTime(.0001,this.ctx.currentTime+dur); o.connect(g).connect(this.master); o.start(); o.stop(this.ctx.currentTime+dur+.02); },
+ noiseHit(vol,dur,fc,type='lowpass'){ if(!this.ctx)return; const s=this.ctx.createBufferSource(); s.buffer=this.noise; const f=this.ctx.createBiquadFilter(); f.type=type; f.frequency.value=fc; const g=this.ctx.createGain(); const t0=this.ctx.currentTime; g.gain.setValueAtTime(vol,t0); g.gain.exponentialRampToValueAtTime(.0001,t0+dur); s.connect(f).connect(g).connect(this.master); s.start(); s.stop(t0+dur+.02); },
+ thud(v){ this.env('sine',95,40,.14,v); this.noiseHit(v*.6,.09,300); },
+ clack(v){ this.env('triangle',240,120,.07,v); this.noiseHit(v*.5,.05,2400,'highpass'); },
+ chime(){ if(!this.ctx)return; const t=this.ctx.currentTime; [[660,0],[990,.09]].forEach(([f,dt])=>{const o=this.ctx.createOscillator(),g=this.ctx.createGain();o.type='sine';o.frequency.value=f;g.gain.setValueAtTime(.0001,t+dt);g.gain.exponentialRampToValueAtTime(.25,t+dt+.02);g.gain.exponentialRampToValueAtTime(.0001,t+dt+.5);o.connect(g).connect(this.master);o.start(t+dt);o.stop(t+dt+.55);}); },
+ jingle(){ [523,659,784,1046].forEach((f,i)=>setTimeout(()=>this.env('triangle',f,null,.18,.3),i*110)); },
+ blip(f=520){ this.env('square',f,f*.8,.06,.12); }
+};
+```
+Mute: AU.master.gain.value = on? .55 : 0.
+
+Slide gain update per frame: `if(AU.slideG){ const t=maxBoxSpeed/7; target=…; g += (target-g)*min(1,dt*12); }`
+
+Throttle impacts: global lastThud time; require >60ms between thuds.
+
+Floating text particles: {type:'text', str, x,y, vy:-1.2, life}. Draw with font in world units — ctx.font = `700 ${0.34}px Impact, sans-serif`? Font px under scaled ctx works (scales). Set textAlign center.
+
+Confetti colors: [amber, teal, cream, red, steel].
+
+Now the HUD DOM:
+```html
+<div id=hud>
+ <div class=hl><span class=tag>SOKOBAN PHYSICS</span><span id=lvName class=name>WARM-UP</span></div>
+ <div class=hr>
+   <div class=stat><label>TIME</label><b id=timeEl>0:00.0</b></div>
+   <div class=stat><label>PUSHES</label><b id=pushEl>0</b></div>
+   <div class=stat><label>BEST</label><b id=bestEl>—</b></div>
+ </div>
+</div>
+<div id=hint>R RESTART · M SOUND · ESC MENU</div>
+```
+
+Menu DOM:
+```html
+<div id=menu class=overlay>
+ <div class=mwrap>
+  <div class=kicker>CANVAS PHYSICS PUZZLE — SIX LEVELS</div>
+  <h1 class=title><span class=t1>SLIDE</span><span class=t2>WORKS</span></h1>
+  <p class=tagline>Sokoban with real momentum. Crates <b>flick, chain and slide</b> — park every one on a glowing pad.</p>
+  <div class=mrow>
+    <div class=cards>
+      <div class=crow><span class=kbd>W A S D</span><span class=kbd>←↑↓→</span><em>walk & push</em></div>
+      <div class=crow><span class=kbd>MOUSE</span><em>hold to steer</em></div>
+      <div class=crow><span class=kbd>R</span><em>restart level</em> <span class=kbd>M</span><em>sound</em> <span class=kbd>ESC</span><em>menu</em></div>
+    </div>
+    <button id=startBtn class=bigbtn>START PUSHING</button>
+  </div>
+  <div class=chips id=chips></div>
+  <div class=bests id=bests></div>
+  <div class=prompt>PRESS <span class=kbd>ENTER</span> TO START</div>
+ </div>
+</div>
+```
+
+Win DOM:
+```html
+<div id=win class="overlay hidden">
+ <div class=wpanel>
+  <div class=stamp>CLEARED!</div>
+  <div id=wName class=wname>LEVEL 1 — WARM-UP</div>
+  <div class=wstats>
+    <div><label>TIME</label><b id=wTime></b></div>
+    <div><label>PUSHES</label><b id=wPush></b></div>
+    <div><label>BEST</label><b id=wBest></b></div>
+  </div>
+  <div id=newBest class=nb hidden>★ NEW BEST ★</div>
+  <div class=wbtns><button id=nextBtn class=bigbtn>NEXT LEVEL →</button><button id=replayBtn class=ghostbtn>REPLAY (R)</button></div>
+ </div>
+</div>
+```
+
+CSS: I'll write it thoughtfully. Title: two spans block; t1 cream with hard shadow offset in red? Retro print: color #f4ead8, text-shadow: 4px 4px 0 #ff5d4d33? Let me do: t1 solid cream, t2 amber outline style: -webkit-text-stroke: 2px var(--amber); color: transparent → fallback fine (most browsers support). Add slight rotate(-2deg) on h1.
+
+Panel for win: background #10222f with border 2px #2b4a63, corner brackets via ::before/::after? Use box-shadow layers + clip-path polygon cutting corners: `clip-path: polygon(0 12px, 12px 0, calc(100% - 12px) 0, 100% 12px, 100% calc(100% - 12px), calc(100% - 12px) 100%, 12px 100%, 0 calc(100% - 12px))` — nice crate-corner look ✓.
+
+Buttons: display font, bg amber, color #14202b, border-bottom 4px darker (pressable), hover lift. Ghost: transparent with line border.
+
+Chips: row of square buttons 34px mono; .done has teal dot.
+
+Blink prompt: animation steps.
+
+Media query max-width 640: title smaller, mrow stacks.
+
+Also add a subtle CSS scanline/noise? Skip — canvas handles ambience.
+
+Now let me write the render code fully. I'll be careful about ctx state (save/restore), font resets.
+
+drawBg: fill #0a1520; big soft radial light top-left teal alpha .06, bottom-right amber .05 (two createRadialGradient per frame OK); motes.
+
+Motes update in screen px with dt.
+
+Floor speckle: for each floor cell if hash%5==0 draw 2 dots at hashed offsets.
+
+Let me write hash: `function h2(i,j){let n=i*374761393+j*668265263;n=(n^(n>>13))*1274126177;return (n^(n>>16))>>>0;}`.
+
+Wall palette: baseA '#274b63', baseB '#2c536e' alternating by hash%2? plus bevels: top '#4d80a3', bottom '#16303f'. Outline 'rgba(8,18,26,.6)'.
+
+Floor palette: A '#c9d3da', B '#c2cdd5'; lines rgba(20,40,55,.08); speckle 'rgba(30,50,65,.18)'.
+
+Hmm the floor is quite light vs dark bg — good contrast for HUD legibility (HUD over dark bg area since level is centered with margins ✓).
+
+Target pad colors: teal '#2fe6c0'; glow via radial gradient rgba(47,230,192,.35→0) radius .8; ring stroke width .045 alpha .55+.3*sin(t*2.6 + (i+j)); center square dot rotated 45deg? Draw a diamond: small rect rotated 45°, size .16. Filled → amber '#ffc94d' with stronger glow and slower pulse; plus occasional sparkle emit when fill>0.8.
+
+Pad.fill computed in update: for each pad, find parked box (slow & within .45) → target=1 else 0; lerp pad.g += (target-g)*min(1,dt*6).
+
+Box drawing with wobble angle: `const sp=hypot(v); const wob = Math.sin(G.time*14 + b.phase) * Math.min(.07, sp*.035);` rotate around center.
+Wood: gradient '#d99a52'→'#b06f31'; frame stroke '#8a5222' lw .07; planks: horizontal lines at ±.13; corner brackets steel: 4 small L paths '#e6eef4' with shadow 'rgba(0,0,0,.25)' offset? Just draw L's in two tones (light + dark edge). Keep simple: bracket = filled path per corner: e.g., top-left: from (-.4,-.4) to (-.18,-.4),(-.18,-.32),(-.26,-.32),(-.26,-.24)… too fiddly; simpler brackets: 4 short thick lines at corners forming L's, stroke '#dfe9f0' lw .07 + darker under-stroke offset .015 'rgba(0,0,0,.3)'.
+Glow when pad fill high & box slow: stroke rounded rect amber alpha .8 lw .06 + shadowBlur? use double stroke (outer rgba(255,201,77,.35) lw .14, inner solid).
+
+Player drawing as planned. Eyes: position offset look = normalized vel (or input dir if moving), else idle wander sin(t). Blink: t%3<0.12 → scaleY .1.
+
+Antenna: from top of body (rotated?) — draw in unrotated space for simplicity: line from (x, y-r*.8) up .22 with sway angle; ball r .05 amber glow. Cute.
+
+Draw order note: boxes before player so player overlaps ✓.
+
+Particles: dust color 'rgba(190,200,205,α)' circle; spark gold; confetti rect rotated; text.
+Update: life-=dt; pos+=vel*dt; vel*=drag; confetti vy+=g*dt, rot+=vr*dt; alpha=life/max.
+
+Spawn helpers: dustBurst(x,y,nx,ny,pow), slideDust(b) (rate-limited via b.dustT), sparkle(x,y), confettiRain().
+
+Shake: G.shake += amt; decay in update: shake*=exp(-5dt); offset = shake*(rand-.5)*2 each frame (px). Cap 16.
+
+Now the main loop:
+```js
+let last=performance.now(), acc=0; const STEP=1/60, SUB=6;
+function frame(now){ requestAnimationFrame(frame); let dt=(now-last)/1000; last=now; if(dt>0.1)dt=0.1; G.time+=dt;
+ // update
+ if(G.state==='playing'||G.state==='won'){ /* keep physics running in won? freeze boxes: only particles */ }
+ if(G.state==='playing'){ const n=SUB; for(let i=0;i<n;i++) physStep(dt/n); snapPass(dt); winCheck(dt); if(G.started){G.timeLvl+=dt;} }
+ slideSound(dt); updateParticles(dt); updateMotes(dt); shakeDecay(dt); padFills(dt); render(); hudText();
+}
+```
+Separate G.time (global anim clock) from G.timeLvl (level timer).
+
+On 'won' state: skip physics (frozen scene + confetti) ✓ looks nice behind overlay.
+
+hudText: timeEl = fmt(G.timeLvl), pushEl, bestEl (static per level — set on load).
+
+fmt(t): m=floor(t/60); s=(t%60); `${m}:${s<10?'0':''}${s.toFixed(1)}`.
+
+Input keys: normalize e.key.toLowerCase(); map 'arrowup' etc + wasd; preventDefault for arrows/space/enter? Enter default fine (buttons). Prevent space scroll ✓ and arrows ✓.
+
+Keydown actions:
+- if !AU.ctx → AU.init() (must be within user gesture — keydown qualifies) & resume.
+- state menu: Enter/Space → startGame(selectedChip?0); also digits 1-6 select+start? chips are buttons; keyboard digits nice: if key in '123456' → startGame(d-1).
+- playing: r → restart (loadLevel same, blip), m → mute, Escape → toMenu.
+- won: Enter/n → next; r → replay; Escape → menu.
+
+Buttons wired with click + blur().
+
+Resize: canvas.width=innerWidth*dpr etc; ctx.setTransform(dpr…) each render start anyway; computeView(); rebuild vignette offscreen.
+
+computeView also stores cell for pointer mapping and font scaling (world fonts scale automatically via transform ✓).
+
+Pointer world coords: wx=(e.clientX - v.ox)/v.cell, wy=(e.clientY - v.oy)/v.cell.
+
+Edge: overlays cover canvas → pointerdown on overlay won't reach canvas; that's fine (menu start via click anywhere? add menu click handler → start). Menu overlay pointer-events: yes for buttons; clicking empty area of menu → start too ✓ (listener on #menu, but chip clicks stopPropagation).
+
+Now — also the "start screen with controls" requirement ✓, restart without reload ✓.
+
+Let me also think about player getting stuck pushing box into a corner while holding key: box against wall, player pressing: each substep small separation + impulse; player oscillates slightly — acceptable; add tiny extra damping on player when in contact? fine as is.
+
+Another risk: push counter increments when player just walks past a box slowly (contact starts) — that's actually correct (a push attempt).
+
+Box-box resting stack: two boxes side by side at rest, damping brings to 0 ✓ no jitter because impulse only if vn<0 and position correction only on overlap; after settling no overlap (snap may cause small overlap → next frame separates gently ✓ but snap disabled while… box.contact is player-contact only. Snap-to-legal-cell ignores other boxes → possible overlap after snap; separation pass fixes with small impulses; low speed so fine).
+
+Snap legal check must also ensure within map bounds: isWall returns true for out-of-bounds ✓ covered.
+
+Also make sure targets list matches boxes count in all levels (verified: 2/2,1/1,2/2,2/2,3/3,4/4 ✓).
+
+Win overlay next button label: if last level → "PLAY AGAIN ↻" and startGame(0); else "NEXT LEVEL →".
+
+Bests list on menu: for each level with best: "L1 WARM-UP · 0:07.2 · 3 pushes"; if none: "NO RECORDS YET — GO LEAVE SOME".
+
+Chips: button per level, text number; class done if best exists.
+
+Now let me write out the full file. I'll be meticulous with syntax. Estimated ~700-900 lines. Let's go.
+
+Also title in <title>: "SLIDEWORKS — Sokoban Physics".
+
+Double-check that physStep uses G.player possibly null? Only during playing/won; player always exists after load ✓.
+
+drawParticles world: for each p, switch by type. Text particle font: `bold ${p.size}px 'Arial Black', Impact, sans-serif` — under scaled ctx, size is in grid units (e.g., 0.32). Fill with color + slight shadow.
+
+Confetti spawn on win: for i<90: x random across level width, y = -1..-3 above? Spawn from top of map area: y=-rand*3, vy 2+rand*3, vx ±1, size .12-.2 grid units… but world coords are clamped to level; confetti above level is fine visually (bg shows). Life 2.5s. Colors array.
+
+Sparkle on park: 10 gold particles radial.
+
+Dust on wall impact: at contact point = box center - n*half, spawn 6 gray puffs with velocity along -n * pow.
+
+Slide dust: while sp>1.6: b.dustT-=dt; if<=0 {b.dustT=0.05; spawn at (b.x + (rand-.5)*.7, b.y+.38) small}.
+
+Sound slide loop gain target uses max box speed & player.
+
+I think the design is solid. Let me write it.
+
+One more check — collideCircleWalls for player when center inside wall cell: handled. Player radius .32 < half corridor ✓.
+
+Box wobble phase: b.phase = random at creation.
+
+Level intro flash: on load, brief "LV n" text? HUD shows name; add a floating big text at level start (type 'banner', life 1.6, fades). Nice.
+
+HUD hidden in menu state via class.
+
+Mute indicator: hint bar shows "M SOUND: ON/OFF" updated.
+
+Let me write the code now, final. Careful with template literals inside HTML — fine.
+
+Also iframe-resize: use window resize + also ResizeObserver on body? window resize should fire when iframe resizes ✓ plus initial call.
+
+devicePixelRatio changes on zoom → recompute in resize (also listen to matchMedia? skip).
+
+Font stacks:
+--display: 'Arial Black','Avenir Next Condensed',Impact,'Franklin Gothic Medium',system-ui,sans-serif; hmm Arial Black is wide; Impact condensed is more "gamey". Use: Impact, 'Arial Narrow Bold', 'Helvetica Neue Condensed', sans-serif? Let me do: `Impact, Haettenschweiler, 'Arial Narrow', sans-serif` for display (condensed poster), and mono for data: `ui-monospace, 'SF Mono', Menlo, Consolas, monospace`, body: `system-ui, -apple-system, 'Segoe UI', sans-serif`. Distinctive pairing ✓.
+
+Title size: clamp(56px, 12vw, 140px). t2 with stroke.
+
+Alright, let me write it all out. Also ensure no external requests at all. Wrap localStorage in try/catch ✓. No alert/confirm/prompt ✓.
+
+Let me carefully write the wobble rotation and box draw:
+
+```js
+function drawBoxes(){ for(const b of G.boxes){ const sp=Math.hypot(b.vx,b.vy);
+ // shadow
+ ctx.fillStyle='rgba(10,20,28,.28)'; ellipse at (b.x+.05,b.y+.09, .46,.40)? draw ellipse: ctx.beginPath(); ctx.ellipse(x,y,rx,ry,0,0,TAU); fill.
+ const ang=Math.sin(G.time*13+b.phase)*Math.min(.07,sp*.03);
+ ctx.save(); ctx.translate(b.x,b.y); ctx.rotate(ang);
+ const h=B_HALF; // .4
+ rr(-h,-h,2h,2h,.08) fill with gradient createLinearGradient(0,-h,0,h): '#dc9c55'→'#a76a2e';
+ frame: rr(-h+.03,-h+.03,2h-.06,2h-.06,.06) stroke '#7e4b1d' lw .05;
+ planks: line at y=-.13 and .13 x from -h+.08 to h-.08 stroke 'rgba(90,50,15,.5)' lw .035;
+ brackets: 4 corners L strokes '#e8f1f7' lw .06 with under-shadow 'rgba(0,0,0,.28)' lw .09 offset? draw dark first then light.
+ // target glow
+ const onT = padFillAt(b) — precompute in update: b.onPad (0..1). if b.onPad>.5 && sp<.3: rr(-h-.04,...) stroke 'rgba(255,201,77,.9)' lw .05; outer glow stroke 'rgba(255,201,77,.28)' lw .16;
+ ctx.restore(); } }
+```
+
+Corner L path helper: function bracket(x,y,sx,sy){ moveTo(x+sx*.2, y); lineTo(x,y); lineTo(x, y+sy*.2); } stroke.
+
+Player:
+```js
+const p=G.player; sp=hypot; look dir = sp>.3? v/sp : idle (sin(t*.8)*…small) or last input dir.
+shadow ellipse (p.x+.04,p.y+.1,.34,.3).
+ctx.save(); translate(p.x,p.y); if(sp>.2){rotate(atan2(vy,vx)); scale(1+sq, 1-sq);} 
+body: radial gradient circle r P_R: '#ff8a6a'→'#e04b2f'; stroke 'rgba(60,15,5,.5)' lw .03.
+cheeks? skip. eyes: in rotated frame, forward = +x: eyes at (.10,±.11) r .075 white; pupils (.135,±.11) r .038 dark; blink scaleY.
+antenna: draw before rotate restore? draw after restore in world: base (p.x, p.y - P_R*.9): sway = sin(G.time*7 + p.x)*.2 + clamp(p.vx,-1,1)*.15; line to (base + sin(sway)*.18, -.2); ball r .045 fill amber glow stroke.
+ctx.restore();
+```
+
+OK writing final answer now. Keep code organized with comments. Also add `<meta name="color-scheme" content="dark">`.
+
+Also make sure that the menu overlay is above canvas (z-index), HUD below overlays.
+
+Potential pitfall: `keys` object — use e.key.toLowerCase(); space key = ' '.
+
+Enter on menu also triggers when a button has focus → double start; guard: in keydown, if e.target is a button and key===' '||'Enter' let default? Simpler: after every button click call btn.blur(), and preventDefault Enter/Space in our handler to stop button activation. I'll preventDefault for space & arrows always (when not typing — no inputs exist) ✓.
+
+Chips keyboard digits: startGame(n). Also update selected highlight? Just start.
+
+Alright, also "won" state still needs render of the scene; physics frozen so boxes stay in place ✓ confetti falls via particles ✓.
+
+Level banner text particle on load: {type:'text', str:`LEVEL ${i+1}`, sub?} plus name — two texts or one with \n? Canvas fillText is single line; spawn two (name smaller below). Fine: big "LV 3" and smaller level name.
+
+Time to write it. I'll keep functions tight but complete. Also ensure I test the logic in my head for typos as I go.
+
+Final check on substep count & dt clamp: frame dt≤0.1, SUB=6 → substep ≤0.0167; max speed 6.4 c/s → movement per substep .107 cells < box half ✓ no tunneling.
+
+Player-box impulse magnitudes: player v 6, box 0: vn=6, j=(1+.18)*6/(1+1/2.6)=7.08/(1.385)=5.11; box dv = j/2.6≈1.96 c/s initial — then continued pushing accelerates it further ✓ feels weighty but responsive.
+
+Box-box chain: e=.45 bouncy clack ✓ fun.
+
+I'm confident. Writing the file.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>SLIDEWORKS — Sokoban Physics</title>
+<style>
+:root{
+  --ink:#0a1520; --panel:#10222f; --line:#2b4a63; --amber:#ffb02e; --teal:#2fe6c0;
+  --cream:#f4ead8; --red:#ff5d4d; --steel:#dfe9f0;
+  --disp:Impact,Haettenschweiler,'Arial Narrow',sans-serif;
+  --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  --body:system-ui,-apple-system,'Segoe UI',sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;background:var(--ink)}
+canvas{position:fixed;inset:0;display:block;width:100vw;height:100vh}
+.hidden{display:none!important}
+kbd{font-family:var(--mono);font-size:11px;color:var(--cream);background:#16324a;border:1px solid var(--line);border-bottom-width:3px;border-radius:5px;padding:2px 7px;letter-spacing:.5px;white-space:nowrap}
+button{font-family:var(--disp);cursor:pointer;letter-spacing:1.5px;text-transform:uppercase}
+button:focus-visible{outline:3px solid var(--teal);outline-offset:2px}
+
+/* ---------- HUD ---------- */
+#hud{position:fixed;top:0;left:0;right:0;display:flex;justify-content:space-between;align-items:flex-start;padding:14px 20px;pointer-events:none;z-index:5;text-shadow:0 2px 6px rgba(0,0,0,.6)}
+#hud .tag{font-family:var(--mono);font-size:10px;letter-spacing:3px;color:var(--teal)}
+#hud .name{display:block;font-family:var(--disp);font-size:30px;letter-spacing:2px;color:var(--cream);margin-top:2px}
+#hud .hr{display:flex;gap:26px;text-align:right}
+.stat label{display:block;font-family:var(--mono);font-size:9px;letter-spacing:2.5px;color:#7fa3bd}
+.stat b{font-family:var(--mono);font-weight:700;font-size:24px;color:var(--cream)}
+.stat.best b{color:var(--amber)}
+#hint{position:fixed;bottom:10px;left:50%;transform:translateX(-50%);z-index:5;font-family:var(--mono);font-size:10px;letter-spacing:2px;color:#5f83a0;text-shadow:0 1px 4px rgba(0,0,0,.7)}
+
+/* ---------- overlays ---------- */
+.overlay{position:fixed;inset:0;z-index:10;display:flex}
+#menu{background:linear-gradient(105deg,rgba(6,13,20,.92) 0%,rgba(6,13,20,.78) 42%,rgba(6,13,20,.35) 100%);align-items:center}
+.mwrap{padding:5vh 6vw;max-width:760px;width:100%}
+.kicker{font-family:var(--mono);font-size:11px;letter-spacing:4px;color:var(--teal);margin-bottom:18px;display:flex;align-items:center;gap:12px}
+.kicker::before{content:"";width:34px;height:2px;background:var(--teal)}
+h1.title{font-family:var(--disp);line-height:.82;transform:rotate(-2deg);margin-left:-4px;user-select:none}
+h1 .t1{display:block;font-size:clamp(58px,13vw,148px);color:var(--cream);text-shadow:0 6px 0 rgba(255,93,77,.28)}
+h1 .t2{display:block;font-size:clamp(58px,13vw,148px);color:transparent;-webkit-text-stroke:2.5px var(--amber);text-shadow:0 6px 0 rgba(255,176,46,.15)}
+.tagline{margin:22px 0 26px;font-family:var(--body);font-size:clamp(14px,1.6vw,18px);color:#b9cddd;max-width:520px;line-height:1.5}
+.tagline b{color:var(--amber);font-weight:700}
+.mrow{display:flex;align-items:center;gap:26px;flex-wrap:wrap}
+.cards{background:rgba(13,30,44,.75);border:1px solid var(--line);padding:14px 18px;display:flex;flex-direction:column;gap:9px;clip-path:polygon(0 10px,10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%)}
+.crow{display:flex;align-items:center;gap:8px;font-family:var(--body);font-size:13px;color:#a9c2d6}
+.crow em{font-style:normal;margin-left:4px}
+.bigbtn{background:var(--amber);color:#14202b;border:none;border-bottom:5px solid #b06f14;font-size:22px;padding:16px 30px;transition:transform .12s,box-shadow .12s,filter .12s}
+.bigbtn:hover{transform:translateY(-3px);box-shadow:0 8px 22px rgba(255,176,46,.35);filter:brightness(1.06)}
+.bigbtn:active{transform:translateY(1px);border-bottom-width:2px}
+.ghostbtn{background:transparent;color:var(--cream);border:2px solid var(--line);padding:14px 22px;font-size:16px;transition:border-color .12s,transform .12s}
+.ghostbtn:hover{border-color:var(--teal);color:var(--teal);transform:translateY(-2px)}
+.chips{display:flex;gap:8px;margin-top:26px}
+.chip{width:40px;height:40px;background:#13293c;border:1px solid var(--line);border-bottom-width:4px;color:var(--cream);font-size:17px;position:relative;transition:transform .1s,background .1s}
+.chip:hover{background:#1b3a52;transform:translateY(-2px)}
+.chip.done::after{content:"";position:absolute;top:4px;right:4px;width:7px;height:7px;border-radius:50%;background:var(--teal);box-shadow:0 0 6px var(--teal)}
+.bests{margin-top:18px;font-family:var(--mono);font-size:12px;color:#7fa3bd;letter-spacing:1px;line-height:1.9}
+.bests b{color:var(--amber)}
+.prompt{margin-top:26px;font-family:var(--disp);font-size:20px;letter-spacing:3px;color:var(--cream);animation:blink 1.4s steps(2) infinite}
+@keyframes blink{50%{opacity:.25}}
+
+/* ---------- win ---------- */
+#win{background:rgba(6,13,20,.62);align-items:center;justify-content:center}
+.wpanel{background:var(--panel);border:2px solid var(--line);padding:40px 48px;text-align:center;min-width:min(420px,90vw);clip-path:polygon(0 16px,16px 0,calc(100% - 16px) 0,100% 16px,100% calc(100% - 16px),calc(100% - 16px) 100%,16px 100%,0 calc(100% - 16px));animation:pop .35s cubic-bezier(.2,1.6,.4,1)}
+@keyframes pop{from{transform:scale(.7) rotate(-4deg);opacity:0}}
+.stamp{display:inline-block;font-family:var(--disp);font-size:clamp(40px,6vw,60px);letter-spacing:3px;color:var(--amber);border:5px solid var(--amber);padding:4px 22px;transform:rotate(-6deg);margin-bottom:18px;text-shadow:0 0 18px rgba(255,176,46,.4)}
+.wname{font-family:var(--mono);font-size:13px;letter-spacing:3px;color:#8fb2cc;margin-bottom:22px}
+.wstats{display:flex;justify-content:center;gap:34px;margin-bottom:8px}
+.wstats label{display:block;font-family:var(--mono);font-size:9px;letter-spacing:2.5px;color:#7fa3bd;margin-bottom:4px}
+.wstats b{font-family:var(--mono);font-size:26px;color:var(--cream)}
+.nb{font-family:var(--disp);color:var(--teal);letter-spacing:3px;font-size:18px;margin:10px 0 4px;animation:blink 1s steps(2) infinite}
+.wbtns{display:flex;gap:14px;justify-content:center;margin-top:22px;flex-wrap:wrap}
+
+@media (max-width:620px){
+  .mrow{flex-direction:column;align-items:flex-start}
+  #hud .name{font-size:22px}
+  .stat b{font-size:18px}
+  #hint{display:none}
+}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<div id="hud" class="hidden">
+  <div><span class="tag">SOKOBAN PHYSICS // LV <span id="lvNum">1</span>/6</span><span class="name" id="lvName">WARM-UP</span></div>
+  <div class="hr">
+    <div class="stat"><label>TIME</label><b id="timeEl">0:00.0</b></div>
+    <div class="stat"><label>PUSHES</label><b id="pushEl">0</b></div>
+    <div class="stat best"><label>BEST</label><b id="bestEl">—</b></div>
+  </div>
+</div>
+<div id="hint" class="hidden">R RESTART · M SOUND <span id="sndState">ON</span> · ESC MENU</div>
+
+<div id="menu" class="overlay">
+  <div class="mwrap">
+    <div class="kicker">CANVAS PHYSICS PUZZLE — SIX LEVELS</div>
+    <h1 class="title"><span class="t1">SLIDE</span><span class="t2">WORKS</span></h1>
+    <p class="tagline">Sokoban with real momentum. Crates don't stop where you want — they <b>flick, chain and slide</b>. Read the friction, set up cascade pushes, and park every crate on a glowing pad.</p>
+    <div class="mrow">
+      <div class="cards">
+        <div class="crow"><span class="kbd">W A S D</span><span class="kbd">← ↑ ↓ →</span><em>walk &amp; push</em></div>
+        <div class="crow"><span class="kbd">MOUSE / TOUCH</span><em>hold to steer the bot</em></div>
+        <div class="crow"><span class="kbd">R</span><em>restart</em>&nbsp;&nbsp;<span class="kbd">M</span><em>sound</em>&nbsp;&nbsp;<span class="kbd">ESC</span><em>menu</em></div>
+      </div>
+      <button id="startBtn" class="bigbtn">Start Pushing →</button>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="bests" id="bests"></div>
+    <div class="prompt">PRESS <span class="kbd">ENTER</span> TO START</div>
+  </div>
+</div>
+
+<div id="win" class="overlay hidden">
+  <div class="wpanel">
+    <div class="stamp" id="stampTxt">CLEARED!</div>
+    <div class="wname" id="wName">LEVEL 1 — WARM-UP</div>
+    <div class="wstats">
+      <div><label>TIME</label><b id="wTime">0:00.0</b></div>
+      <div><label>PUSHES</label><b id="wPush">0</b></div>
+      <div><label>BEST</label><b id="wBest">—</b></div>
+    </div>
+    <div class="nb hidden" id="newBest">★ NEW BEST ★</div>
+    <div class="wbtns">
+      <button id="nextBtn" class="bigbtn">Next Level →</button>
+      <button id="replayBtn" class="ghostbtn">Replay (R)</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ============================== DATA ============================== */
+const LEVELS=[
+ {name:"WARM-UP",map:[
+  "#########",
+  "#.......#",
+  "#..@$$..#",
+  "#...%%..#",
+  "#.......#",
+  "#########"]},
+ {name:"THE FLICK",map:[
+  "#########",
+  "#.......#",
+  "#@.$...%.#",
+  "#.......#",
+  "#.......#",
+  "#########"]},
+ {name:"TWO SLIDES",map:[
+  "##########",
+  "#.......##",
+  "#.$....%.#",
+  "#..$...%.#",
+  "#........#",
+  "#..@.....#",
+  "#........#",
+  "##########"]},
+ {name:"CORRECTION",map:[
+  "##########",
+  "#........#",
+  "#...@....#",
+  "#........#",
+  "#..$...$.#",
+  "#........#",
+  "#.%.....%#",
+  "##########"]},
+ {name:"TRIPLE DROP",map:[
+  "###########",
+  "#@........#",
+  "#.$..$..$.#",
+  "#.........#",
+  "#.........#",
+  "#.%..%..%.#",
+  "#.##..#..##",
+  "#.........#",
+  "###########"]},
+ {name:"CASCADE ROW",map:[
+  "############",
+  "#..........#",
+  "#.$$...$$..#",
+  "#....@.....#",
+  "#..........#",
+  "#...%%.%%..#",
+  "#...##.##..#",
+  "############"]}
+];
+
+/* physics constants (grid units: 1 = one cell) */
+const P_ACC=55, P_DAMP=9, P_MAX=6.4, P_R=0.32;
+const B_HALF=0.4, B_DAMP=2.1, M_PLAYER=1, M_BOX=2.6;
+const E_PW=0.12, E_BW=0.3, E_BB=0.45, E_PB=0.18;
+const TAU=Math.PI*2;
+
+/* ============================== UTILS ============================== */
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const rand=(a,b)=>a+Math.random()*(b-a);
+function h2(i,j){let n=i*374761393+j*668265263;n=(n^(n>>13))*1274126177;return (n^(n>>16))>>>0;}
+function fmt(t){const m=Math.floor(t/60),s=t-m*60;return m+":"+(s<10?"0":"")+s.toFixed(1);}
+const store={
+  get(){try{return JSON.parse(localStorage.getItem("sideworks.best.v1")||"{}");}catch(e){return {};}},
+  set(v){try{localStorage.setItem("sideworks.best.v1",JSON.stringify(v));}catch(e){}}
+};
+
+/* ============================== AUDIO ============================== */
+const AU={ctx:null,master:null,slideG:null,noise:null,on:true,
+ init(){ if(this.ctx)return; const C=window.AudioContext||window.webkitAudioContext; if(!C)return;
+  this.ctx=new C(); this.master=this.ctx.createGain(); this.master.gain.value=.55; this.master.connect(this.ctx.destination);
+  const len=this.ctx.sampleRate|0, buf=this.ctx.createBuffer(1,len,this.ctx.sampleRate), d=buf.getChannelData(0);
+  for(let i=0;i<len;i++)d[i]=Math.random()*2-1; this.noise=buf;
+  const src=this.ctx.createBufferSource(); src.buffer=buf; src.loop=true;
+  const bp=this.ctx.createBiquadFilter(); bp.type="bandpass"; bp.frequency.value=430; bp.Q.value=.8;
+  this.slideG=this.ctx.createGain(); this.slideG.gain.value=0;
+  src.connect(bp); bp.connect(this.slideG); this.slideG.connect(this.master); src.start(); },
+ resume(){ if(this.ctx&&this.ctx.state==="suspended")this.ctx.resume(); },
+ setMute(m){ this.on=!m; if(this.master)this.master.gain.value=m?0:.55; },
+ env(type,f0,f1,vol,dur){ if(!this.ctx)return; const t=this.ctx.currentTime,o=this.ctx.createOscillator(),g=this.ctx.createGain();
+  o.type=type; o.frequency.setValueAtTime(f0,t); if(f1)o.frequency.exponentialRampToValueAtTime(Math.max(1,f1),t+dur);
+  g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(.0001,t+dur);
+  o.connect(g); g.connect(this.master); o.start(t); o.stop(t+dur+.03); },
+ noiseHit(vol,dur,fc,type){ if(!this.ctx)return; const t=this.ctx.currentTime,s=this.ctx.createBufferSource(); s.buffer=this.noise;
+  const f=this.ctx.createBiquadFilter(); f.type=type||"lowpass"; f.frequency.value=fc;
+  const g=this.ctx.createGain(); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(.0001,t+dur);
+  s.connect(f); f.connect(g); g.connect(this.master); s.start(t); s.stop(t+dur+.03); },
+ thud(v){ this.env("sine",95,42,v,.15); this.noiseHit(v*.6,.09,300); },
+ clack(v){ this.env("triangle",240,120,v,.07); this.noiseHit(v*.5,.05,2400,"highpass"); },
+ chime(){ if(!this.ctx)return; const t=this.ctx.currentTime; [[660,0],[990,.09]].forEach(p=>{
+   const o=this.ctx.createOscillator(),g=this.ctx.createGain(); o.type="sine"; o.frequency.value=p[0];
+   g.gain.setValueAtTime(.0001,t+p[1]); g.gain.exponentialRampToValueAtTime(.24,t+p[1]+.02); g.gain.exponentialRampToValueAtTime(.0001,t+p[1]+.5);
+   o.connect(g); g.connect(this.master); o.start(t+p[1]); o.stop(t+p[1]+.55); }); },
+ jingle(){ if(!this.ctx)return; [523,659,784,1046].forEach((f,i)=>setTimeout(()=>this.env("triangle",f,null,.28,.3),i*110)); },
+ blip(f){ this.env("square",f||520,(f||520)*.8,.1,.06); }
+};
+
+/* ============================== GAME STATE ============================== */
+const cv=document.getElementById("cv"), ctx=cv.getContext("2d");
+let dpr=1, W=innerWidth, H=innerHeight, vign=null;
+const view={ox:0,oy:0,cell:48};
+const G={state:"menu",level:0,time:0,tLvl:0,started:false,pushes:0,won:false,winT:0,shake:0,
+  W:0,H:0,walls:new Set(),boxes:[],targets:[],player:null};
+let lastThud=0;
+
+const keys={}; const pointer={active:false,x:0,y:0};
+
+function isWall(i,j){ if(i<0||j<0||i>=G.W||j>=G.H)return true; return G.walls.has(i+j*G.W); }
+
+function loadLevel(idx){
+  const L=LEVELS[idx]; G.level=idx; G.W=L.map[0].length; G.H=L.map.length;
+  G.walls=new Set(); G.targets=[]; G.boxes=[]; G.player=null;
+  for(let j=0;j<L.map.length;j++)for(let i=0;i<L.map[j].length;i++){
+    const c=L.map[j][i];
+    if(c==="#")G.walls.add(i+j*G.W);
+    else if(c==="%"||c==="*"||c==="+")G.targets.push({i,j,g:0});
+    else if(c==="$"||c==="*")G.boxes.push({x:i+.5,y:j+.5,vx:0,vy:0,half:B_HALF,phase:Math.random()*9,contact:false,pushPrev:false,onPad:0,chimed:false,dustT:0});
+    else if(c==="@"||c==="+")G.player={x:i+.5,y:j+.5,vx:0,vy:0,r:P_R};
+  }
+  G.tLvl=0; G.started=false; G.pushes=0; G.won=false; G.winT=0; G.shake=0;
+  computeView(); refreshHudStatic();
+  banner();
+}
+
+function banner(){
+  spawnText("LEVEL "+(G.level+1), G.W/2, 1.1, .5, "var", "#f4ead8", 2);
+  spawnText(LEVELS[G.level].name, G.W/2, 1.95, .3, "var", "#ffb02e", 1.7);
+}
+
+/* ============================== VIEW / RESIZE ============================== */
+function computeView(){
+  const m=Math.min(64,W*.08);
+  view.cell=Math.min((W-m*2)/G.W,(H-m*2-30)/G.H,96);
+  view.ox=(W-G.W*view.cell)/2; view.oy=(H-G.H*view.cell)/2+14;
+}
+function resize(){
+  dpr=Math.min(2,window.devicePixelRatio||1); W=innerWidth; H=innerHeight;
+  cv.width=W*dpr|0; cv.height=H*dpr|0; computeView();
+  vign=document.createElement("canvas"); vign.width=cv.width; vign.height=cv.height;
+  const vc=vign.getContext("2d"); vc.scale(dpr,dpr);
+  const g=vc.createRadialGradient(W/2,H*.42,Math.min(W,H)*.35,W/2,H/2,Math.max(W,H)*.78);
+  g.addColorStop(0,"rgba(5,10,16,0)"); g.addColorStop(1,"rgba(4,9,15,.6)");
+  vc.fillStyle=g; vc.fillRect(0,0,W,H);
+}
+addEventListener("resize",resize);
+
+/* ============================== PHYSICS ============================== */
+function physStep(dt){
+  const p=G.player; if(!p)return;
+  let ix=0,iy=0;
+  if(keys["arrowleft"]||keys["a"])ix--; if(keys["arrowright"]||keys["d"])ix++;
+  if(keys["arrowup"]||keys["w"])iy--;   if(keys["arrowdown"]||keys["s"])iy++;
+  if(pointer.active){ const dx=pointer.x-p.x,dy=pointer.y-p.y,d=Math.hypot(dx,dy); if(d>.25){ix+=dx/d;iy+=dy/d;} }
+  const il=Math.hypot(ix,iy); if(il>1){ix/=il;iy/=il;}
+  p.vx+=ix*P_ACC*dt; p.vy+=iy*P_ACC*dt;
+  const pd=Math.exp(-P_DAMP*dt); p.vx*=pd; p.vy*=pd;
+  const sp=Math.hypot(p.vx,p.vy); if(sp>P_MAX){p.vx*=P_MAX/sp;p.vy*=P_MAX/sp;}
+  p.x+=p.vx*dt; p.y+=p.vy*dt;
+  const bd=Math.exp(-B_DAMP*dt);
+  for(const b of G.boxes){ b.vx*=bd; b.vy*=bd; b.x+=b.vx*dt; b.y+=b.vy*dt; }
+
+  for(const b of G.boxes)collideBoxWalls(b);
+  for(let it=0;it<2;it++)for(let i=0;i<G.boxes.length;i++)for(let j=i+1;j<G.boxes.length;j++)collideBoxes(G.boxes[i],G.boxes[j]);
+  collideCircleWalls(p);
+  for(const b of G.boxes)collidePlayerBox(p,b);
+}
+
+function collideCircleWalls(c){
+  const r=c.r;
+  for(let j=Math.floor(c.y-r);j<=Math.floor(c.y+r);j++)for(let i=Math.floor(c.x-r);i<=Math.floor(c.x+r);i++){
+    if(!isWall(i,j))continue;
+    const cx=clamp(c.x,i,i+1), cy=clamp(c.y,j,j+1);
+    let dx=c.x-cx, dy=c.y-cy, d2=dx*dx+dy*dy;
+    if(d2>=r*r)continue;
+    let nx,ny,pen,d=Math.sqrt(d2);
+    if(d>1e-7){nx=dx/d;ny=dy/d;pen=r-d;}
+    else{const l=c.x-i,rr=i+1-c.x,t=c.y-j,b=j+1-c.y,m=Math.min(l,rr,t,b);
+      if(m===l){nx=-1;ny=0;pen=l+r;}else if(m===rr){nx=1;ny=0;pen=rr+r;}else if(m===t){nx=0;ny=-1;pen=t+r;}else{nx=0;ny=1;pen=b+r;}}
+    c.x+=nx*pen; c.y+=ny*pen;
+    const vn=c.vx*nx+c.vy*ny;
+    if(vn<0){const jimp=-(1+E_PW)*vn; c.vx-=jimp*nx; c.vy-=jimp*ny;}
+  }
+}
+
+function collideBoxWalls(b){
+  let best=null;
+  const x0=Math.floor(b.x-b.half),x1=Math.floor(b.x+b.half),y0=Math.floor(b.y-b.half),y1=Math.floor(b.y+b.half);
+  for(let j=y0;j<=y1;j++)for(let i=x0;i<=x1;i++){
+    if(!isWall(i,j))continue;
+    const ox=Math.min(b.x+b.half,i+1)-Math.max(b.x-b.half,i);
+    const oy=Math.min(b.y+b.half,j+1)-Math.max(b.y-b.half,j);
+    if(ox<=0||oy<=0)continue;
+    let nx,ny,pen;
+    if(ox<oy){nx=b.x<i+.5?-1:1;pen=ox;}else{ny=b.y<j+.5?-1:1;pen=oy;}
+    if(!best||pen<best.pen)best={nx,ny,pen};
+  }
+  if(best){
+    b.x+=best.nx*best.pen; b.y+=best.ny*best.pen;
+    const vn=b.vx*best.nx+b.vy*best.ny;
+    if(vn<0){const jimp=-(1+E_BW)*vn; b.vx-=jimp*best.nx; b.vy-=jimp*best.ny; onImpact(b,best,jimp);}
+  }
+}
+
+function collideBoxes(a,b){
+  const dx=b.x-a.x,dy=b.y-a.y;
+  const ox=(a.half+b.half)-Math.abs(dx),oy=(a.half+b.half)-Math.abs(dy);
+  if(ox<=0||oy<=0)return;
+  let nx,ny,pen;
+  if(ox<oy){nx=dx<0?-1:1;pen=ox;}else{ny=dy<0?-1:1;pen=oy;}
+  a.x-=nx*pen*.5; a.y-=ny*pen*.5; b.x+=nx*pen*.5; b.y+=ny*pen*.5;
+  const vn=(b.vx-a.vx)*nx+(b.vy-a.vy)*ny;
+  if(vn<0){
+    const jimp=-(1+E_BB)*vn/(2/M_BOX);
+    a.vx-=jimp*nx/M_BOX; a.vy-=jimp*ny/M_BOX; b.vx+=jimp*nx/M_BOX; b.vy+=jimp*ny/M_BOX;
+    if(jimp>.45){ AU.clack(Math.min(1,jimp/3)); G.shake=Math.min(16,G.shake+Math.min(5,jimp*.8)); }
+  }
+}
+
+function collidePlayerBox(p,b){
+  const cx=clamp(p.x,b.x-b.half,b.x+b.half), cy=clamp(p.y,b.y-b.half,b.y+b.half);
+  let dx=p.x-cx,dy=p.y-cy,d2=dx*dx+dy*dy;
+  if(d2>=p.r*p.r){ b.contact=false; b.pushPrev=false; return; }
+  let nx,ny,pen,d=Math.sqrt(d2);
+  if(d>1e-7){nx=dx/d;ny=dy/d;pen=p.r-d;}
+  else{const l=p.x-(b.x-b.half),r=(b.x+b.half)-p.x,t=p.y-(b.y-b.half),bo=(b.y+b.half)-p.y,m=Math.min(l,r,t,bo);
+    if(m===l){nx=-1;ny=0;pen=l+p.r;}else if(m===r){nx=1;ny=0;pen=r+p.r;}else if(m===t){nx=0;ny=-1;pen=t+p.r;}else{nx=0;ny=1;pen=bo+p.r;}}
+  const wP=M_BOX/(M_PLAYER+M_BOX),wB=M_PLAYER/(M_PLAYER+M_BOX);
+  p.x+=nx*pen*wP; p.y+=ny*pen*wP; b.x-=nx*pen*wB; b.y-=ny*pen*wB;
+  const vn=(p.vx-b.vx)*nx+(p.vy-b.vy)*ny;
+  if(vn<0){const jimp=-(1+E_PB)*vn/(1/M_PLAYER+1/M_BOX);
+    p.vx+=jimp*nx/M_PLAYER; p.vy+=jimp*ny/M_PLAYER; b.vx-=jimp*nx/M_BOX; b.vy-=jimp*ny/M_BOX;}
+  if(!b.pushPrev&&(vn<0||Math.hypot(p.vx,p.vy)>.4)){G.pushes++;}
+  b.pushPrev=true; b.contact=true;
+}
+
+function onImpact(b,n,j){
+  if(j<.5)return;
+  G.shake=Math.min(16,G.shake+Math.min(9,j*1.2));
+  const now=performance.now();
+  if(now-lastThud>70){lastThud=now; AU.thud(Math.min(.8,j/4));}
+  const px=b.x-n.x*b.half, py=b.y-n.y*b.half;
+  dustBurst(px,py,n.x,n.y,Math.min(1,j/5));
+}
+
+/* snap slow boxes to nearest legal cell center */
+function boxLegal(cx,cy){
+  for(let j=Math.floor(cy-B_HALF);j<=Math.floor(cy+B_HALF);j++)for(let i=Math.floor(cx-B_HALF);i<=Math.floor(cx+B_HALF);i++)
+    if(isWall(i,j))return false;
+  return true;
+}
+function snapPass(dt){
+  for(const b of G.boxes){
+    const sp=Math.hypot(b.vx,b.vy);
+    if(sp>=.3||b.contact)continue;
+    const ic=Math.round(b.x-.5), jc=Math.round(b.y-.5);
+    let best=null,bd=1e9;
+    for(let dj=-1;dj<=1;dj++)for(let di=-1;di<=1;di++){
+      if(Math.abs(di)+Math.abs(dj)>1)continue;
+      const cx=ic+di+.5, cy=jc+dj+.5;
+      if(!boxLegal(cx,cy))continue;
+      const d=Math.hypot(cx-b.x,cy-b.y);
+      if(d<bd){bd=d;best={cx,cy};}
+    }
+    if(best&&bd<.38){
+      const k=Math.min(1,26*dt);
+      b.x+=(best.cx-b.x)*k; b.y+=(best.cy-b.y)*k; b.vx*=.5; b.vy*=.5;
+      if(bd<.02&&sp<.12){b.x=best.cx;b.y=best.cy;b.vx=0;b.vy=0;}
+    }
+  }
+}
+
+/* ============================== WIN / PADS ============================== */
+function padFills(dt){
+  for(const t of G.targets){
+    let on=false;
+    for(const b of G.boxes){
+      const sp=Math.hypot(b.vx,b.vy);
+      if(sp<.3&&!b.contact&&Math.abs(b.x-t.i-.5)<.45&&Math.abs(b.y-t.j-.5)<.45)on=true;
+    }
+    t.g+=((on?1:0)-t.g)*Math.min(1,dt*6);
+  }
+  for(const b of G.boxes){
+    let on=0;
+    for(const t of G.targets){
+      const sp=Math.hypot(b.vx,b.vy);
+      if(sp<.3&&!b.contact&&Math.abs(b.x-t.i-.5)<.45&&Math.abs(b.y-t.j-.5)<.45)on=t.g;
+    }
+    b.onPad=on;
+    if(on>.85&&!b.chimed){b.chimed=true; AU.chime(); sparkleBurst(b.x,b.y); spawnText("PARKED",b.x,b.y-.7,.26,"var","#ffc94d",.9);}
+    if(on<.3)b.chimed=false;
+  }
+}
+function winCheck(dt){
+  if(G.won)return;
+  const all=G.boxes.length>0&&G.boxes.every(b=>{
+    const sp=Math.hypot(b.vx,b.vy); if(sp>.25||b.contact)return false;
+    return G.targets.some(t=>Math.abs(b.x-t.i-.5)<.45&&Math.abs(b.y-t.j-.5)<.45);
+  });
+  if(all){G.won=true;G.winT=.9;}
+}
+
+/* ============================== FX ============================== */
+const parts=[];
+function spawnText(str,x,y,size,colr,life){
+  parts.push({type:"text",str,x,y,vx:0,vy:-.55,rot:0,vr:0,size,life,max:life,colr});
+}
+function dustBurst(x,y,nx,ny,pow){
+  for(let i=0;i<7;i++)parts.push({type:"dust",x:x+rand(-.1,.1),y:y+rand(-.1,.1),
+    vx:nx*rand(.5,2)*pow+rand(-.6,.6),vy:ny*rand(.5,2)*pow+rand(-.9,-.2),rot:0,vr:0,size:rand(.05,.13),life:rand(.3,.55),max:.55});
+}
+function sparkleBurst(x,y){
+  for(let i=0;i<14;i++){const a=rand(0,TAU),s=rand(.8,2.6);
+    parts.push({type:"spark",x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-.6,rot:0,vr:0,size:rand(.03,.07),life:rand(.4,.8),max:.8});}
+}
+const CONF=["#ffb02e","#2fe6c0","#f4ead8","#ff5d4d","#dfe9f0"];
+function confettiRain(){
+  for(let i=0;i<90;i++)parts.push({type:"conf",x:rand(0,G.W),y:rand(-3,0),vx:rand(-1.2,1.2),vy:rand(1.5,3.5),
+    rot:rand(0,TAU),vr:rand(-6,6),size:rand(.09,.18),life:rand(1.8,3),max:3,colr:CONF[i%CONF.length]});
+}
+function updateParticles(dt){
+  for(let i=parts.length-1;i>=0;i--){const p=parts[i];
+    p.life-=dt; if(p.life<=0){parts.splice(i,1);continue;}
+    if(p.type==="conf"){p.vy+=5*dt;}
+    else if(p.type!=="text")p.vx*=Math.exp(-3*dt);
+    p.x+=p.vx*dt; p.y+=p.vy*dt; p.rot+=p.vr*dt;
+  }
+}
+const motes=[];
+for(let i=0;i<38;i++)motes.push({x:Math.random(),y:Math.random(),r:rand(.6,2),s:rand(4,14),ph:rand(0,9)});
+function updateMotes(dt){for(const m of motes){m.y-=m.s*dt/H;m.x+=Math.sin(G.time*.5+m.ph)*.02*dt; if(m.y<-.02){m.y=1.02;m.x=Math.random();}}}
+
+/* ============================== RENDER ============================== */
+function rr(x,y,w,h,r){r=Math.min(r,w/2,h/2);ctx.beginPath();
+  ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+
+function render(){
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  /* bg */
+  ctx.fillStyle="#0a1520"; ctx.fillRect(0,0,W,H);
+  let g=ctx.createRadialGradient(W*.18,H*.1,0,W*.18,H*.1,Math.max(W,H)*.7);
+  g.addColorStop(0,"rgba(47,230,192,.06)");g.addColorStop(1,"rgba(0,0,0,0)");ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+  g=ctx.createRadialGradient(W*.85,H*.95,0,W*.85,H*.95,Math.max(W,H)*.6);
+  g.addColorStop(0,"rgba(255,176,46,.05)");g.addColorStop(1,"rgba(0,0,0,0)");ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+  for(const m of motes){ctx.globalAlpha=.05+.09*(.5+.5*Math.sin(G.time+m.ph));ctx.fillStyle="#cfe6f2";
+    ctx.beginPath();ctx.arc(m.x*W,m.y*H,m.r,0,TAU);ctx.fill();}
+  ctx.globalAlpha=1;
+
+  const shx=(Math.random()*2-1)*G.shake, shy=(Math.random()*2-1)*G.shake;
+  ctx.save(); ctx.translate(view.ox+shx,view.oy+shy); ctx.scale(view.cell,view.cell);
+
+  drawFloor(); drawTargets(); drawWalls(); drawBoxes(); drawPlayer(); drawParticlesWorld();
+  ctx.restore();
+  if(vign)ctx.drawImage(vign,0,0,W,H);
+}
+
+function drawFloor(){
+  for(let j=0;j<G.H;j++)for(let i=0;i<G.W;i++){
+    if(isWall(i,j))continue;
+    const hh=h2(i,j);
+    ctx.fillStyle=(i+j)%2?"#c3ced6":"#cbd5dc";
+    ctx.fillRect(i,j,1,1);
+    ctx.strokeStyle="rgba(20,40,55,.07)";ctx.lineWidth=.02;ctx.strokeRect(i+.01,j+.01,.98,.98);
+    if(hh%5===0){ctx.fillStyle="rgba(30,50,65,.16)";
+      ctx.beginPath();ctx.arc(i+((hh>>4)%7)/8+.15,j+((hh>>8)%7)/8+.15,.025,0,TAU);ctx.fill();}
+    if(!isWall(i,j-1)){ctx.fillStyle="rgba(10,22,32,.14)";ctx.fillRect(i,j,1,.1);}
+  }
+}
+
+function drawTargets(){
+  for(const t of G.targets){
+    const x=t.i+.5,y=t.j+.5, pulse=.5+.5*Math.sin(G.time*2.6+(t.i+t.j)*1.7);
+    const teal=t.g<.5, r=teal?47:255, gg=teal?230:190, b=teal?192:77;
+    let gr=ctx.createRadialGradient(x,y,.05,x,y,.85);
+    gr.addColorStop(0,`rgba(${r},${gg},${b},${.2+.14*pulse})`);gr.addColorStop(1,"rgba(0,0,0,0)");
+    ctx.fillStyle=gr;ctx.beginPath();ctx.arc(x,y,.85,0,TAU);ctx.fill();
+    rr(x-.34,y-.34,.68,.68,.12);
+    ctx.fillStyle=`rgba(${r},${gg},${b},${.1+.08*pulse})`;ctx.fill();
+    ctx.lineWidth=.045;ctx.strokeStyle=`rgba(${r},${gg},${b},${.45+.35*pulse})`;ctx.stroke();
+    ctx.save();ctx.translate(x,y);ctx.rotate(Math.PI/4+G.time*.6);
+    const s=.1+.02*pulse;ctx.fillStyle=`rgba(${r},${gg},${b},.85)`;ctx.fillRect(-s/2,-s/2,s,s);ctx.restore();
+  }
+}
+
+function drawWalls(){
+  for(let j=0;j<G.H;j++)for(let i=0;i<G.W;i++){
+    if(!isWall(i,j))continue;
+    if(!isWall(i,j+1)){ctx.fillStyle="rgba(6,12,18,.3)";ctx.fillRect(i+.02,j+.94,.96,.1);}
+  }
+  for(let j=0;j<G.H;j++)for(let i=0;i<G.W;i++){
+    if(!isWall(i,j))continue;
+    const alt=h2(i,j)%2;
+    ctx.fillStyle=alt?"#274b63":"#2c536e";ctx.fillRect(i,j,1,1);
+    ctx.fillStyle="#4d80a3";ctx.fillRect(i,j,1,.15);
+    ctx.fillStyle="#39657f";ctx.fillRect(i,j+.15,.07,.85);
+    ctx.fillStyle="#152c3b";ctx.fillRect(i,j+.88,1,.12);
+    ctx.strokeStyle="rgba(8,18,26,.55)";ctx.lineWidth=.03;ctx.strokeRect(i+.015,j+.015,.97,.97);
+  }
+}
+
+function drawBoxes(){
+  for(const b of G.boxes){
+    const sp=Math.hypot(b.vx,b.vy), h=b.half;
+    ctx.fillStyle="rgba(10,20,28,.26)";ctx.beginPath();ctx.ellipse(b.x+.05,b.y+.09,h*.95,h*.85,0,0,TAU);ctx.fill();
+    const ang=Math.sin(G.time*13+b.phase)*Math.min(.07,sp*.03);
+    ctx.save();ctx.translate(b.x,b.y);ctx.rotate(ang);
+    if(b.onPad>.4&&sp<.3){rr(-h-.09,-h-.09,2*h+.18,2*h+.18,.16);ctx.lineWidth=.1;ctx.strokeStyle="rgba(255,201,77,.3)";ctx.stroke();}
+    const wg=ctx.createLinearGradient(0,-h,0,h);wg.addColorStop(0,"#dc9c55");wg.addColorStop(1,"#a76a2e");
+    rr(-h,-h,2*h,2*h,.08);ctx.fillStyle=wg;ctx.fill();
+    ctx.lineWidth=.05;ctx.strokeStyle="#7e4b1d";rr(-h+.03,-h+.03,2*h-.06,2*h-.06,.06);ctx.stroke();
+    ctx.lineWidth=.035;ctx.strokeStyle="rgba(90,50,15,.5)";
+    ctx.beginPath();ctx.moveTo(-h+.08,-.13);ctx.lineTo(h-.08,-.13);ctx.moveTo(-h+.08,.13);ctx.lineTo(h-.08,.13);ctx.stroke();
+    const L=.2;
+    const corner=(cx,cy,sx,sy)=>{ctx.beginPath();ctx.moveTo(cx+sx*L,cy);ctx.lineTo(cx,cy);ctx.lineTo(cx,cy+sy*L);ctx.stroke();};
+    ctx.lineWidth=.09;ctx.strokeStyle="rgba(0,0,0,.28)";
+    corner(-h,-h,1,1);corner(h,-h,-1,1);corner(-h,h,1,-1);corner(h,h,-1,-1);
+    ctx.lineWidth=.06;ctx.strokeStyle="#e8f1f7";
+    corner(-h,-h,1,1);corner(h,-h,-1,1);corner(-h,h,1,-1);corner(h,h,-1,-1);
+    if(b.onPad>.4&&sp<.3){rr(-h-.045,-h-.045,2*h+.09,2*h+.09,.11);ctx.lineWidth=.045;ctx.strokeStyle="rgba(255,201,77,.9)";ctx.stroke();}
+    ctx.restore();
+  }
+}
+
+function drawPlayer(){
+  const p=G.player;if(!p)return;
+  const sp=Math.hypot(p.vx,p.vy);
+  ctx.fillStyle="rgba(10,20,28,.3)";ctx.beginPath();ctx.ellipse(p.x+.04,p.y+.12,.33,.28,0,0,TAU);ctx.fill();
+  ctx.save();ctx.translate(p.x,p.y);
+  if(sp>.25){const a=Math.atan2(p.vy,p.vx),sq=Math.min(.16,sp*.035);ctx.rotate(a);ctx.scale(1+sq,1-sq);}
+  const r=p.r*(1+Math.sin(G.time*3.2)*.02);
+  const bg=ctx.createRadialGradient(-r*.3,-r*.4,r*.1,0,0,r);
+  bg.addColorStop(0,"#ff9a78");bg.addColorStop(1,"#dd4526");
+  ctx.beginPath();ctx.arc(0,0,r,0,TAU);ctx.fillStyle=bg;ctx.fill();
+  ctx.lineWidth=.03;ctx.strokeStyle="rgba(70,15,5,.5)";ctx.stroke();
+  const lx=sp>.3?p.vx/sp:Math.sin(G.time*.9)*.3, ly=sp>.3?p.vy/sp:0;
+  const blink=(G.time%3.1)<.12, eh=blink?.012:.075;
+  for(const s of [-1,1]){
+    ctx.fillStyle="#fff";ctx.beginPath();ctx.ellipse(.09,-s*.11,.07,eh,0,0,TAU);ctx.fill();
+    ctx.fillStyle="#1a2430";ctx.beginPath();ctx.arc(.09+lx*.05,-s*.11+ly*.05,.035,0,TAU);ctx.fill();
+  }
+  ctx.restore();
+  const sw=Math.sin(G.time*7+p.x)*.2+clamp(p.vx,-1,1)*.18;
+  const ax=p.x+Math.sin(sw)*.16, ay=p.y-p.r*.95-.22;
+  ctx.lineWidth=.035;ctx.strokeStyle="#7e3a24";ctx.beginPath();ctx.moveTo(p.x,p.y-p.r*.85);ctx.lineTo(ax,ay);ctx.stroke();
+  ctx.fillStyle="#ffb02e";ctx.beginPath();ctx.arc(ax,ay,.05,0,TAU);ctx.fill();
+  ctx.fillStyle="rgba(255,176,46,.3)";ctx.beginPath();ctx.arc(ax,ay,.09,0,TAU);ctx.fill();
+}
+
+function drawParticlesWorld(){
+  for(const p of parts){
+    const a=clamp(p.life/p.max,0,1);
+    if(p.type==="dust"){ctx.globalAlpha=a*.5;ctx.fillStyle="#b8c4cc";ctx.beginPath();ctx.arc(p.x,p.y,p.size*(2-a),0,TAU);ctx.fill();}
+    else if(p.type==="spark"){ctx.globalAlpha=a;ctx.fillStyle="#ffd166";ctx.beginPath();ctx.arc(p.x,p.y,p.size,0,TAU);ctx.fill();}
+    else if(p.type==="conf"){ctx.globalAlpha=Math.min(1,a*2);ctx.save();ctx.translate(p.x,p.y);ctx.rotate(p.rot);ctx.fillStyle=p.colr;ctx.fillRect(-p.size/2,-p.size*.35,p.size,p.size*.7);ctx.restore();}
+    else if(p.type==="text"){ctx.globalAlpha=a;ctx.font=`${p.size}px Impact,Haettenschweiler,'Arial Narrow',sans-serif`;
+      ctx.textAlign="center";ctx.fillStyle=p.colr;ctx.strokeStyle="rgba(6,13,20,.7)";ctx.lineWidth=p.size*.09;
+      ctx.strokeText(p.str,p.x,p.y);ctx.fillText(p.str,p.x,p.y);}
+  }
+  ctx.globalAlpha=1;
+}
+
+/* ============================== UI / FLOW ============================== */
+const $=id=>document.getElementById(id);
+const el={menu:$("menu"),win:$("win"),hud:$("hud"),hint:$("hint"),lvNum:$("lvNum"),lvName:$("lvName"),
+  timeEl:$("timeEl"),pushEl:$("pushEl"),bestEl:$("bestEl"),chips:$("chips"),bests:$("bests"),
+  wName:$("wName"),wTime:$("wTime"),wPush:$("wPush"),wBest:$("wBest"),newBest:$("newBest"),nextBtn:$("nextBtn")};
+
+function refreshHudStatic(){
+  el.lvNum.textContent=G.level+1; el.lvName.textContent=LEVELS[G.level].name;
+  const b=store.get()[G.level]; el.bestEl.textContent=b?fmt(b.t):"—";
+}
+function refreshMenu(){
+  const best=store.get(); let html="";
+  LEVELS.forEach((L,i)=>{const b=best[i];
+    html+=b?`<div>L${i+1} ${L.name} · <b>${fmt(b.t)}</b> · ${b.p} pushes</div>`:"";});
+  el.bests.innerHTML=html||"<div>NO RECORDS YET — GO LEAVE SOME.</div>";
+  el.chips.innerHTML="";
+  LEVELS.forEach((L,i)=>{const c=document.createElement("button");c.className="chip"+(best[i]?" done":"");
+    c.textContent=i+1;c.title=L.name;
+    c.addEventListener("click",e=>{e.stopPropagation();bootAudio();startGame(i);});
+    el.chips.appendChild(c);});
+}
+function setState(s){
+  G.state=s;
+  el.menu.classList.toggle("hidden",s!=="menu");
+  el.win.classList.toggle("hidden",s!=="won");
+  const inGame=s==="playing"||s==="won";
+  el.hud.classList.toggle("hidden",!inGame);
+  el.hint.classList.toggle("hidden",!inGame);
+}
+function startGame(i){ loadLevel(i); setState("playing"); AU.blip(600); }
+function toMenu(){ refreshMenu(); setState("menu"); }
+
+function onWin(){
+  const t=G.tLvl, p=G.pushes, best=store.get(), old=best[G.level];
+  let nb=false;
+  if(!old||t<old.t){best[G.level]={t,p};store.set(best);nb=true;}
+  el.wName.textContent=`LEVEL ${G.level+1} — ${LEVELS[G.level].name}`;
+  el.wTime.textContent=fmt(t); el.wPush.textContent=p;
+  const b2=store.get()[G.level]; el.wBest.textContent=fmt(b2.t);
+  el.newBest.classList.toggle("hidden",!nb);
+  $("stampTxt").textContent=G.level===LEVELS.length-1?"ALL CLEAR!":"CLEARED!";
+  el.nextBtn.textContent=G.level===LEVELS.length-1?"Play Again ↻":"Next Level →";
+  refreshHudStatic(); AU.jingle(); confettiRain(); G.shake=8;
+  setState("won");
+}
+function nextLevel(){ startGame((G.level+1)%LEVELS.length); }
+
+/* ============================== INPUT ============================== */
+function bootAudio(){ AU.init(); AU.resume(); }
+addEventListener("keydown",e=>{
+  const k=e.key.toLowerCase();
+  if(["arrowup","arrowdown","arrowleft","arrowright"," "].includes(k))e.preventDefault();
+  bootAudio(); keys[k]=true;
+  if(G.state==="playing")G.started=true;
+  if(k==="m"){AU.setMute(!AU.on);$("sndState").textContent=AU.on?"ON":"OFF";}
+  if(G.state==="menu"&&(k==="enter"||k===" ")){startGame(0);}
+  else if(G.state==="menu"&&/^[1-6]$/.test(k)){startGame(+k-1);}
+  else if(G.state==="playing"){
+    if(k==="r"){loadLevel(G.level);AU.blip(420);}
+    else if(k==="escape")toMenu();
+  }else if(G.state==="won"){
+    if(k==="enter"||k==="n")nextLevel();
+    else if(k==="r")startGame(G.level);
+    else if(k==="escape")toMenu();
+  }
+});
+addEventListener("keyup",e=>{keys[e.key.toLowerCase()]=false;});
+function ptr(e){const r=cv.getBoundingClientRect();pointer.x=(e.clientX-r.left-view.ox)/view.cell;pointer.y=(e.clientY-r.top-view.oy)/view.cell;}
+cv.addEventListener("pointerdown",e=>{bootAudio();ptr(e);pointer.active=true;if(G.state==="playing")G.started=true;});
+addEventListener("pointermove",e=>{if(pointer.active)ptr(e);});
+addEventListener("pointerup",()=>pointer.active=false);
+addEventListener("pointercancel",()=>pointer.active=false);
+
+$("startBtn").addEventListener("click",function(){bootAudio();this.blur();startGame(0);});
+el.menu.addEventListener("click",e=>{if(e.target===el.menu||e.target.classList.contains("mwrap")){bootAudio();startGame(0);}});
+el.nextBtn.addEventListener("click",function(){this.blur();AU.blip(600);nextLevel();});
+$("replayBtn").addEventListener("click",function(){this.blur();AU.blip(420);startGame(G.level);});
+
+/* ============================== MAIN LOOP ============================== */
+let last=performance.now();
+function frame(now){
+  requestAnimationFrame(frame);
+  let dt=(now-last)/1000; last=now; if(dt>.1)dt=.1;
+  G.time+=dt;
+
+  if(G.state==="playing"){
+    const SUB=6;
+    for(let i=0;i<SUB;i++)physStep(dt/SUB);
+    snapPass(dt); padFills(dt); winCheck(dt);
+    if(!G.won&&G.started)G.tLvl+=dt;
+    /* slide dust */
+    for(const b of G.boxes){const sp=Math.hypot(b.vx,b.vy);
+      if(sp>1.6){b.dustT-=dt;if(b.dustT<=0){b.dustT=.05;
+        parts.push({type:"dust",x:b.x+rand(-.3,.3),y:b.y+.4,vx:-b.vx*.15,vy:rand(-.4,-.1),rot:0,vr:0,size:rand(.04,.09),life:.35,max:.35});}}
+      else b.dustT=0; }
+    if(G.won){G.winT-=dt;if(G.winT<=0)onWin();}
+  }else{ padFills(dt); }
+
+  /* slide sound */
+  if(AU.slideG){let g=0;
+    for(const b of G.boxes)g=Math.max(g,Math.hypot(b.vx,b.vy)/7);
+    const p=G.player; if(p&&Math.hypot(p.vx,p.vy)>1)g=Math.max(g,.25);
+    AU.slideG.gain.value+= (g*.3 - AU.slideG.gain.value)*Math.min(1,dt*10); }
+
+  updateParticles(dt); updateMotes(dt);
+  G.shake*=Math.exp(-5*dt); if(G.shake<.05)G.shake=0;
+  render();
+
+  if(G.state==="playing"||G.state==="won"){
+    el.timeEl.textContent=fmt(G.tLvl); el.pushEl.textContent=G.pushes;
+  }
+}
+
+/* ============================== BOOT ============================== */
+resize();
+loadLevel(0);
+refreshMenu();
+setState("menu");
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
+```
