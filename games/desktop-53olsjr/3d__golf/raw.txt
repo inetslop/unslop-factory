@@ -1,0 +1,2239 @@
+<think>
+The user wants a 3D golf game. Single HTML file, inline CSS and JS, no external libraries (no Three.js since no network requests allowed). So I have to build 3D from scratch — either canvas-based 3D projection (software rendering), or CSS 3D transforms. For a golf game, a simple software 3D renderer on canvas is best: perspective projection of the course (fairway, green, sand traps, water hazards, trees, flag), a ball with physics (gravity, friction, bounces), and camera controls.
+
+Let me design this:
+
+**Core mechanics:**
+- Ball at position (x, y, z). y = height.
+- Aiming: mouse drag or arrow keys to set direction + power. Classic golf: hold to charge power, aim with mouse/keys, click/space to hit.
+- Physics: gravity, ground friction, bounces with coefficient of restitution, rolling friction.
+- Hole at a target position; when ball is near the hole and slow enough → sinks (cupped).
+- Course: fairway plane, green (putting surface), sand bunkers (high friction), water hazards (penalty + reset), trees/obstacles (collision), out of bounds.
+- Strokes counter, par per hole, scorecard.
+
+**Rendering (software 3D on canvas):**
+- Perspective projection: camera positioned behind the ball, looking toward the target; orbitable with mouse drag or keys.
+- Ground: draw as a grid of quads? Could be heavy. Better: draw ground as large colored region via painter's algorithm — project ground polygon vertices and fill. Actually simpler: use "heightfield slice" approach to render the terrain: divide the course into cells (e.g., 2m x 2m), sort by distance from camera, draw each cell as a quad with color based on type (fairway/green/sand/water/rough). Course is about 300x120 units → grid of 150x60 = 9000 quads per frame. Might be heavy but canvas can handle ~9k fill ops at 60fps? Risky. Let me reduce: course length 240, width 80, cell size 4 → 60x20=1200 cells. That's fine. Plus detail: stripes on the fairway (mowing pattern) can be baked into cell color.
+
+Actually even better approach: draw the ground as a set of horizontal strips (rows) — each row is one long quad from z_far to z_near? But course features vary along length, so per-cell quads work fine and give nice detail. 1200-3000 quads is OK.
+
+Optimization: skip cells behind camera, cull with frustum (project and check). Fine.
+
+**Objects:**
+- Trees: cone + trunk, billboard or simple 3D cones (draw as triangle in screen space — billboard approach: project center, draw scaled tree shape). Billboarding is easy and looks decent.
+- Flag/pole on hole: line + flag polygon.
+- Hole: dark ellipse on green.
+- Ball: white sphere with slight shading — draw as circle with radial gradient, plus shadow ellipse on ground.
+- Sand bunkers: cells colored sandy.
+- Water: animated blue cells (slight shimmer over time).
+
+**Camera:**
+- Position: behind ball along aim direction? Better: orbit camera around ball, distance adjustable. Controls: mouse drag to orbit (when not aiming?), or Q/E rotate, mouse wheel zoom. To keep simple and robust in iframe:
+  - Aim: A/D or arrow keys to rotate aim; hold Space (or mouse button) to charge power; release to hit.
+  - Camera: auto-follows ball; left/right drag with mouse to orbit? Might conflict with click-to-hit. Let's do this: hold and drag mouse to orbit camera; use spacebar for shot. Also allow "click & hold to charge, release to fire" — but drag orbits… ambiguous.
+
+Cleaner control scheme (keyboard-centric, mouse optional):
+- Left/Right arrows (or A/D): aim direction.
+- Up arrow / W: fine-tune? No.
+- Space: hold to charge power, release to hit. Power bar oscillates or just fills — fill and clamp is simpler; or ping-pong oscillate for skill. Let's do this: while held, power rises up to max then falls (ping-pong) — classic golf feel. Actually a simple rising bar with cap is fine too; ping-pong adds skill. Let's do rising + slight wobble? Keep it simple: rise to 100%, hold at max. Hmm, many golf games use oscillation. Let's do this: power rises over ~1.2s to max then bounces back down, repeat — player times release. Good.
+- Q/E or mouse drag: orbit camera. Mouse wheel: zoom.
+- Also allow aiming with mouse? Keep keyboard aim for reliability.
+
+Actually let me also support "mouse hold anywhere = charge, release = hit" as alternative to space, and right-drag or two-finger… no. Let's do: left-click-and-hold = charge & shoot (same as space). Mouse drag while holding? If user holds and moves mouse, they're charging — don't orbit. Orbit only via Q/E keys and arrow up/down? Hmm.
+
+Decision:
+- Aim: ←/→ or A/D (hold to keep rotating).
+- Power/shoot: hold SPACE (or left mouse) → power bar ping-pongs; release to fire in aim direction with that power.
+- Camera orbit: Q / E (or drag with right mouse? let's do: hold Shift + drag, or just mouse drag when not charging… simpler: Q/E keys and mouse wheel zoom). Also allow left-drag for camera orbit only when ball is at rest and not charging — but left-click = charge. Conflict. Let me make it explicit: click-and-hold = charge. Orbit with Q/E. Wheel to zoom. That's clean and I'll document in start screen.
+
+Add touch too? Nice to have; skip or minimal (tap-and-hold to charge, drag horizontally to aim). Can add basic touch: horizontal drag to aim, lift finger to shoot with time-based power… gets complex. Let me add simple touch support: touch-drag = rotate camera & aim? Hmm. Keep it keyboard/mouse focused but add a "TAP" button for mobile? I'll add basic touch: touchstart starts charging; touchmove (horizontal) adjusts aim; touchend fires. And two-finger? Skip. Good enough.
+
+**Course design:**
+Design 3 holes with different layouts, or one longer course of 3 holes with par values. Let's do 3 holes:
+1. Par 2 — short straight pitch to green (mini hole).
+2. Par 3 — dogleg with bunker.
+3. Par 4 — long with water crossing and trees.
+
+Simpler: one continuous course? Or separate holes with ball reset on tee box after sink. Let's do 3 separate holes, each defined by a layout function that produces the grid cells (type per cell): TEE (grass), FAIRWAY, ROUGH, GREEN, SAND, WATER, plus object list (trees) and hole/tee positions.
+
+Grid: world coordinates: x lateral (-W/2..W/2), z along course (0..L). y up. Cell size 4. Hole 1: L=80, W=60. Hole 2: L=120, W=80 (dogleg: fairway path curves — can define via centerline function centerX(z) and width; cells within distance of centerline path = fairway, otherwise rough).
+
+Centerline approach: define waypoints per hole; for each cell compute min distance to polyline → < w/2 is fairway, < w*1.6 is light rough? Actually everything outside fairway is rough unless green/sand/water overrides.
+
+Green: circular (or elliptical) region at end. Tee: small rectangle at start.
+
+Bunkers: list of circles {x,z,r,type:'sand'}. Water: list of rectangles or ellipses {x,z,rx,rz} or polyline band. Trees: list of positions avoiding fairway center.
+
+**Physics:**
+- v += g*dt (g = -22 units/s²? scale: 1 unit = ~1m? Ball speed: driver up to ~40 m/s → flight distance ≈ v²/g ≈ 1600/22 ≈ 73 units. Hole lengths 80-200 so power scaling is fine. Let me set max shot velocity ~55, g=30 → range ~100. Tune: g=-30, vmax=50 → range ~83. OK.)
+- Bounce: on hitting ground (y<=r): vy = -vy*0.55; vx,vz *= 0.75 (grass). If speed after bounce low → rolling state (y=r fixed).
+- Rolling friction: depends on surface: green μ high decel small? Actually putting: gentle friction, rolls far. Fairway medium. Rough high friction. Sand very high (ball nearly stops; if it lands in sand while flying → "bounced in sand" — big penalty to velocity).
+- Implementation: apply deceleration a = surfaceFriction * speed (linear) plus small constant.
+- Hole capture: horizontal distance to hole < 0.5 and speed < 6 (and y low) → sink animation (ball spirals down). If within 0.9 and speed > capture threshold → lip out: deflect velocity slightly, reduce speed.
+- Water: if ball lands in water cell and speed>… → splash, +1 penalty stroke, respawn at previous position (or tee/last spot). Standard: drop back with penalty stroke. Track lastShotPos; on water, pos = lastShotPos, strokes+1 (shot already counted? shot was already counted on hit; add 1 penalty). Let me do: count the shot that went into water as +2 total (1 shot + 1 penalty) — display "Water! +1 penalty".
+- Out of bounds: if |x| > W/2+margin or z < -10 or z > L+10 → same as water: return to previous, +1 penalty. Or just clamp? Let's do OOB with penalty and respawn at lastShotPos (or tee if none).
+
+**Ball spin / curve?** Could add slight slice/hook based on aim speed — skip, keep clean. Maybe add a bit of "spin" for visuals only.
+
+**Aiming visualization:** Arrow from ball in aim direction, length by current power; also predicted landing marker? Draw a dashed trajectory preview (simulate quick) — nice touch: simulate shot with same physics at low step count and draw dots. That's a strong feature. Let me add trajectory preview dots while charging (and faintly when idle?). Show while charging with live power → dots update.
+
+**UI:**
+- HUD top-left: Hole #, Par, Strokes, Total (+/- par). Top-right: surface indicator? Scorecard at end.
+- Power bar bottom-center with gradient green→yellow→red.
+- Aim direction readout maybe.
+- Message toast: "SUNK IT!", "BIRDIE!", "WATER +1", etc.
+- Start screen overlay: title "PUTT & PAN"? Name… "GREEN EYE GOLF"? Let me pick a name: "FAIRWAY 3D" or "SUNSET STRIKE". I like "Fairway Frenzy 3D"? Title: "Fairway Frenzy". Or "CUP OF GOLD". Let's go with "FAIRWAY FRENZY — 3D Mini Golf…". Hmm, it's more of a golf course than mini. Name: "GREENLINE GOLF 3D"? Keep it punchy: "SUNSET FAIRWAY". I'll use "Sunset Fairway" and style the sky with a sunset gradient! That gives me a distinctive palette: warm dusk sky (deep teal to orange), silhouetted hills, sun. A sunset palette is lovely for golf.
+
+Actually a bright daytime look might read as "golf" more clearly (green course). But sunset looks more crafted. Let's do golden hour: sky gradient from #2a1a4a top? No — sunset: top deep blue-purple → mid orange → horizon yellow, low sun disc, dark green grass with warm highlights. This is distinctive and beautiful. Contrast check for gameplay: white ball pops, flag red, water darker blue. Good.
+
+- End screen after 3 holes: scorecard table (hole, par, strokes, differential), total vs par, "Play Again" button (restart without reload).
+- Restart key: R to restart anytime; also on-hole reset? Let me keep R = full restart; maybe H for… skip.
+
+**Audio (Web Audio):**
+- Start after first input (create/resume context on first keydown/click).
+- Sounds: hit "thwack" (noise burst + low sine), bounce (soft tick), rolling? (skip or subtle), sink (chime arpeggio + plunk), water splash (filtered noise), UI click, wind ambient? Soft wind loop via filtered noise at low gain — adds atmosphere. Keep gentle. Also a flag jingle when close to hole ("flag drop" chime) — nice golf touch: within 5 units of green edge → chime.
+
+**Visual polish:**
+- Sky: vertical gradient + sun with glow + drifting clouds (billboard ellipses) + distant hills silhouette layer parallax with camera yaw.
+- Grass mowing stripes on fairway/green: alternating light/dark by cell index along z.
+- Water animation: cells tint oscillates with sin(time + x*0.3).
+- Ball: radial gradient white→gray, subtle; shadow ellipse sized by height (bigger/fainter when high).
+- Trail: ball leaves fading dots on ground during flight (small grass dents? draw short-lived marks array).
+- Particles: hit burst (grass tufts), sand puff, water splash droplets, sink confetti. All simple screen-space or world-space particles projected. World-space with projection is cooler — let's do world-space particles {pos, vel, life, color, size}.
+- Camera: smooth follow (lerp position to target behind ball based on yaw), slight bob? Keep stable. FOV fixed; zoom adjusts distance.
+- Aim arrow: 3D line from ball with arrowhead, plus power-dependent color.
+
+**Projection math:**
+Camera: position C (world), yaw θ (around Y), pitch φ (down angle). Transform world point p to camera space:
+ d = p - C; rotate by yaw: x1 = d.x*cos(θ) + d.z*sin(θ)? Let me define yaw as rotation around Y axis. Then pitch rotates around X. Then perspective: sx = cx + f * x2 / z2, sy = cy - f * y2 / z2 where z2 is depth (forward). f = focal length in pixels = (canvas.height/2) / tan(fov/2), or just canvas.height * 0.9.
+
+Let me define: forward direction from yaw: fwd = (sin θ, 0, cos θ)? Let me set up cleanly:
+- Camera yaw a (radians). Camera looks toward direction dir = (sin a, -tan(pitch)?, cos a) — simpler to handle pitch via rotation matrix.
+Camera space transform for point p:
+ v = p - C
+ // rotate around Y by -a:
+ x1 =  v.x * cos(-a) + v.z * sin(-a)??
+
+Let me do it standard:
+ cosA=cos(a), sinA=sin(a)
+ x1 = v.x*cosA - v.z*sinA? — I'll verify with a test case in my head later; let me define camera forward as (sin a, 0, cos a) and right as (cos a, 0, -sin a), up adjusted by pitch.
+
+Simpler: build camera basis vectors directly:
+ fwd = normalize( sin(a)*cos(p), -sin(p)? ...). Let pitch p be downward angle from horizon (positive = looking down). Then:
+ fwd = ( sin(a)*cos(p), -sin(p), cos(a)*cos(p) )? Wait, y is up; looking down means fwd.y negative. fwd = ( sin a * cos p, -sin p, cos a * cos p ). Hmm but then horizontal component shrinks — fine.
+ right = ( cos a, 0, -sin a )
+ up = fwd × right → compute: up = cross(fwd, right)? cross((fx,fy,fz),(rx,ry,rz)) = (fy*rz - fz*ry, fz*rx - fx*rz, fx*ry - fy*rx). With ry=0: up = (fz*0? Let me just compute in code with cross product function. Then camera coords: xc = dot(v,right), yc = dot(v,up), zc = dot(v,fwd). If zc > near, project: sx = cx + f*xc/zc; sy = cy - f*yc/zc.
+
+Good, robust.
+
+Ground cell quad draw: compute 4 projected corners with zc>near check; if any behind, skip (or clip — skipping is fine at this scale, may cause small pop but acceptable; to reduce pops, split? Skip is fine given cells are small and camera is high).
+
+Draw order: sort all ground cells by distance from camera descending (farthest first), then draw objects (trees, flag) interleaved? Painter's algorithm: combine ground cells + billboards into one list sorted by depth. 1200+ quads sorting per frame = fine (sort of ~1500 items at 60fps OK).
+
+Alternatively: since camera looks mostly down and forward, we could sort rows by z relative to camera… but orbit breaks that. Full sort is safest. Cost: 1500 * log(1500) ≈ 16k comparisons — fine.
+
+Culling: skip cells with all corners zc < near (behind), or offscreen bounding box outside canvas margin. Also limit draw distance: skip if depth > maxDist (e.g., 300 units) → reduces count. With fog! Add distance fog that blends cell color toward sky haze — hides pop-in at draw-distance cutoff.
+
+**Colors:**
+- Fairway green: base #4a8f3c, stripe alt #529944? For golden hour maybe slightly desaturated: fairway #3f7d3a / #468a40; rough #356b31 darker and more olive; green (putting) brighter #5aa84e / #63b455 stripes; tee #4c9142; sand #e8cf9a with speckle? Just color + slight noise per cell (precompute per-cell random shade offset); water #2f6f9e base with shimmer.
+- Sky: top #1b2a5e? Sunset: top "#3a2d6e"? Let me craft: gradient stops: 0: "#241a4d", .35: "#7a3b6e"?? hmm that leans purple-pink. Golden hour golf: I'll do: top #16265c → #4a5aa8? no…
+
+Let me pick a warm dusk palette:
+ skyTop = "#1d2b53" (deep blue)
+ skyMid = "#e07a3f"? Too abrupt. Gradient with multiple stops for sunset band:
+ 0.0 "#16214d", 0.45 "#4b3f86"?? this is getting purple. Alternative: classic orange sunset:
+ 0 "#0f1b3d", 0.5 "#5a4a9e"…
+
+OK let me stop dithering and commit: a rich dusk gradient: `#101b3c → #35406e (0.5) → #c96f3b? …` I'll define stops: 0 '#12173a', .48 '#41437a', .66 '#a05a7a'? hmm.
+
+Simpler and confident:
+ skyGrad: 0:'#1a1c4e', 0.55:'#5c4b93', 0.72:'#d76a4e', 0.82:'#f2a65a', 0.9:#'ffd27a'. Sun disc low near horizon, pale yellow #fff3c4 with glow. Hills silhouette: two layers of dark blue-purple (#2a2550, #1f1c40) with slight parallax on yaw. Clouds: soft warm white ellipses alpha 0.5.
+
+Grass gets a warm tint — multiply colors slightly? Just pick greens that look good against dusk: fairway '#3e7d3b'/'#468a41', rough '#2f6130', green '#59a84f'/'#62b258', sand '#e6c98f', water '#3b6ea5' with warm reflection shimmer '#7fa8d8'.
+
+Ball white #fff. Flag: red #e33 with white? Red pops against dusk. Hole: dark ellipse #14201a.
+
+UI palette: deep green panel rgba(10, 30, 20, .55), text warm cream #ffe9c9, accent gold #ffd27a and red for power max. Font: distinctive display + readable body without webfonts… system stack only (no external fonts). Use a stack: display: "Trebuchet MS"? Or use CSS to make chunky logo with letter-spacing and text-shadow — e.g., font-family: 'Arial Black', 'Franklin Gothic Bold' fallback. Body/HUD: 'Segoe UI', Verdana… pair: display 'Georgia'? For golf, a serif like Georgia bold italic could be classy (country club vibe!). Yes! Title in Georgia bold italic + letter-spacing = country club elegance; HUD numbers in Georgia too? Use monospace for scorecard alignment: 'Courier New'. Pairing: Display/serif Georgia; UI sans Verdana/Trebuchet. Good, distinctive and system-safe.
+
+**Start screen:** overlay div with title "SUNSET FAIRWAY" — hmm name… let me finalize the game name: "Golden Cup Golf"? "DUSK FAIRWAY 3D"? I like **"FAIRWAY AT DUSK"**? Title tag needs a name. Let's go with "Sunset Links — 3D Golf". "LINKS" is Scottish golf term, nice. Actually simpler and punchier: **"GOLDEN GREEN GOLF"**?
+
+Decision: **Fairway Frenzy** is generic. I'll use **"SUNSET CUP • 3D Golf"**. Hmm "cup" ties to the hole. OK final: title = "Sunset Cup — 3D Golf". Display heading "SUNSET CUP" with sub "a tiny 3D golf course at golden hour".
+
+Start screen content: name, controls list (Aim ← → / A D; Shoot hold SPACE or mouse; Camera Q/E orbit, wheel zoom; R restart), a "TEE OFF" button + "press Enter". Also par info. Overlay uses canvas-drawn background behind (render the scene even in menu with slow auto-orbiting camera — nice living menu!). Yes: run render loop always; in menu state, camera slowly orbits ball on hole 1.
+
+**States:** 'menu', 'play', 'holeEnd' (brief banner then next hole), 'gameover'. Sink sequence: animate ball spiraling into hole ~0.8s, play chime, show result text (e.g., "EAGLE!" if under par-2… with 3-hole short course, differentials: compute name: -2 ALBATROSS? not realistic but fun; names: >=+1 "THAT'S A {n} OVER", 0 PAR, -1 BIRDIE, -2 EAGLE, -3 ALBATROSS (rare), <=-4 "HOLE IN ONE!" if strokes==1). Then next hole after ~2.5s or key press; after hole 3 → final scorecard overlay with Play Again.
+
+**Scorecard:** table rows Hole 1..3: Par, Strokes, diff (+/−). Total par vs total strokes, overall name ("You finished 2 under par — club champion!"). Buttons: "Play Again". Also show best total in localStorage (try/catch): "Best: −2" if exists.
+
+**Trajectory preview:** while charging, simulate with dt=0.05 up to first ground hit + a few bounces, collect points every few steps, draw as small dots projected on ground. Max ~40 dots. Color white alpha fade. Only when ball at rest and state play. This makes the game much more playable.
+
+**Aim:** aimAngle (radians). Arrow keys rotate 1.8 rad/s; hold to keep rotating. Also allow mouse: move? No — keyboard only for aim (+ touch drag). Show a compass? Draw an arrow on ground + small direction label ("N/E/S/W")? Cute: show degrees. Keep arrow.
+
+Initial aim per hole: toward hole (computed from tee→hole vector). Good default; player fine-tunes.
+
+**Per-hole power curve:** chargeTime ping-pong 0→1 in 1.1s, then back down, repeat. Power → velocity = maxV * (0.15 + 0.85*p)? Minimum tap is a putt-ish tap. maxV = 46? Range = v²/g with g=30: v=46 → 70 units. Hole lengths: h1 60, h2 95, h3 150? Then need v up to ~sqrt(150*30)=67 for full carry on hole 3 — but with rolling after landing, effective reach is more; set maxV=58 → carry 111 + roll. OK. Putt: small p → v=8 → carry 2.1 + roll… rolling friction on green is low so putt rolls decently. Tune friction:
+- Rolling decel (units/s²): green: 3.5 (plus linear term 0.6*v?), use a = μc + μl*v. Green: c=2.2, l=0.9 → v=8: a≈9.4 → distance ≈ v²/(2a)+… ~3.4u+ hmm short. Let's make green gentler: c=1.2, l=0.5 → v=8: a=5.2, dist≈6.2. Putt tap v=4 → 2.7u. OK good for putting scale (hole radius .5, green radius ~10).
+- Fairway roll: c=3, l=1.2.
+- Rough: c=8, l=2.5.
+- Sand: c=25, l=6 (stops fast); on landing in sand while flying: velocity *= 0.25, no bounce up? small bounce.
+- Bounce restitution on grass 0.52, horizontal keep 0.78; sand restitution .1.
+
+Ball radius 0.35 units (~0.35m, golf ball is .043 but game scale — course width ~60 for "golf" feel with meters… whatever, gameplay first).
+
+Hole capture: dist2D < 0.55 and speed < 7 → sink. Lip-out: dist<1.1 && speed>=7: redirect velocity away from hole *0.4, decel.
+
+**Water handling:** cell type water; if ball y<=r and surface is water: splash particles, sound, penalty: strokes+=1 (penalty in addition to the shot), toast "WATER! +1 PENALTY", respawn at lastShotPos (position before this shot) with zero velocity after brief delay. Track lastShotPos on each hit.
+
+OOB similar: |x|>W/2+6 or z>L+8 or z<-8 → "OUT OF BOUNDS +1".
+
+**Trees:** circle collider radius ~1.2 at trunk; if ball within 1.5 of tree base and y < 3 (crown height) → bounce back: reflect velocity along normal *0.4, thwack sound, leaf particles. Trees placed off fairway mostly, some lining the green.
+
+**Course definitions:**
+
+Hole 1 "The Sparrow" par 2: L=70,W=56. Straight. Bunker on right side of green front? Small. Trees flanking mid.
+Hole 2 "The Bend" par 3: L=110, W=84. Dogleg: waypoints (0 center) → curve right at z 60-90. Sand on inside of bend. Water on outside corner? Keep water for hole 3; here: bunkers + tree wall.
+Hole 3 "The Lake" par 4: L=150, W=84. Lake band crossing at z≈70..85 full width or partial; player must carry or go around (narrow corridor on left). Trees on right. Bunker protecting green front-right.
+
+Green positions: end of fairway path, e.g., hole 2 green at waypoint end offset; hole 3 green past lake with bunker guard.
+
+Implementation details: define per hole: {par, L, W, waypoints:[{x,z}...], fairwayW, greens:[{x,z,r}], tees:{x,z}, holes:[{x,z}] (1 per hole), sands:[{x,z,r}], waters:[{x0,z0,x1,z1} rect or ellipse {x,z,rx,rz}], trees:[{x,z,s}] }.
+
+Cell classification: for cell center (cx,cz):
+- if within any green → GREEN.
+- else if within tee rectangle (|cx-tx|<6 && cz < tz+8) → TEE? Actually tee is also fairway-ish; make it FAIRWAY with slight different shade? Keep simple: TEEDZ = FAIRWAY.
+- distance to waypoints polyline: d = minDistToPolyline. If d < fairwayW/2 → FAIRWAY, else ROUGH.
+- sand circles override (check before grass? sand is usually on top of fairway edge): order: WATER > SAND > GREEN > FAIRWAY > ROUGH. Water overrides all.
+Trees are objects not cells.
+
+Also add subtle per-cell shade variance: precompute random value 0..1 per cell → color = base * (0.94+0.12*rand). Mowing stripes: on fairway/green, if floor(cz/cell)%2 alternate light/dark. Stripes oriented along z — classic.
+
+**Rendering pipeline per frame:**
+1. Update physics (fixed dt substep for stability: accumulate, step 1/120).
+2. Camera update (target position = ball + offset(yaw,camDist, height)); smooth lerp; in menu, yaw auto-slowly rotates.
+3. Build draw list:
+ - Ground cells within radius camDist*1.4 of ball? Use frustum-ish: project corners; skip if all behind; compute depth (avg zc), push {depth, draw fn or data}. To reduce GC, use arrays and inline draws: sort indices. Simpler: create objects each frame — 1500 objects/frame is OK in modern JS but let's be a bit careful: store cellType grid statically; per frame compute projected corners for visible cells into reusable Float32? Getting complex. Just create small array of {d, t} entries (t = index into cells) and sort by d desc, then loop drawing using recomputed projection — recompute twice = 2x cost. Better: store projected coords in entry: {d, x1,y1,x2,y2,x3,y3,x4,y4, type, shade}. Fine.
+ - Billboards (trees, flag, ball, particles, aim arrow? arrow is a line not billboard): push with depth too. Flag & tree & ball & hole marker? Hole is on ground — draw as ellipse just after ground (depth = its zc). Include in sort list.
+4. Sky background: gradient rect + sun + clouds + hills (drawn before world; parallax via yaw offset).
+5. Fog: for each cell, blend color toward fogColor by depth factor: t = clamp((d - fogStart)/(fogEnd-fogStart)); use precomputed rgb and mix in JS → fillStyle string. 1500 string builds per frame — OK but a bit heavy; optimize: quantize fog to 8 levels and cell type + stripe + shade into buckets? Simpler optimization: only apply fog when d>fogStart*0.9 (most cells near camera have no fog), else use cached color string. Precompute base color strings per cell (type,stripe,shade) once (store in cell array) — then per frame only mix if fog t>0.
+
+Colors as [r,g,b] arrays; cache final fillStyle string with key `${t|0}-${i}`? Overkill. Just: if t<0.01 use cached str; else compute `rgb(...)` with rounded values. Fine.
+
+Canvas size: devicePixelRatio aware, resize handler. Use ctx.setTransform(dpr,0,0,dpr,0,0) and work in CSS pixels.
+
+**Ball trail:** array of {x,y,z,life} ground marks where ball bounced/rolled? Grass dents on bounce: add mark at impact point (dark small ellipse). Cap 40, fade over 6s. Add to draw list as ground-level items with depth. Nice touch.
+
+**Particles:** world-space {pos, vel, g, life, maxLife, size, col}. Update in physics; project and draw as circle with alpha=life/maxLife. Uses: hit (grass green tufts / sand puff), bounce dust, water splash (blue/white), sink confetti (gold/green), tree leaves.
+
+**Flag:** pole at hole position, height 6; flag triangle waving: animate points with sin(time*3 + phase). Draw as polygon in screen space from projected pole top and offset by wind vector — billboard-ish: compute screen positions of the pole base/top, then draw flag extending horizontally (screen right) from top with wave. Simpler and looks fine. Flag color #ff4d3a? Red-orange. Also a small white circle on ball.
+
+**Hole marker:** dark ellipse at hole position on green + subtle ring. In list depth = zc of that point.
+
+**Aim arrow:** line from ball along aim direction, length 3 + power*10; draw as series of projected segments with alpha; arrowhead triangle at end (compute in world: tip and perpendicular). Color: white → red by power. Also show faint full trajectory dots while charging (as planned).
+
+**HUD layout:**
+- Top-left panel: "HOLE 2 — PAR 3" big serif; below: STROKES n | TOTAL ±x.
+- Top-right: small compass? or last shot distance to hole: "34m TO CUP". Useful! Compute dist = hypot(dx,dz). Show in top-right panel.
+- Bottom-center: power bar (only during charge) with label "POWER" and tick marks; when idle show hint text "HOLD SPACE / CLICK — RELEASE TO SHOOT" small, fading after first shot? Keep persistent subtle hint at bottom-left.
+- Toast center: big serif message with pop animation (CSS class on div).
+
+DOM overlay for HUD (easier than canvas text): absolutely positioned divs over canvas. Yes.
+
+**Message system:** showToast(text, sub, dur) → set text, add 'show' class, remove after timeout. CSS transition scale/opacity.
+
+**Restart:** R key anytime → full reset to hole 1 strokes 0 (skip menu? or go to menu?). Let's do: R = restart round (from hole 1). Enter/click on overlay starts game. From gameover "PLAY AGAIN" button + R also works.
+
+Menu auto camera: yaw += dt*0.15, target ball on tee of hole 1.
+
+**First input for audio:** create AudioContext lazily on first keydown/pointerdown. Wind: looped noise through lowpass gain 0.03 — start after init; keep very quiet; also toggle mute with M (nice extra). Add M to controls list? Sure, small note.
+
+Sounds:
+- swish/hit: bandpass noise burst 0.08s + sine 90Hz decay 0.1 → "thwack". Scale volume/pitch by power.
+- bounce: short sine 160Hz decay .06, vol by impact.
+- roll: skip.
+- sink: plunk (sine 220→80 pitch drop .25) + chime arpeggio (triangle notes E5 G5 B5 E6 spaced 90ms).
+- water: noise lowpass 400, .4s decay + downward blip.
+- flagDrop chime when within green radius+3 of hole and previously outside: two-note ding (E6,A6?) soft.
+- uiClick: short square 660Hz .05.
+- outOfBounds: low buzz sawtooth 110 .2.
+
+Implement helper: env(gainNode, t0, a, d), osc(type,freq), noiseBuffer cached.
+
+**Physics loop details:**
+state.ball = {p:[x,y,z], v:[..], onGround(bool rolling), sunk, inFlight}
+step(dt):
+ if sunk: animate spiral toward hole center: p.x += (hx-p.x)*min(1,dt*8), z similar, y -= dt*2 until y< -0.4 → done flag triggers holeEnd.
+ charging? (no movement).
+ else: v.y -= G*dt; p += v*dt.
+ surface = cellTypeAt(p.x,p.z) (if outside course grid → ROUGH/OOB check separately).
+ if p.y <= R:
+   if surface==WATER && !sunk → waterEvent(); return.
+   impactSpeed = -v.y? Use pre-step vy. Bounce: v.y = -v.y*rest(surface); vx,vz *= keep(surface). If abs(v.y) < 1.2 → v.y=0, rolling (p.y=R). On bounce with speed>6: dust particle + sound.
+   if surface==SAND: extra drag: vx,vz*=0.5 on contact; if was flying && speed>4 → "sand puff".
+ rolling: apply decel: sp=hypot(vx,vz); if sp<0.15→v=0 else f=(c + l*sp)*dt; v -= v/sp*f (clamp to zero).
+ OOB check each step (if p outside bounds & not sunk) → penalty event.
+ Hole capture check (only if on green-ish or any surface? just by distance): dx=p.x-hx etc, d2=hypot; if d2<0.5 && speed<7 && p.y < R+1.2 → start sink (sunk=true, sound later at bottom? play immediately). If d2<1.2 && speed>=7: lipOut: deflect: n = normalize(p-hole); v = n*speed*0.35 + tangent small; also slow.
+ 
+ lastShotPos saved when shot fired.
+
+Events (water/oob) set ball to respawn with 0.6s freeze timer, penalty strokes++, toast, sound, particles at impact point before moving.
+
+**Charging:** charging bool, chargeT; while charging: power = pingPong(chargeT/1.1). Fire on release: v = dir * (minV + (maxV-minV)*power); dir=(sin(aim),0,cos(aim)) — wait, aim direction in world: define aimAngle where 0 = +z? Let me set dir = (sin a, cos a)? Let me use standard: dir.x = sin(a), dir.z = cos(a). Initial aim = atan2(hx-tx, hz-tz).
+
+Shot effect: hit sound, particles at ball backside, slight camera kick? Small.
+
+**Trajectory preview simulation:** clone pos/vel, loop 400 steps dt .04 with same ground logic simplified (gravity, first bounce, then stop after bounce or max). Collect points every 3 steps while y>0.2 and first bounce point + second. Draw as small dots projected on ground. Only when ball at rest and state play.
+
+**Camera controls:** Q: yaw -= 2.2*dt; E: += ; wheel: camDist *= (1 ± .1) clamp [10,60]; also pitch fixed ~ -? pitch = 0.32 rad down + auto-adjust by power? Keep constant 0.35. Camera pos = ball + back offset: C = p - dir(yaw)*camDist*cos(pitch)? Actually place camera at distance behind the look direction: C = target - fwd*dist where fwd is from yaw/pitch… but then pitch changes height — standard orbit: C = target + (sin(yaw)*cos? ...). Let's do: offset vector o = ( sin(yaw)*cosP, sinP, cos(yaw)*cosP ) * dist → C = ballPos - o? If fwd=(sin a*cos p, -sin p, cos a*cos p), then camera is behind: C = target - fwd*dist. Yes. Look at target = ball position + (0, 1, 0) slightly ahead? Use ball + small forward along aim? Just ball center y+0.6.
+
+Smooth: lerp current C toward computed by 1-exp(-dt*5); also store yaw smoothly (input changes targetYaw; actual lerps). Fine.
+
+Menu mode: target = tee ball, yaw auto-increases.
+
+**Resize:** canvas fills window: width/height = clientWidth*dpr etc. No scrollbars: body margin 0 overflow hidden. Iframe safe.
+
+**Start overlay design:** full-screen div with translucent dark green gradient vignette (the game renders behind — nice). Content:
+- small eyebrow: "A TINY GOLF COURSE AT GOLDEN HOUR" letter-spaced.
+- Title "SUNSET CUP" big Georgia italic, cream color with warm shadow; maybe a ball icon drawn in CSS (radial-gradient circle) + flag? Small inline SVG? Inline SVG allowed (not external). Could add small SVG flag/ball emblem. Simple: CSS ball + pole divs. Or just text with "⛳"? Emoji is fine and renders everywhere mostly… let me use a hand-crafted mini scene in CSS: a white ball on a green strip with a red flag — cute emblem, pure divs.
+- Controls grid: keys as <kbd>-styled chips: [A]/[D] or [←][→] aim • hold [SPACE]/[CLICK] to charge, release to shoot • [Q][E] orbit camera • [SCROLL] zoom • [R] restart • [M] mute.
+- Hole list: 1 The Sparrow · Par 2 — 2 The Bend · Par 3 — 3 The Lake · Par 4. Total par 9.
+- Button "TEE OFF ▸" big gold; note "or press ENTER".
+Layout: this is a game start screen, centered is the natural fit here. To keep it from feeling generic I'll make it asymmetric-ish: title left-aligned within a framed card? A "scorecard paper" style card (cream paper, like a golf scorecard!) — that's distinctive! Start overlay = a golf scorecard sheet: bordered double-line frame, serif headings, dashed rules, "PAR / YOUR SCORE" columns with blank dashes. Title across top of card. Controls as a small legend at bottom of card. This is very on-theme and avoids the generic centered hero.
+
+Card background: #f6ead2 (aged paper) with dark green text #1e3a24, red stamp accent? Add a rotated "EST. PAR 9" stamp badge. Paper texture via repeating-linear-gradient faint lines. Yes!
+
+Gameover overlay: same scorecard style filled in with actual scores + total + best.
+
+Toast styling: big serif italic cream text with dark outline shadow, scale pop.
+
+Panels: dark green translucent with gold border-left? Keep consistent: rgba(12,26,18,.72), 1px solid rgba(255,210,122,.35), text #ffe9c9.
+
+Power bar: 240px wide, 14px tall, dark track, fill gradient green→gold→red by width; border cream; label above "POWER". Position bottom-center. Also show a small marker for where current power is? The fill itself shows that.
+
+**Fonts:** display: Georgia, 'Times New Roman', serif (italic for flavor). Body/HUD: Verdana/Geneva/Trebuchet. kbd chips: monospace? Use Trebuchet bold. Good pairing (serif display + sans body).
+
+**Code structure:**
+- const canvas/ctx, DPR resize.
+- Audio module.
+- Course data + buildCells(holeIndex) → {cells grid arrays type[], shade[], W cells, L cells, meta}.
+- Game state object; resetHole(i), startGame(), endHole(), endGame().
+- Input handlers (keydown/up on window, pointerdown/up/move on canvas? charge also via pointer anywhere — attach to window for reliability but avoid double with buttons: use e.target check or just allow).
+  - Space keydown: if state play & ball at rest & !charging → start charge. keyup → fire. (ignore repeat)
+  - Enter: start/restart depending on state.
+  - R: restart round.
+  - Q/E/Arrows: keys held set (keys = {}), processed in update.
+  - M mute.
+  - wheel: zoom.
+- update(dt): input aim/camera, charging time, physics substep, particles, marks, toasts timeout handled by CSS, flag chime check.
+- render(): sky, hills, clouds; build sort list; draw; HUD distance text update (throttle to every frame fine, cheap string set only on change).
+- Main loop rAF with dt clamp 0.033.
+
+Let me write minDistToPolyline for cell classification: for each segment compute point-segment distance. Cells: hole 3 grid: L=150/4=38 rows? Wait, cells along z: 150/4 = 37.5 → 38; width 84/4=21 → ~800 cells. Hole 2: 110/4*84/4≈ 28*21=588. Total fine.
+
+Draw distance cutoff: fogEnd ~ camDist*2.2? Let's set absolute: fogStart = 60, fogEnd = 140; skip cells with depth > 150. Course length 150 so far end fades — nice look at dusk.
+
+Hills parallax: draw as silhouette polygons across screen; offset x by yaw * some factor + camera position x small. Two layers different darkness and speed. Also sun position: fixed on horizon at an angle that shifts with yaw: sunScreenX = cx + ((angleDiff(sunAngle, yaw)))*widthPerRad… Simpler: sunAngle = 2.4 rad; dx = normalizeAngle(sunAngle - camYaw); if |dx| < 1.2 → draw sun at x = cx + dx * (w*0.35), y = horizonY - 40, with glow. Clouds similar parallax: each cloud has worldAngle and height; screenX = cx + normAng(cloud.a - camYaw)*w*0.4; if within ±1 draw ellipse. Also clouds drift a += dt*0.005.
+
+Horizon y: cy? Since pitch is fixed, horizon ≈ cy (screen center) roughly (because up vector tilts). Horizon at projected point at infinity along fwd horizontal → y where yc/zc → 0 → sy=cy. So horizon = cy exactly. Good: draw sky gradient full canvas but ground drawn over; hills above horizon line at cy with slight offset? Hills sit on horizon: base at cy, height up to ~90px. Sun near cy-30.
+
+But wait — when camera is close and pitch down, the ground may not reach top of screen… ground fills from horizon down always (infinite plane projection). Our course ends; beyond course end (z>L) we don't draw cells → gap showing sky below hills? Draw a "beyond" base: large dark greenish-brown quad extending far past course bounds (a single big rectangle covering x -200..200, z 0..L+160) drawn first in list with deepest depth. Plus hills silhouette hides most of the seam.
+
+Also sides beyond |x|>W/2: cells already cover full W; add margin strip outside course (rough dark) — just extend cell grid to W+40 and mark as ROUGH (or DARK rough). Simplest: make grid larger than course with type ROUGH, and OOB triggers at course boundary. Grid width Wc = W + 32 cells? Let me define grid covering x∈[-(W/2+16), W/2+16]. Classify as before (minDist to fairway → beyond that is ROUGH).
+
+**Distance to hole HUD:** meters = hypot(dx,dz).toFixed(0) + "m".
+
+**Lip-out and capture tuning**: ball R=0.35, hole radius 0.5? Real hole radius ~0.11m vs ball .043 → ratio ~2.6. Our ball .35 → hole r ≈ 0.9 for fair feel (arcade). Capture d<0.85 && speed<7.5; lip ring d<1.5 && speed>=7.5. Putt speeds are low so fine. Visual: hole ellipse rx ~0.9 world units.
+
+Flag pole at hole, ball passes under flag? When sink starts, hide flag wobble. Fine — flag is a billboard drawn later maybe overlapping; acceptable, or move flag aside during sink (classic). Let me sway the flag on sink (animate flag points outward) — cute: flagWave amplitude spikes.
+
+**Toast text:**
+- Sink result names by diff = strokes - par (per hole): 1:"HOLE IN ONE!!", -3 "ALBATROSS!", -2 "EAGLE!", -1 "BIRDIE!", 0 "PAR", 1 "BOGEY", 2 "DOUBLE BOGEY", >2 `${strokes-par} OVER`. Sub: "Next: The Bend" or "Final scores →".
+- Water: "WATER HAZARD" sub "+1 penalty • ball returned".
+- OOB: "OUT OF BOUNDS" sub +1.
+- Sand landing maybe small "IN THE SAND" toast? Might be noisy; skip, particles tell the story.
+
+**Scorecard final:** rows with hole name, par, strokes, diff formatted (+2 / −2 / E). Total row. Best from localStorage key 'sunsetCupBest' storing best total diff (number) — display "Course record: −2". Save on finish if better.
+
+**Edge cases:**
+- iframe resize mid-game: recompute canvas + projection focal.
+- Tab hidden: rAF pauses; dt clamp handles.
+- Prevent space scrolling: preventDefault on keydown for handled keys (Space, arrows).
+- Pointer charge: pointerdown on window when state play & ball at rest → start charge (but ignore if click is on a button/overlay — overlays only exist in menu/gameover states so fine). Use e.button===0.
+- Touch: touchstart→pointerdown via pointer events; unify with pointer events. Add `touch-action:none` to canvas/body to prevent scroll.
+- Aim keys also rotate during charge (allow adjusting while charging? Classic allows aim while holding — yes allow, arrow works during charge too).
+
+**Ball at rest check:** speed < 0.15 && rolling && !sunk → can shoot. Also freeze timer after respawn.
+
+Let me now write the code carefully. It's a lot but let me be systematic. I'll aim for clarity + performance.
+
+Constants:
+```
+const G=30, BALL_R=0.35;
+const SURF = {ROUGH:0, FAIRWAY:1, GREEN:2, SAND:3, WATER:4};
+```
+Friction table (rolling): c,l per type: ROUGH [9,2.6], FAIRWAY [3.2,1.15], GREEN [1.1,0.5], SAND [28,7]. Bounce restitution: grass .52 keep .78; sand rest .12 keep .45; water n/a.
+
+Course data:
+```
+holes = [
+ {name:'The Sparrow', par:2, L:70, W:56, tee:{x:0,z:6}, hole:{x:0,z:58}, green:{x:0,z:58,r:11},
+  path:[[0,4],[0,30],[0,52]], fwW:22,
+  sands:[{x:7.5,z:49,r:4}], waters:[], trees:[[ -12,26,1],[12,34,.9],[-10,44,1.1],[11,18,.8]] },
+ {name:'The Bend', par:3, L:112, W:88, tee:{x:-14,z:6}, hole:{x:16,z:98}, green:{x:16,z:98,r:11.5},
+  path:[[-14,4],[-14,40],[6,58],[16,72],[16,92]], fwW:20,
+  sands:[{x:-2,z:52,r:4.5},{x:24,z:84,r:4}], waters:[],
+  trees:[[ -30,50,1.2],[-26,70,1],[28,55,1.1],[30,75,1.2],[-24,90,.9],[2,100,1]] },
+ {name:'The Lake', par:4, L:152, W:88, tee:{x:-6,z:6}, hole:{x:6,z:136}, green:{x:6,z:136,r:12},
+  path:[[-6,4],[-6,50],[2,70]... 
+```
+Hmm, lake crossing: water band z∈[66,84], x from -44 to 30 (leaves corridor on right? or left). Let me place water x∈[-10, 44] so left corridor x<-10 is rough but passable. Path should route through corridor: path [[-6,4],[-14,40],[-22,75],[-18,100],[6,130]]? Wait green at x=6,z=136; approach from left. Bunker front of green: {x:-4,z:124,r:4}. Trees line right side and along lake edge.
+
+Let me finalize hole 3:
+```
+par 4, L:152, W:88, tee:{x:-4,z:6}, hole:{x:4,z:138}, green {x:4,z:138,r:12}
+path: [[-4,4],[-10,40],[-20,78],[-16,105],[4,128]] fwW 20
+waters: [{type:'rect', x0:-8, z0:64, x1:44, z1:86}] — leaves left corridor width from -52..-8 (rough). Hmm that's wide rough; make water x0=-14 → corridor -52..-14 still huge. Water should nearly span: x0:-30? Then corridor is left 30 units… player can also carry over lake (carry ~110 max, lake width 22 — easy carry). So corridor optional. Set water x∈[-26, 44], z∈[64,86]. Corridor left: -52..-26 (26u wide rough). OK.
+sands: [{x:-10,z:126,r:4.5},{x:16,z:96,r:3.5}]
+trees: right side [[30,50,1.2],[38,70,1.3],[30,95,1.1],[-38,90,1.2],[-34,115,1],[22,120,1.1]]
+```
+Hole 2 dogleg check: tee x=-14; path goes straight to z=40 then bends right to x=16 by z=72, green at (16,98). Trees on outside of bend left side and inside right? Bunker inside {x:-2,z:52} near bend apex. Good.
+
+Trees should not sit on fairway path (min distance > fwW/2+3 from path), nor in water/sand/green. Let me eyeball positions above — roughly OK; also add runtime guard: skip tree if within green r+3 of hole or inside water rect.
+
+Tree collision radius 1.4, crown height 5.5.
+
+Now cell classification function per hole:
+```
+function buildHole(i){
+ const H=holes[i], CS=4;
+ gw = Math.ceil((H.W+32)/CS); gl = Math.ceil((H.L+24)/CS); // extra margin
+ x0 = -(H.W/2+16), z0=-12;
+ for cells: cx=x0+(ix+.5)*CS, cz=z0+(iz+.5)*CS
+  type=ROUGH; shade random.
+  if dToPath < H.fwW/2 → FAIRWAY (or TEE zone near tee? skip)
+  green: dist to hole center < green.r → GREEN (circular) — but path passes through green area; green overrides fairway (checked after).
+  sands: dist<r → SAND.
+  water rect/ellipse check → WATER.
+  order: compute grass first, then if sand→SAND, if water→WATER, if green→GREEN? Green should override sand where they overlap? Usually bunkers on fringe of green not over it; either fine. Let me do: start with ROUGH; if dPath<fw/2 → FAIRWAY; if inGreen → GREEN; if inSand → SAND (sand can sit on fringe); if inWater → WATER. Water last = top priority.
+```
+Store cells as typed array: type Uint8Array(gw*gl), shade Float32Array random, plus precomputed base rgb per cell? Precompute final color strings in two variants (stripe on/off) — stripe depends on iz parity and type (fairway/green only). Precompute per cell: colStr (no fog). Also store center x,z.
+
+minDistToPolyline(px,pz, pts): iterate segments with standard formula.
+
+Water rect check: cx between x0..x1 && cz between z0..z1.
+
+**Projection helpers:**
+```
+function project(x,y,z){ // returns [sx,sy,depth] or null if behind
+ vx=x-C.x ... dot with basis → [sx, sy, zc]; if zc<0.2 return null; sx=cx+ f*xc/zc; sy=cy - f*yc/zc; }
+```
+f = h*1.15? fov: f = (H/2)/tan(fovY/2); choose fovY ~ 60° → f = h/(2*tan30)= h*0.866. Let me use f = h*0.95 (slightly wider ~57°). Good.
+
+Camera basis computed per frame:
+```
+cp=cos(pitch), sp=sin(pitch); cyw=cos(yaw), syw=sin(yaw);
+fwd = [syw*cp, -sp, cyw*cp]  // wait sign of y: looking down → fwd.y negative. Yes with pitch>0.
+right = [cyw, 0, -syw]
+up = cross(fwd,right)
+```
+cross(f,r): (f.y*r.z - f.z*r.y, f.z*r.x - f.x*r.z, f.x*r.y - f.y*r.x) with r.y=0:
+ up = (f.z*0? compute: ux = f.y*r.z - f.z*0 = f.y*r.z; uy = f.z*r.x - f.x*r.z; uz = f.x*0 - f.y*r.x = -f.y*r.x.
+With f=(syw*cp, -sp, cyw*cp), r=(cyw,0,-syw):
+ ux = (-sp)(-syw) = sp*syw
+ uy = (cyw*cp)(cyw) - (syw*cp)(-syw) = cp(cyw²+ syw²)=cp
+ uz = -(-sp)(cyw)= sp*cyw
+ up=(sp*syw, cp, sp*cyw). Check orthogonal to fwd: dot = syw*cp*sp*syw + (-sp)(cp) + cyw*cp*sp*cyw = sp(cp(syw²+cyw²)) - sp·cp = 0 ✓.
+
+Camera position C = target - fwd*dist. Target = ballP + [0,0.7,0].
+
+**Draw order list:** array items: {d, k, ...} where k = kind id; store per-item data in parallel fields to reduce object overhead? Just objects fine (~1500/frame). I'll do:
+```
+list.length=0;
+for cells visible: project 4 corners (need raw camera-space zc for depth and screen coords); if all null skip; if some null → skip (cell crosses near plane) — with near=0.2 and camera high this is rare except very close cells at low angle… ball is close to camera when camDist small; pitch .35 down means ground near camera is behind? Cells directly under camera: their corners may be below/behind → some null → skip → hole in ground near feet of camera? Camera height = dist*sin(pitch) ≈ 18*0.34≈6 units above ball; nearest drawn cells around ball are ~a few units in front — should project fine (zc>0). The region directly under/behind camera isn't visible anyway (below screen bottom). So skip is safe.
+ depth = avg zc of corners.
+ push {d:depth, t:type, s:shadeIdx?, x1..y4, fogT}
+```
+Hmm storing 8 numbers + fields per cell object → ~1500 objects * 12 props — GC churn but OK for modern browsers at 60fps? Probably fine; to be safe I'll preallocate a pool of N=4096 item objects and reuse (reset list length, fill). Let me do that: items = new Array(POOL); item fields d,k,a,b,c,d2,e,f,g,h (numbers), reusing — zero allocation per frame. k codes: 1..n for cell types with data indices? Need type+shade+stripe → precompute per-cell `col` string and fog blend needs rgb… store per cell: r,g,b base ints + colStr; item stores ci (cell index) → lookup CELL[ci].r etc. So item fields: d, ci, proj x1,y1..x4,y4 (8). For other kinds (tree/flag/ball/particle/mark/hole): k kind, then data refs. Let me use generic: item = {d, k, ref, sx, sy, extra...}. Different kinds need different fields; reuse a superset of fields: d,k,o(obj),x,y,z? For billboards I compute screen pos + scale at draw time (recompute projection from stored world coords — but that's a second project call; acceptable for ~60 non-cell items). So item = {d, k, o} where o is the object reference (tree obj / particle / mark / special constants). For cells: k=0, o=ci.
+
+Sort list by d descending. Then draw switch on k.
+
+Kinds: 0 cell, 1 tree, 2 flag(+pole+hole?), 3 ball, 4 particle, 5 groundmark, 6 holeEllipse (draw before flag — include in sorted list with its depth; the ellipse is on the ground so it should be drawn right after cells around that depth — works via sort), 7 aimArrow? Arrow should always be visible on top of ground but below ball? Draw arrow after all cells and before trees/ball? Simplest: draw arrow in same sorted pass (k=8) with depth = ball depth; its segments project at draw time.
+
+Flag parts: pole line + flag polygon: k=2 draws both. Ball shadow: part of ball draw (ellipse at ground point, alpha by height).
+
+**Sky render:**
+```
+horizonY = cy (center) — but if pitch changes? fixed pitch .34 → horizon at cy exactly only if looking at infinite distance… yes since up tilt is constant, horizon projects to sy where yc/zc→0 → sy=cy. ✓
+sky gradient: create once per resize (cache canvas gradient): stops as planned.
+fill rect 0,0,w,h with gradient? Ground covers below; just fill entire then draw world over. Slight cost fine.
+Sun: angle sunA = some rad; dx = wrap(sunA - yaw); if |dx|<1.1: sx=cx+dx*w*0.42, sy=cy- h*0.10; radial glow gradient circle r=h*0.30 alpha; disc r=h*0.05 color #fff2c8.
+Hills: two layers: layer(offset, col, amp): path across screen: for x steps 0..w by 40: y = cy - (noise) ... use deterministic sin combo: h1(x)= 30+22*sin((x*0.004)+seed)+14*sin(x*0.011+seed2); shift x by (yaw*parallax + camX*0.2). Fill down to cy+2? Hills should sit on horizon and ground drawn after covers below cy — but hill base at cy, ground cells from cy downward → overlap fine. Actually ground near horizon is at exactly cy; hills above. ✓
+Clouds: array of {a (angle), y (px above horizon), s(scale), sp} 6 clouds; sx = cx + wrap(cloud.a - yaw)*w*0.5; if |...|<1.2 draw: soft ellipse cluster alpha .35 warm white; drift a += dt*0.004.
+```
+wrap(a) → ((a+PI)%(2PI))-PI (handle negatives).
+
+**Fog color:** mix toward dusk haze e.g. rgb(196,132,96)? Haze should match horizon glow: #e8a06b-ish → (232,158,107). Blend t = smoothstep(fogStart=55, fogEnd=135, d). If t>0.98 skip draw.
+
+Cell color precompute:
+```
+base per type with stripe variants:
+FAIRWAY: A(62,124,58) B(70,136,64)? Let me define rgb: fairwayA [63,124,59], fairwayB[71,134,65]; rough [45,92,49] (darker olive); greenA [88,168,80] greenB[97,178,88]; sand [226,196,140]; water [58,108,158] with shimmer handled at draw time: modulate lightness by sin(time*2 + (cx+cz)*0.35)*8 → compute at draw only if type WATER (fewer cells).
+shade variance: multiply by (0.93+0.14*rand) per channel, round, cache string `rgb(r,g,b)`.
+```
+Water shimmer needs dynamic color → build string for water cells each frame (only visible ones, ~dozens). OK.
+
+**Ball draw:** projected center; radius px = f*BALL_R/zc *? screenR = f*BALL_R/ zc. Gradient: create per frame (cheap enough) or cache a 64px sprite and drawImage scaled — better perf: pre-render ballSprite canvas 64x64 once (radial gradient white, gray edge, small highlight). drawImage with size 2*sR… plus shadow ellipse before at ground projection.
+
+**Tree draw:** world base (x,0,z), height hgt=4.5*s, crown radius 2.6*s. Project base and top; length px → scale. Draw trunk: short line/rect brown #5a3d28; crown: two stacked triangles or round blobs — stylized pine? Dusk pine silhouette is nice: dark green triangle stack with warm rim? Let me do layered: 3 triangles decreasing width, color #1f4a2c base to #2c5f36 top, plus subtle darker side? Keep flat 2-tone + slight sway offset at top by sin(time+seed)*0.15 world units — apply to top x before projection (sway whole crown: project crown center with sway). Simplest: compute screen base B and screen top T (with sway); draw trunk line B→(T interpolated 30%); then triangles around T going down with width = f*crownR/zcTop.
+
+**Flag draw:** pole from hole ground to +6u; flag cloth: 4 points waving: p0=top, p1=top+dir*(len=2.2) with sin offset vertical, p2=p1 - (0.8 down), p3 = top - 0.8. dir = screen right? Use world direction perpendicular to view: use camera right vector for wave plane → flag extends along +right and waves in up/down → looks billboarded. Compute in world: clothPts = [top, top+R*2.4+wob, ...] then project each (4 points) — fine.
+
+**Hole ellipse:** project center; radiusX px = f*0.95/zc, y scale 0.45 (approx perspective for flat ellipse with this pitch). Fill #101d16, plus rim highlight arc? Keep simple + subtle inner gradient. Also a faint circle ring for "cup" edge lighter.
+
+**Aim arrow:** from ball p along dir: sample t 0..len step len/8; project each; draw polyline with width tapering (use lineTo with lineWidth set per segment), color lerp white→#ff5a3c by power; arrowhead: two short lines back at tip. Alpha .9. Also a small circle at ball? Skip.
+
+**Trajectory dots:** simulate on charge update every frame (or when power changes) — cheap enough (~200 iterations). Store pts array; draw as projected circles r=2-3px alpha decreasing, color #ffe9c9. Only when charging && state play. Also show a soft "landing" ring at first ground contact.
+
+**HUD DOM:**
+```
+#hud (pointer-events none)
+ .panel.tl: HOLE <b id=hNum>1</b> <span id=hName>The Sparrow</span> / PAR <b id=hPar>2</b> ; row2: STROKES <b id=strokes>0</b> · TOTAL <b id=total>±0</b>
+ .panel.tr: CUP <b id=dist>62m</b>; BEST? maybe best total here during play. 
+ #powerWrap bottom center: label POWER + bar (#pfill)
+ #toast center
+ #hint bottom-left small: "A/D aim · hold SPACE to power, release to hit · Q/E orbit · scroll zoom · R restart"
+```
+Update textContent on change (cache last values).
+
+Total format: diff = totalStrokes - parSoFar; show 'E', '+n', '−n' (use minus sign U+2212 for looks? Plain '-' safer. Use '−'? Fine in UTF-8 file.)
+
+**Gameover scorecard:** build rows innerHTML on end:
+```
+HOLE | PAR | SCORE | +/-
+1 The Sparrow 2 3 +1 ...
+TOTAL 9 10 −? 
+```
+Plus a verdict line by total diff. Best record note + "NEW COURSE RECORD!" if beat.
+
+**Menu scorecard:** rows with '–' blanks, title big across card top: "SUNSET CUP" + sub "3D MINI-GOLF AT GOLDEN HOUR"? It's not mini golf; "a three-hole course at golden hour". Controls legend below (kbd chips). Button TEE OFF.
+
+Overlay container: #overlay with .card child; toggle hidden class. Card CSS: paper bg, double border (border + outline offset?), width min(520px, 86vw), rotate -1deg slightly for charm? Subtle rotate(-1.2deg) on card — playful. Add corner "stamp": absolute positioned rotated badge circle with dashed border red text "PAR 9".
+
+Paper texture: background: #f7ecd4 + repeating-linear-gradient(0deg, rgba(120,90,40,.05) 0 2px, transparent 2px 26px)? Scorecard lines. Plus subtle radial vignette. Text color #233d2a; headings Georgia; red accent #b3402e for stamp and hole numbers.
+
+Button: gold gradient? Solid deep green bg (#1e5b38) cream text, hover lift + glow; active press. Focus visible outline.
+
+Toast CSS: position center 30% top, font Georgia italic 54px, color #fff7e0, text-shadow multi dark + warm; .show → animation pop (scale .6→1 with overshoot) then fade out via timeout adding .hide.
+
+Also small "chip" notification for penalties reuses toast with smaller class? Keep one style with size variant class.
+
+**Audio implementation:**
+```
+let AC=null, muted=false, master;
+function initAudio(){ if(AC) return; try{ AC=new (window.AudioContext||window.webkitAudioContext)(); master=AC.createGain(); master.gain.value=.5; master.connect(AC.destination); wind... }catch(e){} }
+noiseBuf cached 1s.
+function blip(type,f0,f1,dur,vol,t0?) generic osc with freq ramp + gain env.
+function noiseBurst(filterType,freq,dur,vol,Q)
+sounds:
+ sHit(p): noiseBurst('bandpass',1200+800p? , .07, .5+.5p) + blip('sine', 140-60p?, 60, .12, .5) → thwack: low sine 150→50 .1 + noise bp 900 .05.
+ sBounce(v): blip('sine',180,90,.07,v*.3)
+ sSink(): plunk sine 320→70 .3 vol .6; then chime: [740,988,1175,1568] triangle each .12 spaced .09 vol .25.
+ sWater(): noiseBurst('lowpass',500,.5,.5) + blip sine 300→80 .35 .3
+ sOut(): blip('sawtooth',120,60,.3,.25)
+ sFlagChime(): two triangle notes 1319(E6),1760(A6)? Use B? E6+A6 pleasant. vol .18 spaced .1
+ sClick(): square 700 .04 .15
+ wind: bufferSource loop noise → lowpass 400 Q .5 → gain .035; also LFO on gain? Keep static, add slight LFO osc 0.07Hz→gainNode.gain (±.015). Nice ambient.
+```
+All wrapped in if(!AC||muted) return; resume on init (AC.state==='suspended' → resume()).
+
+Mute toggle M: muted flag → master.gain = muted?0:.5.
+
+**Input details:**
+keys object; keydown:
+- if e.repeat for space skip charging start (but allow repeat for aim via keys set).
+- Space/Enter preventDefault.
+- state menu: Enter or Space → startGame.
+- gameover: Enter/R → restart.
+- play: Space → beginCharge (if canShoot). R → restartRound. M mute. Q/E/A/D/arrows tracked in keys.
+keyup: Space → releaseShot if charging.
+pointerdown (window): initAudio; if state menu→? Click on canvas to start? Overlay has button; also clicking anywhere starts? Might be accidental; only button/Enter. If play & canShoot & !charging → beginCharge. pointerup → releaseShot.
+wheel: camDistTarget *= e.deltaY>0?1.12:0.9 clamp 10..70. preventDefault to avoid page scroll (iframe anyway). Add {passive:false}.
+
+canShoot(): state==='play' && !ball.sunk && ballResting && freeze<=0.
+
+Aim input in update: dir = (keys.right?1:0)-(keys.left?1:0); aim += dir*2.0*dt; also during charge same rate.
+
+**Sink animation:** on capture: ball.sunk=true; sinkT=0; sSink(); flag wobble amp=3; confetti at hole; after 0.9s → holeComplete(): compute result, toast big, state='holeend', timer 2.4s → nextHole() or endGame(). Also disable shots meanwhile (canShoot false because sunk).
+
+Ball physics when sunk: p.x += (hx-p.x)*min(1,dt*10); z same; y = max(-0.6, y - dt*3.2); also rotate? no.
+
+**Respawn (water/oob):** freeze=0.9; ball at lastShotPos (or tee), v=0, rolling=true, y=R; toast; sound; particles at impact point before moving (splash droplets). Also set canShoot false while freeze>0 (freeze decrements in update).
+
+lastShotPos = copy of p before applying velocity on shot. If water again immediately → lastShotPos same → fine.
+
+Edge: ball rests in…? Can't rest in water (immediate respawn). Sand can rest. OK.
+
+**Distance HUD:** update each frame: d=hypot; text = d<10? d.toFixed(1): round + 'm'. Only if changed.
+
+**Flag chime trigger:** track wasNear flag: within green.r+2 of hole and previously not → sFlagChime (only during play, ball moving? also on landing). Use cooldown 3s.
+
+**Now performance sanity check:** cells visible maybe ~800-1500; each: 4 projections (dot products) + fill. Plus sort ~1600 items. Should run 60fps on desktop; acceptable.
+
+DPR cap at 2 for perf.
+
+**Let me now write the HTML/CSS/JS.** I'll be careful with syntax. Let me draft key code sections in my head then write final.
+
+Also remember: game name in <title>: "Sunset Cup — 3D Golf".
+
+Structure:
+```html
+<!DOCTYPE html><html><head><meta charset=utf-8><meta viewport><title>Sunset Cup — 3D Golf</title><style>...</style></head>
+<body>
+<canvas id=c></canvas>
+<div id=hud>...panels, power, hint</div>
+<div id=toast></div>
+<div id=overlay><div class=card id=card>...content injected by JS for menu/gameover?</div></div>
+<script>...</script>
+```
+I'll build overlay content via JS (setCardMenu / setCardEnd) so it reuses.
+
+CSS details:
+- html,body{margin:0;height:100%;overflow:hidden;background:#0d1030}
+- canvas{position:fixed;inset:0;width:100vw;height:100vh;display:block;touch-action:none;cursor:crosshair}
+- .panel{position:fixed;...} font Verdana 12px letter-spacing; color #ffe9c9; background rgba(13,28,20,.72); border:1px solid rgba(255,210,122,.35); padding 10px 14px; text-transform uppercase; box-shadow inset? Add a small gold corner accent via ::before? Keep clean.
+- Big numbers Georgia italic 26px gold #ffd27a.
+- Power bar: width min(300px,60vw); track height 12 background #14251b border 1px rgba(cream,.5); fill gradient linear (90deg,#5ad16a,#ffd24a 60%,#ff5a3c) width %.
+- Toast: font Georgia italic clamp(34px,7vw,64px); color #fff6dd; text-shadow 0 2px 0 rgba(0,0,0,.45), 0 0 24px rgba(255,180,90,.5); animation pop .5s cubic-bezier(.2,1.6,.4,1).
+- Card: background paper; color #22371f? Let me write full CSS.
+
+Card content (menu):
+```
+<div class=stamp>PART 9</div>? "PAR 9"
+<h1>SUNSET CUP</h1>
+<p class=tag>A three-hole course at golden hour</p>
+<table class=hlist><tr><td>01 · The Sparrow</td><td>Par 2</td></tr>...</table>
+<div class=rules> kbd chips grid:
+ AIM ← → / A D
+ SHOOT hold SPACE or CLICK — release to fire
+ CAMERA Q / E orbit · SCROLL zoom
+ RESTART R · MUTE M </div>
+<button id=startBtn>TEE OFF</button>
+<p class=or>— or press ENTER —</p>
+```
+Gameover card: h1 "FINAL SCORECARD", table rows, total row highlighted, verdict line, record line, button PLAY AGAIN.
+
+Verdict by total diff d: <=-3 "A round for the books."; -2/-1 "Under par — the caddies are cheering."; 0 "Even par. Respectably polite."; 1/2 "The course got you back."; >=3 "The sunset was lovely, though." Fun flavor.
+
+OK also small live "best" display in top-right panel: BEST −2 (if saved) label "COURSE RECORD".
+
+Let me write the JS carefully now. I'll be careful with syntax. Let me draft main code sections then write final.
+
+Constants and helpers:
+```js
+'use strict';
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+let W=0,Hh=0,dpr=1,focal=0,cx=0,cy=0;
+function resize(){ dpr=Math.min(2,window.devicePixelRatio||1); W=innerWidth; Hh=innerHeight; cv.width=W*dpr|0; cv.height=Hh*dpr|0; ctx.setTransform(dpr,0,0,dpr,0,0); cx=W/2; cy=Hh/2; focal=Hh*0.95; skyGrad=null; }
+addEventListener('resize',resize); resize();
+```
+
+Math:
+```js
+const TAU=Math.PI*2;
+function wrapA(a){a=(a+Math.PI)%TAU; if(a<0)a+=TAU; return a-Math.PI;}
+```
+
+Camera:
+```js
+const cam={yaw:0,pitch:0.34,dist:26,tx:0,ty:1,tz:0,x:0,y:8,z:-20,fx:0,fy:0,fz:0,rx:0,ry:0,rz:0,ux:0,uy:0,uz:0};
+let camYawT=0; // target yaw for smoothness? Let me smooth dist and pos directly.
+function updateCamera(dt){
+ let tx,ty,tz,auto=false;
+ if(state==='menu'){tx=ball.p[0];ty=1.2;tz=ball.p[2]; camYawT+=dt*0.18;}
+ else {tx=ball.p[0];ty=ball.p[1]+0.9;tz=ball.p[2];}
+ const cp=Math.cos(cam.pitch),sp=Math.sin(cam.pitch),cyw=Math.cos(camYawT),syw=Math.sin(camYawT);
+ cam.fx=syw*cp; cam.fy=-sp; cam.fz=cyw*cp;
+ cam.rx=cyw; cam.ry=0; cam.rz=-syw;
+ cam.ux=cam.fy*cam.rz - cam.fz*cam.ry; // = -sp*(-syw)= sp*syw? wait formula ux=fy*rz-fz*ry
+ ...
+```
+Let me just compute up as cross(fwd,right): u = f×r:
+ux = f.y*r.z - f.z*r.y
+uy = f.z*r.x - f.x*r.z
+uz = f.x*r.y - f.y*r.x
+With r.y=0: ux=f.y*r.z; uy=f.z*r.x - f.x*r.z; uz=-f.y*r.x. ✓ (matches earlier).
+
+Smooth camYawT? Orbit input changes it instantly — fine, but camera position lerp gives smoothness. Actually if yaw snaps by small dt increments it's already smooth. OK.
+
+dist: camDistT target from wheel; lerp cam.dist→target.
+
+Camera pos: C.x = tx - fx*dist etc. Then lerp actual cam.x toward C with k=1-exp(-6dt). First frame set directly (snap flag).
+
+project:
+```js
+function project(x,y,z,out){ // out=[sx,sy,depth] ; returns false if behind
+ const vx=x-cam.x, vy=y-cam.y, vz=z-cam.z;
+ const dz=vx*cam.fx+vy*cam.fy+vz*cam.fz;
+ if(dz<0.25) return false;
+ const dxo=vx*cam.rx+vy*cam.ry+vz*cam.rz;
+ const dyo=vx*cam.ux+vy*cam.uy+vz*cam.uz;
+ out[0]=cx+focal*dxo/dz; out[1]=cy-focal*dyo/dz; out[2]=dz; return true;
+}
+```
+
+Hole data and build (as planned). Let me write minDistSeg:
+```js
+function dPath(x,z,pts){ let m=1e9; for(let i=0;i<pts.length-1;i++){ const ax=pts[i][0],az=pts[i][1],bx=pts[i+1][0],bz=pts[i+1][1]; const dx=bx-ax,dz=bz-az; const t=Math.max(0,Math.min(1,((x-ax)*dx+(z-az)*dz)/(dx*dx+dz*dz))); const px=ax+dx*t-x, pz=az+dz*t-z; const d=px*px+pz*pz; if(d<m)m=d;} return Math.sqrt(m);}
+```
+
+buildHole(i): returns object with grid arrays and meta stored in `cur`:
+```js
+const CS=4;
+let cur=null;
+function loadHole(i){
+ const hd=HOLES[i]; const gw=Math.ceil((hd.W+36)/CS), gl=Math.ceil((hd.L+30)/CS);
+ const x0=-hd.W/2-18, z0=-15;
+ const type=new Uint8Array(gw*gl), sh=new Float32Array(gw*gl), colr=new Int16Array..., actually store r,g,b arrays.
+ let ci=0;
+ for(let iz=0;iz<gl;iz++)for(let ix=0;ix<gw;ix++){
+   const wx=x0+(ix+.5)*CS, wz=z0+(iz+.5)*CS;
+   let t=0; // rough
+   if(dPath(wx,wz,hd.path) < hd.fwW/2) t=1;
+   const gdx=wx-hd.hole.x,gdz=wz-hd.hole.z;
+   if(gdx*gdx+gdz*gdz < hd.green.r*hd.green.r) t=2;
+   for(const s of hd.sands){const sx=wx-s.x,sz=wz-s.z; if(sx*sx+sz*sz<s.r*s.r){t=3;break;}}
+   for(const w of hd.waters){ if(wx>w.x0&&wx<w.x1&&wz>w.z0&&wz<w.z1){t=4;break;} }
+   type[ci]=t; sh[ci]=Math.random(); ci++;
+ }
+ // colors precomputed strings
+ const cols=new Array(gw*gl);
+ for(ci...){ compute rgb by t & stripe(iz%2) & shade → cols[ci]=`rgb(...)`; also store r,g,b in arrays for fog mix: CR,CG,CB Int16Array. }
+ cur={hd,gw,gl,x0,z0,type,sh,cols,CR,CG,CB};
+}
+```
+Color function:
+```js
+function cellRGB(t,stripe,shade){
+ let r,g,b;
+ switch(t){case 1: [r,g,b]= stripe? [72,135,64]:[62,122,58]; break;
+ case 2: stripe? [99,178,90]:[88,166,80];
+ case 3: [224,196,142] (sand) — vary by shade more;
+ case 4: [52,102,152];
+ default: [44,88,47]; }
+ const m=0.9+0.18*shade; r*=m... round.
+```
+Wait stripe for sand/water? No — only t 1,2 use stripe param, else stripe ignored.
+
+Water dynamic shimmer at draw: if t===4: l = Math.sin(time*2.2 + (ix*7+iz*13)*0.35) → r+=l*10 etc. Compute string. Fine.
+
+Ball and game state:
+```js
+const ball={p:[0,0.35,0],v:[0,0,0],rolling:true,sunk:false};
+let state='menu', holeIdx=0, strokes=0, totals=[0,0,0], parSoFar=0;
+let aim=0, charging=false, chargeT=0, power=0;
+let lastShot=[0,0.35,0]; let freeze=0;
+const parts=[]; const marks=[]; let flagWob=0;
+```
+
+startGame(): holeIdx=0; totals reset; loadHole(0); placeBallTee(); state='play'; hide overlay; toast "HOLE 1 — PAR 2" sub "The Sparrow"? Or just a small toast "TEE OFF". Let me show a toast with hole name.
+
+placeBallTee(): p=[tee.x, R, tee.z]; v=0; aim=Math.atan2(hole.x-tee.x, hole.z-tee.z); reset camera to behind: camYawT = aim+PI (so camera looks from behind ball toward hole? Camera forward dir at yaw a is (sin a, cos a)… we want camera looking toward hole → forward ≈ dir to hole → yaw = aim. But classic golf camera sits behind ball looking at target → camera forward points from ball to hole → yaw=aim. Then ball is near camera… camera offset = -fwd*dist puts it behind ball opposite of hole. ✓ So camYawT=aim. Also snap camera (set pos directly).
+
+nextHole(): holeIdx++; if >2 endGame() else loadHole, placeBallTee, toast.
+
+endHoleFlow: after sink anim complete → compute diff etc., state='holeend', holeEndT=0; in update when t>2.6 → nextHole().
+
+endGame(): state='over'; show overlay with scorecard; save best.
+
+restartRound(): same as startGame (works from any state); if playing, just reset.
+
+Shot:
+```js
+function beginCharge(){ if(!canShoot())return; charging=true; chargeT=0; }
+function releaseShot(){ if(!charging)return; charging=false;
+ const v = 7 + 51*power; // 7..58
+ const dx=Math.sin(aim), dz=Math.cos(aim);
+ lastShot=[ball.p[0],Math.max(ball.p[1],R),ball.p[2]];
+ ball.v[0]=dx*v; ball.v[1]=v*0.10? slight loft! A loft angle: vy = v*sin(loft). Loft ~ 6° → vy=v*0.105, horizontal v*cos≈v*0.994. Add small loft for arc: yes vy=v*0.12, vx=dx*v*0.98...
+ ball.v=[dx*v*0.985, v*0.13, dz*v*0.985];
+ ball.rolling=false; strokes++; sHit(power); particles at ball backward (grass tufts): spawn 6 green puffs behind; small camera kick: camKick=power*1.2 (applied as temporary extra forward offset? skip or simple: bump dist lerp target temporarily). Let me add shake: shakeT=0.15+0.2*power, random offset per frame *shakeT.
+ updateHUD();
+}
+```
+Power ping-pong: chargeT+=dt; p = tri(chargeT/1.15): x=chargeT%2.3/1.15 → power = x<1?x:2-x.
+
+Physics step (dt fixed 1/120, substep from accumulator):
+```js
+function physStep(dt){
+ if(freeze>0) return; // frozen during respawn pause (decrement in update)
+ const p=ball.p,v=ball.v;
+ if(ball.sunk){ p[0]+=(hole.x-p[0])*Math.min(1,dt*9); p[2]+=... ; p[1]=Math.max(-0.7,p[1]-dt*3.4); return;}
+ v[1]-=G*dt;
+ p[0]+=v[0]*dt; p[1]+=v[1]*dt; p[2]+=v[2]*dt;
+ // tree collision
+ for(const t of trees){ const dx=p[0]-t.x,dz=p[2]-t.z; const rr=1.35+t.s*0.4; if(p[1]<5.2*t.s && dx*dx+dz*dz < rr*rr){ const d=Math.sqrt(...)||1e-4; nx=dx/d,nz=dz/d; p[0]=t.x+nx*rr; p[2]=t.z+nz*rr; const dot=v[0]*nx+v[2]*nz; if(dot<0){ v[0]-=1.6*dot*nx; v[2]-=1.6*dot*nz; v[0]*=0.55;v[2]*=0.55; sThwack? use bounce sound vol .3; leaf particles; flagWob? no } } }
+ const t = surfAt(p[0],p[2]);
+ if(p[1]<=R){
+   if(t===4){ waterEvent(); return;}
+   const imp=-v[1]; // approx impact vy before flip (current v[1] is negative)
+   v[1]= -v[1]*(t===3?0.12:0.52);
+   const keep=t===3?0.42:0.8;
+   v[0]*=keep; v[2]*=keep;
+   p[1]=R;
+   if(imp>7){ dust(t, p, imp*0.05); sBounce(Math.min(.6, imp*0.03)); addMark(p); }
+   else { v[1]=0; ball.rolling=true; }
+   if(t===3 && Math.hypot(v[0],v[2])>3){ big sand puff; v[0]*=0.5;v[2]*=0.5;}
+ }
+ // rolling friction
+ const sp=Math.hypot(v[0],v[2]);
+ if(ball.rolling || v[1]===0 && p[1]<=R+0.001){
+   const [fc,fl]=FRIC[t];
+   const dec=(fc+fl*sp)*dt;
+   if(sp<=dec||sp<0.12){v[0]=0;v[2]=0;} else {const k=1-dec/sp; v[0]*=k;v[2]*=k;}
+ }
+ // hole capture
+ const hdx=p[0]-hole.x, hdz=p[2]-hole.z; const hd=Math.hypot(hdx,hdz);
+ if(!ball.sunk && p[1]<R+1.5){
+   const spd=Math.hypot(v[0],v[1],v[2]);
+   if(hd<0.85 && spd<8) startSink();
+   else if(hd<1.6 && spd>=8){ // lip out
+     const nx=hdx/(hd||1e-4), nz=hdz/(hd||1e-4);
+     v[0]=nx*spd*0.35+ (Math.random()-.5)*2; v[2]=nz*spd*0.35+(Math.random()-.5)*2; v[1]=Math.max(v[1],1.5); ball.rolling=false; sBounce(.3);
+   }
+ }
+ // OOB
+ if(p[0]<-hd.W/2-8||p[0]>hd.W/2+8||p[2]<-14||p[2]>hd.L+16) oobEvent();
+}
+```
+Wait, rolling friction should apply even when not "rolling" but on ground (after bounce with v.y=0). Condition: p[1]<=R+0.01 && Math.abs(v[1])<0.01. Let me define grounded = p[1]<=R+0.02 && Math.abs(v[1])<0.05. Then rolling friction always when grounded.
+
+Also for ball resting check: grounded && sp<0.12 → treat as at rest (v already zeroed).
+
+surfAt(x,z): map to cell index; if outside grid → ROUGH(0) (OOB triggers anyway).
+```js
+function surfAt(x,z){ const ix=((x-cur.x0)/CS)|0, iz=((z-cur.z0)/CS)|0; if(ix<0||iz<0||ix>=cur.gw||iz>=cur.gl)return 0; return cur.type[iz*cur.gw+ix]; }
+```
+
+waterEvent(): splash particles at p; sWater(); strokes++ (penalty); toast('WATER HAZARD','+1 penalty — ball returned'); respawnAt(lastShot); updateHUD.
+oobEvent(): sOut(); strokes++; toast('OUT OF BOUNDS',...); respawnAt(lastShot).
+respawnAt(pos): freeze=0.9; ball.p=[pos[0],R,pos[2]]; v=0; rolling=true; sunk=false.
+
+startSink(): ball.sunk=true; flagWob=4; sSink(); confetti(hole); sinkDelay handled: in update, if sunk && sinkT>1.0 && state==='play' → finishHole(). Track sinkT += dt when sunk.
+
+finishHole(): const d=strokes-Hd.par; name per diff; toast(name, sub next hole or final); state='holeend'; endT=0; totals[holeIdx]=strokes.
+update: if holeend: endT+=dt; if>2.4 → nextHole().
+
+Note: strokes counted per hole; reset strokes=0 in loadHole/placeBallTee flow (in nextHole/startGame set strokes=0).
+
+Flag chime: in update during play, cooldown flagCoo-=dt; d=hypot to hole; if(d<hd.green.r+2.5 && !flagNear){flagNear=true; sChime();} if d> green.r+4 flagNear=false. Only when ball not at rest? Also fine on rest (putt near). Keep with cooldown 2s.
+
+Particles:
+```js
+function spawn(x,y,z,n,col,spd,life,g,up){ for i<n: parts.push({x,y,z, vx:(Math.random()-.5)*spd, vy:Math.random()*spd*0.8+ (up? spd*0.4:0), vz:..., life:life*(0.6+Math.random()*.6), max: same, r: 0.12+Math.random()*0.15, col}); }
+update: vy-=g*dt; pos+=v dt; if y<0 && !onGround keep? just die at y<0 → set life=min(life,0.2). Cap parts length 300 (splice oldest).
+```
+cols: grass '#7ec86b', sand '#e9d4a1', water '#bfe0ff'/'#7fb5ea', leaf '#2f6b3a', confetti ['#ffd24a','#fff2c0','#ff7a4d','#8fe08a'].
+
+Marks: {x,z,r,life,max} fade 8s; draw as dark ellipse alpha life*0.35 color #1c2b18 (on grass) — if in sand maybe lighter? Just use dark with low alpha universally.
+
+Aim arrow and preview:
+```js
+function trajectoryPreview(){ pts.length=0; const p=[...ball.p]; let v=[dx,vy,dz]*speed(power); simulate dt .05 up to 320 steps or until (grounded && sp<1): gravity, ground bounce simplified (rest .5 keep .78), if water hit → stop and mark. push every 4th point while y>0.3. }
+```
+Call each frame when charging (cheap ~300 iterations).
+
+Draw list building:
+```js
+const POOL=6000; const items=new Array(POOL); for(i<POOL)items[i]={d:0,k:0,o:0,x:0,y:0,z:0}; let nItems=0;
+function pushItem(d,k,o){ if(nItems>=POOL)return; const it=items[nItems++]; it.d=d;it.k=k;it.o=o;}
+```
+Cells: loop visible range: limit by distance from ball? Use frustum via projection. Loop all cells (≤ ~1000): compute corners in world → project 4. To reduce cost, quick reject: cell center depth & screen bounds: project center first (1 proj); if behind or offscreen margin > CS*focal/dz*1.5 skip; else project 4 corners.
+Then push item k=0 o=ci with d=centerDepth. Store projected corners somewhere for draw pass — recompute in draw (second projection) — acceptable? That's 2x the ~visible cells (~600) → fine.
+
+Actually store: it.x1..it.y4 not in my item struct; add fields x1,y1,x2,y2,x3,y3,x4,y4 to pool items. Then draw pass uses stored. Let me do that — avoids recompute. Pool items have those numeric fields always present (initial 0).
+
+Other items:
+- Trees: each tree in cur.hd.trees (with precomputed seed) → project base; if ok push k=1 o=tree.
+- Flag: project hole point → k=2 (draw pole+flag+? no hole ellipse separate k=6 with slightly larger depth so drawn before flag: d = dz + 0.01? Hole is on ground at same point as flag base; if flag drawn after hole we want hole first: give hole item d = flagD - 0.05 (drawn later in sort desc → smaller d drawn later… wait sort descending → larger d first. Hole should be drawn before flag → hole.d > flag.d? No: draw order = list order after sort desc; earlier = farther. We want hole earlier than flag (flag is closer to camera? They're at same location…). Same depth; painter's ambiguity — force: holeD = dz+0.1, flagD=dz-0.1 → hole drawn first. ✓
+- Ball shadow + ball: k=3 o=ball (if !sunk or during sink still draw until y<-0.3).
+- Marks: k=5 each (depth from projection of its point; if behind skip).
+- Particles: k=4 each.
+- Aim arrow: k=8 o=null, d = ballDepth+0.2 (drawn just after cells near ball… but trees behind ball should be drawn before arrow? Arrow is on ground in front of ball; trees are usually farther → fine with any order). Actually if tree is between camera and arrow tip, arrow should be occluded — rare; accept.
+- Trajectory dots: k=9 (drawn after arrow).
+
+Sort: items.slice? Can't sort subarray in place without helper: use array `list` of references: list.length=nItems; for i push items[i]; list.sort((a,b)=>b.d-a.d). Allocates nItems refs — fine.
+
+Draw pass switch on k with ctx ops.
+
+Cell draw: path moveTo x1,y1 lineTo x2,y2 x3,y3 x4,y4 closePath fillStyle = fogBlend(ci, d).
+fogBlend: t=(d-fogS)/(fogE-fogS); if t<=0 return cur.cols[ci] (but water shimmer needs dynamic… handle: if type 4 always build string with shimmer and then fog mix). else compute rgb from CR/CG/CB * (1-t) + FOGC*t → `rgb(...)`.
+Quantize to reduce cost: fine as is.
+
+fogS=52, fogE=132. Also skip cells d>fogE.
+
+Sky drawn before world. Ground beyond course: add a big "base" quad? My grid already extends 18u past W and 15-16 past L — with fog at 132 the far end (L up to 152 + green) fades; behind that, hills+sky. The gap between grid edge and horizon: cells end at z=L+15; from camera near tee looking forward, area beyond grid projects below cy but above? It will show sky color there → looks like haze — acceptable with fog fade (far cells nearly fog color ≈ haze). To be safer, extend grid by +40u past L and make far rows ROUGH dark. gl = ceil((L+30+40)/CS)? Let me set z margin back 55: z0=-15, gl covers to z0+gl*CS ≥ L+45 → for L=152: need length 70..212 → gl=56 cells. gw similar W+36. Max cells: hole 3: (88+36)/4=31 wide? W=88→ +36=124/4=31; length (152+15+45)=212/4=53 → 31*53=1643 cells. OK.
+
+Also left/right beyond: x0=-W/2-18 covers margin 18u each side ✓.
+
+Hills drawn after sky, before world; but world ground near horizon will overlap hill bases — good (hills are behind course). But if camera yaw points away from course (player orbits), hills still show across all directions (parallax by yaw) ✓ consistent.
+
+Sun: choose sunA so at hole 1 initial view (aim ~ +z, yaw=aim≈0… hole 1 tee→hole direction is +z → aim=atan2(0-0,58-6)=atan2(0,52)=0 → yaw 0, forward +z). Place sun ahead for hero shot: sunA = 0.35 rad? Screen x offset small. Let me set sunA=0.5.
+
+Clouds init random angles.
+
+HUD update function caches strings.
+
+Toast implementation:
+```js
+let toastTO=null;
+function toast(main,sub='',cls=''){ const el=$('#toast'); el.className=''; void el.offsetWidth; el.innerHTML=`<b>${main}</b>${sub?`<i>${sub}</i>`:''}`; el.classList.add('show'+(cls?' '+cls:'')); clearTimeout(toastTO); toastTO=setTimeout(()=>el.classList.remove('show'), cls==='sm'?1600:2400); }
+```
+CSS .show animation.
+
+Overlay card builder:
+```js
+function showMenu(){ state='menu'; overlay.classList.remove('hidden'); card.innerHTML = menuHTML(); wire start button; }
+```
+Button click → sClick + startGame. Also keydown Enter handled globally.
+
+Scorecard end html: build rows.
+
+localStorage:
+```js
+function getBest(){try{return localStorage.getItem('sunsetCupBest')||null}catch(e){return null}}
+function setBest(v){try{const b=getBest(); if(b===null||v<parseInt(b))localStorage.setItem('sunsetCupBest',String(v));}catch(e){}}
+```
+Best = total diff (lower better, can be negative). Display with fmt.
+
+fmtDiff(d): d>0?`+${d}`: d<0?`−${-d}`:'E'.
+
+Now — one more consideration: "hole" object reference: cur.hd.hole; define `hole` getter → cur.hd.hole. And Hd = cur.hd.
+
+Trees list with seed: on loadHole, map hd.trees to {x,z,s,seed:i}. Filter out any within green r+2 of hole or inside water.
+
+Menu state: loadHole(0)+placeBallTee before first render; camera auto-orbits (camYawT += ). In menu, physics idle (ball at rest). Render everything. HUD hidden in menu? Keep hud visible but dim? Hide hint/power; show panels only during play/holeend/over? Simpler: hide #hud in menu and over (class on body: state-menu etc.). Let me toggle a class 'inplay' on document.body when state is play/holeend.
+
+Power bar shown only while charging (class 'on').
+
+Also show "strokes" and hole info during holeend ✓.
+
+Edge: user releases pointer outside window → pointerup on window captures? Use `window.addEventListener('pointerup')` — will fire mostly; also pointercancel. Fine.
+
+Prevent context menu on long-press touch? Add contextmenu preventDefault on canvas.
+
+Also prevent double-tap zoom: touch-action none + user-select none.
+
+Now let me finalize the numbers and write everything out. Also add subtle vignette overlay div (radial gradient) for mood — pointer-events none, cheap. Yes: #vig with radial-gradient(transparent 55%, rgba(10,8,24,.5)). Adds cinematic feel.
+
+Grass "wind" on trees sway ✓; flag wave ✓; water shimmer ✓; clouds drift ✓; sun glow pulse subtle (sin*2px) — tiny life. Ball rolling: draw a small rotating marker? Skip; add slight squash on bounce? Could scale sprite with impact — skip for scope.
+
+One more feature for juice: when ball at rest and near hole (<3u), show "PUTT" hint? Skip.
+
+Sound on charge: rising tick? A subtle ratchet while charging: every .1s a small click with pitch scaling to power — nice! Implement in update: if charging && (chargeT - lastTick > 0.09) → sTick(power) (blip square 300+500*power, .03, .08). Subtle.
+
+Also add "whoosh" on shot with power — the hit noise covers it.
+
+Let me write out the final code now, carefully. I'll be thorough with syntax checks as I go.
+
+Key risk areas:
+1. Projection math signs — verify: yaw=0 → fwd=(0,-sp,cp) i.e., looking +z slightly down ✓ (course extends +z from tee, camera behind ball at -fwd*dist → z negative side, looking toward +z where hole is ✓). right=(1,0,0) ✓. up=(0,cp? compute: ux=f.y*r.z-f.z*r.y = (-sp)(0)-(cp)(0)=0; uy=f.z*r.x - f.x*r.z = cp*1-0=cp; uz=f.x*r.y - f.y*r.x = 0-(-sp)(1)=sp → up=(0,cp,sp) ✓ points mostly +y with slight +z (tilt back) correct.
+Point directly ahead on ground: v=(0,-6? ...). Trust it.
+
+screenY: sy = cy - focal*dyo/dz. Ground point below camera center → dyo negative → sy > cy (lower on screen) ✓.
+
+2. Sort and pool — straightforward.
+
+3. Cell corners order: for cell (ix,iz): world corners:
+ A=(x0+ix*CS, z0+iz*CS) B=(A.x+CS, same z) C=(B.x? ...). Just compute p1..p4 = (wx,wz),(wx+CS,wz),(wx+CS,wz+CS),(wx,wz+CS), y=0. Project each; if any fail skip cell.
+
+Water cells: slightly lower y (-0.15) for inset look? Nice detail: water surface 0.12 below grass → draw with y=-0.12. Sand maybe +0.03. Let me set y per type: WATER -0.14, else 0. Ball resting on water would be at R but we respawn anyway; ball in sand rolls on ground y=R fine (sand surface visually same level OK).
+
+Edge seams between cell and lower water: small gap visible from side — negligible at this scale/pitch.
+
+4. Trajectory preview sim must mirror physics roughly (same G, bounce) — separate lightweight function.
+
+5. HUD distance: use hole coords.
+
+Let me write the menu HTML string with kbd chips:
+```
+<div class="card-top"><span class="eyebrow">A THREE-HOLE COURSE AT GOLDEN HOUR</span><h1>Sunset Cup</h1><span class="rule"></span></div>
+<table class="holes">... rows ...</table>
+<div class="controls">
+ <div><kbd>A</kbd><kbd>D</kbd> or <kbd>←</kbd><kbd>→</kbd> aim</div>
+ <div>hold <kbd>SPACE</kbd>/<kbd>CLICK</kbd>, release to shoot</div>
+ <div><kbd>Q</kbd><kbd>E</kbd> orbit · <span class=wheel>SCROLL</span> zoom</div>
+ <div><kbd>R</kbd> restart · <kbd>M</kbd> sound</div>
+</div>
+<button id="go">TEE OFF ▸</button>
+<p class="or">press <b>ENTER</b></p>
+```
+h1 styled Georgia italic uppercase? "SUNSET CUP" with letter-spacing, color #23422a? On paper cream bg text deep green; title maybe red-brown #8c2f1d for contrast pop. Eyebrow small letterspaced #6b7a55.
+
+Stamp: absolute top-right rotate 8deg: circle border 2px solid #b3402e color #b3402e text "PAR 9" small, opacity .8.
+
+Table rows: hole number in red Georgia, name serif italic, right-aligned "PAR 2". Dashed bottom rules.
+
+Controls: grid 2 cols? single col list with kbd chips (border 1px solid #3a5a40? on paper: border #7a8b6f, bg #fffef7, padding 1px 7px, radius 4px, font bold Verdana 10px, color #2c4630, box-shadow 0 1px 0 #7a8b6f).
+
+Button: bg linear-gradient(#2c6e42,#1d5232); color #fdf3d7; border:1px solid #123020; padding 12px 34px; font Georgia bold 20px letter-spacing 2px; radius 8px? small radius fine. Hover: translateY(-2px) + shadow glow gold; active press down.
+
+Card width 560, max-height 92vh overflow auto (for short screens).
+
+Gameover card: same styling; h1 "FINAL SCORECARD"; table with columns HOLE PAR YOU ±; total row bold with top double border; verdict italic serif; record line small red if new record "★ NEW COURSE RECORD"; else "course record: −2".
+
+Overlay background: rgba(8,10,24,.45) + slight backdrop blur? Blur over canvas is expensive but static overlay fine… backdrop-filter may hurt perf on some iframes; use plain translucent. Also add subtle top/bottom gradient darkening for text legibility.
+
+Now let me write the JS fully. I'll be disciplined. Also wrap everything in an IIFE or just top-level script (fine).
+
+Let me also handle "holeend" toast sub: `Next → ${HOLES[i+1].name}` or "Final scorecard coming up".
+
+Verdict function for finishHole name:
+```js
+function shotName(d,s){ if(s===1)return 'HOLE IN ONE!!'; if(d<=-3)return 'ALBATROSS!'; if(d===-2)return 'EAGLE!'; if(d===-1)return 'BIRDIE!'; if(d===0)return 'PAR'; if(d===1)return 'BOGEY'; if(d===2)return 'DOUBLE BOGEY'; return d+' OVER PAR'; }
+```
+
+Confetti on sink: spawn 26 at hole pos with upward velocity, gravity, mixed colors, life ~1.2-1.8.
+
+Splash: 18 blue droplets up + ring? Ring drawn as mark-like expanding circle: add special particle type 'ring'? Keep it: add splashRing {x,z,r growing,life} to marks list variant — draw as stroke ellipse. Add `rings` array: {x,z,r0,life,max,col}. Draw alpha fade, radius grows r0+ (1-life/max)*2.5. Uses: water splash (blue), sink (gold)? Cute.
+
+Now the camera shake: on hit set shake=0.25*power+0.05; each frame if shake>0: apply random offset to cam.x/y/z before computing basis? Apply after pos computed: ox=(rand-.5)*shake*1.4 etc, decay shake*=exp(-6dt). Subtle.
+
+Preview dots also drawn during idle (no charge)? A faint short aim line always (the arrow) is enough; full trajectory only while charging — teaches power→distance mapping. ✓
+
+Let me write the code now. Also don't forget: no external anything; all sounds after first input (initAudio on first keydown/pointerdown, and any sound function guards AC).
+
+Potential pitfall: `power` used in releaseShot must be current ping-pong value — update power in update() while charging ✓; also when not charging set power=0 (bar hides anyway).
+
+HUD total: sum(totals[0..holeIdx-1]) + strokes? During play, "TOTAL" should show accumulated including current hole progress: total = completedSum + strokes; parSoFar = sum of pars of completed + current par. diff vs that. ✓
+
+Let me write it all out now. Being careful with template literals inside HTML strings (backticks fine).
+
+CSS font stacks:
+--serif: Georgia,'Times New Roman',serif;
+--sans: 'Trebuchet MS','Segoe UI',Verdana,sans-serif;
+Display uses serif italic. HUD sans small-caps-ish via letter-spacing + uppercase.
+
+Let me write the final file, mentally compiling as I go.
+
+One more check — pool item fields: d,k,o,x1,y1,x2,y2,x3,y3,x4,y4. For non-cell items only need d,k,o (and maybe sx,sy for convenience? I'll recompute projection in draw for those; ~80 items → fine).
+
+list array: `const list=[];` each frame: list.length=0; for(i=0;i<nItems;i++)list.push(items[i]); list.sort(...); then iterate. Push of same object refs — no allocation beyond the list length change (reuses capacity) ✓.
+
+Ball sprite pre-render:
+```js
+const ballSpr=document.createElement('canvas'); ballSpr.width=ballSpr.height=64; const bctx=...; radial gradient center offset (-8,-10): stops white, #f2f2ee 60%, #b9c0bb 100%; plus subtle bottom shading arc? Keep gradient. Also small green reflection dot at bottom? skip.
+```
+
+Tree draw details:
+```js
+function drawTree(o){ base B=project(x,0,z); top T=project(x+sway, hgt, z) where sway=Math.sin(time*1.3+seed)*0.25*s; if(!B||!T)return; const sTop=focal/T[2]; const w=sTop*2.6*s? crown radius world 2.4*s → px = focal*2.4*s/Tz... draw:
+ trunk: strokeStyle '#4a3222', lineWidth=Math.max(1, focal*0.35*s/B[2]), line B→ lerp(B,T,0.45)
+ crown triangles (pine): 3 tiers from bottom of crown (y at T.y+? actually top is apex). Let me define apex=T; base width wpx=focal*(2.6*s)/Tz; tier i in [0..2]: yBase = T.y + wpx*(0.55+i*0.42)? hmm triangle going down from apex:
+  tri1: apex T, half-width wpx*0.55, height hpx*0.5 where hpx = distance B→T px * (crown portion). Let me define crownH = (B.y-T.y)*0.62;
+  tiers: for i=0..2: yb=T.y+crownH*(0.45+0.32*i); hw=wpx*(0.38+0.21*i); fill triangle (T.x, T.y + crownH*0.0?) ...
+```
+Simpler: draw 3 overlapping triangles each with apex slightly below previous base… Let me do classic pine:
+```
+const hpx=B.y-T.y; const wpx=focal*(2.7*s)/T[2];
+for(i=0;i<3;i++){ const y0=T.y+hpx*(0.10+0.30*i); const hw=wpx*(0.45-0.12*i)?? widths should increase downward: hw=wpx*(0.35+0.16*i); fill triangle [(T.x,y0-hpx*0.18),(T.x-hw,y0),(T.x+hw,y0)] }
+```
+Colors: base tier darker '#173f24', mid '#1d4a2b', top '#255733'? With dusk warm rim: add a small highlight triangle offset? Keep flat 3-tone, reads as pine silhouette at dusk. Also slight darkening with distance handled by fog? Trees don't get fog… acceptable (silhouette style). Could alpha trees with depth toward haze: t=fog(d) → draw crown color mixed with haze — let me do simple: globalAlpha? No—mix color: compute rgb base per tier, blend to FOGC by t, build string (3 strings per tree × ~15 trees fine).
+
+Flag draw:
+```js
+hole position h; pole top world (hx,6.4,hz); B=project(hx,0,hz), T=project(hx,6.4,hz);
+pole: line width 2 '#e8e2d0'? Whitish pole with red? Classic: white/red striped pole — draw two overlapping lines offset? Keep cream pole + red flag.
+flag points (world): p0=T world; extend along camera right R: q1=(hx+R.x*2.3, 6.4 - wob1, hz+R.z*2.3) where wob = sin(time*5)*0.25*(1+flagWob); q2=(qx- R.x*0.9? ...
+```
+Simpler cloth in screen space: after T known, dir = (1,0) screen right; len= focal*2.3/Tz; wave vertical offset wv=Math.sin(time*6)*len*0.12*(1+flagWob*0.5); polygon: T, (T.x+len, T.y+wv), (T.x+len*0.55, T.y+ len*0.42 + wv*0.5)? Let me do a pennant: points A=T, B=(T.x+len, T.y+1? ), C=(T.x+len*0.5, T.y+len*0.5)?? That's a downward triangle — pennant typically horizontal with notch:
+ A=T (attach at top of pole), B=(T.x+len, T.y + 2 + wv) (tip), C=(T.x+len*0.45, T.y+len*0.38 + wv*0.6) (bottom middle). Draw path A→B→C→close with slight bottom edge: actually pennant = triangle A,B,C where C is below middle — that gives a swallow-ish shape; simpler: rectangle flag with waving bottom: points A=T, B=(T.x+len,T.y+wv), D=(T.x+len, T.y+len*0.45+wv), E=(T.x, T.y+len*0.45) → quad. Let me do quad with wave on right edge. Fill '#e8402f', slight darker shade line? Add subtle inner shadow via second path — skip.
+
+flagWob decays *= exp(-1.5dt).
+
+Hole ellipse:
+```js
+C=project(hx,0,hz); if C: rx=focal*0.95/C[2], ry=rx*0.42; fill '#0f1d14'; ring: stroke rgba(255,240,200,.25) lineWidth 1 ellipse rx+? Draw a slightly bigger outer ring first color 'rgba(230,220,190,0.5)'? Subtle rim helps readability.
+```
+
+Ball shadow: project ground point (p.x,0,p.z): alpha = clamp(0.45 - h*0.02, 0.06), size rx=focal*(0.5+ h*0.01)/dz? Shadow grows with height but fades: rx base 0.4 world → scale by (1+h*0.03). Draw ellipse alpha*0.8 color #0a140c.
+
+Ball draw: project(p.x, p.y, p.z): r=focal*BALL_R/dz; drawImage(ballSpr, x-r*1.6? sprite includes padding — draw at size r*2.6 to include soft edge? Let me make sprite tight (ball fills it) → drawImage size 2r… radial gradient with hard edge at rim looks flat; add slight anti-alias by drawing at 2.2r and scaling gradient inset. Let me make sprite: gradient from center white to edge #cfd6cf, plus outer ring transparent? Keep filled circle radius = full 32px (tight). Draw at 2r. Fine.
+
+Aim arrow draw:
+```js
+if(state play && canShoot-ish? show when ball at rest && !sunk): from p dir len=4+power*14; sample 9 points world y=R+0.15? Slightly above ground (y=0.2). Project each; stroke segments with lw taper 4→1, color lerp by power: use `rgba(255, ${230-160*pw|0}, ${180-140*pw|0}, .95)` white→orange-red. Arrowhead at tip: compute perpendicular in screen from last 2 points; draw two lines back 10px.
+```
+Also small circle at ball? Skip.
+
+Trajectory dots (charging): for each pt i: project; if ok: alpha=0.75*(1-i/n); r=2.6-1.6*i/n; fill '#fff3d0'. Landing ring at first ground contact point: stroke ellipse.
+
+OK — I also want a subtle "rest" indicator: when ball at rest, draw a faint pulsing ring around ball on ground (helps know you can shoot): alpha sin pulse 0.15-0.3 color gold. Nice affordance. Draw as item k=10 or part of ball draw when at rest && state play.
+
+Let me finalize the update order and write it all. Also `time` global += dt always (for animations even in menu).
+
+I think we're ready to write. Length will be substantial (~900-1000 lines). Let me go.
+
+Don't forget: title tag "Sunset Cup — 3D Golf". Start screen shows name ✓ controls ✓ restart without reload ✓ (R + button). Keys on window ✓. No alert/confirm/prompt ✓. localStorage try/catch ✓. Audio after first input ✓. Fill window, rescale, no scrollbars ✓.
+
+Let me write the code now in final form, double-checking syntax as I go. I'll keep functions compact.
+
+One more detail — pointer charging: click on HUD panels shouldn't charge? Panels are pointer-events:none so clicks pass through to window → fine (charging anywhere is OK).
+
+Wheel zoom only during play/menu.
+
+For touch: horizontal drag while charging should aim: track lastTouchX; on pointermove if charging && pointerType==='touch': aim += dx*0.005. Add that — makes mobile usable. Also two-finger? no.
+
+Also add double-tap? no.
+
+Edge: beginCharge from pointerdown fires on click of overlay button too (button is in state menu → canShoot false because state!=='play' ✓; state over also ✓). But pointerup after button click could call releaseShot — guarded by charging flag ✓.
+
+Enter key during play does nothing (or maybe "next hole" skip? no).
+
+R: restartRound from any state: startGame() fresh. In menu, R also starts? Fine, allow.
+
+Let me write the scorecard table HTML for end:
+```js
+let rows=''; let tt=0,tp=0;
+for(i<3){const s=totals[i],p=HOLES[i].par;tt+=s;tp+=p;rows+=`<tr><td class="hn">${i+1} · ${HOLES[i].name}</td><td>${p}</td><td>${s}</td><td class="${diffCls(s-p)}">${fmtDiff(s-p)}</td></tr>`;}
+```
+diffCls: positive → 'bad' (red), 0 → '', negative → 'good' (green).
+
+Verdict + record. Button id go again.
+
+Menu best line: if best!==null show "course record: fmt(best)" small under holes table? Put in menu too — nice touch: `<p class="rec">COURSE RECORD <b>${fmt}</b></p>` only if exists.
+
+Now let me write the actual file. Careful with `−` character use (fine in UTF-8).
+
+Physics substep: acc+=dt; while(acc>1/120){physStep(1/120);acc-=1/120;} cap iterations 5.
+
+canShoot(): state==='play' && !ball.sunk && freeze<=0 && isResting(); isResting = ball.rolling && v≈0? Actually allow shot any time ball grounded (even if still rolling slowly)? Classic: only when stopped. sp<0.15.
+
+After sink completes → finishHole sets state 'holeend'; canShoot false ✓.
+
+placeBallTee also resets flagWob=0, parts=[], marks=[], rings=[], lastShot=tee pos.
+
+Toast on startGame: toast('HOLE 1','The Sparrow · Par 2'); similarly in nextHole.
+
+Flag chime: only during play && !sunk.
+
+Also add a small detail: when ball comes to rest within green.r of hole → "PUTT IT" hint? skip.
+
+OK, writing the final answer now. I'll keep code organized with section comments. Let me be careful that every referenced DOM id exists.
+
+DOM ids: c, hud, hNum,hName,hPar,strokesEl,totalEl,distEl,bestEl, powerWrap,pfill, toast, overlay, card, hint, vig.
+
+hud panels html:
+```html
+<div id=hud>
+ <div class="panel tl">
+   <div class="row1"><span class="lbl">Hole</span><b id=hNum>1</b><span id=hName>The Sparrow</span></div>
+   <div class="row2"><span class="lbl">Par</span><b id=hPar>2</b><i class="sep"></i><span class="lbl">Strokes</span><b id=strokesEl>0</b><i class="sep"></i><span class="lbl">Total</span><b id=totalEl>E</b></div>
+ </div>
+ <div class="panel tr">
+   <div>Cup <b id=distEl>—</b></div>
+   <div id=bestWrap class="best" hidden>Record <b id=bestEl></b></div>
+ </div>
+ <div id=hint>AIM <kbd>A</kbd><kbd>D</kbd> · SHOOT hold <kbd>SPACE</kbd>/<kbd>CLICK</kbd> release · ORBIT <kbd>Q</kbd><kbd>E</kbd> · ZOOM scroll · <kbd>R</kbd> restart</div>
+ <div id=powerWrap><span class="plabel">POWER</span><div id=pbar><div id=pfill></div></div></div>
+</div>
+```
+
+CSS for these. body.inplay hides? Instead: hud has class 'off' when not in play → opacity 0. Toggle in setState helper.
+
+Let me write a helper `setUI()` called on state changes: body.classList.toggle('inplay', state==='play'||state==='holeend'); overlay hidden = state==='play'||state==='holeend'.
+
+Time to produce final code. I'll write it out and mentally lint.
+
+Potential bug watch:
+- In loadHole, `hd` is referenced in physStep via cur.hd — define alias `let Hd;` set in loadHole.
+- Hole capture uses Hd.hole.
+- aim init uses atan2(dx,dz) ✓ consistent with dir=(sin a, cos a): sin(atan2(dx,dz))=dx/hyp ✓.
+
+Preview sim:
+```js
+function previewPts(){ prev.length=0; if(!charging)return; const spd=7+51*power; let px=ball.p[0],py=ball.p[1],pz=ball.p[2]; let vx=Math.sin(aim)*spd*0.985, vy=spd*0.13, vz=Math.cos(aim)*spd*0.985; const dt=0.045; let land=null;
+ for(let i=0;i<260;i++){ vy-=G*dt; px+=vx*dt;py+=vy*dt;pz+=vz*dt; if(i%3===0)prev.push([px,Math.max(py,0),pz]); if(py<=R){ const t=surfAt(px,pz); if(t===4){prev.push? mark water: prevWater=[px,pz]; break;} vy=-vy*0.52; vx*=0.78;vz*=0.78; py=R; if(Math.abs(vy)<1.3){ // rolling: simulate a few friction steps
+   let spx=vx,spz=vz; for(let j=0;j<60&&Math.hypot(spx,spz)>0.4;j++){const [fc,fl]=FRIC[t]; const dec=(fc+fl*Math.hypot(spx,spz))*dt; const s=Math.hypot(spx,spz); if(s<=dec)break; const k=1-dec/s; spx*=k;spz*=k; px+=spx*dt;pz+=spz*dt;} prev.push([px,R,pz]); break; }
+ }}
+}
+```
+Also check hole capture in preview? If it lands near hole → stop and mark "in". Cute: if within 0.85 of hole with low speed → push hole point and set prevIn=true → draw a gold ring at hole instead. Add simple check after rolling sim.
+
+Draw dots from prev each frame (recomputed during charge). When not charging, skip (leave array stale — guard by charging flag in draw ✓ or clear on release: prev.length=0 in releaseShot ✓).
+
+FRIC table: index by type: FRIC[0]=[9,2.6] rough, [1]=[3.4,1.15], [2]=[1.15,0.5], [3]=[30,7], water unused [0,0].
+
+Ball resting on ROUGH after bounce — fine.
+
+Also ball could roll off grid into beyond → OOB triggers at boundary before that ✓ (boundary check uses Hd.W etc.).
+
+OOB while sunk? Guard: skip OOB and water if sunk ✓.
+
+waterEvent/oob use lastShot — ensure lastShot initialized to tee on placeBallTee so first-shot water returns to tee ✓.
+
+Penalty: strokes++ then updateHUD.
+
+Also make sure that when state==='holeend' or 'over', physics stops (guard physStep by state play? Ball is sunk anyway; freeze not needed). Guard: only run physics if state==='play'. In holeend, ball stays in hole (sunk anim finished at y<-0.7 → clamp; keep drawing? Hide ball when y<-0.2).
+
+Sink anim timing: startSink sets sinkT=0; update: if(ball.sunk){sinkT+=dt; ...} and when sinkT>1.1 && state==='play' → finishHole().
+
+finishHole: totals[holeIdx]=strokes; compute; toast(name, sub); state='holeend'; endT=0; setUI().
+update holeend: endT+=dt; if(endT>2.6) nextHole();
+nextHole: holeIdx++; if(holeIdx>=3){endGame();} else {strokes=0; loadHole; placeBallTee; state='play'; toast(`HOLE ${holeIdx+1}`, `${name} · Par ${par}`); setUI(); updateHUD();}
+
+startGame(): holeIdx=0; totals=[0,0,0]; strokes=0; loadHole(0); placeBallTee(); state='play'; setUI(); toast('SUNSET CUP','The Sparrow · Par 2')? Better toast 'HOLE 1'/'The Sparrow · Par 2'. sClick.
+
+endGame(): state='over'; const total=totals sum, tp=9; save best diff; showCard end; setUI(); sSink? Play a fanfare: small arpeggio (reuse chime bigger). Add sEnd(): three notes.
+
+placeBallTee(): const t=Hd.tee; ball.p=[t.x,R,t.z]; v0; rolling true; sunk false; aim=atan2(hole.x-t.x,hole.z-t.z); camYawT=aim; snap camera: recompute pos directly (call updateCamera with big lerp factor? set a flag camSnap=true → in updateCamera if snap, copy directly). lastShot=[...]; freeze=0; parts/marks/rings reset; prev clear.
+
+Menu init on load: loadHole(0); placeBallTee(); state='menu'; showCard menu; setUI().
+
+I think the design is complete. Let me write it out. I'll be generous with small polish but keep code correct.
+
+Also double-check sort draw of aim arrow vs ball: arrow d = ballDepth+0.3 (drawn before ball) ✓ trees behind ball have larger d → drawn first ✓.
+
+Rings (splash) items k=11 drawn near ground depth.
+
+Marks k=5.
+
+Ball rest pulse ring: part of ball draw when atRest && state play && !charging? Show always when canShoot: pulsing gold ellipse at ball base.
+
+Also add "strokes" flash on increment? Small CSS animation retrigger — skip, toast covers events.
+
+Final check on power bar UI: #pfill width = power*100% each frame (style update cheap). powerWrap class 'on' while charging.
+
+Tick sound cadence in update.
+
+Mute: toggle muted; master.gain.value = muted?0:0.5; toast small 'SOUND OFF/ON' sm.
+
+Alright — writing the final HTML now.
+
+Actually one more consideration for `keys` handling of ArrowLeft etc.: map both arrows and AD to left/right booleans each frame:
+left = keys['ArrowLeft']||keys['a']||keys['A']; right similarly. q/e for orbit.
+
+keydown sets keys[e.key]=true; keyup deletes. Space e.code 'Space' — use e.code for letters? e.key is fine but uppercase issues with shift — normalize: const k=e.key.length===1?e.key.toLowerCase():e.key.
+
+Prevent default for [' ','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].
+
+Enter handling: state menu→start; over→start (restart). Also 'r' → startGame from any state? If in play, restart whole round — confirm? No confirm allowed; just do it (it's a short game). Fine.
+
+Now writing. I'll produce the file.
+
+Let me draft the sky gradient stops concretely:
+```
+g=ctx.createLinearGradient(0,0,0,cy*1.05);
+stops: 0 '#141a3f', .42 '#3c3a74', .62 '#8a4a6e'?? 
+```
+Hmm I want golden: let me do: 0:'#101638', 0.45:'#3b3d7d', 0.62:'#9c5a6e'? that's mauve… then .78:'#e08a4a', .92:'#ffc46b', 1:'#ffe3a0'. The mauve band is actually the classic sunset transition (blue→purple→orange). OK:
+0 '#0f1536', .40 '#33386f', .58 '#7c4a68', .72 '#c96b4e', .85 '#f5a95c', 1 '#ffdf9e'. Horizon at cy; gradient ends slightly below.
+
+Fog color to match mid-horizon: (230,150,100) → #e69664.
+
+Hill colors: far layer 'rgba(70,52,94,1)'? Silhouette against orange sky: dark plum '#3a2b52' and nearer '#241d3e'. With slight alpha? Solid fine.
+
+Clouds: color 'rgba(255,214,170,.5)'.
+
+Sun position y: cy - Hh*0.085; radius Hh*0.045; glow radial to transparent r*4.
+
+Water shimmer also add warm reflection line? skip.
+
+Ball color in dusk: pure white pops ✓.
+
+OK — final code writing now. I'll number nothing, just clean sections.
+
+Let me also make sure `ctx.ellipse` is available (standard). Use for shadows/rings/hole.
+
+Potential issue: fillStyle strings per cell per frame for fog — visible cells ~700 → fine.
+
+Write it all out:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
+<title>Sunset Cup — 3D Golf</title>
+<style>
+ :root{ --serif:Georgia,'Times New Roman',serif; --sans:'Trebuchet MS','Segoe UI',Verdana,sans-serif; --cream:#ffe9c9; --gold:#ffd27a; }
+ *{box-sizing:border-box}
+ html,body{margin:0;height:100%;overflow:hidden;background:#0f1536;font-family:var(--sans)}
+ #c{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:crosshair}
+ #vig{position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse at 50% 42%,transparent 52%,rgba(8,6,20,.42) 100%)}
+ ...
+</style>
+```
+
+I'll now write the complete thing in the answer. Let me make sure JS is error-free by careful review after writing each part. Given length, I'll be extra careful with brackets.
+
+A few more implementation decisions to lock:
+
+- `let time=0;` global anim clock.
+- Clouds array init once.
+- sunA=0.55.
+- FOGS=52, FOGE=138, FOGC=[226,150,104].
+
+Cell color precompute (store CR,CG,CB as Int16Arrays + cols string):
+```js
+function baseRGB(t,stripe,sh){ let r,g,b;
+ if(t===1){ if(stripe){r=74;g=138;b=66;} else {r=63;g=124;b=58;} }
+ else if(t===2){ if(stripe){r=104;g=182;b=92;} else {r=92;g=168;b=82;} }
+ else if(t===3){ r=226;g=199;b=145; }
+ else if(t===4){ r=56;g=104;b=152; }
+ else { r=46;g=88;b=49; }
+ const m=0.9+0.2*sh; return [Math.min(255,r*m|0),Math.min(255,g*m|0),Math.min(255,b*m|0)]; }
+```
+
+Draw cell:
+```js
+const it; t=cur.type[ci];
+if(t===4){ const wsh=Math.sin(time*2.1+(ix? need coords)... store per-cell wx,wz? Use ci→ ix=ci%gw, iz=(ci/gw)|0; wx=cur.x0+ix*CS ... compute shimmer offset = Math.sin(time*2 + (ix*5.3+iz*7.7)); r+=... }
+```
+Compute in draw for water only: base from CR etc + shimmer 12*sin → then fog mix.
+
+Fog mix helper inline:
+```js
+let r=CR[ci],g=CG[ci],b=CB[ci];
+if(t===4){const s8=Math.sin(time*2+(ix*5.3+iz*7.7))*14; r+=s8; g+=s8*0.8; b+=s8;}
+const ft=(it.d-FOGS)/(FOGE-FOGS);
+if(ft>0){ if(ft>=1) continue; const f=ft<0?0:ft; r+= (FOGC[0]-r)*f; ... }
+ctx.fillStyle='rgb('+(r|0)+','+(g|0)+','+(b|0)+')';
+```
+But non-fog cells should use cached string to save time: if ft<=0 → ctx.fillStyle=cur.cols[ci]; (except water which always dynamic).
+
+Path and fill.
+
+Cell corners projection: compute wx, wz; y = t===4? -0.14 : 0.
+
+Quick center reject: project center [wx+2, wz+2] to tmp3; if !ok skip; screen margin: m=focal*CS/dz*1.6+8; if sx<-m||sx>W+m||sy<-m||sy>Hh+m skip; if dz>FOGE skip.
+
+Then 4 corner projections; any fail → skip cell (rare near plane).
+
+Store into item.x1..y4 and d=dz.
+
+OK. Also handle the "beyond grid" area behind far end: extended grid covers +? Let me set gl to cover z up to L+50: gl=Math.ceil((hd.L+15+50)/CS). For hole 3: (152+65)/4=54 → 54*31≈1674 cells. OK.
+
+Left/right beyond: x0=-W/2-18 covers margin 18u each side ✓.
+
+Alright, time to write the final output. I'll now write it all out in one go, carefully.
+
+(As I write drawTree with fog mix per tier — compute f=clamp((d-FOGS)/(FOGE-FOGS)); colors: tiers rgb [23,63,36],[30,75,44],[38,89,52]; mix to FOGC by f; if f>=1 skip tree.)
+
+Trunk color '#503626' also mixed? just alpha? Keep trunk simple with same fog: compute string.
+
+Flag & ball & arrow don't need fog (usually near camera). Ball could be far after a big drive — but camera follows ball so ball is always at camDist ~26 → no fog needed ✓. Trees can be far when panning around → fog them ✓.
+
+Rings and marks: fade only.
+
+Now, the code:
+
+I'll write it and then do a mental lint pass focusing on: undeclared vars, mismatched braces, template literal issues (nested backticks — avoid), division by zero guards.
+
+`fmtDiff`:
+```js
+const fmtD=d=>d>0?'+'+d:(d<0?'\u2212'+(-d):'E');
+```
+
+Scorecard HTML uses template strings with ${} — ensure no stray backticks inside.
+
+Button wiring after innerHTML: document.getElementById('go').onclick=...
+
+Also add cursor: pointer on button focus styles.
+
+One subtle thing: `#toast` center should not block clicks → pointer-events none ✓.
+
+Hint element: bottom-left, small, opacity .75; hide during charge? Keep.
+
+Power wrap position bottom center 26px.
+
+Let me write CSS in full:
+
+```css
+.panel{position:fixed;z-index:5;background:rgba(12,24,17,.78);border:1px solid rgba(255,210,122,.38);color:var(--cream);padding:9px 14px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;box-shadow:0 4px 18px rgba(0,0,0,.35)}
+.panel b{font-family:var(--serif);font-style:italic;font-size:20px;color:var(--gold);letter-spacing:0;margin:0 2px}
+.tl{top:14px;left:14px;min-width:230px}
+.tr{top:14px;right:14px;text-align:right}
+.lbl{opacity:.65;font-size:9px}
+#hName{font-family:var(--serif);font-style:italic;text-transform:none;letter-spacing:.02em;font-size:14px;color:#f7d9a8;margin-left:8px}
+.sep{display:inline-block;width:1px;height:14px;background:rgba(255,210,122,.3);margin:0 10px;vertical-align:-2px}
+.best{margin-top:6px;font-size:9px;opacity:.8}
+.best b{font-size:14px;color:#ff9d7a}
+#hud.off .panel,#hud.off #hint{opacity:0}
+#hud{transition:opacity .5s}
+#hint{position:fixed;left:14px;bottom:12px;z-index:5;color:rgba(255,233,201,.72);font-size:10px;letter-spacing:.1em;text-transform:uppercase}
+#hint kbd,#ovl kbd{...chip style...}
+```
+Chip on dark hint: border rgba(cream,.4) bg rgba(0,0,0,.3). In paper card different — scope: `#hint kbd` vs `.card kbd`.
+
+Power:
+```css
+#powerWrap{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:5;text-align:center;opacity:0;transition:opacity .15s}
+#powerWrap.on{opacity:1}
+.plabel{display:block;color:var(--cream);font-size:10px;letter-spacing:.3em;margin-bottom:6px;text-shadow:0 1px 2px #000}
+#pbar{width:min(320px,64vw);height:13px;border:1px solid rgba(255,233,201,.75);background:rgba(10,20,13,.8);padding:2px;box-shadow:0 3px 12px rgba(0,0,0,.4)}
+#pfill{height:100%;width:0%;background:linear-gradient(90deg,#67d873,#ffd24a 55%,#ff5a3c);transition:none}
+```
+
+Toast:
+```css
+#toast{position:fixed;left:50%;top:24%;transform:translate(-50%,-50%) scale(.6);z-index:8;text-align:center;pointer-events:none;opacity:0;color:#fff6dd;font-family:var(--serif);font-style:italic}
+#toast b{display:block;font-size:clamp(34px,7vw,62px);letter-spacing:.04em;text-shadow:0 3px 0 rgba(40,15,5,.5),0 0 30px rgba(255,170,80,.55)}
+#toast i{display:block;font-size:clamp(13px,2.2vw,18px);letter-spacing:.28em;text-transform:uppercase;font-family:var(--sans);font-style:normal;margin-top:6px;color:#ffe9c9;text-shadow:0 1px 3px rgba(0,0,0,.6)}
+#toast.show{animation:tst 2.4s cubic-bezier(.18,1.4,.3,1) forwards}
+#toast.show.sm{animation-duration:1.5s}
+@keyframes tst{0%{opacity:0;transform:translate(-50%,-50%) scale(.5)}12%{opacity:1;transform:translate(-50%,-50%) scale(1.04)}20%{transform:translate(-50%,-50%) scale(1)}78%{opacity:1}100%{opacity:0;transform:translate(-50%,-58%) scale(.96)}}
+```
+sm duration shorter but same keyframes — fine.
+
+Overlay + card:
+```css
+#ovl{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,rgba(10,8,26,.55),rgba(10,8,26,.35) 40%,rgba(10,8,26,.6));padding:16px}
+#ovl.hidden{display:none}
+.card{position:relative;width:min(540px,92vw);max-height:92vh;overflow:auto;background:#f6ecd3;color:#2b4026;border:1px solid #cbb98d;outline:4px double #a89467;outline-offset:-10px? 
+```
+Hmm outline double inside: use box-shadow inset instead: `box-shadow:inset 0 0 0 6px #f6ecd3, inset 0 0 0 7px #b3a077, 0 24px 60px rgba(0,0,0,.5);` plus paper lines bg:
+```
+background-image:repeating-linear-gradient(0deg,rgba(122,98,52,.06) 0 1px,transparent 1px 27px);
+transform:rotate(-1.1deg);
+padding:34px 38px 30px;
+```
+Stamp:
+```css
+.stamp{position:absolute;top:18px;right:20px;width:74px;height:74px;border:2px solid #b3402e;color:#b3402e;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:11px;letter-spacing:.18em;transform:rotate(9deg);opacity:.75;text-align:center;box-shadow:inset 0 0 0 3px transparent, inset 0 0 0 4px rgba(179,64,46,.25)}
+```
+Card text:
+```css
+.eyebrow{font-size:10px;letter-spacing:.34em;color:#7c8a63;text-transform:uppercase}
+.card h1{font-family:var(--serif);font-style:italic;font-weight:700;font-size:clamp(38px,7vw,52px);margin:6px 0 2px;color:#8c2f1d;letter-spacing:.01em}
+.tag{font-family:var(--serif);font-style:italic;color:#54663f;margin:0 0 14px;font-size:15px}
+.rule{height:1px;background:#b3a077;margin:2px 0 16px;position:relative}
+table.holes{width:100%;border-collapse:collapse;margin:0 0 14px;font-size:13px}
+.holes td{padding:7px 2px;border-bottom:1px dashed #bfae83}
+.holes .hn{font-family:var(--serif);font-style:italic;color:#3c5136}
+.holes .hp{text-align:right;font-weight:bold;letter-spacing:.08em;color:#8c2f1d}
+.controls{margin:4px 0 18px;font-size:11.5px;line-height:2.1;color:#4a5c39}
+.card kbd{display:inline-block;padding:1px 7px;margin:0 2px;border:1px solid #9aa87f;border-bottom-width:2px;background:#fffdf4;border-radius:4px;font-family:var(--sans);font-weight:bold;font-size:10px;color:#33452a;letter-spacing:.05em}
+#go{display:block;width:100%;padding:14px 0;font-family:var(--serif);font-weight:700;font-size:21px;letter-spacing:.22em;color:#fdf3d7;background:linear-gradient(180deg,#2f7a49,#1c5231);border:1px solid #12301e;border-radius:6px;cursor:pointer;box-shadow:0 5px 0 #10301f,0 10px 24px rgba(0,0,0,.35);transition:transform .12s,box-shadow .12s}
+#go:hover{transform:translateY(-2px);box-shadow:0 7px 0 #10301f,0 16px 30px rgba(0,0,0,.4),0 0 24px rgba(255,200,110,.35)}
+#go:active{transform:translateY(2px);box-shadow:0 2px 0 #10301f}
+.or{text-align:center;font-size:10px;letter-spacing:.28em;color:#7c8a63;margin:12px 0 0;text-transform:uppercase}
+.rec{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#7c8a63;margin:-6px 0 12px}
+.rec b{color:#8c2f1d;font-family:var(--serif);font-style:italic;font-size:15px}
+td.good{color:#2e7d3f;font-weight:bold} td.bad{color:#b3402e;font-weight:bold}
+tr.tot td{border-top:2px solid #6b7a55;border-bottom:none;font-weight:bold;padding-top:9px}
+.verdict{font-family:var(--serif);font-style:italic;font-size:16px;color:#54663f;text-align:center;margin:10px 0 4px}
+.nrec{text-align:center;color:#b3402e;font-weight:bold;letter-spacing:.2em;font-size:11px;margin:0 0 14px;text-transform:uppercase;animation:blink? skip}
+```
+
+OK. Now the JS — writing it fully now in final answer format. I'll do a final mental lint pass while writing.
+
+Remember to define `hole` as an alias updated in loadHole: `let holePos;` use holePos everywhere (avoid name clash with holes array). Use `CUP = Hd.hole`.
+
+Let me lock variable names:
+- HOLES (data), cur (built), Hd (cur.hd), cup (alias to Hd.hole set on load).
+
+physStep uses cup.
+
+Writing the answer now. Also include a small favicon? Not needed; skip (no external). Could add inline data URI favicon to avoid 404 noise — optional; add `<link rel="icon" href="data:,">` to silence. Fine.
+
+Let me also make sure I use `requestAnimationFrame(loop)` with dt clamp and the first-time flag.
+
+Final: ensure everything referenced is defined. I'll now write it out completely.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
+<link rel="icon" href="data:,"/>
+<title>Sunset Cup — 3D Golf</title>
+<style>
+:root{--serif:Georgia,'Times New Roman',serif;--sans:'Trebuchet MS','Segoe UI',Verdana,sans-serif;--cream:#ffe9c9;--gold:#ffd27a;}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:#0f1536;font-family:var(--sans)}
+#c{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:crosshair}
+#vig{position:fixed;inset:0;pointer-events:none;z-index:4;background:radial-gradient(ellipse at 50% 42%,transparent 52%,rgba(8,6,20,.42) 100%)}
+/* ---------- HUD ---------- */
+#hud{transition:opacity .5s;z-index:5}
+#hud.off .panel,#hud.off #hint{opacity:0;pointer-events:none}
+.panel{position:fixed;background:rgba(12,24,17,.8);border:1px solid rgba(255,210,122,.38);color:var(--cream);padding:9px 14px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;box-shadow:0 4px 18px rgba(0,0,0,.35)}
+.panel b{font-family:var(--serif);font-style:italic;font-weight:700;font-size:20px;color:var(--gold);letter-spacing:0;margin:0 2px}
+.tl{top:14px;left:14px;min-width:250px;line-height:1.9}
+.tr{top:14px;right:14px;text-align:right;line-height:1.7}
+.lbl{opacity:.6;font-size:9px}
+#hName{font-family:var(--serif);font-style:italic;text-transform:none;letter-spacing:.02em;font-size:15px;color:#f7d9a8;margin-left:10px}
+.sep{display:inline-block;width:1px;height:14px;background:rgba(255,210,122,.3);margin:0 10px;vertical-align:-2px}
+.best{margin-top:6px;font-size:9px;opacity:.85}
+.best b{font-size:15px;color:#ff9d7a}
+#hint{position:fixed;left:14px;bottom:12px;color:rgba(255,233,201,.7);font-size:10px;letter-spacing:.1em;text-transform:uppercase;transition:opacity .5s}
+#hint kbd{display:inline-block;padding:0 6px;margin:0 2px;border:1px solid rgba(255,233,201,.4);background:rgba(0,0,0,.3);border-radius:4px;font-weight:bold;font-size:9px;color:var(--cream)}
+/* power */
+#powerWrap{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);z-index:5;text-align:center;opacity:0;transition:opacity .15s}
+#powerWrap.on{opacity:1}
+.plabel{display:block;color:var(--cream);font-size:10px;letter-spacing:.34em;margin-bottom:6px;text-shadow:0 1px 2px #000}
+#pbar{width:min(320px,64vw);height:14px;border:1px solid rgba(255,233,201,.75);background:rgba(10,20,13,.85);padding:2px;box-shadow:0 3px 12px rgba(0,0,0,.45)}
+#pfill{height:100%;width:0%;background:linear-gradient(90deg,#67d873,#ffd24a 55%,#ff5a3c)}
+/* toast */
+#toast{position:fixed;left:50%;top:24%;transform:translate(-50%,-50%) scale(.6);z-index:8;text-align:center;pointer-events:none;opacity:0;color:#fff6dd;font-family:var(--serif);font-style:italic}
+#toast b{display:block;font-size:clamp(34px,7vw,62px);letter-spacing:.04em;text-shadow:0 3px 0 rgba(40,15,5,.5),0 0 30px rgba(255,170,80,.55)}
+#toast i{display:block;font-size:clamp(12px,2.2vw,17px);letter-spacing:.3em;text-transform:uppercase;font-family:var(--sans);font-style:normal;margin-top:6px;color:#ffe9c9;text-shadow:0 1px 3px rgba(0,0,0,.6)}
+#toast.show{animation:tst 2.5s cubic-bezier(.18,1.4,.3,1) forwards}
+#toast.show.sm{animation-duration:1.5s}
+@keyframes tst{0%{opacity:0;transform:translate(-50%,-50%) scale(.5)}12%{opacity:1;transform:translate(-50%,-50%) scale(1.04)}20%{transform:translate(-50%,-50%) scale(1)}78%{opacity:1}100%{opacity:0;transform:translate(-50%,-58%) scale(.96)}}
+/* ---------- scorecard overlay ---------- */
+#ovl{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,rgba(10,8,26,.6),rgba(10,8,26,.3) 40%,rgba(10,8,26,.65));padding:16px}
+#ovl.hidden{display:none}
+.card{position:relative;width:min(540px,94vw);max-height:94vh;overflow:auto;color:#2b4026;border:1px solid #cbb98d;padding:36px 40px 30px;transform:rotate(-1.1deg);
+background-color:#f6ecd3;background-image:repeating-linear-gradient(0deg,rgba(122,98,52,.07) 0 1px,transparent 1px 27px);
+box-shadow:inset 0 0 0 7px #f6ecd3,inset 0 0 0 8px #b3a077,0 24px 60px rgba(0,0,0,.55)}
+.stamp{position:absolute;top:16px;right:18px;width:76px;height:76px;border:2px solid #b3402e;color:#b3402e;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:11px;letter-spacing:.16em;transform:rotate(9deg);opacity:.78;text-align:center;box-shadow:inset 0 0 0 3px transparent,inset 0 0 0 4px rgba(179,64,46,.25)}
+.eyebrow{font-size:10px;letter-spacing:.32em;color:#7c8a63;text-transform:uppercase}
+.card h1{font-family:var(--serif);font-style:italic;font-weight:700;font-size:clamp(38px,7vw,52px);margin:6px 0 2px;color:#8c2f1d;letter-spacing:.01em;line-height:1}
+.tag{font-family:var(--serif);font-style:italic;color:#54663f;margin:2px 0 14px;font-size:15px}
+.rule{height:1px;background:#b3a077;margin:2px 0 14px}
+table.holes{width:100%;border-collapse:collapse;margin:0 0 12px;font-size:13px}
+.holes td{padding:7px 2px;border-bottom:1px dashed #bfae83}
+.holes .hn{font-family:var(--serif);font-style:italic;color:#3c5136}
+.holes .hp{text-align:right;font-weight:bold;letter-spacing:.08em;color:#8c2f1d}
+.holes th{font-size:9px;letter-spacing:.2em;text-transform:uppercase;color:#7c8a63;padding-bottom:4px;border-bottom:1px solid #bfae83;text-align:left}
+.holes th.r,.holes td.r{text-align:right}
+.controls{margin:4px 0 20px;font-size:11.5px;line-height:2.15;color:#4a5c39}
+.card kbd{display:inline-block;padding:1px 7px;margin:0 2px;border:1px solid #9aa87f;border-bottom-width:2px;background:#fffdf4;border-radius:4px;font-family:var(--sans);font-weight:bold;font-size:10px;color:#33452a;letter-spacing:.05em}
+#go{display:block;width:100%;padding:14px 0;font-family:var(--serif);font-weight:700;font-size:21px;letter-spacing:.22em;color:#fdf3d7;background:linear-gradient(180deg,#2f7a49,#1c5231);border:1px solid #12301e;border-radius:6px;cursor:pointer;box-shadow:0 5px 0 #10301f,0 10px 24px rgba(0,0,0,.35);transition:transform .12s,box-shadow .12s}
+#go:hover{transform:translateY(-2px);box-shadow:0 7px 0 #10301f,0 16px 30px rgba(0,0,0,.4),0 0 24px rgba(255,200,110,.35)}
+#go:active{transform:translateY(2px);box-shadow:0 2px 0 #10301f}
+.or{text-align:center;font-size:10px;letter-spacing:.28em;color:#7c8a63;margin:12px 0 0;text-transform:uppercase}
+.rec{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:#7c8a63;margin:-4px 0 14px}
+.rec b{color:#8c2f1d;font-family:var(--serif);font-style:italic;font-size:15px}
+td.good{color:#2e7d3f;font-weight:bold}
+td.bad{color:#b3402e;font-weight:bold}
+tr.tot td{border-top:2px solid #6b7a55;border-bottom:none;font-weight:bold;padding-top:9px;font-size:14px}
+.verdict{font-family:var(--serif);font-style:italic;font-size:16px;color:#54663f;text-align:center;margin:12px 0 4px}
+.nrec{text-align:center;color:#b3402e;font-weight:bold;letter-spacing:.22em;font-size:11px;margin:2px 0 16px;text-transform:uppercase}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="vig"></div>
+
+<div id="hud" class="off">
+  <div class="panel tl">
+    <div><span class="lbl">Hole</span><b id="hNum">1</b><span id="hName">The Sparrow</span></div>
+    <div><span class="lbl">Par</span><b id="hPar">2</b><i class="sep"></i><span class="lbl">Strokes</span><b id="strokesEl">0</b><i class="sep"></i><span class="lbl">Total</span><b id="totalEl">E</b></div>
+  </div>
+  <div class="panel tr">
+    <div><span class="lbl">To cup</span>&nbsp;<b id="distEl">—</b></div>
+    <div class="best" id="bestWrap" hidden>course record&nbsp;<b id="bestEl"></b></div>
+  </div>
+  <div id="hint">aim <kbd>A</kbd><kbd>D</kbd>/<kbd>←</kbd><kbd>→</kbd> · shoot: hold <kbd>SPACE</kbd>/<kbd>CLICK</kbd> release to fire · orbit <kbd>Q</kbd><kbd>E</kbd> · zoom scroll · <kbd>R</kbd> restart</div>
+  <div id="powerWrap"><span class="plabel">P O W E R</span><div id="pbar"><div id="pfill"></div></div></div>
+</div>
+
+<div id="toast"></div>
+<div id="ovl" class="hidden"><div class="card" id="card"></div></div>
+
+<script>
+'use strict';
+/* ============================== SETUP ============================== */
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+let W=0,Hh=0,dpr=1,focal=600,cx=0,cy=0,skyGrad=null;
+function resize(){
+  dpr=Math.min(2,window.devicePixelRatio||1);
+  W=innerWidth;Hh=innerHeight;
+  cv.width=(W*dpr)|0;cv.height=(Hh*dpr)|0;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  cx=W/2;cy=Hh/2;focal=Hh*0.95;skyGrad=null;
+}
+addEventListener('resize',resize);resize();
+
+const TAU=Math.PI*2,R=0.35,G=30,CS=4;
+const FOGS=52,FOGE=138,FOGC=[226,150,104];
+const FRIC=[[9,2.6],[3.4,1.15],[1.15,0.5],[30,7],[0,0]]; // rough,fairway,green,sand,water
+function wrapA(a){a=(a+Math.PI)%TAU;if(a<0)a+=TAU;return a-Math.PI;}
+const fmtD=d=>d>0?'+'+d:(d<0?'\u2212'+(-d):'E');
+
+/* ============================== AUDIO ============================== */
+let AC=null,master=null,muted=false,noiseBuf=null;
+function initAudio(){
+  if(AC)return;
+  try{
+    AC=new (window.AudioContext||window.webkitAudioContext)();
+    master=AC.createGain();master.gain.value=muted?0:0.5;master.connect(AC.destination);
+    const len=(AC.sampleRate*1)|0;noiseBuf=AC.createBuffer(1,len,AC.sampleRate);
+    const d=noiseBuf.getChannelData(0);for(let i=0;i<len;i++)d[i]=Math.random()*2-1;
+    // soft wind bed
+    const src=AC.createBufferSource();src.buffer=noiseBuf;src.loop=true;
+    const lp=AC.createBiquadFilter();lp.type='lowpass';lp.frequency.value=380;
+    const wg=AC.createGain();wg.gain.value=0.028;
+    const lfo=AC.createOscillator();lfo.frequency.value=0.07;const lg=AC.createGain();lg.gain.value=0.012;
+    lfo.connect(lg);lg.connect(wg.gain);lfo.start();
+    src.connect(lp);lp.connect(wg);wg.connect(master);src.start();
+  }catch(e){}
+  if(AC&&AC.state==='suspended')AC.resume();
+}
+function blip(type,f0,f1,dur,vol,when){
+  if(!AC)return;const t=AC.currentTime+(when||0);
+  const o=AC.createOscillator(),g=AC.createGain();
+  o.type=type;o.frequency.setValueAtTime(f0,t);o.frequency.exponentialRampToValueAtTime(Math.max(20,f1),t+dur);
+  g.gain.setValueAtTime(0.0001,t);g.gain.linearRampToValueAtTime(vol,t+0.012);g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  o.connect(g);g.connect(master);o.start(t);o.stop(t+dur+0.05);
+}
+function noiseBurst(ft,freq,dur,vol,Q){
+  if(!AC)return;const t=AC.currentTime;
+  const s=AC.createBufferSource();s.buffer=noiseBuf;
+  const f=AC.createBiquadFilter();f.type=ft;f.frequency.value=freq;f.Q.value=Q||1;
+  const g=AC.createGain();g.gain.setValueAtTime(vol,t);g.gain.exponentialRampToValueAtTime(0.0001,t+dur);
+  s.connect(f);f.connect(g);g.connect(master);s.start(t);s.stop(t+dur+0.05);
+}
+const sHit=p=>{noiseBurst('bandpass',900+700*p,0.06,0.35+0.4*p,1.2);blip('sine',150-60*p,55,0.13,0.5);};
+const sBounce=v=>{if(v>0.05)blip('sine',190,95,0.07,Math.min(0.4,v));};
+const sSink=()=>{blip('sine',330,68,0.3,0.55);[740,988,1175,1568].forEach((f,i)=>blip('triangle',f,f,0.14,0.22,0.12+i*0.09));};
+const sWater=()=>{noiseBurst('lowpass',520,0.5,0.5,0.8);blip('sine',300,70,0.35,0.3);};
+const sOut=()=>blip('sawtooth',130,55,0.3,0.22);
+const sChime=()=>{blip('triangle',1319,1319,0.16,0.16);blip('triangle',1760,1760,0.22,0.14,0.1);};
+const sTick=p=>blip('square',300+520*p,300+520*p,0.03,0.06);
+const sClick=()=>blip('square',700,640,0.05,0.14);
+const sEnd=()=>[523,659,784,1047].forEach((f,i)=>blip('triangle',f,f,0.35,0.24,i*0.14));
+
+/* ============================== COURSE DATA ============================== */
+const HOLES=[
+ {name:'The Sparrow',par:2,L:70,W:56,tee:{x:0,z:6},hole:{x:0,z:58},green:{r:11},fwW:23,
+  path:[[0,4],[0,30],[0,52]],
+  sands:[{x:7.5,z:49,r:4}],waters:[],
+  trees:[[-12,26,1],[12,34,.9],[-10,44,1.1],[11,18,.8]]},
+ {name:'The Bend',par:3,L:112,W:88,tee:{x:-14,z:6},hole:{x:16,z:98},green:{r:11.5},fwW:20,
+  path:[[-14,4],[-14,40],[6,58],[16,72],[16,92]],
+  sands:[{x:-2,z:52,r:4.5},{x:24,z:84,r:4}],waters:[],
+  trees:[[-30,50,1.2],[-26,70,1],[28,55,1.1],[30,75,1.2],[-24,90,.9],[2,104,1]]},
+ {name:'The Lake',par:4,L:152,W:88,tee:{x:-4,z:6},hole:{x:4,z:138},green:{r:12},fwW:20,
+  path:[[-4,4],[-10,40],[-20,78],[-16,105],[4,128]],
+  sands:[{x:-10,z:126,r:4.5},{x:16,z:96,r:3.5}],
+  waters:[{x0:-26,x1:44,z0:64,z1:86}],
+  trees:[[30,50,1.2],[38,70,1.3],[30,95,1.1],[-38,90,1.2],[-34,115,1],[22,120,1.1]]}
+];
+function dPath(x,z,pts){
+  let m=1e9;
+  for(let i=0;i<pts.length-1;i++){
+    const ax=pts[i][0],az=pts[i][1],bx=pts[i+1][0],bz=pts[i+1][1];
+    const dx=bx-ax,dz=bz-az;
+    const t=Math.max(0,Math.min(1,((x-ax)*dx+(z-az)*dz)/(dx*dx+dz*dz)));
+    const px=ax+dx*t-x,pz=az+dz*t-z,d=px*px+pz*pz;
+    if(d<m)m=d;
+  }
+  return Math.sqrt(m);
+}
+function baseRGB(t,stripe,sh){
+  let r,g,b;
+  if(t===1){if(stripe){r=74;g=138;b=66}else{r=63;g=124;b=58}}
+  else if(t===2){if(stripe){r=104;g=182;b=92}else{r=92;g=168;b=82}}
+  else if(t===3){r=226;g=199;b=145}
+  else if(t===4){r=56;g=104;b=152}
+  else{r=46;g=88;b=49}
+  const m=0.9+0.2*sh;
+  return [Math.min(255,r*m|0),Math.min(255,g*m|0),Math.min(255,b*m|0)];
+}
+let cur=null,Hd=null,cup=null,trees=[];
+function loadHole(i){
+  const hd=HOLES[i];Hd=hd;cup=hd.hole;
+  const gw=Math.ceil((hd.W+36)/CS),gl=Math.ceil((hd.L+65)/CS);
+  const x0=-hd.W/2-18,z0=-15;
+  const type=new Uint8Array(gw*gl),CR=new Int16Array(gw*gl),CG=new Int16Array(gw*gl),CB=new Int16Array(gw*gl);
+  const cols=new Array(gw*gl);
+  let ci=0;
+  for(let iz=0;iz<gl;iz++)for(let ix=0;ix<gw;ix++){
+    const wx=x0+(ix+.5)*CS,wz=z0+(iz+.5)*CS;
+    let t=0;
+    if(dPath(wx,wz,hd.path)<hd.fwW/2)t=1;
+    const gdx=wx-hd.hole.x,gdz=wz-hd.hole.z;
+    if(gdx*gdx+gdz*gdz<hd.green.r*hd.green.r)t=2;
+    for(const s of hd.sands){const sx=wx-s.x,sz=wz-s.z;if(sx*sx+sz*sz<s.r*s.r){t=3;break}}
+    for(const w of hd.waters){if(wx>w.x0&&wx<w.x1&&wz>w.z0&&wz<w.z1){t=4;break}}
+    const c=baseRGB(t,(t===1||t===2)??true?iz%2:0,Math.random());
+    type[ci]=t;CR[ci]=c[0];CG[ci]=c[1];CB[ci]=c[2];
+    cols[ci]='rgb('+c[0]+','+c[1]+','+c[2]+')';
+    ci++;
+  }
+  cur={hd,gw,gl,x0,z0,type,CR,CG,CB,cols};
+  trees=[];let seed=0;
+  for(const t of hd.trees){
+    const dx=t[0]-hd.hole.x,dz=t[1]-hd.hole.z;
+    if(dx*dx+dz*dz<(hd.green.r+2.5)*(hd.green.r+2.5))continue;
+    let inW=false;for(const w of hd.waters){if(t[0]>w.x0-1&&t[0]<w.x1+1&&t[1]>w.z0-1&&t[1]<w.z1+1)inW=true}
+    if(inW)continue;
+    trees.push({x:t[0],z:t[1],s:t[2],seed:seed++*2.39});
+  }
+}
+function surfAt(x,z){
+  const ix=((x-cur.x0)/CS)|0,iz=((z-cur.z0)/CS)|0;
+  if(ix<0||iz<0||ix>=cur.gw||iz>=cur.gl)return 0;
+  return cur.type[iz*cur.gw+ix];
+}
+
+/* ============================== STATE ============================== */
+const ball={p:[0,R,0],v:[0,0,0],rolling:true,sunk:false};
+let state='menu',holeIdx=0,strokes=0,totals=[0,0,0];
+let aim=0,charging=false,chargeT=0,power=0,lastTick=-1;
+let lastShot=[0,R,0],freeze=0,sinkT=0,endT=0,flagWob=0,shake=0,flagNear=false,flagCoo=0,time=0;
+const parts=[],marks=[],rings=[],prev=[];
+
+/* camera */
+const cam={yaw:0,pitch:0.34,dist:26,tDist:26,x:0,y:10,z:-24,fx:0,fy:0,fz:0,rx:0,ry:0,rz:0,ux:0,uy:0,uz:0,snap:true};
+const tmp3=[0,0,0];
+function project(x,y,z,out){
+  const vx=x-cam.x,vy=y-cam.y,vz=z-cam.z;
+  const dz=vx*cam.fx+vy*cam.fy+vz*cam.fz;
+  if(dz<0.25)return false;
+  out[0]=cx+focal*(vx*cam.rx+vy*cam.ry+vz*cam.rz)/dz;
+  out[1]=cy-focal*(vx*cam.ux+vy*cam.uy+vz*cam.uz)/dz;
+  out[2]=dz;return true;
+}
+function updateCamera(dt){
+  let tx,ty,tz;
+  if(state==='menu'){tx=ball.p[0];ty=1.4;tz=ball.p[2];cam.yaw+=dt*0.16;}
+  else{tx=ball.p[0];ty=ball.p[1]+0.9;tz=ball.p[2];}
+  const cp=Math.cos(cam.pitch),sp=Math.sin(cam.pitch),cA=Math.cos(cam.yaw),sA=Math.sin(cam.yaw);
+  cam.fx=sA*cp;cam.fy=-sp;cam.fz=cA*cp;
+  cam.rx=cA;cam.ry=0;cam.rz=-sA;
+  cam.ux=cam.fy*cam.rz;cam.uy=cam.fz*cam.rx-cam.fx*cam.rz;cam.uz=-cam.fy*cam.rx;
+  cam.dist+=(cam.tDist-cam.dist)*Math.min(1,dt*6);
+  const nx=tx-cam.fx*cam.dist,ny=ty-cam.fy*cam.dist,nz=tz-cam.fz*cam.dist;
+  if(shake>0){shake*=Math.exp(-6*dt);cam.x+= (Math.random()-.5)*shake*1.6;cam.y+=(Math.random()-.5)*shake*1.2;}
+  const k=cam.snap?1:Math.min(1,dt*6);
+  cam.x+=(nx-cam.x)*k;cam.y+=(ny-cam.y)*k;cam.z+=(nz-cam.z)*k;
+  cam.snap=false;
+}
+
+/* ============================== FLOW ============================== */
+const $=id=>document.getElementById(id);
+let toastTO=null;
+function toast(main,sub,cls){
+  const el=$('toast');el.className='';void el.offsetWidth;
+  el.innerHTML='<b>'+main+'</b>'+(sub?'<i>'+sub+'</i>':'');
+  el.classList.add('show'+(cls?' '+cls:''));
+  clearTimeout(toastTO);toastTO=setTimeout(()=>el.classList.remove('show'),cls==='sm'?1500:2500);
+}
+function getBest(){try{return localStorage.getItem('sunsetCupBest')}catch(e){return null}}
+function setBest(v){try{const b=getBest();if(b===null||v<parseInt(b,10))localStorage.setItem('sunsetCupBest',String(v))}catch(e){}}
+function refreshBest(){
+  const b=getBest();
+  if(b!==null){$('bestWrap').hidden=false;$('bestEl').textContent=fmtD(parseInt(b,10));}
+  else $('bestWrap').hidden=true;
+}
+function setUI(){
+  document.getElementById('hud').classList.toggle('off',!(state==='play'||state==='holeend'));
+  document.getElementById('ovl').classList.toggle('hidden',state==='play'||state==='holeend');
+  refreshBest();
+}
+function placeBallTee(){
+  const t=Hd.tee;
+  ball.p=[t.x,R,t.z];ball.v=[0,0,0];ball.rolling=true;ball.sunk=false;
+  aim=Math.atan2(cup.x-t.x,cup.z-t.z);
+  cam.yaw=aim;cam.snap=true;
+  lastShot=[t.x,R,t.z];freeze=0;sinkT=0;flagWob=0;flagNear=false;
+  parts.length=0;marks.length=0;rings.length=0;prev.length=0;charging=false;power=0;
+}
+function startGame(){
+  sClick();holeIdx=0;totals=[0,0,0];strokes=0;
+  loadHole(0);placeBallTee();
+  state='play';setUI();updateHUD();
+  toast('HOLE 1','The Sparrow · Par 2');
+}
+function nextHole(){
+  holeIdx++;
+  if(holeIdx>=3){endGame();return;}
+  strokes=0;loadHole(holeIdx);placeBallTee();
+  state='play';setUI();updateHUD();
+  toast('HOLE '+(holeIdx+1),HOLES[holeIdx].name+' · Par '+HOLES[holeIdx].par);
+}
+function shotName(d,s){
+  if(s===1)return 'HOLE IN ONE!!';
+  if(d<=-3)return 'ALBATROSS!';if(d===-2)return 'EAGLE!';if(d===-1)return 'BIRDIE!';
+  if(d===0)return 'PAR';if(d===1)return 'BOGEY';if(d===2)return 'DOUBLE BOGEY';
+  return d+' OVER PAR';
+}
+function finishHole(){
+  totals[holeIdx]=strokes;
+  const d=strokes-Hd.par;
+  toast(shotName(d,strokes),holeIdx<2?('Next \u2192 '+HOLES[holeIdx+1].name):'Final scorecard');
+  state='holeend';endT=0;setUI();
+}
+function endGame(){
+  state='over';
+  const tt=totals[0]+totals[1]+totals[2],tp=9,d=tt-tp;
+  setBest(d);sEnd();
+  let rows='',recLine='';const b=getBest();
+  for(let i=0;i<3;i++){
+    const s=totals[i],p=HOLES[i].par,dd=s-p;
+    rows+='<tr><td class="hn">'+(i+1)+' \u00b7 '+HOLES[i].name+'</td><td class="r">'+p+'</td><td class="r">'+s+'</td><td class="r '+(dd>0?'bad':dd<0?'good':'')+'">'+fmtD(dd)+'</td></tr>';
+  }
+  if(parseInt(b,10)===d&&b!==null)recLine='<p class="nrec">\u2605 new course record \u2605</p>';
+  const verdict=d<=-3?'A round for the books. The caddies are weeping.':d<0?'Under par \u2014 the sunset was only half the magic.':'Even par. Respectably polite.';
+  $('card').innerHTML=
+   '<div class="stamp">PAR 9</div>'
+   +'<span class="eyebrow">Sunset Cup \u00b7 Final Scorecard</span><h1>The Round Is Over</h1><p class="rule"></p>'
+   +'<table class="holes"><tr><th>Hole</th><th class="r">Par</th><th class="r">You</th><th class="r">\u00b1</th></tr>'+rows
+   +'<tr class="tot"><td>Total</td><td class="r">'+tp+'</td><td class="r">'+tt+'</td><td class="r '+(d>0?'bad':d<0?'good':'')+'">'+fmtD(d)+'</td></tr></table>'
+   +'<p class="verdict">"'+verdict+'"</p>'+recLine
+   +(b!==null?'<p class="rec">Course record <b>'+fmtD(parseInt(b,10))+'</b></p>':'')
+   +'<button id="go">PLAY AGAIN</button><p class="or">press enter or R</p>';
+  $('go').onclick=()=>startGame();
+  setUI();
+}
+function showMenu(){
+  state='menu';
+  const b=getBest();
+  let rows='';
+  for(let i=0;i<3;i++)rows+='<tr><td class="hn">'+('0'+(i+1)).slice(-2)+' \u00b7 '+HOLES[i].name+'</td><td class="hp">Par '+HOLES[i].par+'</td></tr>';
+  $('card').innerHTML=
+   '<div class="stamp">PAR 9</div>'
+   +'<span class="eyebrow">A three-hole course at golden hour</span><h1>Sunset Cup</h1><p class="tag">3D golf, hand-rolled in one file \u2014 no engines were harmed.</p>'
+   +'<p class="rule"></p><table class="holes">'+rows+'</table>'
+   +(b!==null?'<p class="rec">Course record <b>'+fmtD(parseInt(b,10))+'</b></p>':'')
+   +'<div class="controls">'
+   +'<div>\u25b6 <kbd>A</kbd><kbd>D</kbd> or <kbd>\u2190</kbd><kbd>\u2192</kbd> aim your shot</div>'
+   +'<div>\u25b6 hold <kbd>SPACE</kbd> or <kbd>CLICK</kbd>, release to fire \u2014 watch the arc</div>'
+   +'<div>\u25b6 <kbd>Q</kbd><kbd>E</kbd> orbit camera \u00b7 scroll to zoom</div>'
+   +'<div>\u25b6 <kbd>R</kbd> restart round \u00b7 <kbd>M</kbd> sound on/off</div></div>'
+   +'<button id="go">TEE OFF</button><p class="or">press enter</p>';
+  $('go').onclick=()=>startGame();
+  setUI();
+}
+
+/* ============================== HUD ============================== */
+let _hudCache={};
+function setTxt(id,v){if(_hudCache[id]!==v){_hudCache[id]=v;$(id).textContent=v;}}
+function updateHUD(){
+  const tp=HOLES.slice(0,holeIdx+1).reduce((a,h)=>a+h.par,0);
+  const done=HOLES.slice(0,holeIdx).reduce((a,h)=>a+h.par,0)+strokes;
+  setTxt('hNum',String(holeIdx+1));setTxt('hName',Hd.name);setTxt('hPar',String(Hd.par));
+  setTxt('strokesEl',String(strokes));setTxt('totalEl',fmtD(done-tp));
+}
+
+/* ============================== SHOTS & PHYSICS ============================== */
+function canShoot(){return state==='play'&&!ball.sunk&&freeze<=0&&ball.rolling&&Math.hypot(ball.v[0],ball.v[2])<0.15;}
+function beginCharge(){if(!canShoot())return;charging=true;chargeT=0;lastTick=-1;$('powerWrap').classList.add('on');}
+function releaseShot(){
+  if(!charging)return;charging=false;$('powerWrap').classList.remove('on');
+  const spd=7+51*power,dx=Math.sin(aim),dz=Math.cos(aim);
+  lastShot=[ball.p[0],Math.max(ball.p[1],R),ball.p[2]];
+  ball.v=[dx*spd*0.985,spd*0.13,dz*spd*0.985];
+  ball.rolling=false;strokes++;shake=0.15+0.3*power;
+  sHit(power);prev.length=0;
+  spawn(ball.p[0]-dx*0.6,R-0.1,ball.p[2]-dz*0.6,7,[120,200,110],4,0.5,14,true);
+  power=0;updateHUD();
+}
+function spawn(x,y,z,n,col,spd,life,g,up){
+  for(let i=0;i<n;i++){
+    if(parts.length>300)parts.shift();
+    parts.push({x,y,z,vx:(Math.random()-.5)*spd,vy:Math.random()*spd*(up?0.9:0.45),vz:(Math.random()-.5)*spd,
+      life:life*(0.6+Math.random()*0.6),max:life,r:0.12+Math.random()*0.16,col,g:g||18});
+  }
+}
+function respawnAt(pos){freeze=0.9;ball.p=[pos[0],R,pos[2]];ball.v=[0,0,0];ball.rolling=true;ball.sunk=false;}
+function waterEvent(){
+  spawn(ball.p[0],0.2,ball.p[2],18,[150,200,240],7,0.9,22,true);
+  rings.push({x:ball.p[0],z:ball.p[2],life:0.7,max:0.7,col:'rgba(200,230,255,'});
+  sWater();strokes++;toast('WATER HAZARD','+1 penalty \u00b7 ball returned','sm');
+  respawnAt(lastShot);updateHUD();
+}
+function oobEvent(){
+  sOut();strokes++;toast('OUT OF BOUNDS','+1 penalty \u00b7 ball returned','sm');
+  respawnAt(lastShot);updateHUD();
+}
+function startSink(){
+  ball.sunk=true;ball.v=[0,0,0];sinkT=0;flagWob=4;sSink();
+  spawn(cup.x,R,cup.z,26,null,5,1.3,12,true);
+  parts[parts.length-26]&&null; // confetti handled below
+  const cols=[[255,210,74],[255,242,192],[255,122,77],[143,224,138]];
+  for(let i=0;i<26&&i<parts.length-0;i++){} // (no-op)
+  spawnConfetti();
+}
+function spawnConfetti(){
+  const cols=[[255,210,74],[255,242,192],[255,122,77],[143,224,138]];
+  for(let i=0;i<26;i++){
+    if(parts.length>300)parts.shift();
+    const c=cols[i%4];
+    parts.push({x:cup.x,y:R+0.2,z:cup.z,vx:(Math.random()-.5)*6,vy:3+Math.random()*6,vz:(Math.random()-.5)*6,
+      life:1+Math.random()*0.7,max:1.6,r:0.14,col:c,g:15});
+  }
+}
+function physStep(dt){
+  const p=ball.p,v=ball.v;
+  if(ball.sunk){
+    p[0]+=(cup.x-p[0])*Math.min(1,dt*9);p[2]+=(cup.z-p[2])*Math.min(1,dt*9);
+    p[1]=Math.max(-0.7,p[1]-dt*3.4);return;
+  }
+  v[1]-=G*dt;
+  p[0]+=v[0]*dt;p[1]+=v[1]*dt;p[2]+=v[2]*dt;
+  // trees
+  for(const t of trees){
+    const dx=p[0]-t.x,dz=p[2]-t.z,rr=1.35+t.s*0.4;
+    if(p[1]<5.2*t.s&&dx*dx+dz*dz<rr*rr){
+      const d=Math.sqrt(dx*dx+dz*dz)||1e-4,nx=dx/d,nz=dz/d;
+      p[0]=t.x+nx*rr;p[2]=t.z+nz*rr;
+      const dot=v[0]*nx+v[2]*nz;
+      if(dot<0){v[0]-=1.6*dot*nx;v[2]-=1.6*dot*nz;v[0]*=0.55;v[2]*=0.55;sBounce(0.3);spawn(p[0],p[1],p[2],5,[47,107,58],4,0.6,12,true);}
+    }
+  }
+  const t=surfAt(p[0],p[2]);
+  if(p[1]<=R){
+    if(t===4){waterEvent();return;}
+    const imp=-v[1];
+    v[1]=-v[1]*(t===3?0.12:0.52);
+    const keep=t===3?0.42:0.8;v[0]*=keep;v[2]*=keep;p[1]=R;
+    if(imp>7){sBounce(Math.min(0.6,imp*0.03));spawn(p[0],R,p[2],t===3?10:5,t===3?[233,212,161]:[110,180,95],4,0.5,12,true);
+      if(marks.length>40)marks.shift();marks.push({x:p[0],z:p[2],life:6,max:6});}
+    else v[1]=0;
+    ball.rolling=true;
+    if(t===3){const s=Math.hypot(v[0],v[2]);if(s>3){v[0]*=0.5;v[2]*=0.5;spawn(p[0],R,p[2],12,[233,212,161],5,0.7,10,true);}}
+  }
+  const grounded=p[1]<=R+0.02&&Math.abs(v[1])<0.05;
+  if(grounded){
+    const sp=Math.hypot(v[0],v[2]);
+    if(sp>0){
+      const fc=FRIC[t][0],fl=FRIC[t][1],dec=(fc+fl*sp)*dt;
+      if(sp<=dec||sp<0.12){v[0]=0;v[2]=0;}else{const k2=1-dec/sp;v[0]*=k2;v[2]*=k2;}
+    }
+  }
+  const hdx=p[0]-cup.x,hdz=p[2]-cup.z,hd=Math.sqrt(hdx*hdx+hdz*hdz);
+  if(!ball.sunk&&p[1]<R+1.5){
+    const spd=Math.hypot(v[0],v[1],v[2]);
+    if(hd<0.85&&spd<8)startSink();
+    else if(hd<1.6&&spd>=8){
+      const nx=hdx/(hd||1e-4),nz=hdz/(hd||1e-4);
+      v[0]=nx*spd*0.35+(Math.random()-.5)*2;v[2]=nz*spd*0.35+(Math.random()-.5)*2;
+      v[1]=Math.max(v[1],1.5);ball.rolling=false;sBounce(0.3);
+    }
+  }
+  if(p[0]<-Hd.W/2-8||p[0]>Hd.W/2+8||p[2]<-14||p[2]>Hd.L+16)oobEvent();
+}
+
+/* trajectory preview */
+function computePreview(){
+  prev.length=0;
+  if(!charging)return;
+  const spd=7+51*power;
+  let px=ball.p[0],py=ball.p[1],pz=ball.p[2];
+  let vx=Math.sin(aim)*spd*0.985,vy=spd*0.13,vz=Math.cos(aim)*spd*0.985;
+  const dt=0.045;
+  for(let i=0;i<260;i++){
+    vy-=G*dt;px+=vx*dt;py+=vy*dt;pz+=vz*dt;
+    if(i%3===0)prev.push([px,Math.max(py,0),pz]);
+    if(py<=R){
+      const t=surfAt(px,pz);
+      if(t===4){prev.push([px,R,pz,true]);break;}
+      vy=-vy*0.52;vx*=0.78;vz*=0.78;py=R;
+      if(Math.abs(vy)<1.3){
+        let spx=vx,spz=vz;
+        for(let j=0;j<60&&Math.hypot(spx,spz)>0.4;j++){
+          const s=Math.hypot(spx,spz),dec=(FRIC[t][0]+FRIC[t][1]*s)*dt;
+          if(s<=dec)break;const k2=1-dec/s;spx*=k2;spz*=k2;px+=spx*dt;pz+=spz*dt;
+        }
+        prev.push([px,R,pz]);
+      }
+    }
+  }
+}
+
+/* ============================== INPUT ============================== */
+const keys={};
+addEventListener('keydown',e=>{
+  initAudio();
+  const k=e.key.length===1?e.key.toLowerCase():e.key;
+  if([' ','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key))e.preventDefault();
+  keys[k]=true;
+  if(k==='Enter'){if(state==='menu'||state==='over')startGame();}
+  else if(k==='r'){startGame();}
+  else if(k==='m'){muted=!muted;if(master)master.gain.value=muted?0:0.5;toast(muted?'SOUND OFF':'SOUND ON','', 'sm');}
+  else if(k===' '&&!e.repeat){if(state==='menu'||state==='over')startGame();else beginCharge();}
+});
+addEventListener('keyup',e=>{
+  const k=e.key.length===1?e.key.toLowerCase():e.key;
+  keys[k]=false;
+  if(k===' ')releaseShot();
+});
+addEventListener('pointerdown',e=>{
+  initAudio();
+  if(state==='play'&&e.button!==2)beginCharge();
+});
+addEventListener('pointerup',()=>releaseShot());
+addEventListener('pointercancel',()=>releaseShot());
+let lastTX=0;
+addEventListener('pointermove',e=>{
+  if(charging&&e.pointerType==='touch'){
+    const dx=e.clientX-lastTX;lastTX=e.clientX;aim+=dx*0.005;
+  }
+});
+addEventListener('wheel',e=>{
+  e.preventDefault();
+  cam.tDist=Math.max(11,Math.min(70,cam.tDist*(e.deltaY>0?1.12:0.9)));
+},{passive:false});
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+
+/* ============================== UPDATE ============================== */
+let acc=0;
+function update(dt){
+  time+=dt;
+  // aim & orbit
+  const L=(keys['a']||keys['ArrowLeft'])?1:0,Rt=(keys['d']||keys['ArrowRight'])?1:0;
+  if(L||Rt)aim+=(L-Rt)*2.0*dt;
+  if(keys['q'])cam.yaw-=2.2*dt;
+  if(keys['e'])cam.yaw+=2.2*dt;
+  // charge
+  if(charging){
+    chargeT+=dt;
+    const x=(chargeT%2.3)/1.15;power=x<1?x:2-x;
+    $('pfill').style.width=(power*100).toFixed(1)+'%';
+    if(chargeT-lastTick>0.09){lastTick=chargeT;sTick(power);}
+    computePreview();
+  }else power=0;
+  if(freeze>0)freeze-=dt;
+  flagWob*=Math.exp(-1.5*dt);flagCoo-=dt;
+  // physics
+  if(state==='play'){
+    acc+=dt;let n=0;
+    while(acc>1/120&&n<5){physStep(1/120);acc-=1/120;n++;}
+    if(ball.sunk){sinkT+=dt;if(sinkT>1.1)finishHole();}
+    // flag chime
+    const d=Math.hypot(ball.p[0]-cup.x,ball.p[2]-cup.z);
+    if(!ball.sunk&&d<Hd.green.r+2.5&&!flagNear){flagNear=true;if(flagCoo<=0){sChime();flagCoo=2;}}
+    if(d>Hd.green.r+4)flagNear=false;
+  }
+  if(state==='holeend'){endT+=dt;if(endT>2.6)nextHole();}
+  // particles / marks / rings
+  for(let i=parts.length-1;i>=0;i--){const q=parts[i];q.life-=dt;
+    if(q.life<=0){parts.splice(i,1);continue;}
+    q.vy-=q.g*dt;q.x+=q.vx*dt;q.y+=q.vy*dt;q.z+=q.vz*dt;if(q.y<0.05)q.y=0.05;}
+  for(let i=marks.length-1;i>=0;i--){marks[i].life-=dt;if(marks[i].life<=0)marks.splice(i,1);}
+  for(let i=rings.length-1;i>=0;i--){rings[i].life-=dt;if(rings[i].life<=0)rings.splice(i,1);}
+  // clouds drift
+  for(const c of clouds)c.a+=dt*0.006;
+  // distance HUD
+  const dd=Math.hypot(ball.p[0]-cup.x,ball.p[2]-cup.z);
+  setTxt('distEl',(dd<10?dd.toFixed(1):Math.round(dd))+'m');
+  updateCamera(dt);
+}
+
+/* ============================== SKY ============================== */
+const sunA=0.55;
+const clouds=[];for(let i=0;i<7;i++)clouds.push({a:Math.random()*TAU,y:20+Math.random()*90,s:0.6+Math.random()*1.2,ph:Math.random()*9});
+function drawSky(){
+  if(!skyGrad){
+    skyGrad=ctx.createLinearGradient(0,0,0,cy*1.05);
+    skyGrad.addColorStop(0,'#0f1536');skyGrad.addColorStop(0.40,'#33386f');
+    skyGrad.addColorStop(0.58,'#7c4a68');skyGrad.addColorStop(0.72,'#c96b4e');
+    skyGrad.addColorStop(0.85,'#f5a95c');skyGrad.addColorStop(1,'#ffdf9e');
+  }
+  ctx.fillStyle=skyGrad;ctx.fillRect(0,0,W,Hh);
+  // sun
+  const dxA=wrapA(sunA-cam.yaw);
+  if(Math.abs(dxA)<1.2){
+    const sx=cx+dxA*W*0.42,sy=cy-Hh*0.085-Math.sin(time*0.6)*2;
+    let g=ctx.createRadialGradient(sx,sy,0,sx,sy,Hh*0.3);
+    g.addColorStop(0,'rgba(255,240,190,0.85)');g.addColorStop(0.25,'rgba(255,190,110,0.35)');g.addColorStop(1,'rgba(255,170,90,0)');
+    ctx.fillStyle=g;ctx.fillRect(sx-Hh*0.3,sy-Hh*0.3,Hh*0.6,Hh*0.6);
+    ctx.fillStyle='#fff3c8';ctx.beginPath();ctx.arc(sx,sy,Hh*0.045,0,TAU);ctx.fill();
+  }
+  // clouds
+  for(const c of clouds){
+    const da=wrapA(c.a-cam.yaw);if(Math.abs(da)>1.2)continue;
+    const x=cx+da*W*0.5,y=cy-c.y-6;
+    ctx.fillStyle='rgba(255,214,170,'+(0.28+c.s*0.1)+')';
+    ctx.beginPath();
+    ctx.ellipse(x,y,52*c.s,13*c.s,0,0,TAU);
+    ctx.ellipse(x+30*c.s,y+6*c.s,40*c.s,11*c.s,0,0,TAU);
+    ctx.ellipse(x-34*c.s,y+7*c.s,34*c.s,9*c.s,0,0,TAU);
+    ctx.fill();
+  }
+  // hills (two parallax silhouettes)
+  hill(0.55,'#3a2b52',34,17,3,91);hill(1.0,'#241d3e',22,12,7,47);
+}
+function hill(par,col,a1,a2,f1,f2){
+  const off=cam.yaw*W*0.5*par+cam.x*2*par;
+  ctx.fillStyle=col;ctx.beginPath();ctx.moveTo(0,cy+3);
+  for(let x=0;x<=W;x+=24){
+    const u=x+off;
+    const y=cy-((a1+a2*Math.sin(u*0.004*f1)+a2*0.6*Math.sin(u*0.011*f2))* (0.5+0.5*Math.sin(u*0.0013+par*5)));
+    ctx.lineTo(x,y);
+  }
+  ctx.lineTo(W,cy+3);ctx.closePath();ctx.fill();
+}
+
+/* ============================== RENDER ============================== */
+const POOL=6000,items=new Array(POOL),list=[];
+for(let i=0;i<POOL;i++)items[i]={d:0,k:0,o:0,x1:0,y1:0,x2:0,y2:0,x3:0,y3:0,x4:0,y4:0};
+let nItems=0;
+function pushItem(d,k,o){if(nItems>=POOL)return;const it=items[nItems++];it.d=d;it.k=k;it.o=o;}
+const ballSpr=(()=>{const c=document.createElement('canvas');c.width=c.height=64;const g=c.getContext('2d');
+  const gr=g.createRadialGradient(25,22,4,32,32,32);
+  gr.addColorStop(0,'#ffffff');gr.addColorStop(0.55,'#f1f2ec');gr.addColorStop(0.85,'#c9d1c6');gr.addColorStop(1,'#aab4a6');
+  g.fillStyle=gr;g.beginPath();g.arc(32,32,31,0,TAU);g.fill();return c;})();
+
+function render(){
+  drawSky();
+  nItems=0;
+  /* --- ground cells --- */
+  const {gw,gl,x0,z0,type}=cur;
+  for(let iz=0;iz<gl;iz++){
+    const wz=z0+iz*CS;
+    for(let ix=0;ix<gw;ix++){
+      const wx=x0+ix*CS,t=type[iz*gw+ix];
+      if(!project(wx+2,0,wz+2,tmp3))continue;
+      if(tmp3[2]>FOGE)continue;
+      const m=focal*CS/tmp3[2]*1.7+8;
+      if(tmp3[0]<-m||tmp3[0]>W+m||tmp3[1]<-m||tmp3[1]>Hh+m)continue;
+      const gy=t===4?-0.14:0;
+      if(!project(wx,gy,wz,tmp3))continue;const x1=tmp3[0],y1=tmp3[1];
+      if(!project(wx+CS,gy,wz,tmp3))continue;const x2=tmp3[0],y2=tmp3[1];
+      if(!project(wx+CS,gy,wz+CS,tmp3))continue;const x3=tmp3[0],y3=tmp3[1];
+      if(!project(wx,gy,wz+CS,tmp3))continue;
+      const it=items[nItems++];it.d=tmp3[2];it.k=0;it.o=iz*gw+ix;
+      it.x1=x1;it.y1=y1;it.x2=x2;it.y2=y2;it.x3=x3;it.y3=y3;it.x4=tmp3[0];it.y4=tmp3[1];
+    }
+  }
+  /* --- objects --- */
+  for(const t of trees){if(project(t.x,0,t.z,tmp3)&&tmp3[2]<FOGE)pushItem(tmp3[2],1,t);}
+  if(project(cup.x,0,cup.z,tmp3)){
+    pushItem(tmp3[2]+0.1,6,cup);
+    if(!ball.sunk||sinkT<0.5)pushItem(tmp3[2]-0.1,2,cup);
+  }
+  for(const m of marks){if(project(m.x,0,m.z,tmp3))pushItem(tmp3[2],5,m);}
+  for(const r of rings){if(project(r.x,0,r.z,tmp3))pushItem(tmp3[2],11,r);}
+  for(const q of parts){if(project(q.x,q.y,q.z,tmp3)&&tmp3[2]<FOGE)pushItem(tmp3[2],4,q);}
+  if(!ball.sunk||sinkT<0.6){
+    if(project(ball.p[0],ball.p[1],ball.p[2],tmp3))pushItem(tmp3[2]-0.05,3,ball);
+    if(state==='play'&&canShoot())pushItem(tmp3[2]+0.3,8,null);
+  }
+  list.length=0;for(let i=0;i<nItems;i++)list.push(items[i]);
+  list.sort((a,b)=>b.d-a.d);
+
+  for(const it of list){
+    const d=it.d,f=Math.max(0,Math.min(1,(d-FOGS)/(FOGE-FOGS)));
+    if(it.k===0){
+      const ci=it.o;
+      if(f>=1)continue;
+      let r2=cur.CR[ci],g2=cur.CG[ci],b2=cur.CB[ci];
+      const t=cur.type[ci];
+      if(t===4){const s8=Math.sin(time*2+(ci%cur.gw)*5.3+((ci/cur.gw)|0)*7.7)*14;r2+=s8;g2+=s8*0.8;b2+=s8;}
+      ctx.fillStyle=f<=0&&t!==4?cur.cols[ci]:'rgb('+((r2+(FOGC[0]-r2)*f)|0)+','+((g2+(FOGC[1]-g2)*f)|0)+','+((b2+(FOGC[2]-b2)*f)|0)+')';
+      ctx.beginPath();ctx.moveTo(it.x1,it.y1);ctx.lineTo(it.x2,it.y2);ctx.lineTo(it.x3,it.y3);ctx.lineTo(it.x4,it.y4);ctx.closePath();ctx.fill();
+    }
+    else if(it.k===6){ /* hole */
+      if(!project(cup.x,0,cup.z,tmp3))continue;
+      const rx=focal*0.95/tmp3[2],ry=rx*0.42;
+      ctx.fillStyle='rgba(230,220,190,0.5)';ctx.beginPath();ctx.ellipse(tmp3[0],tmp3[1],rx*1.18,ry*1.18,0,0,TAU);ctx.fill();
+      ctx.fillStyle='#0f1d14';ctx.beginPath();ctx.ellipse(tmp3[0],tmp3[1],rx,ry,0,0,TAU);ctx.fill();
+    }
+    else if(it.k===2){ /* flag */
+      if(!project(cup.x,0,cup.z,tmp3))continue;const B=tmp3;
+      if(!project(cup.x,6.4,cup.z,tmp3))continue;const T=tmp3;
+      ctx.strokeStyle='#efe6cf';ctx.lineWidth=Math.max(1,focal*0.09/T[2]);
+      ctx.beginPath();ctx.moveTo(B[0],B[1]);ctx.lineTo(T[0],T[1]);ctx.stroke();
+      const len=focal*2.3/T[2],wv=Math.sin(time*6)*len*0.14*(1+flagWob*0.6);
+      ctx.fillStyle='#e8402f';ctx.beginPath();
+      ctx.moveTo(T[0],T[1]);ctx.lineTo(T[0]+len,T[1]+2+wv);ctx.lineTo(T[0]+len,T[1]+len*0.45+wv);ctx.lineTo(T[0],T[1]+len*0.45);
+      ctx.closePath();ctx.fill();
+    }
+    else if(it.k===1){ /* tree */
+      const o=it.o;
+      if(!project(o.x,0,o.z,tmp3))continue;const B=tmp3;
+      const sway=Math.sin(time*1.3+o.seed)*0.25*o.s;
+      if(!project(o.x+sway,4.6*o.s,o.z,tmp3))continue;const T=tmp3;
+      const hf=(B[1]-T[1])*0.62,wpx=focal*(2.7*o.s)/T[2];
+      ctx.strokeStyle=mixC([80,54,38],f);ctx.lineWidth=Math.max(1,focal*0.32*o.s/B[2]);
+      ctx.beginPath();ctx.moveTo(B[0],B[1]);ctx.lineTo(T[0]+(B[0]-T[0])*0.4,T[1]+hf*0.5);ctx.stroke();
+      const tiers=[[23,63,36],[30,75,44],[38,89,52]];
+      for(let i=0;i<3;i++){
+        const y0=T[1]+hf*(0.42+0.3*i),hw=wpx*(0.42+0.15*i);
+        ctx.fillStyle=mixC(tiers[i],f);
+        ctx.beginPath();ctx.moveTo(T[0],T[1]-hf*0.16+i*hf*0.1);
+        ctx.lineTo(T[0]-hw,y0);ctx.lineTo(T[0]+hw,y0);ctx.closePath();ctx.fill();
+      }
+    }
+    else if(it.k===5){ /* ground mark */
+      const m=it.o;if(!project(m.x,0,m.z,tmp3))continue;
+      const a=m.life/m.max*0.32,r2=focal*0.4/tmp3[2];
+      ctx.fillStyle='rgba(16,28,16,'+a.toFixed(3)+')';
+      ctx.beginPath();ctx.ellipse(tmp3[0],tmp3[1],r2,r2*0.45,0,0,TAU);ctx.fill();
+    }
+    else if(it.k===11){ /* splash ring */
+      const r=it.o;if(!project(r.x,0,r.z,tmp3))continue;
+      const t2=1-r.life/r.max,rad=focal*(0.4+t2*2.6)/tmp3[2];
+      ctx.strokeStyle=r.col+(r.life/r.max*0.7).toFixed(3)+')';ctx.lineWidth=2;
+      ctx.beginPath();ctx.ellipse(tmp3[0],tmp3[1],rad,rad*0.42,0,0,TAU);ctx.stroke();
+    }
+    else if(it.k===4){ /* particle */
+      const q=it.o;if(!project(q.x,q.y,q.z,tmp3))continue;
+      ctx.globalAlpha=Math.max(0,q.life/q.max);
+      ctx.fillStyle='rgb('+q.col[0]+','+q.col[1]+','+q.col[2]+')';
+      ctx.beginPath();ctx.arc(tmp3[0],tmp3[1],Math.max(1,focal*q.r/tmp3[2]),0,TAU);ctx.fill();
+      ctx.globalAlpha=1;
+    }
+    else if(it.k===8){ /* rest pulse */
+      if(!project(ball.p[0],0,ball.p[2],tmp3))continue;
+      const a=0.16+0.14*Math.sin(time*4),r2=focal*(0.9+0.12*Math.sin(time*4))/tmp3[2];
+      ctx.strokeStyle='rgba(255,210,122,'+a.toFixed(3)+')';ctx.lineWidth=2;
+      ctx.beginPath();ctx.ellipse(tmp3[0],tmp3[1],r2,r2*0.42,0,0,TAU);ctx.stroke();
+    }
+    else if(it.k===3){ /* ball */
+      const p=ball.p;
+      if(p[1]>-0.2){
+        if(project(p[0],0,p[2],tmp3)){
+          const h=Math.max(0,p[1]),sa=Math.max(0.06,0.42-h*0.02),sr=focal*(0.42+h*0.02)/tmp3[2];
+          ctx.fillStyle='rgba(8,16,9,'+sa.toFixed(3)+')';
+          ctx.beginPath();ctx.ellipse(tmp3[0],tmp3[1],sr,sr*0.42,0,0,TAU);ctx.fill();
+        }
+        if(project(p[0],p[1],p[2],tmp3)){
+          const r2=focal*R/tmp3[2];
+          ctx.drawImage(ballSpr,tmp3[0]-r2*1.15,tmp3[1]-r2*1.15,r2*2.3,r2*2.3);
+        }
+      }
+    }
+  }
+  /* aim arrow + preview */
+  if(state==='play'&&canShoot()){
+    const len=4+power*14,dx=Math.sin(aim),dz=Math.cos(aim);
+    let px=null,py=null;
+    ctx.lineCap='round';
+    for(let i=0;i<=8;i++){
+      const t2=i/8;
+      if(!project(ball.p[0]+dx*len*t2,0.25,ball.p[2]+dz*len*t2,tmp3))continue;
+      if(px!==null){
+        ctx.strokeStyle='rgba(255,'+((230-160*power)|0)+','+((180-140*power)|0)+',0.9)';
+        ctx.lineWidth=4-3*t2;
+        ctx.beginPath();ctx.moveTo(px,py);ctx.lineTo(tmp3[0],tmp3[1]);ctx.stroke();
+      }
+      px=tmp3[0];py=tmp3[1];
+    }
+    if(charging){
+      for(let i=0;i<prev.length;i++){
+        const pt=prev[i];if(!project(pt[0],pt[1],pt[2],tmp3))continue;
+        const t2=i/prev.length;
+        ctx.globalAlpha=(0.75*(1-t2)).toFixed(3);
+        ctx.fillStyle='#fff3d0';
+        ctx.beginPath();ctx.arc(tmp3[0],tmp3[1],2.6-1.6*t2,0,TAU);ctx.fill();
+        if(pt[3]){ctx.globalAlpha=0.8;ctx.strokeStyle='#ff7a4d';ctx.lineWidth=2;
+          ctx.beginPath();ctx.ellipse(tmp3[0],tmp3[1],focal*0.9/tmp3[2],focal*0.4/tmp3[2],0,0,TAU);ctx.stroke();}
+      }
+      ctx.globalAlpha=1;
+    }
+  }
+}
+function mixC(c,f){if(f<=0)return'rgb('+c[0]+','+c[1]+','+c[2]+')';
+  return'rgb('+((c[0]+(FOGC[0]-c[0])*f)|0)+','+((c[1]+(FOGC[1]-c[1])*f)|0)+','+((c[2]+(FOGC[2]-c[2])*f)|0)+')';}
+
+/* ============================== LOOP ============================== */
+let lastT=performance.now();
+function loop(now){
+  const dt=Math.min(0.033,(now-lastT)/1000);lastT=now;
+  update(dt);render();
+  requestAnimationFrame(loop);
+}
+loadHole(0);placeBallTee();showMenu();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
+```
