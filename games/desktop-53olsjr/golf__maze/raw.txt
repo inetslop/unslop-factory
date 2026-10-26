@@ -1,0 +1,2352 @@
+<think>
+The user wants a "maze golf" game. Let me think about what this means: a golf game inside a maze — you roll a ball through a maze, sink it into a hole, count the number of strokes/hits. Like mini-golf but with maze walls.
+
+Design concept:
+- A maze generated procedurally (recursive backtracker or similar), drawn on canvas.
+- The player aims from the ball's position, sets power, and hits the ball. Physics: velocity, friction, wall collisions (maze walls are axis-aligned, so simple AABB collision against wall segments).
+- The ball needs to reach the hole — if it passes through at low speed, or within capture radius and below a certain speed, it gets captured; otherwise it might slip past (fun element).
+- Strokes counted per level. Par per level. Scorecard. Multiple levels (e.g., 9 holes) with increasing maze sizes/complexity.
+- Power meter: hold to charge, release to fire? Or click-and-drag aim like mini-golf. Drag from the ball: drag direction + power, show an aiming arrow and trajectory preview (dashed line until first wall hit). That feels good.
+- Controls: mouse/touch drag to aim; keyboard alternative too — arrow keys rotate the aim, hold space to charge power, release to fire. Since it's "listen for keys on window", should support both mouse and keyboard. Keyboard controls are a must: "how to operate" needs to be listed on the start screen.
+- Sound via WebAudio: hit sound, wall-tick sound (pitch depending on velocity), hole-in sound (rising arpeggio), UI click.
+- Start screen with game name, controls, restart. Restart without reload — a "New Game" button resets the scorecard. Also R key to retry the hole (reset ball to tee, +1 stroke? or free reset? Let's do this: R = redo shot if the ball is stopped and at least 1 stroke has been used… simpler: R returns the ball to the last position before the previous stroke; no penalty? In golf you can't undo. Simpler: "R" restarts the current hole, keeping the stroke count? Hmm. Let's do this: R = reset ball to tee of the current hole, keep accumulated strokes (i.e., strokes for that hole continue). Actually that's weird.
+
+Let's define the rules clearly:
+- 9 holes (or generate endless? A scorecard of 9 feels satisfying; after finishing show a final score screen with total vs par and restart button).
+- Each hole: maze size grows, par = based on maze complexity (e.g., par = round(mazeSize/2)+1 or computed from Manhattan distance).
+- Strokes per hole. Ball stops when velocity falls below threshold. Then aim again.
+- Hole capture: if dist(ball, cup) < cupRadius and speed < captureSpeed → sink. If faster, maybe deflect slightly (fun). If within radius but fast, add a small "lip out" wobble sound.
+- Max strokes per hole? Maybe no cap; but to prevent infinite, if strokes > par + 4 then… keep it simple: no cap, scorecard shows the number. Or 10-stroke limit → automatic pickup at 10 (like golf's drop rule). Let's do this: max 8 strokes per hole ("pick up at 8") to keep game tempo. Actually, let's make it a soft cap: stroke > par+3… hmm, simplest and most robust: no cap. But then the player can't get stuck… well, they can always reach it eventually. Fine, no cap, but display "Max +5"? Let's do this: pickup at 10 strokes per hole for game flow. Hmm, that could be frustrating. No cap — maze golf is chill. Actually a light structure helps: after 9 holes, final screen with total stroke count, total par, difference (E, +n, -n), and rating text. Buttons: Play Again.
+
+Visual design: I want it lively, layered backgrounds, motion, micro-interactions, strong typographic contrast, and a distinctive display typeface paired with a readable body typeface. No external fonts — must use system font stack. Display typeface: something like "Impact, 'Arial Black', sans-serif" or better: Georgia? For a golf/maze game, chunky slab or monospace can be fun. Options without webfonts:
+- Display: `"Bungee"` isn't available. Use `Impact, Haettenschweiler, "Franklin Gothic Bold", "Arial Black"` — bold condensed, sporty scoreboard feel. Good for the "MAZE GOLF" title and big numbers.
+- Body: system-ui stack or `"Trebuchet MS", Verdana` — Trebuchet has character and is widely available. Use `Trebuchet MS, Tahoma, sans-serif`.
+
+Palette: golf theme → deep green felt course but maze twist: "night neon fairway"? Let's do a rich retro-golf arcade: deep pine green field (#0d3b2e / #145c43), cream/ivory walls? Or chalk-white maze lines on green. Accents: warm gold (putt cup flag, score highlights) and coral/red for the flag. Ball is white with subtle shading; hole is a dark circle with gold rim; flag is red.
+
+Layered background: outside the maze area — a vignette, subtly animated diagonal stripes or drifting "light" gradient, faintly animated grass texture (drawn once to an offscreen canvas pattern). The course itself: green felt with slightly varied cell shading (checker of two greens), walls as raised cream/ivory bars with soft shadow. Cup has a flag that sways (animated). Ball has a motion trail. Particles on wall hit and on sink (confetti). Screen shake on hard hits? Small.
+
+HUD: top bar with hole number, par, strokes so far, total score vs par. Scorecard strip at bottom? Maybe compact chips for the 9 holes showing each result (birdie/par/bogey glyph or number). Keep it manageable.
+
+Aim UX details:
+- Mouse: press anywhere (or on ball) and drag — vector from ball to pointer defines direction; power = clamp(distance / maxDrag). Show an arrow + dashed trajectory preview that raycasts against walls, maybe bounces once? A one-bounce preview is a nice touch but might be too telegraphy. Let's do this: show up to 2 reflections with fading dashes — helpful and fun.
+- Keyboard: ←/→ or A/D rotate aim; ↑/↓ or W/S adjust power (0–100); Space (hold to charge? or press when ready) fires. Simpler: arrows set direction, up/down set power, Enter/Space fires. Also show the same arrow. R = restart hole (ball back to tee, keep strokes). M = mute.
+- Touch: same drag as mouse.
+
+Physics loop: fixed timestep substeps for stability. Ball radius ~10px (scaled to cell size). Walls are axis-aligned segments from maze grid; collision: circle vs segment — since walls are horizontal/vertical lines with thickness, treat as rectangles (wall thickness) and do circle-rect collision resolving along the min penetration axis. Standard approach:
+For each wall rectangle near the ball, compute closest point on rect to center, if dist < r push out along normal and reflect velocity component.
+Maze walls stored in a list of rects; use spatial hash or only check nearby cells (ball's cell + neighbors) for performance. Mazes up to about 15x15 cells → at most ~2*(w*h) wall segments ≈ 450 rects; checking all per substep is fine (60fps * a few substeps * 450 = trivial).
+
+Maze generation: recursive backtracker on grid NxN. Outer border walls always. Cell size computed from canvas size. For each hole, dimensions: hole1: 5x5… up to maybe 13x9? Keep it near-square for fit; compute cellSize = min(availW/cols, availH/rows).
+
+Tee placement: a random corner-ish cell far from the cup (choose cup at a random cell, tee at a cell with large BFS distance — actually just pick the cell with max BFS distance from the cup → interesting long path, par derived from BFS path length: par = ceil(pathLen / 4)+1? Ball can travel multiple cells per stroke depending on power. Let's say par = clamp(3 + floor(bfsDist/5), 3, 9). Good enough.
+
+Hole capture physics: if distance to cup < cupR and speed < threshold → sink animation (ball spirals/shrinks into cup over ~0.4s) then next hole after a short pause. If within cupR*1.6 and speed high → "lip out": small tangential deflection + sound.
+
+Stroke result naming: 1 = Hole-in-one!, <par-1 eagle, par-1 birdie, par, par+1 bogey, etc. Show a little banner on the hole transition with the word in display font.
+
+Scorecard: array of results; bottom bar shows 9 chips labeled H1..H9 with number or dot.
+
+Screens:
+1. Start screen: title "MAZE GOLF" (big display type), tagline, controls list (mouse + keyboard), "Tee Off" button. Maybe an animated background where the demo ball rolls around? Could run an attract-mode simulation behind the start overlay — nice touch: a ghost ball bouncing randomly within the maze. That adds life. Implementation: run the same physics with auto-aimed random shots. Doable: reuse the game loop in "attract" mode.
+2. Play screen.
+3. Hole-complete banner (overlay, short) then next hole.
+4. Final screen after 9 holes: total, par, diff, rating, per-hole scorecard table, "Play Again".
+
+Pause? P or Esc toggles pause overlay with resume/restart. Good for completeness. Keep it lightweight.
+
+Audio: WebAudio context created on first input (pointerdown/keydown). Sounds:
+- putt: short filtered noise + sine thump, pitch by power.
+- wall tick: click sound (short square/noise burst), volume by impact velocity.
+- sink: 3-note arpeggio (e.g., 660, 880, 1320 triangle) + low "thunk".
+- UI hover/click: soft blip.
+- lip-out: descending blip.
+- fanfare at end: small arpeggio sequence.
+Mute toggle M and a button in the corner.
+
+Layout/responsive: canvas fills window (100vw/100vh, no scrollbars). Use devicePixelRatio scaling. On resize, recompute layout: HUD height fixed-ish (scaled with font-size in px based on min dimension), maze centered in remaining area.
+
+Structure:
+- Single full-window <canvas id="game">; HUD drawn as DOM overlay or canvas? Mixed: DOM for crisp text/buttons (start screen, banner, scorecard chips) is easier and more accessible; game field + ball + effects on canvas. Use DOM overlays positioned absolutely over the canvas. This gives nice CSS micro-interactions (button hover), typographic contrast.
+
+DOM structure:
+- #stage (position fixed inset 0)
+  - canvas#game
+  - header #hud (top bar): left: hole info "HOLE 3 / 9", par; center: big strokes counter? right: total vs par + mute button.
+  - footer #scorecard chips.
+  - #banner (center overlay for hole result / hole-in-one) — animated in.
+  - #screen-start, #screen-end, #screen-pause overlays.
+
+CSS: layered background behind canvas? Canvas draws the entire scene including the outer field; DOM overlays are semi-transparent panels. Panels: solid deep green with gold border and hard shadow (retro arcade / course-signage vibe), not glassmorphism. Slightly rounded corners (6-10px). Buttons: chunky, uppercase display font, gold fill on hover with press-down translate.
+
+Colors:
+- Deep bg: #07231b → #0e3a2c radial.
+- Field greens: #1c5c40 / #1a563d checker; border wall cream #f3ead2, shadow rgba(0,0,0,.35).
+- Accent gold: #f5c542 / #ffd75e; red flag #e8543f; ball white #fdfdf8 with shading.
+- Text ivory #f6f1e2; muted #9fb8a8.
+
+Typography: display: Impact/ Arial Black stack for title and big numbers, letter-spacing; body: "Trebuchet MS". Strong size contrast: title clamp(3rem..7rem), labels small caps 0.7rem tracking.
+
+Now the code plan (JS):
+
+Constants and state:
+```js
+const H = { hole:1, par, strokes, results:[], phase:'start'|'aim'|'rolling'|'sinking'|'holeDone'|'end', ... }
+```
+
+Maze generation:
+```js
+function genMaze(cols, rows){ // returns cells with walls {N,E,S,W} boolean + list of wall rects
+  standard iterative backtracker using stack.
+}
+```
+Wall rect construction: each cell (x,y) has size cs; if wall.E between (x,y)-(x+1,y), draw a vertical segment at px=(x+1)*cs from py=y*cs to (y+1)*cs, thickness t. Also border walls. To avoid duplicates: iterate cells, add E wall if x<cols-1 and cell.e; add S wall if y<rows-1 and cell.s; plus the full border ring as 4 rects (or per-cell edges — fine).
+
+Store wallRects as {x,y,w,h} in maze-local coords (0..W,0..H), then transform by offset when drawing/colliding. Better: keep in absolute coords after layout computed; recompute on resize? On resize during play, ball position is relative to maze… Save ball position in maze-local units (in cell-size units? or px within a fixed virtual maze space).
+
+Simplest: define the maze in a fixed "world" coordinate system where cell size = 100 world units. Ball radius = e.g., 26 world units, cup radius 34. Then on render, scale to fit and translate. Collision in world units — resolution independent of screen.
+
+So worldW = cols*CS, CS=100. ballPos {x,y} in world. Velocity in world/sec. Friction: v *= (1 - k*dt) or exponential decay; plus a small constant deceleration to ensure stop. Let's do: speed -= (decel * dt + speed*drag*dt). Tune: maxShot speed ~ 2600 u/s, decel 900 u/s², drag 0.9/s → shot travels up to ~? With pure quadratic decel: v=2600, a=900+0.9v… let's just tune numerically in head: want full-power shot to cross maybe 8-10 cells (800-1000 u). Energy-like: dv/dt = -a - b*v, a=420, b=0.55. Integrate roughly: v(t)=… at v=2600, initial decel = 420+1430=1850 → stops in ~1.9s, distance ≈ average v * t ≈ (2600*~0.55)*1.9 ≈ 2700 u = 27 cells. Too far. Let's lower max speed to 1700 and a=520, b=0.8: initial decel=520+1360=1880; stop ~1.5s; distance ≈ maybe 1500-1800 u (15-18 cells). Still far for a 5-cell maze — but that's fine, high power = overshoot risk; player learns to use less power. Actually for small mazes I should scale maxPower so full shot ≈ cols*CS*0.9? Nice: maxSpeed = clamp(cols*CS*0.75, 900, 2400). That way full power crosses most of the maze diagonally-ish. Good adaptive design.
+
+Collision with walls (world units): ball radius rb=26 (CS=100 → ball diameter 52 < cell 100 ✓). Wall thickness wt=14 world units, centered on grid lines? Walls as rects: for vertical wall at gx (grid x), y0..y1: rect {x: gx*CS - wt/2, y: y0, w: wt, h: CS}. Border: outer ring of thickness wt.
+
+Circle-rect resolve:
+```js
+function collide(w){
+  const cx = clamp(b.x, w.x, w.x+w.w), cy = clamp(b.y, w.y, w.y+w.h);
+  let dx=b.x-cx, dy=b.y-cy; d2=dx*dx+dy*dy;
+  if(d2 < rb*rb){
+    if(d2===0){ push out along min axis } else {
+      d=sqrt; nx=dx/d, ny=dy/d; pen=rb-d; b.x+=nx*pen; b.y+=ny*pen;
+      const vn = v·n; if(vn<0){ v -= (1+e)*vn*n; e=0.78; play tick with |vn| }
+    }
+  }
+}
+```
+Substepping: fixed dt 1/240, accumulate real dt (clamped to 50ms), steps = ceil. Max speed 2400 u/s → per substep movement ≤ 10 u < rb ✓ tunneling-safe.
+
+Cup logic during rolling: distance to cup center; if dist < cr - 6 and speed < captureV (e.g., 520) → sink. If dist < cr*1.35 and speed >= captureV*1.4 → lip deflection: add small tangential impulse, play sound, maybe a "Lip out!" floating text.
+
+Ball stopped when speed < 25 → v=0, phase='aim'. Also safety: if strokes > 60… nah. If ball can't move? In the maze it always can (open path to cup exists by construction — but wait, cup might be on a cell; ball starts on a different cell; maze is fully connected ✓).
+
+Aim state: aimAngle, aimPower (0..1). Mouse drag: while dragging, pointer position P → vector from ball to P? Classic mini-golf: drag away from target (slingshot) or toward? "Toward" aiming is more intuitive: click and drag in the direction you want to putt, arrow shows that. Power = clamp(dist/maxDragDist). Let's do direct aim: arrow points from ball toward pointer; power proportional to distance. Keyboard: arrows rotate in 1° steps (hold to repeat), W/S for ±power.
+
+Trajectory preview: raycast from ball along direction, find first wall hit (segment intersection with each wall rect — since axis-aligned rects, compute t along ray via slab method against the rect expanded by rb? Simpler: sample? No — do proper ray-AABB slab test). Show up to 3 bounces with fading dashes; at end point draw a small circle. This is a strong gameplay aid and looks cool. Ray-rect slab:
+```js
+function rayRect(px,py,dx,dy,r){ // returns t>0 or null
+ let tmin=0, tmax=Infinity;
+ if(dx≈0){ if(px<r.x||px>r.x+r.w) return null } else { t1=(r.x-px)/dx; t2=(r.x+r.w-px)/dx; ...}
+ standard.
+}
+```
+For bounce reflection: normal = axis with min penetration… For an AABB hit, the entry face gives the normal (axis of tmin). Reflect direction. Repeat up to 3 times or until time budget (distance ~ power*maxDist) is exhausted.
+
+Sinking animation: phase 'sinking', animate ball position → cup center with spiral + shrink over 0.45s, particles, then banner "BIRDIE!" etc., advance after 1.6s.
+
+Particles: simple array {x,y,vx,vy,life,color,size}; spawn on wall hit (small dust), on sink (gold confetti + green sparks). Update in loop, draw as circles/rects with rotation for confetti.
+
+Trail: store last N ball positions while moving; draw fading circles.
+
+Flag: at cup, pole + waving flag via sin(time) — draw a triangle with a wavy offset. When ball sinks, flag drops? Cute: lower the flag on sink (animate flagY). Reset per hole.
+
+Screen shake: on strong impact, shake magnitude decays; apply as canvas translate random*mag.
+
+Attract mode on start screen: run simulation with an AI that periodically fires a random direction/power toward the cup when ball is stopped; overlay covers the screen but the canvas behind shows motion (overlay semi-transparent? Maybe a solid-ish gradient panel in the center and the field visible around the edges). Make the start overlay a centered card, bg dimmed with radial so maze is still visible.
+
+Scorecard chips: 9 boxes; current one highlighted gold; completed ones show number or symbol (HIO "★", birdie "−1"…). Use small text.
+
+End screen rating: diff = total - totalPar: ≤-4 "Tour Pro", ≤-1 "Sharp Putter", 0 "Even Par", ≤+5 "Solid Golfer", else "Maze Rookie".
+
+Keyboard handling on window keydown/keyup; preventDefault for arrows/space to avoid scroll (no scroll anyway). Keys:
+- ArrowLeft/A, ArrowRight/D: rotate aim.
+- ArrowUp/W, ArrowDown/S: power.
+- Space or Enter: fire (when phase is aim).
+- R: redo hole (reset ball to tee; strokes for this hole reset? Let's make it a free "redo hole" — resets strokes for the current hole to 0 and repositions ball to tee. To prevent cheese, that's fine, casual game.) Actually let's label as "Retry hole (strokes on this hole reset)".
+- M: mute. P/Esc: pause.
+- On start screen: Enter/Space starts; on end: Enter restarts.
+
+Fire validation: phase==='aim' && power > 0.05. strokes++.
+
+Now HUD numbers: "HOLE 4/9 · PAR 5", big center number = current stroke count, right "TO PAR +2" (total including current hole? Show overall to par with live update: sum(results) + currentStrokes - totalParSoFar). Live to-par is fun.
+
+Banner element: absolutely positioned centered; CSS animation pop-in/scale, auto hide.
+
+Edge cases:
+- Resize: recompute scale/offset; keep world coords — trivially fine.
+- devicePixelRatio changes on zoom — handle in resize.
+- iframe focus: listen keys on window ✓. Also click canvas to focus? Window listener is enough.
+- Audio context resume on first gesture.
+
+Performance: maze up to 15x11 = 165 cells, walls ≤ ~2*165=330 rects — fine.
+
+Hole setup (9 holes): cols/rows and par formula. Let's define:
+```
+holes = [ {c:5,r:5}, {c:7,r:5}, {c:7,r:7}, {c:9,r:6}, {c:9,r:8}, {c:11,r:7}, {c:11,r:9}, {c:13,r:9}, {c:13,r:11} ]
+```
+Par computed from BFS distance d (in cells): par = clamp(2 + ceil(d/4), 3, 8). Cup at a random cell; tee at farthest cell by BFS.
+
+Ball start position: center of tee cell. Cup: center of cup cell. Ensure ball radius fits: cell 100, fine.
+
+One more polish: draw the maze walls with slight 3D: cream fill + darker bottom edge (offset shadow) → chunky look. Draw order: field cells (checker), subtle noise pattern? Pre-render a grass texture offscreen once (speckles) and tile it; or per-cell deterministic speckle via hash — cheap: for each cell draw 6 dots at pseudo-random positions from a seeded function, color slightly lighter. With 165 cells * 6 = ~990 dots per frame — fine but let's pre-render the maze+field to an offscreen canvas on hole start and on resize, then blit each frame + dynamic elements (cup, flag, ball, effects).
+
+Also draw a tee marker (small circle) and a "1" pin? A subtle dashed line from tee? Skip.
+
+Floating text: array of {text,x,y,t} e.g., "Lip out!", "+1"? Show stroke result on banner instead. Maybe small "+strokes". Keep lip-out text and hole-in-one sparkles.
+
+Now let me think about the aim arrow rendering: from ball, length = 30 + power*90 (world units), thick gold line with arrowhead; plus a power meter arc around ball? A radial gauge around the ball showing power (arc from -90°). Nice micro-feedback: color shifts green→gold→red as power rises. Also dashed trajectory.
+
+Keyboard aim initial angle: toward cup? Start aimAngle pointing at cup — friendly.
+
+Drag aiming: pointerdown anywhere on canvas (not on DOM button) when phase is aim → drag begins; update on pointermove; fire on pointerup if power>min. Use pointer events with setPointerCapture. Also touch-action none in CSS to prevent scroll.
+
+Pause: overlay panel with Resume/Restart Hole/Main? Keep Resume + Restart Hole + Mute state. Esc/P toggles.
+
+Now let's write the code carefully. Sizeable but manageable. Let me draft the key parts.
+
+CSS skeleton:
+```css
+*{margin:0;box-sizing:border-box}
+html,body,#stage{width:100%;height:100%;overflow:hidden;background:#07231b}
+canvas{position:absolute;inset:0;display:block;touch-action:none;cursor:crosshair}
+#hud{position:absolute;top:0;left:0;right:0;display:flex;...pointer-events:none}
+button pointer-events auto.
+```
+
+Fonts:
+```css
+--disp: Impact, Haettenschweiler,'Arial Black', sans-serif;
+--body: 'Trebuchet MS', Tahoma, Verdana, sans-serif;
+```
+Impact has no lowercase charm but fine for uppercase. Letter-spacing 0.5-2px.
+
+HUD layout: three groups with flex space-between; chips in center? Let's do top bar: left block (HOLE x/9 + PAR n), center big stroke number with label, right block (TO PAR value + mute button). Bottom center: scorecard chip row.
+
+Panel style:
+```css
+.panel{background:#0b2f23;border:3px solid #f5c542; box-shadow: 0 10px 0 rgba(0,0,0,.35), inset 0 0 0 2px rgba(0,0,0,.3); border-radius:10px}
+```
+Buttons:
+```css
+.btn{font-family:var(--disp);letter-spacing:2px;background:#f5c542;color:#123826;border:none;padding:...;box-shadow:0 6px 0 #a8791b; transform/translate on active}
+.btn:hover{filter:brightness(1.08)} .btn:active{transform:translateY(4px);box-shadow:0 2px 0 ...}
+```
+
+Banner: big display text with gold stroke? Use text-shadow layered. Animation: keyframes pop {from scale .6 opacity 0 → overshoot 1.06 → 1}.
+
+Now JS structure:
+
+```js
+(()=>{ 'use strict';
+ // ---------- helpers
+ const TAU=Math.PI*2;
+ const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+ const rand=(a=1,b)=> b===undefined? Math.random()*a : a+Math.random()*(b-a);
+ const irand=(a,b)=>Math.floor(rand(a,b+1));
+ // seeded random for speckles
+ function mulberry(seed){ return function(){ seed|=0; seed=seed+0x6D2B79F5|0; let t=Math.imul(seed^seed>>>15,1|seed); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; } }
+
+ // ---------- audio
+ const AudioSys = { ctx:null, muted:false, ensure(){...}, beep(...), putt(p), tick(v), sink(), lip(), ui(), fanfare() }
+```
+
+Audio implementation details:
+```js
+function ensureCtx(){ if(!A.ctx){ A.ctx=new (window.AudioContext||window.webkitAudioContext)(); A.master=A.ctx.createGain(); A.master.gain.value=0.5; A.master.connect(A.ctx.destination);} if(A.ctx.state==='suspended') A.ctx.resume(); }
+function blip(freq,dur,type,vol,slideTo){ osc + gain envelope exp decay }
+function noiseBurst(dur,vol,filterFreq){ buffer noise -> biquad lowpass -> gain env }
+putt(power): blip(140+power*80, .09,'sine',.5) + noiseBurst(.06,.25+power*.3, 900)
+tick(v): v normalized 0..1: blip(700+rand*..., .03,'square', vol .05+.2v) plus a small noise
+sink(): thunk (blip 90 sine .18) then arpeggio [660,880,1320] triangle staggered by .09
+lip(): blip slide 500→260 .12 'sawtooth' vol .15
+ui(): blip(420,.05,'triangle',.15)
+fanfare(): notes [523,659,784,1046] staggered by .12 + final chord
+```
+
+Game state object:
+```js
+const G = {
+ phase:'start', // start | aim | rolling | sinking | banner | end | paused(sub)
+ holeIndex:0, strokes:0, results:[], totalPar:0,
+ maze:null, // {cols,rows,cells,walls}
+ cup:{x,y,r}, tee:{x,y},
+ ball:{x,y,vx,vy,r},
+ aim:{ang:0,power:0},
+ dragging:false, dragStart... ,
+ shake:0, time:0, sinkT:0, bannerTimer:0,
+ trail:[], parts:[], texts:[],
+ flagLower:0 (0..1),
+ paused:false, prevPhase
+}
+```
+
+Maze gen:
+```js
+function genMaze(c,r){
+ const cells = Array.from({length:c*r},(_,i)=>({x:i%c,y:(i/c)|0,walls:[true,true,true,true],vis:false})); // N,E,S,W
+ const idx=(x,y)=>y*c+x;
+ const stack=[cells[irand(0,c*r-1)]]; cells[start].vis=true;
+ while(stack.length){ const cur=stack[stack.length-1]; const nb=[]; for each direction where in-bounds && !visited push {n,d,opp}
+  if(nb.length){ pick random n; remove walls: cur.walls[d]=false; n.walls[opp]=false; n.vis=true; stack.push(n);} else stack.pop(); }
+ // wall rects
+ const CS=100, T=16; walls=[];
+ for y..r for x..c: cell; if(cell.walls[1] && x<c-1) walls.push({x:(x+1)*CS-T/2,y:y*CS,w:T,h:CS});
+  if(cell.walls[3] && y<r-1) walls.push({x:x*CS,y:(y+1)*CS-T/2,w:CS,h:T});
+ // border ring (4 rects) thickness T at outside edge? Center border on grid boundary to match interior walls: outer ring covers x from -T/2..c*CS+T/2. Let's make border as 4 rects of thickness T centered on the perimeter lines: top {x:-T/2,y:-T/2,w:c*CS+T,h:T}, bottom, left, right. Then play area is slightly larger; ball starts inside anyway.
+ return {c,r,cells,walls,W:c*CS,H:r*CS};
+}
+```
+BFS from cup cell to find farthest → tee. Par from distance d: par = clamp(2+Math.ceil(d/4),3,9).
+
+Hole setup:
+```js
+function setupHole(i){
+ const spec=HOLES[i]; maze=genMaze(spec.c,spec.r);
+ // cup cell random; bfs dist; tee=farthest;
+ cup={x:(cx+.5)*CS,y:(cy+.5)*CS,r:30};
+ ball at tee center; v=0; strokes=0 (per hole), results[i]=null;
+ aim.ang = angle to cup; power default 0.45? Start 0.
+ Pre-render field canvas.
+ phase='aim'; show banner "HOLE n" briefly? Show small toast "HOLE 4 — PAR 5". Use banner with smaller style.
+}
+```
+
+Pre-render: offscreen canvas sized mazeW*scale? Scale changes on resize → re-render on resize too (cheap, hole ≤ ~1300x1100 world * scale). Render at device pixels: fieldCanvas width = mazePixelW*dpr etc. Draw: bg around the maze? Outer area drawn by main canvas each frame (gradient + stripes). Field canvas contains: outer ring (dark green apron), checker cells, speckles, walls with shadow, tee marker, cup base (dark circle) — static. Dynamic: flag, ball, trail, particles, aim UI, floating text.
+
+Cup dynamic or static? Cup is static → include in field render; flag dynamic (waving). Flag lowering animation on sink.
+
+Main draw loop:
+```js
+function frame(t){ dt=...; if(!G.paused) update(dt); render(); requestAnimationFrame(frame);}
+```
+Update by phase:
+- aim: idle ball bob? no. Update particles, texts, flag sway time, shake decay. Attract AI if phase==='start'? On start screen we run a full sim — simpler: on 'start' phase, use same update as aim/rolling with an AI controller (when ball stopped for >0.8s, fire toward cup + random offset). Ball can sink in attract mode → reset to tee silently, no stroke count.
+- rolling: substep physics; wall collisions; cup check; trail push; stop → phase 'aim' (if start phase, remain 'start').
+- sinking: animate t 0→1 over .5s: ball position lerp to cup + spiral offset, scale down; spawn confetti at start; on complete → record result, show banner with word, phase='banner', timer 1.6s → next hole or end.
+
+Result words:
+```js
+function scoreWord(s,par){ if(s===1)return 'HOLE-IN-ONE!'; const d=s-par; if(d<=-3)return'ALBATROSS!'; if(d===-2)return'EAGLE!'; if(d===-1)return'BIRDIE!'; if(d===0)return'PAR'; if(d===1)return'BOGEY'; if(d===2)return'DOUBLE BOGEY'; return '+'+d; }
+```
+
+Render:
+- ctx save; clear; draw outer background (cache gradient? recreate on resize). Vignette. Faintly moving diagonal light band? Slowly animate a large soft radial "spotlight" — subtle. Keep cheap: 2 radial gradients per frame OK. Or pre-render bg to offscreen on resize with static, and only animate a slow-moving highlight ellipse (one gradient fill) — fine.
+- Apply shake translate.
+- drawImage(fieldCanvas).
+- Draw flag (pole from cup upward? Pole above cup: line + waving pennant triangle with sin waves; lower animation lerp toward cup).
+- Trail, ball (with radial shading + tiny highlight + shadow ellipse), aim UI when phase aim and !dragging? Show even while dragging. Trajectory dashes.
+- Particles, texts.
+- HUD is DOM (updated on change via setHud()).
+
+DOM updates: function updateHUD() sets textContent for hole/par/strokes/topar; chip row built once (9 spans) updated classes.
+
+Chips: `<span class="chip">1</span>` etc. On complete, fill with result number or '★'. Current: gold outline pulse.
+
+Banner DOM: #banner div with inner title + sub; toggle .show class; CSS animation. setTimeout-based hide via phase timer (in update, not setTimeout for pause-safety — use G.bannerTimer countdown in update).
+
+Pause: overlay panel with Resume/Restart Hole/Main? Keep Resume + Restart Hole + Mute state. Esc/P toggles.
+
+Now let's write the code carefully. Sizeable but manageable. Let me draft key parts.
+
+CSS skeleton:
+```css
+*{margin:0;box-sizing:border-box}
+html,body,#stage{width:100%;height:100%;overflow:hidden;background:#07231b}
+canvas{position:absolute;inset:0;display:block;touch-action:none;cursor:crosshair}
+#hud{position:absolute;top:0;left:0;right:0;display:flex;...pointer-events:none}
+button pointer-events auto.
+```
+
+Fonts:
+```css
+--disp: Impact, Haettenschweiler,'Arial Black', sans-serif;
+--body: 'Trebuchet MS', Tahoma, Verdana, sans-serif;
+```
+Impact has no lowercase charm but fine for uppercase. Letter-spacing 0.5-2px.
+
+HUD layout: three groups with flex space-between; chips in center? Let's do top bar: left block (HOLE x/9 + PAR n), center big stroke number with label, right block (TO PAR value + mute button). Bottom center: scorecard chip row.
+
+Panel style:
+```css
+.panel{background:#0b2f23;border:3px solid #f5c542; box-shadow: 0 10px 0 rgba(0,0,0,.35), inset 0 0 0 2px rgba(0,0,0,.3); border-radius:10px}
+```
+Buttons:
+```css
+.btn{font-family:var(--disp);letter-spacing:2px;background:#f5c542;color:#123826;border:none;padding:...;box-shadow:0 6px 0 #a8791b; transform/translate on active}
+.btn:hover{filter:brightness(1.08)} .btn:active{transform:translateY(4px);box-shadow:0 2px 0 ...}
+```
+
+Banner: big display text with gold stroke? Use text-shadow layered. Animation: keyframes pop {from scale .6 opacity 0 → overshoot 1.06 → 1}.
+
+Now JS structure (I already sketched the state object above).
+
+Let me carefully write out all the functions in order, being careful about correctness.
+
+```js
+(()=>{ 'use strict';
+const TAU = Math.PI*2;
+const clamp=(v,a,b)=> v<a?a: v>b?b: v;
+const lerp=(a,b,t)=> a+(b-a)*t;
+const rand=(a=1,b)=> b===undefined? Math.random()*a : a+Math.random()*(b-a);
+const irand=(a,b)=> (a+Math.random()*(b-a+1))|0; // careful: Math.floor(rand)
+```
+irand fix: `a + Math.floor(Math.random()*(b-a+1))`.
+
+mulberry32:
+```js
+function mulberry(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
+```
+
+Audio:
+```js
+const Snd={ctx:null,gain:null,muted:false,
+ ensure(){ if(this.ctx) { if(this.ctx.state==='suspended') this.ctx.resume(); return; }
+   const AC=window.AudioContext||window.webkitAudioContext; if(!AC) return;
+   this.ctx=new AC(); this.gain=this.ctx.createGain(); this.gain.gain.value=.45; this.gain.connect(this.ctx.destination); },
+ tone(f,dur,type='sine',vol=.3,slide=0,delay=0){ if(!this.ctx||this.muted)return; const t0=this.ctx.currentTime+delay;
+   const o=this.ctx.createOscillator(),g=this.ctx.createGain();
+   o.type=type; o.frequency.setValueAtTime(f,t0);
+   if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(30,f+slide),t0+dur);
+   g.gain.setValueAtTime(vol,t0); g.gain.exponentialRampToValueAtTime(.0001,t0+dur);
+   o.connect(g); g.connect(this.gain); o.start(t0); o.stop(t0+dur+.02); },
+ noise(dur,vol,freq,delay=0){ if(!this.ctx||this.muted)return; const t0=this.ctx.currentTime+delay;
+   const n=(this.ctx.sampleRate*dur)|0, buf=this.ctx.createBuffer(1,n,this.ctx.sampleRate), d=buf.getChannelData(0);
+   for(let i=0;i<n;i++) d[i]=(Math.random()*2-1)*(1-i/n);
+   const src=this.ctx.createBufferSource(); src.buffer=buf;
+   const f=this.ctx.createBiquadFilter(); f.type='lowpass'; f.frequency.value=freq;
+   const g=this.ctx.createGain(); g.gain.value=vol;
+   src.connect(f);f.connect(g);g.connect(this.gain); src.start(t0); },
+ putt(p){ this.tone(120+p*90,.1,'sine',.5); this.noise(.07,.25+p*.35, 1200); },
+ tick(v){ v=clamp(v,0,1); this.tone(500+rand(300), .03, 'square', .04+.18*v); this.noise(.03,.12*v,3000); },
+ sink(){ this.tone(90,.2,'sine',.6,-40); [660,880,1320].forEach((f,i)=>this.tone(f,.18,'triangle',.25,0,.06+i*.09)); },
+ lip(){ this.tone(420,.12,'sawtooth',.15,-180); },
+ ui(){ this.tone(440,.06,'triangle',.18); },
+ deny(){ this.tone(160,.12,'square',.12,-40); },
+ fanfare(){ [523,659,784,1046].forEach((f,i)=>this.tone(f,.22,'triangle',.22,0,i*.12)); this.tone(1568,.5,'triangle',.15,0,.5); }
+};
+```
+
+Maze:
+```js
+const CS=100, WT=16, BR=26; // cell, wall thickness, ball radius
+function genMaze(c,r){
+ const cells=[]; for(let i=0;i<c*r;i++) cells.push({x:i%c,y:(i/c)|0,w:[true,true,true,true],v:false});
+ const I=(x,y)=>y*c+x;
+ const D=[[0,-1,0,2],[1,0,1,3],[0,1,2,0],[-1,0,3,1]]; // dx,dy,dir,opp
+ let si=irand(0,c*r-1); cells[si].v=true; const st=[si];
+ while(st.length){ const cur=cells[st[st.length-1]]; const opts=[];
+  for(const d of D){ const nx=cur.x+d[0], ny=cur.y+d[1]; if(nx<0||ny<0||nx>=c||ny>=r) continue; if(cells[I(nx,ny)].v) continue; opts.push(d); }
+  if(opts.length){ const d=opts[irand(0,opts.length-1)]; const n=cells[I(cur.x+d[0],cur.y+d[1])];
+    cur.w[d[2]]=false; n.w[d[3]]=false; n.v=true; st.push(I(cur.x+d[0],cur.y+d[1])); } else st.pop(); }
+ // walls
+ const W=c*CS,Hh=r*CS, walls=[];
+ for(let y=0;y<r;y++)for(let x=0;x<c;x++){ const cl=cells[I(x,y)];
+   if(cl.w[1]&&x<c-1) walls.push({x:(x+1)*CS-WT/2,y:y*CS,w:WT,h:CS});
+   if(cl.w[3]&&y<r-1) walls.push({x:x*CS,y:(y+1)*CS-WT/2,w:CS,h:WT}); }
+ // border ring (4 rects) thickness WT centered on perimeter lines
+ const t=WT;
+ walls.push({x:-t/2,y:-t/2,w:c*CS+t,h:t},{x:-t/2,y:Hh-t/2,w:c*CS+t,h:t},{x:-t/2,y:-t/2,w:t,h:Hh+t},{x:c*CS-t/2,y:-t/2,w:t,h:Hh+t});
+ return {c,r,cells,walls,W:c*CS,H:Hh};
+}
+```
+
+BFS:
+```js
+function bfs(maze, sx,sy){ const dist=new Int16Array(maze.c*maze.r).fill(-1); const q=[[sx,sy]]; dist[sy*maze.c+sx]=0; let far=[sx,sy], fd=0;
+ while(q.length){ const [x,y]=q.shift(); const d0=dist[y*maze.c+x]; if(d0>fd){fd=d0;far=[x,y];}
+  for(const d of DIRS){ const cl=maze.cells[y*maze.c+x]; if(cl.w[d[2]]) continue; const nx=x+d[0],ny=y+d[1]; if(nx<0||ny<0||nx>=maze.c||ny>=maze.r)continue; const i=ny*maze.c+nx; if(dist[i]<0){dist[i]=d0+1;q.push([nx,ny]);} } }
+ return {far,dist}; }
+```
+DIRS constant shared: `const DIRS=[[0,-1,0,2],[1,0,1,3],[0,1,2,0],[-1,0,3,1]]`.
+
+Hole setup:
+```js
+function setupHole(i){ const s=HOLES[i]; G.maze=genMaze(s.c,s.r);
+ const cx=irand(0,m.c-1), cy=irand(0,m.r-1);
+ const {far}=bfs(m,cx,cy); // tee at farthest
+ G.cup={x:(cx+.5)*CS, y:(cy+.5)*CS, r:32};
+ G.tee={x:(far[0]+.5)*CS,y:(far[1]+.5)*CS};
+ const d = bfs dist to cup? need dist value at tee: recompute: let's have bfs return the dist array too. par = clamp(3+Math.ceil(d/4),3,9).
+ G.par=par; G.strokes=0; G.ball={x:G.tee.x,y:G.tee.y,vx:0,vy:0};
+ G.trail.length=0; G.parts.length=0; G.texts.length=0; G.flagDown=0; G.maxShot=Math.min(2400, m.c*CS*.8+500);? 
+```
+maxShot: want full power to cross the maze ~ cols cells. Distance estimate with a=520,b=.8: solve v dv/dx = -(a+bv) → ∫ v dv from 0..v0 = -∫(a+bv)dx → x_stop = (v0²)/(2b) - (a/b) ln(1 + b v0/a). With a=520,b=.8: term2=(520/.8)*ln(1+.8v/520)=650*ln(1+v/650).
+- v0=1700: x= (2.89e6)/(1.6) - 650*ln(3.615)=1.806e6 - 650*1.285=1.806e6-835=… wait units: v²/(2b)= 2,890,000/1.6 = 1,806,250 → huge. That's wrong because a,b are per second; distance is in u: x_stop formula from dv/dt: dx=dv * v/(-a-bv). ∫_{v}^{0} ... = ∫_v^0 v dv / (a+bv) with sign flip → x= ∫_0^{v0} v/(a+bv) dv = (1/b)[ v0 - (a/b) ln(1+b v0/a) ].
+So x=(1/.8)[1700 - 650*ln(1+1360/520)] = 1.25*[1700-650*ln(3.615)] =1.25*[1700-650*1.285]=1.25*(1700-835)=1.25*865=1081 u ≈ 10.8 cells.
+v0=900: x=1.25*[900-650*ln(1+720/520)]=1.25*(900-650*.639)=1.25*(900-415)=1.25*485=606 u ≈ 6 cells.
+v0=1400: 1.25*(1400-650*ln(3.692))=1.25*(1400-842)=1.25*558=697?? wait ln(1+1120/520)=ln(3.154)=1.149→ 650*1.149=747; x=1.25*(1400-747)=816 u = 8 cells. OK so:
+Full power ≈ 10-11 cells (v0 1700). For 5-cell maze, full shot overshoots past wall → bounces; that's fine and fun. Let's tie maxShot to maze size: maxShot = clamp(m.c*CS*1.1? … for c=13 want full ≈ 12 cells → v0 such that x≈1200: solve (1/b)(v - a/b ln(1+bv/a)) with a=520,b=.8: try v=2100: 1.25*(2100-650*ln(1+1680/520)=ln(4.23)=1.442→947) =1.25*(2100-947)=1.25*1153=1441 (14 cells). v=1900: ln(1+1520/520=3.92)=1.366→888; 1.25*(1900-888)=1.265k → 12.6 cells. So maxShot for big mazes ~1900, small (c=5) ~900-1000 (full ≈ 6.5-7 cells → overshoots slightly).
+Formula: maxShot = clamp(520 + c*CS*.115? Let's just do: maxShot = Math.min(2000, 700 + (m.c+m.r)*55). c=5,r=5 → 700+550=1250 (~8.5 cells? compute: 1.25*(1250-650*ln(1+1000/520)=ln(2.923)=1.073→697) =1.25*553=691 u=6.9 cells — good for 5). c=13,r=11 → 700+1320=2020→cap 2000 (~12.8 cells vs maze width 13 ✓). Good: `G.maxShot=Math.min(2000, 700+(m.c+m.r)*55)`.
+
+captureV: ~ 460+? Scale a bit with size? Keep constant 500. Cup r 32.
+
+Physics update (rolling):
+```js
+function stepBall(dt){ const b=G.ball; b.x+=b.vx*dt; b.y+=b.vy*dt;
+ // collisions
+ for(const w of G.maze.walls) collideWall(w);
+ // friction
+ let sp=Math.hypot(b.vx,b.vy);
+ if(sp>0){ const dec=(FRICTION_A + FRICTION_B*sp)*dt; if(dec>=sp){b.vx=b.vy=0;} else { b.vx*= (1-dec/sp); b.vy*=(1-dec/sp);} }
+ // cup
+ cupCheck();
+}
+```
+collideWall as designed with restitution .75. Play tick only if impact > 60 u/s, throttle: track lastTickTime to avoid machine-gun (min interval .03s).
+
+cupCheck:
+```js
+const dx=b.x-cup.x, dy=b.y-cup.y, d=Math.hypot(dx,dy), sp=hypot(v);
+if(d < cup.r-8 && sp<520) startSink();
+else if(d < cup.r*1.4 && sp>760){ lip out: apply tangential nudge; text "Lip!"; Snd.lip(); }
+```
+Tangential: perpendicular to radial dir: tx=-dy/d, ty=dx/d; add impulse 90 in that direction (choose sign randomly or consistent): b.vx += tx*120 etc. Only when just entered? This condition can trigger every frame while within zone — but after nudge ball leaves zone. Add cooldown G.lipCd timer .3s.
+
+Also "slow roll near cup" gravity: if d < cup.r+40 and sp<520 → slight attraction toward cup (adds realism): a = 260*(1-d/(cup.r+40)) toward cup. Nice touch — ball can curl in. Add when sp>0.
+
+startSink: phase='sinking'; G.sinkT=0; spawn confetti; Snd.sink(); record stroke result after animation? Record now: const s=G.strokes; G.results[i]=s; banner text computed later. Flag lowering anim during sinking (flagDown→1).
+
+Sinking update:
+```js
+G.sinkT+=dt/.5; // .5s
+k=easeIn? ball pos = lerp(startPos,cup, t) + spiral: angle=t*TAU*1.5, rad=(1-t)*30 → offset
+On t>=1: phase='banner'; G.bannerTimer=1.7; showBanner(word, sub); if(hole 9) after banner → end screen.
+```
+Store sinkStart position.
+
+Fire:
+```js
+function fire(pw){ if(G.phase!=='aim'&&G.attract? ...) }
+function shoot(){ const p=G.aim.power; if(p<.04){ Snd.deny(); return;} G.strokes++; G.ball.vx=Math.cos(ang)*p*G.maxShot; ... Snd.putt(p); G.phase='rolling'; G.trail.length=0; updateHUD(); }
+```
+
+Aim input (pointer):
+Canvas pointerdown: if phase==='aim' && !paused → dragging=true; set aim from pointer. pointermove: update. pointerup: if power>.04 shoot else keep previous? If tiny drag, cancel (keep old aim). Save prevAim before drag start to restore on cancel.
+
+Pointer→world: rect=canvas.getBoundingClientRect(); px=(e.clientX-rect.left)*(view.scale) + view.ox - cupOffset… we have worldFromScreen(sx,sy): x=(sx - offX)/scale.
+
+View compute (resize):
+```js
+function layout(){ const w=innerWidth,h=innerHeight; dpr=devicePixelRatio||1; canvas.width=w*dpr; canvas.height=h*dpr; canvas.style.width=w+'px'... ctx.setTransform(dpr,0,0,dpr,0,0);
+ const top=86 (hud) + bottom=54; availW=w-32, availH=h-top-bottom; m=G.maze; scale=Math.min(availW/m.W, availH/m.H); center: offX=(w - m.W*scale)/2; offY=top+(availH-m.H*scale)/2.
+ renderField(); // re-draw fieldCanvas at this scale*dpr
+}
+```
+fieldCanvas: size (m.W+pad*2)*scale*dpr? Include apron padding of 40px around the maze for looks. Actually let's draw the apron in the main bg; simpler: fieldCanvas exactly the maze area, and outer background drawn behind (whole canvas). But wall shadow extends outside border by a few px — clip? Draw field with margin pad=30 world units? Let's include padding PAD=26 world units on each side in fieldCanvas so border wall shadow fits.
+
+fieldCanvas dims: fw=(m.W+PAD*2)*scale*dpr, fh similar; draw with ctx2.scale(scale*dpr) then translate(-PAD,-PAD). Store the blit position: fx = offX - PAD*scale, fy = offY - PAD*scale.
+
+Field render content (world coords):
+- Apron: rounded rect covering entire fieldCanvas area? Just fill entire canvas with a darker green (#123f2e) then inner course? Let's do this: apron = #14503a; inner course cells checker #1c6b49/#186141 (two greens). Speckles: per cell, seeded rng from holeIndex+cell → 8 dots alpha .05 white / .06 black.
+- Grid subtle? no.
+- Tee marker: small cream circle + ring at tee.
+- Cup: dark circle r32 (#0a1f16), inner shadow ring, gold rim arc? Rim: stroke #f5c542 width 3 alpha .9 on r=32; plus subtle highlight.
+- Walls: for each wall rect: first draw shadow (offset +4,+6, black alpha .3) merged? per-rect shadow OK (rounded? no). Then fill cream #f2e8cf; top-edge highlight line #fffbe9 (2px) and bottom edge shade #cbbd97. To keep chunky: rect fill + 3px darker at bottom/right edges.
+Rounded corners r=4 for interior walls to look nice? use roundRect if available, fallback rect. ctx.roundRect exists in modern; provide fallback helper rr(ctx,x,y,w,h,r).
+
+Dynamic render:
+- Flag: pole from cup center upward length 90 world (scale), slight tilt? Vertical line #e8e2d0 width 5; pennant: triangle with waving: draw path with 3 segments offset by sin(time*6 + y). Color #e8543f with darker edge. Ball sinking → flag lowers: pole height animates from 90→18, flag near cup.
+- Trail: for i, alpha=i/len*.35 radius lerp 4..BR*.7. Draw before ball.
+- Ball: shadow ellipse offset (2, +6) alpha .25; body radial gradient (#ffffff → #d9dcd2 edge), highlight small white circle top-left, subtle dimple dots? skip dimples (too small). Slight squash when rolling? skip.
+- Aim UI (phase aim && !paused): arrow from ball to angle direction: length L=40+power*110; gold line width 6 round cap with alpha .9; arrowhead triangle; power ring: arc around ball radius BR+8, from -PI/2 spanning power*TAU, color lerp green→red (hsl(120*(1-p)?? actually hue 140 to 10: `hsl(${140-130*p},85%,55%)`), width 5.
+- Trajectory preview dashes: compute path segments (up to 3 bounces, total length budget = shot distance at that power? Use x_stop formula * .9 for honesty). Draw dashed circles along polyline: pre-compute point list every 14 world units; draw small dots alpha fading. Dots read better than dashes for preview. Let's do dots radius 2.5, step 16u, fade with distance.
+- Particles: confetti rects with rotation & gravity (vy += g*dt), dust circles fade.
+- Floating texts: rise + fade, display font small caps gold with dark stroke.
+
+Screen shake: G.shake decays *= exp(-8dt); render translate by rand*shake. On wall hit with impact>700: shake=min(14, impact/90). On sink: shake 6? plus a flash? Add a white flash overlay alpha .25 for .1s on hole-in-one/sink — G.flash.
+
+Attract AI (phase 'start'): when ball stopped and aimT timer elapses: choose angle = atan2(cup-ball) + rand(-.35,.35), power rand(.45,.9); shoot (no stroke count). If ball sinks in attract: after banner? no — silently reset to tee after .8s. Implement in update: if phase==='start': run same rolling physics; when stopped → G.aiT-=dt; when <=0 fire AI. When sink completes in start mode → setupHole(0)? just reset ball to tee, keep maze (or regenerate new maze for variety: genMaze with same spec). Let's regenerate the current attract maze on sink for visual variety. Also on start screen, HUD shows a demo? Hide HUD during start (class hidden) — cleaner.
+
+HUD visibility: #hud and #scorecard get .hidden when phase is start/end/banner? Keep them visible during banner. Manage via setPhase helper that toggles classes.
+
+Phases overview: 'start', 'aim', 'rolling', 'sinking', 'banner', 'end'. paused flag separate (only from aim/rolling).
+
+Banner DOM usage:
+- Hole intro: when a new hole begins (after previous banner or start), show "HOLE 3" + "PAR 5" for ~1.2s — but that blocks aiming; let's make it non-blocking (pointer-events none, positioned at top-center below HUD) and fade out. Use small toast style: #toast div. Hole-in-one/result uses big #banner center.
+Implementation: showToast(text, sub). Banner: showBanner(main, sub, colorClass).
+
+Toast timing via G.toastT countdown; set el opacity/transform in update (or CSS animation via class toggle — simpler: add .show, remove after timer in update loop).
+
+Scorecard chips: build 9 spans. Update: for each i<current: filled with results[i] (number or '★' if 1); current → .cur; future → dim. Also show par under chip? Small "P5" above the number? Chip: two-line small: top tiny index, bottom value. Keep chip ~34px wide.
+
+Total to-par: computed = sum(results for holes<current) + G.strokes - (sumPar(<current)+G.par). Display with sign: E / +n / −n (use proper minus '−').
+
+End screen content:
+- Big "ROUND COMPLETE" or rating word huge; total strokes vs par line; scorecard table: 9 columns HOLE, PAR row, YOU row; diff colored. Buttons: Play Again (restarts), plus "Menu"? Keep Play Again + small hint keys. Rating based on diff.
+
+Play again: reset results, holeIndex=0, setupHole(0), phase aim with toast.
+
+Start button: startGame(): hide start screen, phase→'aim', setupHole(0) (maze already generated for attract? Attract uses its own maze instance — reuse: on load G.maze = genMaze(HOLES[0]); setupHole regenerates; fine).
+
+Actually simpler: on load, generate an attract maze via setupAttract() which is like setupHole but phase='start', strokes not counted. On startGame call setupHole(0) fresh.
+
+Keyboard repeat: use keydown with e.repeat allowed for rotate/power (continuous while held — browser auto-repeat ~30hz fine). Track keys set for smoothing? Auto-repeat OK.
+
+Rotation step per event: 1.5°; power step .04. Long-press also works via repeat. Provide fine-tune: Shift+arrows = half step? Nice: e.shiftKey halves the delta. Add in help text.
+
+Fire on Space keydown (not repeat). Enter too.
+
+Prevent default for Space/arrows to avoid page scroll (no scroll anyway) and button re-trigger (if a button is focused, Space would click it — blur buttons after click: btn.blur()).
+
+Pause overlay: Resume (button), Restart Hole (reset ball to tee, strokes=0? "Restart hole" resets current hole strokes to 0 — consistent with R key behavior). Mute toggle shown as text. Esc/P to resume.
+
+Mute button in HUD toggles Snd.muted; icon 🔊/🔇 (emoji OK) or draw text "SND ON/OFF". Emoji fine but style: use small chip button.
+
+localStorage high score? Could store best total diff. Wrap in try/catch. Show on start screen "Best: −3" if exists, and update at end. Nice touch — include.
+
+Now sizes/typography for HUD (DOM):
+Top bar height ~72px: left panel chip: "HOLE 4/9" small label + big number? Let's design:
+- Left: two lines: tiny "HOLE" label, big "4 / 9"; plus a pill "PAR 5".
+- Center: strokes: label "STROKES" + huge number (display font 40px).
+- Right: "TO PAR" + value; mute button.
+Use panels with dark green bg, gold left border accent.
+
+Bottom scorecard: row of chips centered; each chip: index small on top, value below; current pulses in gold; done filled.
+
+Banner CSS: big text 64px display, letter-spacing 3px, color #ffd75e with layered shadow (dark outline via multiple text-shadow), sub line body font. Animation pop-in + slight rotation -2deg → 0. Backdrop: radial dim? Just a subtle dark radial behind the text for readability: use box background transparent but add drop-shadow.
+
+Start screen layout: centered card panel, width min(560px, 92vw):
+- Kicker line "A PUTTING PUZZLE" small tracking gold.
+- Title "MAZE GOLF" huge (clamp 44-84px), maybe two-tone: MAZE cream, GOLF gold with underline swoosh? Add a CSS ball+flag icon? Draw a small inline SVG? Inline SVG is allowed (no external). Let's add a small SVG of flag+ball in the card header for charm. Keep it simple: circle + pole + pennant.
+- Tagline body text one line.
+- Controls grid: 2 columns: MOUSE (drag to aim, release to putt) / KEYS (←→ aim · ↑↓ power · space putt · R retry · P pause · M sound). Use <kbd> styling.
+- Best score line if present.
+- Big button "TEE OFF".
+Also a footnote "9 holes · par total X".
+
+Par total: compute after generation? Par depends on generated maze (BFS), so it's variable per game — show "9 holes · pars vary" or compute live. Say "9 procedurally-mazed holes". Fine.
+
+End screen: panel with rating, big diff, table built in JS, Play Again button, "New Best!" badge if updated.
+
+Now let me write the render helpers.
+
+roundRect helper:
+```js
+function rr(c,x,y,w,h,r){ r=Math.min(r,w/2,h/2); c.beginPath(); c.moveTo(x+r,y); c.arcTo(x+w,y,x+w,y+h,r); c.arcTo(x+w,y+h,x,y+h,r); c.arcTo(x,y+h,x,y,r); c.arcTo(x,y,x+w,y,r); c.closePath(); }
+```
+
+Background (main canvas, per frame): fill base #07231b; big radial light from top center rgba(38,94,66,.5)→transparent; slow-moving soft band: draw a second radial at position oscillating with time alpha .12. Vignette: radial transparent→rgba(0,0,0,.5) at edges. Also faint diagonal stripe pattern? Pre-render stripes to offscreen on resize: 45° lines alpha .03 white spacing 90px — adds texture cheaply (blit once per frame). Do it in bgCanvas with vignette + base gradient + stripes; then per frame only dynamic light band + shake.
+
+Order per frame:
+1. ctx.drawImage(bgCanvas,0,0,w,h) (bgCanvas is dpr-scaled; drawImage with dest w,h under dpr transform — careful: ctx transform is set to dpr so drawing at CSS pixel coords. bgCanvas internal is w*dpr → drawImage(bg,0,0,w,h) scales correctly.)
+2. Light band ellipse gradient (two fills).
+3. Shake translate.
+4. fieldCanvas blit.
+5. Cup dynamic? cup static in field; flag drawn dynamically.
+6. Trail, ball, aim, particles, texts, flash.
+
+Ball draw:
+```js
+const px=offX+b.x*scale ... all world→screen inline: sx(x)=x*scale+offX.
+Shadow: ellipse at (sx(b.x)+2, sy(b.y)+6) rx BR*.9*scale ry BR*.45*scale fill rgba(0,0,0,.28)
+Body: radial gradient centered offset (-BR*.3): stops #ffffff, .75 #eef0e6, 1 #c9cec0.
+Rim: stroke rgba(0,0,0,.15)
+Highlight: small circle at (-BR*.35,-BR*.4) r BR*.18 white alpha .8
+```
+
+Flag draw (world coords via transform? just compute in screen): pole base at cup center; height Hf = lerp(96, 20, flagDown); wave phase. Pole: line from (cx, cy) to (cx, cy-Hf), width max(3, 5*scale). Pennant path: from top point (cx,cy-Hf) to (cx+len, cy-Hf+len*.28 + wave) back to (cx, cy-Hf+len*.6)? Classic triangle pointing right with wavy tip:
+```js
+const len=44*max(1,scale?) — use world units: L=50; tip=(cx+L*s, cyTop+14*s + Math.sin(t*7)*3*s)
+Path: moveTo(cx,cyTop); quadraticCurveTo(cx+L*.5*s, cyTop-4*s+wave, cx+L*s, cyTop+10*s+wave2); lineTo? then back to (cx, cyTop+16*s). Fill #e8543f; darker stripe? add a small white circle? keep solid + shadow.
+```
+Also cup rim highlight already in field.
+
+Aim arrow: from ball edge (start at BR+4 along dir) to end point; line width 7*scale min 2; color gold #ffd75e alpha .95; head triangle length 16s. Power ring arc around ball radius BR+10, start -PI/2, span p*TAU, strokeStyle hsl(130-120*p,90%,58%), width 5, cap round. Also small power % text? show near ball: tiny "64%" body font — helpful for keyboard players. Draw when phase aim (alpha .8, offset below-right of ball).
+
+Trajectory dots: function tracePath(ang,power):
+```js
+let x=ball.x,y=ball.y,dx=cos,dy=sin; const total = shotDist(power)*0.92; let dist=0; pts=[{x,y}];
+for(let bnc=0;bnc<3 && dist<total;){
+  // find min t among walls via slab
+  let best=null,bn=null;
+  for(const w of maze.walls){ const r=rayAABB(x,y,dx,dy,w); if(r.t>1e-6 && (!best||r.t<best.t)){best=r;bn=r.n;} }
+  if(!best || best.t> total-dist){ const ex=x+dx*(total-dist), ey=y+dy*(total-dist); pts.push({x:ex,y:ey}); break; }
+  x+=dx*best.t; y+=dy*best.t; pts.push({x,y}); dist+=best.t;
+  // reflect
+  if(bn[0]!==0) dx=-dx; else dy=-dy; // bn is axis normal (1,0)/(0,1)… but for a rectangle we could hit corner — ignore.
+}
+```
+rayAABB slab:
+```js
+function rayAABB(px,py,dx,dy,r){ let tmin=-(Infinity),tmax=Infinity;
+ if(Math.abs(dx)<1e-9){ if(px<r.x||px>r.x+r.w) return null; } else { let t1=(r.x-px)/dx,t2=(r.x+r.w-px)/dx; if(t1>t2)[t1,t2]=[t2,t1]; tmin=Math.max(tmin,t1); tmax=Math.min(tmax,t2); }
+ same y...
+ if(tmax<Math.max(tmin,0)) return null; const t=tmin>1e-6?tmin:(tmax>1e-6? tmax: null); if(t===null) return null;
+ // normal: which axis gave tmin
+ ... compute face: if t from x slab → n=[sign(-dx)?..] actually entry face normal = (t1x==tmin? [-sign(dx),0] : [0,-sign(dy)])
+ return {t,n}; }
+```
+Edge case ball inside rect shouldn't happen in preview.
+
+shotDist(power): v=p*maxShot; x=(v - (A/B)*Math.log(1+B*v/A))/B with A=520,B=.8 — matches physics. Use same constants for consistency. If p tiny → small.
+
+Physics constants: FA=520, FB=.8, REST=.75, STOPV=30, CAPTURE_V=520? Let's set capture 500. Also near-cup attraction as above.
+
+Stopping: after friction if speed<STOPV → 0, phase→'aim' (or start). Also max roll time guard 12s → force stop (safety).
+
+Stroke text feedback: on shoot, small floating "+1"? No — HUD shows count bump animation: CSS class 'bump' re-triggered (scale pop) via reflow. Implement updateHUD: strokesEl.classList.remove('bump'); void offsetWidth; add.
+
+Toast for hole intro also bumps? OK.
+
+Banner colors: birdie/eagle/HIO → gold/green; bogey+ → cream/red-ish. Add class .good/.ok/.bad to banner main text (color).
+
+Results table on end: build rows: header H1..H9; PAR row values; YOU row values with per-hole diff color (green if <par, red if >). Total cell. Use CSS grid 10 columns, small font.
+
+Best score storage key 'mazeGolfBest' = min diff (lower is better) or store strokes? Par varies per game so diff comparable. Store diff number. Display "BEST: −2" on start; end screen: if new best show badge and update.
+
+Now — pause implementation detail: G.paused boolean; when true, skip update (except time for flag? freeze all — fine), show overlay. Toggle only from aim/rolling/sinking? Allow anytime during play phases (aim, rolling). Save prevPhase to restore (just unflag since phase unchanged).
+
+Restart hole (R): if in start/end ignore. strokes=0; ball→tee; v=0; trail clear; phase='aim'; toast "HOLE RESET".
+
+End → Play Again: reset results, best updated already, setupHole(0), show HUD.
+
+Also handle visibilitychange: auto pause when hidden during play (nice): document.addEventListener('visibilitychange', if hidden && playing → pause).
+
+Time source: performance.now in rAF; dt=clamp((t-last)/1000, 0, .05). G.time += dt for animations (flag wave uses G.time which freezes on pause — acceptable).
+
+Substepping: acc += dt; const h=1/240; while(acc>=h && phase rolling){ stepBall(h); acc-=h; if(phase changed) break; } Reset acc when not rolling.
+
+Wall tick throttle: G.lastSnd=0.
+Shake on impact: in collideWall, if |vn|>500 → G.shake=Math.min(12, G.shake + |vn|*.012); Snd.tick(|vn|/G.maxShot).
+
+Confetti spawn on sink: 40 parts: random angles, speed 200-700 world u/s? Particles in world units (scaled at draw) — gravity 900 u/s². Colors: gold #ffd75e, cream #fff7e0, green #37c871, red #e8543f. Size 6-12 world. Life .8-1.4s. Rotation spin.
+Dust on wall hit: 6 small white-green dots at contact point, low speed, life .4.
+
+Floating texts in world coords, rise 40u/s, fade 1s. Font size ~ 30 world units display.
+
+Flash: G.flash=1 on sink → overlay fillRect white alpha flash*.35; decay fast.
+
+Hole-in-one special: bigger confetti (80), text "★".
+
+I think the design is solid. Let me also add a subtle idle animation: ball has tiny breathing? no — golf ball still. Flag waves ✓, light band drifts ✓, current chip pulses ✓, buttons hover ✓. Attract mode ✓.
+
+Cursor: crosshair on canvas during aim; default otherwise — set via class on body per phase (body.classList 'aiming').
+
+Edge: pointerdown on HUD button shouldn't start drag — listener only on canvas ✓ (HUD is DOM above canvas; but HUD container is pointer-events none except buttons).
+
+Banner/toast pointer-events none ✓.
+
+OK now let me write the final HTML. Include <title>Maze Golf</title>. Meta viewport for mobile: width=device-width, initial-scale=1, user-scalable=no.
+
+Let me write CSS carefully.
+
+Root variables:
+```css
+:root{
+ --bg0:#06231a; --bg1:#0d3b2c;
+ --felt1:#1d6a48; --felt2:#1a6142;
+ --apron:#154e37;
+ --wall:#f2e9cf; --wallDk:#c9b98f;
+ --ink:#f6f1e0; --mut:#9dbfa9;
+ --gold:#ffd75e; --goldDk:#b8860b? use #a8791b;
+ --red:#e8543f;
+ --panel:#0c3326; --line:#2a5d47;
+ --disp: Impact, Haettenschweiler, 'Franklin Gothic Bold', 'Arial Black', sans-serif;
+ --body:'Trebuchet MS','Segoe UI',Tahoma,sans-serif;
+}
+```
+
+Body font-size base 16. Display elements uppercase letter-spacing.
+
+HUD:
+```css
+#hud{position:absolute;top:10px;left:12px;right:12px;display:flex;justify-content:space-between;align-items:stretch;gap:10px;pointer-events:none;z-index:5}
+.hudbox{background:rgba(8,40,29,.85);border:2px solid var(--line);border-radius:10px;padding:8px 14px;color:var(--ink);box-shadow:0 6px 18px rgba(0,0,0,.35)}
+.hudbox .lbl{font-size:10px;letter-spacing:.22em;color:var(--mut)}
+.hudbox .big{font-family:var(--disp);font-size:26px;letter-spacing:.04em;line-height:1.05}
+#strokeBox{text-align:center;min-width:110px;border-color:#3c7a5d}
+#strokes{font-family:var(--disp);font-size:42px;color:var(--gold);line-height:1;display:block}
+.bump{animation:bump .28s ease} @keyframes bump{40%{transform:scale(1.35)}}
+```
+To-par value colored via classes (good → green #7ee2a8, bad → #ff9b8a).
+
+Mute button pointer-events auto.
+
+Scorecard:
+```css
+#scorecard{position:absolute;bottom:10px;left:0;right:0;display:flex;justify-content:center;gap:6px;z-index:5;pointer-events:none}
+.chip{width:38px;background:rgba(8,40,29,.85);border:2px solid var(--line);border-radius:8px;text-align:center;padding:4px 0 5px;color:var(--mut);transition:.2s}
+.chip .ci{font-size:9px;letter-spacing:.1em}
+.chip .cv{font-family:var(--disp);font-size:16px;line-height:1.1}
+.chip.cur{border-color:var(--gold);color:var(--ink);animation:pulse 1.4s infinite}
+@keyframes pulse{50%{box-shadow:0 0 0 5px rgba(255,215,94,.18)}}
+.chip.done{background:#123f2e;color:var(--ink)}
+.chip.win .cv{color:#7ee2a8} .chip.lose .cv{color:#ff9b8a}
+```
+
+Overlays (start/end/pause): absolute inset-0, display flex center, background radial dim rgba(4,20,14,.55) + backdrop? avoid glass; simple dim is fine (attract visible behind ✓). z-index 10. Panels:
+```css
+.card{background:var(--panel);border:3px solid var(--gold);border-radius:14px;box-shadow:0 18px 0 rgba(0,0,0,.28), 0 30px 60px rgba(0,0,0,.5);padding:26px 30px;width:min(560px,92vw);text-align:center;position:relative}
+.card::before — top ribbon? add a small "course sign" bar: .card h1 margin.
+```
+Title:
+```css
+.title{font-family:var(--disp);font-size:clamp(44px,9vw,76px);letter-spacing:.03em;line-height:.95;color:var(--ink)}
+.title em{color:var(--gold);font-style:normal}
+```
+"Maze Golf" → "MAZE <em>GOLF</em>" with a red flag dot? Add small svg inline before title.
+
+Kicker: gold, 11px, ls .35em.
+
+Controls grid:
+```css
+.ctrls{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0;text-align:left}
+.ctrlbox{background:#0a2b20;border:2px solid var(--line);border-radius:10px;padding:10px 12px;font-size:13px;color:var(--mut)}
+.ctrlbox b{display:block;color:var(--ink);font-family:var(--disp);letter-spacing:.15em;font-size:12px;margin-bottom:6px}
+kbd{background:#123c2c;border:1.5px solid #3c7a5d;border-bottom-width:3px;border-radius:5px;padding:1px 6px;font-family:var(--body);font-size:11px;color:var(--ink)}
+```
+
+Button:
+```css
+.btn{pointer-events:auto;cursor:pointer;font-family:var(--disp);letter-spacing:.12em;font-size:18px;background:var(--gold);color:#14301f;border:none;border-radius:10px;padding:12px 30px;box-shadow:0 6px 0 #a8791b, 0 10px 16px rgba(0,0,0,.35);transition:transform .08s, box-shadow .08s, filter .15s}
+.btn:hover{filter:brightness(1.07) saturate(1.05)}
+.btn:active{transform:translateY(4px);box-shadow:0 2px 0 #a8791b}
+.btn.ghost{background:#123c2c;color:var(--ink);box-shadow:0 6px 0 #06231a;border:2px solid var(--line)}
+```
+
+Banner:
+```css
+#banner{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:8;pointer-events:none;opacity:0}
+#banner.show{animation:ban 1.7s ease forwards}
+@keyframes ban{0%{opacity:0;transform:scale(.7) rotate(-3deg)}12%{opacity:1;transform:scale(1.06) rotate(1deg)}20%{transform:scale(1) rotate(0)}80%{opacity:1}100%{opacity:0;transform:translateY(-14px)}}
+#bannerMain{font-family:var(--disp);font-size:clamp(40px,8vw,72px);letter-spacing:.06em;color:var(--gold);text-shadow:0 3px 0 rgba(0,0,0,.45), 0 0 30px rgba(255,215,94,.25)}
+#bannerSub{font-size:15px;letter-spacing:.28em;color:var(--ink);text-transform:uppercase;margin-top:6px}
+```
+Timing: banner animation 1.7s matches G.bannerTimer=1.7 → then advance. Good — CSS-driven, JS just toggles class and timer.
+
+Toast (hole intro): small top-center pill below HUD:
+```css
+#toast{position:absolute;top:96px;left:50%;transform:translate(-50%,-8px);opacity:0;transition:.35s;z-index:7;pointer-events:none;background:rgba(8,40,29,.9);border:2px solid var(--gold);color:var(--ink);padding:8px 18px;border-radius:999px;font-family:var(--disp);letter-spacing:.1em;font-size:16px}
+#toast.show{opacity:1;transform:translate(-50%,0)}
+```
+
+Hidden class: .hidden{display:none!important}.
+
+Start screen svg icon: small 64px: green circle felt, white ball, pole+red flag. Inline:
+```html
+<svg width="72" height="72" viewBox="0 0 72 72"><circle cx="36" cy="38" r="30" fill="#1d6a48"/><circle cx="36" cy="38" r="30" fill="none" stroke="#f2e9cf" stroke-width="3"/><line x1="36" y1="38" x2="36" y2="10" stroke="#f2e9cf" stroke-width="3"/><path d="M36 10 L54 16 L36 22 Z" fill="#e8543f"/><circle cx="27" cy="45" r="6" fill="#fff"/><ellipse cx="27" cy="52" rx="6" ry="2.4" fill="rgba(0,0,0,.25)"/></svg>
+```
+
+End screen table:
+```css
+table.score{border-collapse:collapse;margin:14px auto;font-size:13px}
+table.score th,td{width:38px;text-align:center;padding:4px 2px;border-bottom:2px solid var(--line)}
+th.hole{font-family:var(--disp);letter-spacing:.05em;color:var(--mut);font-weight:normal;font-size:12px}
+td.good{color:#7ee2a8} td.lose{color:#ff9b8a} td.total{border-left:2px solid var(--gold)}
+```
+
+Now the full JS. Let me write it out fully and double-check logic.
+
+One more design consideration for the HUD center: maybe show a mini "power hint" too? no, keep clean.
+
+Mobile: touch drag works; HUD sizes OK at 360px width? hudbox shrinks: add media query to reduce padding/font. Add `@media (max-width:560px){ .hudbox{padding:6px 9px}.hudbox .big{font-size:18px}#strokes{font-size:32px} .chip{width:30px} }`.
+
+Also prevent iOS double-tap zoom: touch-action none on canvas; user-scalable=no.
+
+Let me write updateHUD:
+```js
+function updateHUD(){
+ holeNum.textContent = (G.holeIndex+1)+' / 9';
+ parVal.textContent = G.par;
+ strokesEl.textContent = G.strokes;
+ // topar
+ let done=0, pdone=0; for(let i=0;i<G.holeIndex;i++){done+=G.results[i]; pdone+=G.pars[i];}
+ const tp = done + G.strokes - (pdone + G.par);
+ const el=toparEl; el.textContent = tp===0?'E':(tp>0?'+':'−')+Math.abs(tp);
+ el.className='val '+(tp<0?'good':tp>0?'bad':'');
+ // chips
+ chips.forEach((c,i)=>{ c.classList.toggle('cur', i===G.holeIndex && !ended); const v=c.querySelector('.cv'); if(G.results[i]!=null){ c.classList.add('done'); v.textContent=G.results[i]===1?'★':G.results[i]; const d=G.results[i]-G.pars[i]; c.classList.toggle('win',d<0); c.classList.toggle('lose',d>0);} else {v.textContent='–';} });
+}
+```
+Store G.pars array (per-hole par) since par varies.
+
+Bump animation on stroke change: track lastStrokeShown.
+
+Fire flow sets strokes then updateHUD(true /*bump*/).
+
+Now the physics collideWall detail:
+```js
+function collideWall(w){ const b=G.ball;
+ const cx=clamp(b.x,w.x,w.x+w.w), cy=clamp(b.y,w.y,w.y+w.h);
+ let dx=b.x-cx, dy=b.y-cy; const d2=dx*dx+dy*dy; if(d2>=BR*BR) return;
+ let nx,ny,pen;
+ if(d2>1e-9){ const d=Math.sqrt(d2); nx=dx/d; ny=dy/d; pen=BR-d; }
+ else { // center inside rect: push out along min axis
+  const l=b.x-w.x, r=w.x+w.w-b.x, tp=b.y-w.y, bt=w.y+w.h-b.y;
+  const m=Math.min(l,r,tp,bt);
+  if(m===l){nx=-1;ny=0;pen=l+BR;} else if(m===r){nx=1;ny=0;pen=r+BR;} else if(m===tp){nx=0;ny=-1;pen=tp+BR;} else {nx=0;ny=1;pen=bt+BR;}
+ }
+ b.x+=nx*pen; b.y+=ny*pen;
+ const vn=b.vx*nx+b.vy*ny; if(vn<0){ b.vx-=(1+REST)*vn*nx; b.vy-=(1+REST)*vn*ny; const imp=-vn;
+   if(imp>90 && G.time-G.lastTick>.035){ Snd.tick(imp/G.maxShot); G.lastTick=G.time; }
+   if(imp>600){ G.shake=Math.min(13,G.shake+imp*.012); spawnDust(cx,cy,nx,ny,imp); }
+ }}
+```
+
+Cup attraction and capture inside stepBall after collisions:
+```js
+const c=G.cup; const dx=c.x-b.x, dy=c.y-b.y; const d=Math.hypot(dx,dy)||1e-6;
+let sp=Math.hypot(b.vx,b.vy);
+if(d<c.r+46 && sp<CAPTURE_V*1.05 && sp>0){ const pull=300*(1-d/(c.r+46)); b.vx+=dx/d*pull*dt; b.vy+=dy/d*pull*dt; sp=Math.hypot(b.vx,b.vy);}
+if(d<c.r-8 && sp<CAPTURE_V){ startSink(); return; }
+if(d<c.r*1.5 && sp>CAPTURE_V+260 && G.time>G.lipCd){ G.lipCd=G.time+.35; const tx=-dy/d, ty=dx/d; b.vx+=tx*140; b.vy+=ty*140; Snd.lip(); addText('LIP!', c.x, c.y-60); }
+```
+Hmm the lip nudge direction is tangential — pick sign by cross product of velocity? Just random sign: s=Math.random()<.5?-1:1.
+
+Friction after that:
+```js
+sp=Math.hypot(b.vx,b.vy); if(sp>0){ const dec=(FA+FB*sp)*dt; if(dec>=sp){b.vx=0;b.vy=0; onBallStopped();} else {const k=1-dec/sp; b.vx*=k;b.vy*=k;} }
+```
+onBallStopped: if phase==='rolling' → phase='aim', toast? no, small "AIM" hint maybe first hole only. If 'start' → G.aiT=rand(.6,1.4).
+
+Roll timer safety: G.rollT+=dt in rolling; >10s force stop.
+
+Trail: while rolling and sp>60 push {x,y} each frame (not substep), cap 22, shift.
+
+Sinking update:
+```js
+G.sinkT+=dt/0.55; const t=Math.min(1,G.sinkT); const e=t*t*(3-2*t)? ease-in better for falling: e=t*t;
+const ang=G.sinkA+t*7; const rad=(1-e)*34;
+b.x=lerp(G.sinkFrom.x,c.x,e)+Math.cos(ang)*rad*(1-e);
+b.y=lerp(G.sinkFrom.y,c.y,e)+Math.sin(ang)*rad*(1-e);
+G.flagDown=Math.min(1,t*1.4);
+if(t>=1 && !G.sinkDone){ G.sinkDone=true; onSunk(); }
+```
+onSunk: const s=G.strokes, p=G.pars[G.holeIndex]; G.results[i]=s; word=scoreWord(s,p); Snd already played at sink start. Show banner (word, `HOLE ${i+1} · PAR ${p}`, class). If attract mode (phase==='start') → instead: after short delay regenerate: just setupAttract again + toast? Keep silent reset in .5s: G.phase='start'; ball→tee; flagDown=0; new maze? Regeneration causes visual pop — acceptable, or keep same maze and just move ball. Let's regenerate for variety (attract behind dim overlay anyway).
+Else phase='banner', bannerTimer=1.75; updateHUD.
+
+Banner timer in update: if phase==='banner': G.bannerTimer-=dt; when ≤0 → next: hide banner class; holeIndex++; if >=9 → endGame() else setupHole(holeIndex) (with toast "HOLE n").
+
+setupHole(i):
+```js
+G.holeIndex=i; const s=HOLES[i]; G.maze=genMaze(s.c,s.r);
+const m=G.maze; // cup and tee
+let cx=irand(0,m.c-1), cy=irand(0,m.r-1);
+// prefer cup not on corner? any fine.
+const {dist,far}=bfs(m,cx,cy); const d=dist[far[1]*m.c+far[0]];
+G.par=Math.min(9,Math.max(3, 2+Math.ceil(d/4))); G.pars[i]=G.par;
+G.cup={x:(cx+.5)*CS,y:(cy+.5)*CS,r:32};
+G.tee={x:(far[0]+.5)*CS,y:(far[1]+.5)*CS};
+G.ball={x:G.tee.x,y:G.tee.y,vx:0,vy:0};
+G.strokes=0; G.trail=[];G.parts=[];G.texts=[];G.flagDown=0;G.sinkT=0;G.sinkDone=false;
+G.maxShot=Math.min(2050, 700+(m.c+m.r)*55);
+G.aim={ang:Math.atan2(G.cup.y-G.ball.y,G.cup.x-G.ball.x), power:.5};
+layout(); // field re-render + scale
+G.phase='aim'; showHUD(true); toast(`HOLE ${i+1} · PAR ${G.par}`); updateHUD();
+```
+bfs returns dist and far.
+
+Attract: setupAttract(): similar but phase 'start', strokes 0, aiT=1; use HOLES[irand(0,3)]? Use hole 0 spec or random small for visual appeal — pick irand(0,4) for variety. Actually let's cycle attract mazes randomly each time: const s=HOLES[irand(0,5)].
+
+startGame(): Snd.ensure(); hide start screen; G.pars=[];G.results=[]; setupHole(0).
+
+endGame(): compute totals: tot=sum results, parT=sum pars, diff=tot-parT. Best: try{ b=parseInt(localStorage.getItem(K)); if(b===undefined... } Save min. Build end DOM: rating word, big diff text, table. phase='end'; show end screen; Snd.fanfare(); hide HUD? Keep scorecard visible behind? End overlay covers; set HUD hidden for cleanliness — but chip row is the same info as table; hide both.
+
+Rating:
+```js
+function rating(diff){ if(diff<=-6)return['TOUR PRO','A legendary round through the maze.']; if(diff<=-3)return['SHARP PUTTER','Eagle eyes and a steady hand.']; if(diff===0? diff<0 → 'SOLID' ...] }
+```
+Let me do: ≤-5 "TOUR PRO"; -4..-1 "SHARP PUTTER"; 0 "EVEN PAR — CLEAN ROUND"; 1..4 "STRAIGHT SHOOTER"? hmm wording: "FAIRWAY FINDER"; 5..9 "BACK NINE BENDER" (lol) → "ROUGH RIDER"; else "MAZE ROOKIE".
+
+End screen layout:
+- Kicker "ROUND COMPLETE"
+- Rating big title (display, gold)
+- Big line: "38 STROKES · PAR 41 · −3" with diff colored.
+- If new best badge: "★ NEW BEST" pill red/gold pop animation.
+- Table.
+- Buttons: PLAY AGAIN (primary), hint text "ENTER to play again".
+
+Keyboard on end: Enter → playAgain.
+
+Pause screen: card small: "PAUSED", buttons Resume / Restart Hole, key hint (P resume). Also show current hole info? Fine.
+
+Now input wiring:
+
+```js
+window.addEventListener('keydown',e=>{ Snd.ensure(); const k=e.key;
+ if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(k)) e.preventDefault();
+ if(G.phase==='start'){ if(k==='Enter'||k===' ') startGame(); return; }
+ if(G.phase==='end'){ if(k==='Enter') playAgain(); return; }
+ if(k==='m'||k==='M'){ toggleMute(); return; }
+ if(k==='p'||k==='P'||k==='Escape'){ togglePause(); return; }
+ if(G.paused) return;
+ if(k==='r'||k==='R'){ retryHole(); return; }
+ if(G.phase==='aim'){
+   const st=e.shiftKey?.5:1;
+   switch(k){case 'ArrowLeft':case 'a':case 'A': G.aim.ang-=1.6*Math.PI/180*st; break; ...}
+   power up/down...
+   if((k===' '||k==='Enter') && !e.repeat) shoot();
+ }
+});
+```
+Note: Space preventDefault before button focus issue — after a button click, blur it so Space doesn't retrigger. Add helper onPointerUp? just call btn.blur() in each click handler.
+
+Pointer:
+```js
+canvas.addEventListener('pointerdown',e=>{ Snd.ensure(); if(G.paused||G.phase!=='aim') return; G.dragPrev={...G.aim}; G.dragging=true; canvas.setPointerCapture(e.pointerId); aimFromPointer(e); });
+pointermove: if(G.dragging) aimFromPointer(e);
+pointerup/cancel: if(G.dragging){ G.dragging=false; if(G.aim.power<.05) G.aim={...G.dragPrev}; else shoot(); }
+```
+aimFromPointer: world position of pointer: rect=canvas.getBoundingClientRect(); wx=(e.clientX-rect.left - offX)/scale; dy=wx-ball.x etc; ang=atan2; power=clamp(dist/ (CS*3.2), 0,1)? Max drag distance in world ~ 3.2 cells feels good but on small screens drag is short in world units… use screen pixels instead: power = clamp(screenDist / 190px, 0, 1) — device-independent-ish (mobile fingers need less? 150?). Use min(1, dist/ (Math.min(w,h)*0.28))? Simpler: dist/170 clamped. OK use 170.
+
+Also allow click without drag = tiny power → cancel to prev ✓.
+
+shoot():
+```js
+function shoot(){ const p=G.aim.power; if(p<.05){ return;} G.strokes++; const v=p*G.maxShot; G.ball.vx=Math.cos(G.aim.ang)*v; G.ball.vy=Math.sin(G.aim.ang)*v; G.phase='rolling'; G.rollT=0; G.trail=[]; Snd.putt(p); updateHUD(true); }
+```
+
+togglePause: only if phase aim/rolling/sinking/banner? If banner, pausing is weird — restrict to aim|rolling|sinking. Set G.paused, show/hide overlay.
+
+Auto pause on hidden: if playing && !paused → pause.
+
+Main loop and render — write carefully with view vars: G.view={scale,offX,offY,pad}. sx=x*scale+offX etc.
+
+renderField():
+```js
+function renderField(){ const m=G.maze; const v=G.view; const pad=v.pad; // world units 34
+ const fw=(m.W+pad*2)*v.scale*dpr, fh=(m.H+pad*2)*v.scale*dpr;
+ fieldC.width=Math.max(1,fw|0); fieldC.height=Math.max(1,fh|0);
+ const c=fieldC.getContext('2d'); c.setTransform(v.scale*dpr,0,0,v.scale*dpr,0,0); c.translate(-pad,-pad);
+ // apron
+ c.fillStyle='#154e37'; rr(c,-pad,-pad,m.W+pad*2,m.H+pad*2, 18); c.fill();
+ // inner felt border? draw course cells:
+ const rnd=mulberry(1234+G.holeIndex*77+m.c*13);
+ for(let y=0;y<m.r;y++)for(let x=0;x<m.c;x++){ c.fillStyle=(x+y)%2? '#1a6142':'#1d6a48'; c.fillRect(x*CS,y*CS,CS,CS); }
+ // speckles
+ for cells: 7 dots: c.fillStyle= rnd()<.5?'rgba(255,255,255,.05)':'rgba(0,0,0,.06)'; small rect 3-4px at random position in cell (inset 8).
+ // tee marker
+ c.strokeStyle='rgba(246,241,224,.5)';c.lineWidth=3; circle r 12 at tee + dot.
+ // cup
+ const cp=G.cup; c.fillStyle='#0a2018'; circle r cp.r fill; c.strokeStyle='rgba(255,215,94,.85)'; lineWidth 3.5; circle r cp.r stroke; inner: gradient darker center: radial from #061710 to #10362a? Let's do: fill base dark then rim.
+ Add subtle inner shadow: c.strokeStyle='rgba(0,0,0,.5)'; lineWidth 6; arc r cp.r-4.
+ // walls with shadow pass then body pass
+ const sh=6;
+ c.fillStyle='rgba(0,0,0,.30)'; for w of m.walls rr(c,w.x+4,w.y+6,w.w,w.h,5) fill;
+ for w: c.fillStyle='#f2e9cf'; rr(c,w.x,w.y,w.w,w.h,5); c.fill();
+  edge shading: draw a darker line at bottom/right: c.strokeStyle='rgba(120,100,60,.35)' lineWidth 3; path along bottom and right? Simpler: second inset rect stroke: rr(c,w.x+1.5,w.y+1.5,w.w-3,w.h-3,4) stroke 'rgba(255,255,255,.5)'? That's inner highlight — meh.
+ Let me do: fill cream; then thin dark edge at bottom/right per orientation:
+  c.fillStyle='rgba(160,140,95,.55)'; if(w.h>=w.w){ // vertical wall: right edge rect {x+w.w-3,y,3,h} and bottom cap {x,y+h-3,w,3}; } else horizontal: bottom edge + right cap.
+  top-left highlight: c.fillStyle='rgba(255,255,255,.6)'; if vertical: left edge 3px; else top edge 3px.
+```
+That gives a beveled chunky wall ✓.
+
+Border ring walls are also in list → same treatment ✓.
+
+Main render():
+```js
+const w=vw,h=vh (css px); ctx.clearRect? drawImage bg covers all.
+ctx.drawImage(bgC,0,0,w,h);
+// moving light: const lx=w*(.5+.28*Math.sin(G.time*.13)), ly=h*.3; radial grad rgba(120,220,160,.10)→0 radius w*.5 fill whole? createRadialGradient each frame is OK.
+// shake
+const shx=(Math.random()*2-1)*G.shake, shy=... ctx.save(); ctx.translate(shx,shy);
+ctx.drawImage(fieldC, v.offX - pad*v.scale, v.offY - pad*v.scale, (m.W+pad*2)*v.scale, (m.H+pad*2)*v.scale);
+drawFlag(); drawTrail(); if(!(phase==='sinking'&&sinkT>0.9)) drawBall(); drawAimUI() if aim; particles; texts; ctx.restore();
+if(G.flash>0){ctx.fillStyle=`rgba(255,246,214,${G.flash*.35})`;fillRect} 
+```
+bgC built in layout(): size w*dpr,h*dpr: base fill #07231b; radial glow top: gradient at (w/2, -h*.2) r h*1.1 rgba(34,96,68,.55)→transparent; stripes: pattern? draw diagonal lines: for(x=-h;x<w+h;x+=64){ line strokeStyle 'rgba(255,255,255,.025)' width 26 rotate -20°? Simpler: save/rotate around center, loop horizontal bands. Then vignette radial transparent→rgba(3,15,10,.55) at corners (center w/2,h/2 r inner .55min → outer .8hyp).
+
+Per-frame light band: two gradients — fine.
+
+drawBall with trail:
+```js
+G.trail.forEach((p,i)=>{ const a=(i+1)/G.trail.length; ctx.fillStyle=`rgba(250,250,240,${a*.16})`; circle at (sx(p.x),sy(p.y)) r BR*scale*(.3+.5*a); });
+```
+Ball shadow + body as planned. During sinking, scale ball by (1 - e*.9): pass scale factor from sinkT: bs = phase==='sinking'? (1-Math.min(1,G.sinkT)*.85) : 1.
+
+drawAimUI():
+```js
+const b=G.ball, a=G.aim.ang, p=G.aim.power;
+// trajectory dots
+const pts=tracePath(a,p); ctx.fillStyle='rgba(255,247,220,.8)';
+pts.forEach((pt,i)=>{ if(i===0)return; const f=1-i/pts.length; ctx.globalAlpha=.15+.55*f; circle r (2.6+1.5*f)*Math.max(.9,scale); }); globalAlpha=1;
+// arrow
+const L=(34+p*120); ex=b.x+cos*L ... line width Math.max(2,6*scale) round cap stroke 'rgba(255,215,94,.95)'; head: triangle at end.
+// power ring
+ctx.beginPath(); ctx.arc(sx(b.x),sy(b.y),(BR+11)*scale,-Math.PI/2,-Math.PI/2+p*TAU); strokeStyle=`hsl(${130-118*p},90%,56%)`; lineWidth Math.max(3,5.5*scale); lineCap round; stroke();
+// power % label if p>0: text at ball + offset (BR+26)*scale below: font `${Math.max(11,14*s)}px Trebuchet` fill 'rgba(246,241,224,.75)'; textAlign center; `${Math.round(p*100)}`
+```
+tracePath returns array of points along path (sampled): let's produce sampled dots directly: walk segments and push a point every 18u.
+
+Implementation:
+```js
+function tracePath(ang,p){ const b=G.ball; let x=b.x,y=b.y,dx=Math.cos(ang),dy=Math.sin(ang);
+ const total=shotDist(p)*.95; let used=0; const out=[{x,y}]; const B=.8,A=520; const v=p*G.maxShot; 
+ for(let i=0;i<3;i++){ let bt=Infinity,bn=null;
+  for(const w of G.maze.walls){ const r=rayAABB(x,y,dx,dy,w); if(r&&r.t>1e-4&&r.t<bt){bt=r.t;bn=r.n;} }
+  const rem=total-used;
+  if(bt>rem || bt===Infinity){ out.push({x:x+dx*rem,y:y+dy*rem}); break; }
+  x+=dx*bt;y+=dy*bt;used+=bt; out.push({x,y});
+  if(bn[0]) dx=-dx; else dy=-dy;
+ }
+ // resample to uniform dots
+ const res=[out[0]]; for(let i=1;i<out.length;i++){ const a0=out[i-1],a1=out[i]; const d=Math.hypot(a1.x-a0.x,a1.y-a0.y); const n=Math.max(1,Math.floor(d/18)); for(let k=1;k<=n;k++) res.push({x:lerp(a0.x,a1.x,k/n),y:lerp(a0.y,a1.y,k/n)}); }
+ return res; }
+```
+
+shotDist(p): v=p*maxShot; if v<5 return 0; (v - (A/B)*Math.log(1+B*v/A))/B.
+
+rayAABB:
+```js
+function rayAABB(px,py,dx,dy,r){
+ let tmin=-Infinity,tmax=Infinity; let ax='x';
+ if(Math.abs(dx)<1e-9){ if(px<r.x||px>r.x+r.w)return null; }
+ else{ let t1=(r.x-px)/dx,t2=(r.x+r.w-px)/dx; if(t1>t2){const t=t1;t1=t2;t2=t;} const a=Math.max(tmin,t1), b=Math.min(tmax,t2); if(a>b) return null; tmin=a;tmax=b; ax='x'; }
+ if(Math.abs(dy)<1e-9){ if(py<r.y||py>r.y+r.h)return null; }
+ else{ let t1=(r.y-py)/dy,t2=(r.y+r.h-py)/dy; if(t1>t2){const t=t1;t1=t2;t2=t;} const a=Math.max(tmin,t1), b=Math.min(tmax,t2); if(a>b) return null; if(a>tmin) ax='y'; tmin=a;tmax=b; }
+ const t=tmin>1e-4? tmin : (tmax>1e-4? tmax : null); if(t===null) return null;
+ // normal on entry face: recompute which slab produced the final tmin
+ let n=[0,0];
+ // determine: compare original slab starts
+ ...simpler: compute tx entry and ty entry separately:
+```
+Cleaner: compute tEnterX (x slab entry), tEnterY; entry axis = whichever is larger (the last constraint). Let me restructure:
+```js
+function rayAABB(px,py,dx,dy,r){
+ let tx1,tx2; if(Math.abs(dx)<1e-9){ if(px<r.x||px>r.x+r.w)return null; tx1=-Infinity;tx2=Infinity; } else { tx1=(r.x-px)/dx; tx2=(r.x+r.w-px)/dx; if(tx1>tx2){const t=tx1;tx1=tx2;tx2=t;} }
+ let ty1,ty2; same for y.
+ const tmin=Math.max(tx1,ty1), tmax=Math.min(tx2,ty2);
+ if(tmax<Math.max(tmin,0)) return null;
+ const t=tmin>1e-4?tmin:(tmax>1e-4?tmax:null); if(!t) return null;
+ let n; if(tx1>=ty1) n=[dx>0?-1:1,0]; else n=[0,dy>0?-1:1];
+ return {t,n}; }
+```
+Wait normal sign: if entering from x face, ball moving +x hits the left face → normal (-1,0) = dx>0? -1 : 1 ✓.
+
+Edge: tmin negative (origin inside slab range but outside box?) — handled by max(tmin,0) in tmax check and fallback to tmax. Good enough for preview.
+
+Particles update:
+```js
+for(i--){ p.t+=dt; if(p.t>p.life) remove; p.x+=p.vx*dt;p.y+=p.vy*dt; if(p.grav)p.vy+=900*dt; p.rot+=p.vr*dt; }
+draw: alpha=1-p.t/p.life; confetti: save translate rotate fillRect(-s/2,-s/4,s,s/2) color; dust: circle.
+```
+
+Texts: {x,y,txt,t,life:1}; y -= 30*dt in world? rise: store and draw at sy(y - t*36). Alpha 1-t/life. Font display: `700 ${Math.max(14,26*s)}px Impact...` with dark stroke for legibility (strokeText then fillText gold or cream).
+
+Flag:
+```js
+function drawFlag(){ const c=G.cup; const hgt=lerp(96,22,G.flagDown); const topY=c.y-hgt;
+ // pole
+ ctx.strokeStyle='#efe7d0'; lineWidth=Math.max(2.5,4.5*s); line from (sx(c.x),sy(c.y)) to (sx(c.x), sy(topY));
+ // pennant wave
+ const w1=Math.sin(G.time*6)*3*s? in world: use world units: L=48; wave=Math.sin(G.time*7)*4;
+ path: moveTo(sx(c.x),sy(topY)); quadraticCurveTo(sx(c.x+L*.55), sy(topY-5+wave*.4), sx(c.x+L), sy(topY+10+wave)); lineTo? then back to (sx(c.x), sy(topY+18)); fill '#e8543f'; plus a darker stripe: thin path along bottom? skip.
+ // base ball on pole top: small gold circle r 3s at top.
+}
+```
+
+HUD show/hide: function setScreens(): toggle .hidden on hudEl, chipsEl per phase (visible in aim/rolling/sinking/banner/paused; hidden in start/end). Start overlay visible only in 'start'; end overlay in 'end'; pause overlay if G.paused.
+
+Simplify: call refreshUI() after state changes + in update cheaply? Just call on transitions.
+
+Toast function:
+```js
+let toastTimer=0;
+function toast(txt, ms=1500){ toastEl.textContent=txt; toastEl.classList.add('show'); G.toastT=ms/1000; }
+in update: if(G.toastT>0){G.toastT-=dt; if(G.toastT<=0) toastEl.classList.remove('show');}
+```
+
+Banner:
+```js
+function showBanner(main,sub,cls){ bannerMain.textContent=main; bannerSub.textContent=sub; bannerMain.className=cls||''; bannerEl.classList.remove('show'); void bannerEl.offsetWidth; bannerEl.classList.add('show'); }
+On advance: bannerEl.classList.remove('show');
+```
+CSS animation duration 1.7s matches timer 1.75 ✓ (final opacity 0 persists via 'forwards').
+
+Hole-in-one detection for extra flash/confetti: if strokes===1 → G.flash=.9, extra confetti, Snd.fanfare? Keep sink sound + additional chord. OK: in startSink if G.strokes===1 && phase!=='start' → fanfare().
+
+Scoreword classes: word contains 'HOLE-IN-ONE','EAGLE','ALBATROSS','BIRDIE' → 'good'; 'PAR' → ''; else 'bad'.
+
+Now the "retry hole" (R):
+```js
+function retryHole(){ if(G.phase==='start'||G.phase==='end')return; G.strokes=0; G.ball={x:G.tee.x,y:G.tee.y,vx:0,vy:0}; G.trail=[]; G.flagDown=0; G.phase='aim'; Snd.ui(); toast('HOLE RESET'); updateHUD(true); }
+```
+
+PlayAgain:
+```js
+function playAgain(){ Snd.ensure(); endEl.classList.add('hidden'); G.results=[]; G.pars=[]; Snd.ui(); setupHole(0); }
+```
+
+Start:
+```js
+function startGame(){ Snd.ensure(); Snd.ui(); startEl.classList.add('hidden'); G.results=[];G.pars=[]; setupHole(0); }
+```
+
+Init on load:
+```js
+buildChips(); layout needs maze → setupAttract() first (generates a random small maze, phase 'start'), then rAF loop. showHUD(false). Load best into start screen element.
+window resize → layout().
+```
+layout() uses G.maze — ensure exists before calling ✓ (setupAttract runs first). Also bgC rebuilt in layout ✓.
+
+dpr: stored globally, updated in layout.
+
+Pause overlay buttons: Resume → togglePause; Restart Hole → retryHole + unpause? Retry while paused: set paused false then retryHole. Handle.
+
+Mute button label update: 'SOUND ON'/'SOUND OFF' or icon. Use text "♪ ON"/"♪ OFF".
+
+visibilitychange: if(document.hidden && (G.phase==='aim'||G.phase==='rolling') && !G.paused) togglePause(true).
+
+Also blur → pause similarly? visibility enough.
+
+Double-checking the par formula values: d = BFS cell count from cup to farthest tee. For 5x5 max d ~ maybe 12-16 (snake path). par=2+ceil(d/4): d=14→ 2+4=6. Hmm might be high; actual strokes needed with good power: can cover ~7 cells per shot, but maze turns limit it. Par 5-7 for small mazes is generous ✓. For 13x11 max d could be ~40 → 2+10=12 cap 9. OK cap at 9.
+
+Wait — tee is farthest from cup: that's the longest path; typical shots will take multiple strokes with turns. Par feels right.
+
+One concern: ball radius 26, walls thickness 16 centered on grid lines → corridor width between opposing walls = 100-16=84 world? Actually adjacent interior wall rects: cell A east wall at x=CS (from CS-8 to CS+8), next cell has no wall (open). Wall-to-wall corridor when both sides are walled: from CS+8 to 2CS-8 = 84 > ball diameter 52 ✓ plenty of room.
+
+Cup r 32 vs capture d<r-8=24 at speed <500 → forgiving ✓. Cup in cell center; walls don't overlap cup (cup is within open cell, nearest wall edge 50-8=42 from center > 32+? ball can reach: ball center min distance to wall = BR+8=34 <50 ✓ ball can get near cup ✓).
+
+Ball start at tee center; no overlap with walls (center is 50 from any wall, need 34) ✓.
+
+Now the attract AI shooting: in update when phase==='start' && ball stopped (vx=vy=0): G.aiT-=dt; if<=0: ang=atan2(cup-ball)+rand(-.4,.4); p=rand(.5,.95); fire with no stroke count — call shootAttract(): set velocity, phase? keep phase 'start', but rolling logic is triggered by velocity being nonzero… my update structure: physics runs when (phase==='rolling'||(phase==='start' && moving)). Let me restructure: define a bool isMoving = speed>0. In update: if(phase==='rolling' || (phase==='start')){ if(speed>0){ stepBall substeps } else { ai timer } }. phase 'sinking' handled separately. onBallStopped for start → just set aiT.
+
+But shoot() sets phase='rolling' — in attract, don't change phase; write fireShot(countStroke):
+```js
+function fireShot(){ const p=G.aim.power; if(p<.05)return; if(G.phase!=='start') G.strokes++; ... Snd.putt(p); if(G.phase!=='start'){G.phase='rolling';G.rollT=0;} G.trail=[]; updateHUD(true); }
+```
+And stepBall's cup check startSink only when phase==='rolling'? In attract, ball reaching cup: allow sink animation and reset (fun!). startSink works in both; onSunk branches by phase. But phase 'start' with sinking → need subphase flag: use G.phase='sinking' even from attract, and remember G.wasAttract=true; after banner/reset return to 'start'. Simpler: in startSink: const attract = (G.phase==='start'); G.attract=attract; G.phase='sinking'. onSunk: if(G.attract){ // silent reset
+   G.phase='start'; newAttractMaze(); } else { record, banner... }
+But setupHole sets phase 'aim' — for attract use setupAttract that sets phase 'start'. After sink in attract, call setupAttract() again (new random small maze) ✓.
+
+HUD hidden during start ✓ so strokes irrelevant.
+
+Now stepBall cupCheck only when phase==='rolling' or 'sinking'? During sinking skip physics entirely (handled in its own block). Fine: cup logic inside stepBall which is only called in rolling/attract-moving.
+
+Rolling timer safety in attract too — include.
+
+Let me also add a subtle "course entrance" detail: draw the hole number on felt? e.g., big faint number at a random corner cell of field ("4") — nice touch: draw at (pad+10, pad+CS*0.8) with display font huge alpha .07 cream. Add in renderField using G.holeIndex+1 (attract shows "?" or its number? show "P" for practice? just show nothing for attract: if(G.phase==='start') skip). OK include when !attract… but setupHole knows; store G.showNum = phase!=='start'.
+
+Tee marker also small "TEE"? Skip.
+
+Now let me finalize the HTML skeleton:
+
+```html
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Maze Golf</title>
+<style> ... </style></head>
+<body>
+<div id="stage">
+ <canvas id="game"></canvas>
+ <header id="hud" class="hidden">
+   <div class="hudbox"><span class="lbl">HOLE</span><span class="big" id="holeNum">1 / 9</span></div>
+   <div class="hudbox" id="strokeBox"><span class="lbl">STROKES <em id="parVal" class="parpill">PAR 5</em></span><span id="strokes">0</span></div>
+   <div class="hudbox right"><span class="lbl">TO PAR</span><span class="big val" id="topar">E</span>
+     <button id="muteBtn" class="mini">♪ ON</button></div>
+ </header>
+ <div id="scorecard" class="hidden"></div>
+ <div id="toast"></div>
+ <div id="banner"><div id="bannerMain"></div><div id="bannerSub"></div></div>
+
+ <section id="startScreen" class="overlay">
+  <div class="card">
+   svg icon
+   <p class="kicker">A PUTTING PUZZLE IN NINE MAZES</p>
+   <h1 class="title">MAZE<br><em>GOLF</em></h1>? 
+```
+Hmm title layout: "MAZE GOLF" one line with em on GOLF, plus a red flag svg between? Keep it as `<h1 class="title">MAZE <em>GOLF</em></h1>` and svg above.
+
+Tagline: "Read the maze. Set your putt. One ball, nine labyrinths."
+Controls grid 2 boxes:
+- PUTTER (MOUSE/TOUCH): "Press & drag from anywhere — aim with the arrow, pull farther for more power, release to putt."
+- KEYS: kbd rows: ← → aim · ↑ ↓ power · Space putt · R reset hole · P pause · M sound. Plus "Hold Shift for fine aim".
+Best line: `<p id="bestLine" class="best"></p>` hidden if none.
+Button TEE OFF + hint "or press Enter".
+
+End screen:
+```html
+<section id="endScreen" class="overlay hidden">
+ <div class="card endcard">
+  <p class="kicker">ROUND COMPLETE</p>
+  <h2 id="ratingTitle" class="title small"></h2>
+  <p id="ratingSub" class="sub"></p>
+  <p id="totalLine" class="totalline"></p>
+  <div id="newBest" class="bestbadge hidden">★ NEW COURSE RECORD</div>
+  <table class="score" id="scoreTable"></table>
+  <button id="againBtn" class="btn">PLAY AGAIN</button>
+  <p class="hint">PRESS ENTER TO RESTART</p>
+ </div>
+</section>
+```
+
+Pause:
+```html
+<section id="pauseScreen" class="overlay hidden">
+ <div class="card small">
+  <h2 class="title mid">PAUSED</h2>
+  <button id="resumeBtn" class="btn">RESUME</button>
+  <button id="restartBtn" class="btn ghost">RESET HOLE</button>
+  <p class="hint">P OR ESC TO RESUME</p>
+ </div>
+</section>
+```
+
+Now, one more: par pill inside strokeBox label — style .parpill{font-style:normal;color:#7ee2a8;margin-left:6px}.
+
+Right hudbox: display flex align center gap.
+
+Mute mini button: small ghost chip.
+
+End table build:
+```js
+function buildTable(){ let h='<tr><th class="rowlbl">HOLE</th>'; for(i<9) h+=`<th>${i+1}</th>`; h+='<th>TOT</th></tr>';
+ h+='<tr><th class="rowlbl">PAR</th>'+pars.map(p=>`<td>${p}</td>`).join('')+`<td>${parT}</td></tr>`;
+ h+='<tr><th class="rowlbl">YOU</th>'+results.map((r,i)=>`<td class="${r< pars[i]?'good':r>pars[i]?'lose':''}">${r===1?'★':r}</td>`).join('')+`<td class="total ${diff<0?'good':diff>0?'lose':''}">${tot}</td></tr>`;
+ scoreTable.innerHTML=h; }
+```
+
+Total line: `${tot} STROKES · PAR ${parT} · <b class="${cls}">${fmt(diff)}</b>`.
+
+Best handling:
+```js
+const BESTKEY='mazeGolfBest';
+function loadBest(){ try{ const v=localStorage.getItem(BESTKEY); return v===null?null:parseInt(v,10);}catch(e){return null;} }
+function saveBest(d){ try{ localStorage.setItem(BESTKEY,String(d)); }catch(e){} }
+```
+On end: prev=loadBest(); isNew = prev===null||d<prev; if(isNew) saveBest(d).
+
+bestLine on start: b=loadBest(); if(b!==null) bestLine.textContent='COURSE RECORD: '+fmt(b); else hidden. Update after game? Start screen only shown at load; also refresh when returning to menu — no return-to-menu button… add a "MENU" ghost button on end screen → show start (refresh best line, setupAttract, phase 'start'). Nice completeness. Also small link on pause? Skip.
+
+menuBtn: G.results=[] etc; phase='start'; setupAttract(); show start overlay; update bestLine; hide hud.
+
+OK — also ensure that when phase==='banner', input aim disabled ✓ (phase check).
+
+Potential bug: pointerup outside canvas after capture — setPointerCapture ensures event goes to canvas ✓. Also handle 'lostpointercapture' → same as up.
+
+Also prevent context menu on long press? Add contextmenu preventDefault on canvas.
+
+Font stack for canvas text: use `Impact, 'Arial Black', sans-serif` string; body `'Trebuchet MS', Verdana, sans-serif`.
+
+Let me double-check the update loop structure:
+
+```js
+let last=performance.now();
+function frame(now){ const dt=Math.min(.05,(now-last)/1000); last=now; if(!G.paused){ G.time+=dt; update(dt);} render(); requestAnimationFrame(frame); }
+requestAnimationFrame(frame);
+```
+update:
+```js
+function update(dt){
+ // decay shake and flash always
+ G.shake*=Math.exp(-7*dt); if(G.shake<.1)G.shake=0;
+ G.flash=Math.max(0,G.flash-3*dt);
+ if(G.toastT>0){...}
+ // particles and texts always
+ updParts(dt); updTexts(dt);
+ const b=G.ball; const moving = Math.abs(b.vx)>1||Math.abs(b.vy)>1;
+ if(G.phase==='rolling' || (G.phase==='start')){
+   if(moving){ G.rollT+=dt; let acc=G.acc+=dt; const hstep=1/240; let n=0;
+     while(acc>=hstep && n++<30 && (G.phase==='rolling'||G.phase==='start')){ stepBall(hstep); acc-=hstep; }
+     G.acc=acc;
+     if(moving && Math.hypot(b.vx,b.vy)>80){ G.trail.push({x:b.x,y:b.y}); if(G.trail.length>22)G.trail.shift(); }
+   } else {
+     if(G.phase==='start'){ G.aiT-=dt; if(G.aiT<=0){ const a=Math.atan2(G.cup.y-b.y,G.cup.x-b.x)+rand(-.45,.45); G.aim={ang:a,power:rand(.5,.95)}; fireShot(); } }
+     else { G.phase='aim'; }
+   }
+   if(G.rollT>12){ b.vx=b.vy=0; } // safety (next frame will transition)
+ } else if(G.phase==='sinking'){ ...sinking update... }
+ else if(G.phase==='banner'){ G.bannerTimer-=dt; if(G.bannerTimer<=0){ bannerEl.classList.remove('show'); advanceHole(); } }
+}
+```
+G.acc reset when entering rolling (in fireShot set G.acc=0).
+
+stepBall can change phase to 'sinking' → while loop condition stops ✓.
+
+Sinking block:
+```js
+G.sinkT+=dt/.55; const t=Math.min(1,G.sinkT); const e=t*t;
+const sp2=G.sinkT*9; 
+b.x=lerp(G.sinkFrom.x,G.cup.x,e)+Math.cos(sp2)*(1-e)*30;
+b.y=...
+G.flagDown=Math.min(1,G.flagDown+dt*2.2);
+if(t>=1&&!G.sinkDone){G.sinkDone=true;onSunk();}
+```
+
+onSunk:
+```js
+function onSunk(){ if(G.attract){ setupAttract(); return; }
+ const i=G.holeIndex, s=G.strokes, p=G.pars[i]; G.results[i]=s;
+ const word=scoreWord(s,p); let cls=''; const d=s-p; if(d<0||s===1)cls='good'; else if(d>0)cls='bad';
+ showBanner(word, `HOLE ${i+1} · PAR ${p}`, cls);
+ G.phase='banner'; G.bannerTimer=1.8; updateHUD(); }
+```
+Banner CSS 1.7s vs timer 1.8 → banner fades at 1.7, advance at 1.8 ✓.
+
+advanceHole: holeIndex++; if>=HOLES.length endGame() else setupHole(G.holeIndex).
+
+startSink():
+```js
+G.attract=(G.phase==='start'); G.sinkFrom={x:b.x,y:b.y}; G.sinkT=0; G.sinkDone=false; b.vx=b.vy=0; G.phase='sinking'; Snd.sink(); G.flash=.55; spawnConfetti(G.cup.x,G.cup.y, G.strokes===1&&!G.attract?70:38); if(!G.attract&&G.strokes===1){Snd.fanfare();}
+```
+
+scoreWord(1) → 'HOLE-IN-ONE!' ✓.
+
+Now let me confirm fireShot from keyboard Space when phase 'aim' only — wired in keydown handler ✓ (and guard e.repeat for space).
+
+Power keyboard: ArrowUp increases .05, down decreases; clamp .05..1? Allow 0 too but fire needs ≥.05. Start power .5 default so a quick Space works ✓. Show ring at 0? if p<.02 skip ring draw.
+
+Aim rotation wrap fine (atan natural).
+
+Draw order: aim UI drawn after ball so arrow overlays ✓. During rolling, hide aim (phase check) but keep last trajectory? no.
+
+Trail during sinking: freeze trail (no push) and fade it? Just leave; looks fine as it fades with new? Trail remains static — let's clear on startSink: G.trail=[] ✓ cleaner.
+
+Chip 'cv' initial '–'.
+
+Also add subtle CSS animation to title em: gold shimmer? Use text-shadow pulse keyframes on .title em (subtle). And kicker has letter-spacing animation on load? Keep the em pulse gentle.
+
+Card entrance animation: .overlay .card {animation: cardIn .45s cubic-bezier(.2,1.4,.4,1)} from translateY(24px) scale(.92) opacity 0.
+
+Overlay background: `background:radial-gradient(ellipse at center, rgba(4,26,18,.35), rgba(3,18,12,.78))` — attract maze visible around card ✓ (not glassmorphism, just a dim).
+
+z-index: canvas 0, hud 5, toast 7, banner 8, overlays 10.
+
+Edge case: banner during pause? Banner phase not pausable ✓ (togglePause restricted to aim|rolling|sinking — but sink is short; fine).
+
+Also add: clicking on canvas while phase 'aim' shows a small ripple at click location? Micro-interaction: spawn 6 dust particles at click point. Cute, cheap — do in pointerdown before drag logic. Actually the drag itself gives feedback (arrow+preview); skip extra ripple to avoid noise. Hmm — tiny "click blip" sound on aim adjust? no, too noisy. Fine.
+
+Let me write the CSS for the .val.good/.bad colors and totalline b.
+
+Also add `#stage{position:fixed;inset:0}`.
+
+Body overflow hidden + overscroll-behavior none.
+
+Now — one thing about layout(): HUD height varies (mobile smaller). Use fixed offsets: top margin 92 desktop / but on mobile hud could be taller? Keep hud single-row compact; top offset 84, bottom 64. Media query shrinks hud so it stays ~60px tall → topOffset = min(90, h*.16)? Compute in layout: const topH = innerWidth<560?72:92; const botH= innerWidth<560?54:64.
+
+availH = h - topH - botH - 8. Ensure positive min 200.
+
+Also ensure maze fits with pad: use (m.W+pad*2) in scale calc so apron visible: scale=min(availW/(m.W+pad*2), availH/(m.H+pad*2)). offX = (w - m.W*scale)/2; offY = topH + (availH - m.H*scale)/2.
+
+fieldC blit uses pad in world ✓.
+
+bgC: rebuilt with w,h,dpr in layout.
+
+I think I'm ready to write the final code. Also let me double check `em` inside .lbl span for parpill — use a span not em.
+
+One more: strokes bump animation class on #strokes (display block, transform-origin center) ✓.
+
+Let me also handle window 'blur' → if playing pause (good UX). Use visibilitychange only to avoid annoyance? Add both but blur-pause might be annoying in devtools… keep just visibilitychange.
+
+Double-check no external resources: fonts are system, emoji OK, inline svg OK.
+
+Potential issue: Impact font on some systems (Android) — fallback 'Arial Black', sans-serif bold; acceptable.
+
+Let me write scoreWord:
+```js
+function scoreWord(s,p){ if(s===1)return'HOLE-IN-ONE!'; const d=s-p; if(d<=-3)return'ALBATROSS!'; if(d===-2)return'EAGLE!'; if(d===-1)return'BIRDIE!'; if(d===0)return'PAR'; if(d===1)return'BOGEY'; if(d===2)return'DOUBLE BOGEY'; return '+'+d; }
+```
+
+fmt(diff): diff===0?'E':(diff>0?'+':'−')+Math.abs(diff).
+
+Rating:
+```js
+function ratingOf(d){ if(d<=-5)return['TOUR PRO','Maze-shattering. The flag is in a state of panic.'];
+ if(d<=-1)return['SHARP PUTTER','Birdies, eagles and a very confident ball.'];
+ if(d===0)return['EVEN PAR','Dead even. Textbook maze work.'];
+ if(d<=4)return['FAIRWAY FINDER','A few bogeys, but the line was always there.'];
+ if(d<=9)return['ROUGH RIDER','The walls won some of those.'];
+ return['MAZE ROOKIE','Every lollipop ball starts somewhere.']; }
+```
+
+End title uses rating word; sub uses second string.
+
+Now — chips: build once with 9 children; updateHUD refreshes classes/texts. '–' for future holes.
+
+Also on endGame, mark all chips done + hide scorecard (overlay covers anyway).
+
+Mute persistence? try localStorage 'mazeGolfMute'. Nice: save toggle. Add.
+
+Time to write it all out. I'll be meticulous with brackets. Let me draft the final file in my head and count the major functions… just write it now.
+
+Also: `const HOLES=[{c:5,r:5},{c:7,r:5},{c:7,r:7},{c:9,r:6},{c:9,r:8},{c:11,r:7},{c:11,r:9},{c:13,r:9},{c:13,r:11}];`
+
+Attract spec: HOLES[irand(0,4)].
+
+setupAttract():
+```js
+function setupAttract(){ const s=HOLES[irand(0,4)]; G.maze=genMaze(s.c,s.r); const m=G.maze;
+ const cx=irand(0,m.c-1),cy=irand(0,m.r-1); const {far}=bfs(m,cx,cy);
+ G.cup={x:(cx+.5)*CS,y:(cy+.5)*CS,r:32}; G.tee={x:(far[0]+.5)*CS,y:(far[1]+.5)*CS};
+ G.ball={x:G.tee.x,y:G.tee.y,vx:0,vy:0}; G.trail=[];G.parts=[];G.texts=[];G.flagDown=0;G.maxShot=Math.min(2050,700+(m.c+m.r)*55);
+ G.aim={ang:Math.atan2(G.cup.y-G.ball.y,G.cup.x-G.ball.x),power:.6}; G.aiT=rand(.8,1.6); G.par=4;G.pars=G.pars||[];
+ G.showNum=false; layout(); G.phase='start'; }
+```
+
+In renderField, big faint number only if G.showNum.
+
+refreshUI():
+```js
+function refreshUI(){ const inPlay=['aim','rolling','sinking','banner'].includes(G.phase);
+ hudEl.classList.toggle('hidden',!inPlay&&!G.paused? !inPlay : !inPlay); 
+```
+Simpler: show hud when inPlay || (G.paused && lastInPlay). Since pause only from in-play phases, just use inPlay (phase unchanged during pause) ✓.
+scorecard same. startScreen hidden unless phase==='start'. endScreen hidden unless 'end'. pauseScreen hidden unless G.paused.
+
+Call refreshUI() after transitions: setupHole, setupAttract, onSunk→banner? (inPlay stays true, no change), advanceHole/endGame, togglePause, menuBtn, startGame, playAgain. Also once initially.
+
+updateHUD separate for numbers.
+
+Edge: endGame sets phase 'end' → refreshUI hides hud ✓ shows end overlay.
+
+Now the audio ensure called on any keydown/pointerdown (top of handler) ✓ — satisfies "starts only after first input".
+
+Let me write spawnConfetti(x,y,n):
+```js
+const cols=['#ffd75e','#fff3c4','#7ee2a8','#e8543f','#f6f1e0'];
+for(i<n){ const a=rand(TAU), sp=rand(120,620); G.parts.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp-160,life:rand(.7,1.4),t:0,rot:rand(TAU),vr:rand(-9,9),s:rand(5,11),c:cols[irand(0,4)],grav:1,type:'conf'}); }
+```
+spawnDust(x,y,nx,ny,imp):
+```js
+const n=Math.min(8, 3+imp/250|0); for: a=atan2(ny,nx)+rand(-1,1); sp=rand(40,120+imp*.15); parts.push({type:'dust',x,y,vx:cos*sp,vy:sin*sp,life:rand(.3,.55),t:0,s:rand(3,7),c:'rgba(230,255,235,'});
+```
+Dust draw with alpha.
+
+updParts:
+```js
+for(let i=G.parts.length-1;i>=0;i--){ const p=G.parts[i]; p.t+=dt; if(p.t>p.life){G.parts.splice(i,1);continue;} p.x+=p.vx*dt;p.y+=p.vy*dt; if(p.grav)p.vy+=980*dt; p.vx*= (1-1.6*dt)? light drag for conf; p.rot+=p.vr*dt; }
+```
+
+Draw parts in world→screen: conf: save,translate,sx? use screen coords: const px=p.x*s+offX... rotate(p.rot); fillRect(-p.s*s/2,...) — sizes scale with s (world units) ✓. Alpha=1-p.t/p.life.
+
+Texts: addText(txt,x,y): G.texts.push({txt,x,y,t:0,life:1.1}).
+Draw: alpha=1-t/life; yOff=t*34; font size=Math.max(13,26*s); strokeStyle 'rgba(0,0,0,.5)' lineWidth 4 strokeText then fill '#ffd75e' (or cream). textAlign center.
+
+OK. Also add slight ball "squash" on wall hit? skip — enough juice.
+
+Final check of collision iteration order: substep h=1/240, max speed ~2050 → move 8.5u per step < BR ✓.
+
+Trail push only when moving in update (not per substep) ✓.
+
+Also during 'aim', ball should be exactly at rest; ensure zeroed on stop ✓.
+
+Now let me write the HTML/CSS/JS all out, carefully and completely. Also add `aria-hidden` sparingly? Keep minimal but include some aria-labels on buttons. Keep it reasonable.
+
+Let me also double-check keydown preventDefault list includes 'Enter'? Enter default is fine (button focus). We blur() on button click so Space/Enter won't retrigger. Add btn.blur() in handler.
+
+muteBtn inside hudbox needs pointer-events:auto (hud is none) ✓ via .mini{pointer-events:auto}.
+
+One subtle thing: canvas pointerdown fires even when clicking through an overlay? Overlay covers screen with its own div → pointer events go to overlay, not canvas ✓ (overlay has background so it captures). Start overlay covers full screen → attract input blocked (fine; Enter/click TEE OFF starts).
+
+Pause overlay covers → blocks canvas ✓.
+
+Banner/toast are pointer-events none ✓ so dragging continues through them? Banner phase can't aim anyway.
+
+Let me write the CSS for .mini:
+```css
+.mini{pointer-events:auto;cursor:pointer;font-family:var(--body);font-size:11px;letter-spacing:.08em;color:var(--mut);background:#0a2b20;border:2px solid var(--line);border-radius:999px;padding:4px 10px;margin-left:10px;transition:.15s}
+.mini:hover{color:var(--ink);border-color:#3c7a5d}
+```
+
+hudbox.right{display:flex;align-items:center}.
+
+Now the table CSS rowlbl th style.
+
+Let me write it all out. Also remember to include a small "HOLE 1 · PAR x" toast on startGame via setupHole ✓.
+
+Also initial page: setupAttract + refreshUI (start overlay visible, hud hidden) + fill bestLine.
+
+Potential pitfall: renderField uses G.view and dpr — ensure layout() sets view before renderField call; order inside layout: compute then bgC build then renderField ✓.
+
+dpr global `let DPR=1`.
+
+Canvas ctx: `const ctx=cv.getContext('2d')`.
+
+In render, use CSS pixel coordinates because transform set to DPR in layout (ctx.setTransform(DPR,0,0,DPR,0,0)) — but canvas.width changes on resize reset transform → re-set in layout ✓.
+
+bgC drawImage: bgC internal w*DPR; ctx.drawImage(bgC, 0,0,w,h) under DPR transform renders at correct size ✓ (scale down by DPR of source… drawImage scales source to dest rect w,h in current user space = w*DPR device px → 1:1 ✓).
+
+Light band gradient per frame: createRadialGradient(lx,ly,0,lx,ly,w*.55) colors rgba(140,230,170,.09)→transparent; fillRect entire. Second smaller warm one? One is enough + static bg glow.
+
+Vignette in bgC ✓.
+
+Stripe drawing:
+```js
+b.save(); b.translate(w/2,h/2); b.rotate(-.5); const sp=86; for(let x=-Math.hypot(w,h)/2;x<Math.hypot(w,h)/2;x+=sp){ b.fillStyle='rgba(255,255,255,.018)'; b.fillRect(x,-Math.hypot(w,h), 34, Math.hypot(w,h)*2);} b.restore();
+```
+
+Vignette:
+```js
+const vg=b.createRadialGradient(w/2,h*.45,Math.min(w,h)*.35,w/2,h/2,Math.hypot(w,h)*.62);
+vg.addColorStop(0,'rgba(0,0,0,0)');vg.addColorStop(1,'rgba(2,12,8,.6)'); b.fillStyle=vg; fillRect.
+```
+
+Base: fill '#07231b'; top glow radial at (w/2,-h*.25) r h*1.05 rgba(43,116,82,.5)→0.
+
+OK writing final answer now. Keep code organized with section comments. Also wrap everything in an IIFE and 'use strict'.
+
+Let me re-check the rayAABB normal logic once more:
+```js
+function rayAABB(px,py,dx,dy,r){
+ let tx1=-Infinity,tx2=Infinity;
+ if(Math.abs(dx)<1e-9){ if(px<r.x||px>r.x+r.w) return null; }
+ else{ tx1=(r.x-px)/dx; tx2=(r.x+r.w-px)/dx; if(tx1>tx2){const t=tx1;tx1=tx2;tx2=t;} }
+ let ty1=-Infinity,ty2=Infinity;
+ if(Math.abs(dy)<1e-9){ if(py<r.y||py>r.y+r.h) return null; }
+ else{ ty1=(r.y-py)/dy; ty2=(r.y+r.h-py)/dy; if(ty1>ty2){const t=ty1;ty1=ty2;ty2=t;} }
+ const tmin=Math.max(tx1,ty1), tmax=Math.min(tx2,ty2);
+ if(tmax<Math.max(tmin,0)) return null;
+ let t; if(tmin>1e-4) t=tmin; else if(tmax>1e-4) t=tmax; else return null;
+ let n; if(tx1>=ty1) n=[dx>0?-1:1,0]; else n=[0,dy>0?-1:1];
+ return {t,n}; }
+```
+When dx≈0, tx1=-Inf → ty1 wins ✓.
+
+tracePath loop uses bt===Infinity guard: initialize bt=Infinity; if none found and rem finite → push end, break ✓ (condition `if(bt>rem || !bn)` — careful: initial Infinity > rem true ✓).
+
+After bounce at a corner, direction might still point into wall (rare) — preview may look weird for 1 segment; acceptable.
+
+shotDist uses same A,B as physics: FA=520, FB=0.8 → x=(v-(FA/FB)*ln(1+FB*v/FA))/FB.
+
+Physics friction in stepBall uses same formula per dt ✓ consistent with preview length (preview .95x).
+
+CAPTURE_V=500; STOPV=30; REST=.75.
+
+Near-cup attraction only when sp<CAPTURE_V*1.05 to avoid pulling fast balls weirdly — but a 480 ball should also curl in ✓ (condition sp<525).
+
+Lip-out condition sp>CAPTURE_V+260 → >760 and d<r*1.5(=48) — cup r32 so zone is 48; ball passing center fast triggers one nudge with cooldown .35s ✓ plus text.
+
+Now DOM ids list: game, hud, holeNum, parVal, strokes, topar, muteBtn, scorecard, toast, banner, bannerMain, bannerSub, startScreen, bestLine, teeBtn, endScreen, ratingTitle, ratingSub, totalLine, newBest, scoreTable, againBtn, menuBtn, pauseScreen, resumeBtn, restartHoleBtn.
+
+Wire events at the end.
+
+Also add `#startScreen .hint` etc.
+
+Final: ensure no stray references; define everything before use inside IIFE (function declarations hoisted ✓).
+
+Also small detail: strokes element initial '0'.
+
+For mobile touch: big tap target TEE OFF ✓.
+
+Let me write it out. Length will be substantial (~700-800 lines) — that's fine for this scope.
+
+One more consideration on the "banner" CSS animation restart trick: remove 'show', force reflow with void offsetWidth, add 'show' ✓.
+
+Toast timer uses G.toastT; ensure defined 0 initially.
+
+In updateHUD bump param: if(bump && lastStroke!==G.strokes){strokesEl.classList.remove('bump');void strokesEl.offsetWidth;strokesEl.classList.add('bump');} lastStroke=G.strokes.
+
+Initialize lastStroke=-1.
+
+Also add class on topar change? skip.
+
+Pause during 'sinking': allowed; sinking update skipped while paused ✓ (update is gated).
+
+togglePause(force?):
+```js
+function togglePause(on){ const can=['aim','rolling','sinking'].includes(G.phase); if(!on) { if(!G.paused) return; } else if(!can) return; G.paused=on===undefined?!G.paused:on; refreshUI(); Snd.ui(); }
+```
+Simplify: function setPaused(p){ if(p&&!['aim','rolling','sinking'].includes(G.phase))return; G.paused=p; refreshUI(); }.
+
+Key P/Esc → setPaused(!G.paused). Resume btn → setPaused(false). RestartHole btn → setPaused(false); retryHole().
+
+visibilitychange: if(document.hidden) setPaused(true).
+
+OK, writing the final file now. Being careful with template literals inside HTML (fine), and '−' minus character use.
+
+Also make sure that `#hud.hidden{display:none}` works via .hidden{display:none!important} ✓.
+
+Chip row on very small screens: 9 chips * ~34px + gap ≈ 340px — fits in 360? With media query width 30 → 270+gaps≈310 ✓.
+
+Let me write the code.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Maze Golf</title>
+<style>
+:root{
+  --bg0:#06231a; --ink:#f6f1e0; --mut:#9dbfa9;
+  --gold:#ffd75e; --goldDk:#a8791b; --red:#e8543f;
+  --panel:#0c3326; --line:#2a5d47;
+  --disp:Impact,Haettenschweiler,'Franklin Gothic Bold','Arial Black',sans-serif;
+  --body:'Trebuchet MS','Segoe UI',Tahoma,Verdana,sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:var(--bg0);overscroll-behavior:none}
+body{font-family:var(--body);color:var(--ink)}
+#stage{position:fixed;inset:0}
+canvas#game{position:absolute;inset:0;display:block;touch-action:none;cursor:crosshair}
+.hidden{display:none!important}
+.kbd, kbd{background:#123c2c;border:1.5px solid #3c7a5d;border-bottom-width:3px;border-radius:5px;padding:1px 6px;font-family:var(--body);font-size:11px;color:var(--ink)}
+
+/* ---------- HUD ---------- */
+#hud{position:absolute;top:10px;left:12px;right:12px;display:flex;justify-content:space-between;align-items:stretch;gap:10px;pointer-events:none;z-index:5}
+.hudbox{background:rgba(8,40,29,.88);border:2px solid var(--line);border-radius:10px;padding:8px 14px;box-shadow:0 6px 18px rgba(0,0,0,.35)}
+.hudbox .lbl{display:block;font-size:10px;letter-spacing:.22em;color:var(--mut);margin-bottom:2px}
+.parpill{font-style:normal;color:#7ee2a8;margin-left:6px;letter-spacing:.14em}
+.hudbox .big{font-family:var(--disp);font-size:26px;letter-spacing:.05em;line-height:1.05;display:block}
+#strokeBox{text-align:center;min-width:118px;border-color:#3c7a5d}
+#strokes{display:block;font-family:var(--disp);font-size:42px;line-height:1;color:var(--gold)}
+#strokes.bump{animation:bump .3s ease}
+@keyframes bump{40%{transform:scale(1.35)}}
+.hudbox.right{display:flex;align-items:center}
+.val.good{color:#7ee2a8}.val.bad{color:#ff9b8a}
+.mini{pointer-events:auto;cursor:pointer;font-family:var(--body);font-size:11px;letter-spacing:.08em;color:var(--mut);background:#0a2b20;border:2px solid var(--line);border-radius:999px;padding:5px 11px;margin-left:12px;transition:.15s}
+.mini:hover{color:var(--ink);border-color:#3c7a5d}
+
+/* ---------- scorecard chips ---------- */
+#scorecard{position:absolute;bottom:10px;left:0;right:0;display:flex;justify-content:center;gap:6px;z-index:5;pointer-events:none}
+.chip{width:38px;background:rgba(8,40,29,.88);border:2px solid var(--line);border-radius:8px;text-align:center;padding:4px 0 5px;color:var(--mut);transition:.2s}
+.chip .ci{display:block;font-size:9px;letter-spacing:.1em}
+.chip .cv{display:block;font-family:var(--disp);font-size:16px;line-height:1.15}
+.chip.cur{border-color:var(--gold);color:var(--ink);animation:pulse 1.4s infinite}
+@keyframes pulse{50%{box-shadow:0 0 0 5px rgba(255,215,94,.18)}}
+.chip.done{background:#123f2e;color:var(--ink)}
+.chip.win .cv{color:#7ee2a8}.chip.lose .cv{color:#ff9b8a}
+
+/* ---------- toast + banner ---------- */
+#toast{position:absolute;top:96px;left:50%;transform:translate(-50%,-10px);opacity:0;transition:.35s;z-index:7;pointer-events:none;background:rgba(8,40,29,.92);border:2px solid var(--gold);color:var(--ink);padding:8px 20px;border-radius:999px;font-family:var(--disp);letter-spacing:.12em;font-size:16px;white-space:nowrap}
+#toast.show{opacity:1;transform:translate(-50%,0)}
+#banner{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:8;pointer-events:none;opacity:0}
+#banner.show{animation:ban 1.7s ease forwards}
+@keyframes ban{0%{opacity:0;transform:scale(.7) rotate(-3deg)}12%{opacity:1;transform:scale(1.06) rotate(1deg)}22%{transform:scale(1) rotate(0)}80%{opacity:1}100%{opacity:0;transform:translateY(-14px)}}
+#bannerMain{font-family:var(--disp);font-size:clamp(38px,8vw,72px);letter-spacing:.06em;color:var(--gold);text-shadow:0 3px 0 rgba(0,0,0,.45),0 0 34px rgba(255,215,94,.28)}
+#bannerMain.good{color:#7ee2a8;text-shadow:0 3px 0 rgba(0,0,0,.45),0 0 34px rgba(126,226,168,.3)}
+#bannerMain.bad{color:#ff9b8a;text-shadow:0 3px 0 rgba(0,0,0,.45),0 0 34px rgba(255,155,138,.25)}
+#bannerSub{font-size:14px;letter-spacing:.3em;color:var(--ink);text-transform:uppercase;margin-top:8px;text-shadow:0 2px 4px rgba(0,0,0,.6)}
+
+/* ---------- overlays ---------- */
+.overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:10;background:radial-gradient(ellipse at center,rgba(4,26,18,.35),rgba(3,18,12,.8));overflow:auto;padding:16px}
+.card{background:var(--panel);border:3px solid var(--gold);border-radius:14px;box-shadow:0 18px 0 rgba(0,0,0,.28),0 30px 60px rgba(0,0,0,.5);padding:26px 30px;width:min(560px,94vw);text-align:center;animation:cardIn .5s cubic-bezier(.2,1.4,.4,1)}
+@keyframes cardIn{from{opacity:0;transform:translateY(26px) scale(.93)}}
+.card.small{width:min(400px,94vw)}
+.kicker{font-size:11px;letter-spacing:.4em;color:var(--gold);margin-bottom:10px}
+.title{font-family:var(--disp);font-size:clamp(44px,9vw,72px);letter-spacing:.03em;line-height:.95;color:var(--ink)}
+.title em{font-style:normal;color:var(--gold);animation:glow 2.6s ease-in-out infinite}
+@keyframes glow{50%{text-shadow:0 0 22px rgba(255,215,94,.55)}}
+.title.mid{font-size:clamp(34px,7vw,52px)}
+.tagline{margin:12px auto 4px;max-width:40ch;color:var(--mut);font-size:14.5px;line-height:1.5}
+.iconrow{display:flex;justify-content:center;margin-bottom:6px}
+.ctrls{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0 6px;text-align:left}
+@media (max-width:520px){.ctrls{grid-template-columns:1fr}}
+.ctrlbox{background:#0a2b20;border:2px solid var(--line);border-radius:10px;padding:11px 13px;font-size:12.5px;color:var(--mut);line-height:1.75}
+.ctrlbox b{display:block;color:var(--ink);font-family:var(--disp);letter-spacing:.18em;font-size:12px;margin-bottom:6px;font-weight:normal}
+.best{margin-top:14px;font-family:var(--disp);letter-spacing:.14em;font-size:14px;color:#7ee2a8}
+.btn{pointer-events:auto;cursor:pointer;font-family:var(--disp);letter-spacing:.12em;font-size:18px;background:var(--gold);color:#14301f;border:none;border-radius:10px;padding:13px 32px;margin-top:16px;box-shadow:0 6px 0 var(--goldDk),0 12px 18px rgba(0,0,0,.35);transition:transform .08s,box-shadow .08s,filter .15s}
+.btn:hover{filter:brightness(1.08) saturate(1.05)}
+.btn:active{transform:translateY(4px);box-shadow:0 2px 0 var(--goldDk)}
+.btn.ghost{background:#123c2c;color:var(--ink);box-shadow:0 6px 0 #06231a;border:2px solid var(--line)}
+.hint{margin-top:14px;font-size:10.5px;letter-spacing:.28em;color:var(--mut)}
+.sub{color:var(--mut);font-size:14px;margin-top:8px;line-height:1.5}
+.totalline{font-family:var(--disp);letter-spacing:.1em;font-size:20px;margin-top:14px}
+.totalline b{font-size:26px}
+.bestbadge{display:inline-block;margin-top:12px;background:var(--red);color:#fff;font-family:var(--disp);letter-spacing:.14em;font-size:13px;padding:6px 16px;border-radius:999px;animation:bump .5s ease}
+table.score{border-collapse:collapse;margin:16px auto 4px;font-size:13px}
+table.score th,table.score td{width:38px;text-align:center;padding:4px 2px;border-bottom:2px solid var(--line)}
+table.score thead th{font-family:var(--disp);letter-spacing:.05em;color:var(--mut);font-weight:normal;font-size:12px}
+table.score .rowlbl{text-align:right;padding-right:8px;color:var(--mut);width:auto!important;letter-spacing:.1em;font-size:11px}
+td.good{color:#7ee2a8}td.lose{color:#ff9b8a}td.total{border-left:2px solid var(--gold);font-family:var(--disp);font-size:15px}
+
+@media (max-width:560px){
+  .hudbox{padding:6px 9px}.hudbox .big{font-size:18px}#strokes{font-size:32px}
+  #strokeBox{min-width:92px}.chip{width:30px}.mini{margin-left:7px;padding:4px 8px}
+  #toast{top:78px;font-size:13px}
+}
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="game"></canvas>
+
+  <header id="hud" class="hidden">
+    <div class="hudbox"><span class="lbl">HOLE</span><span class="big" id="holeNum">1 / 9</span></div>
+    <div class="hudbox" id="strokeBox"><span class="lbl">STROKES<span class="parpill" id="parVal">PAR 5</span></span><span id="strokes">0</span></div>
+    <div class="hudbox right"><span style="align-self:flex-end"><span class="lbl">TO PAR</span><span class="big val" id="topar">E</span></span><button id="muteBtn" class="mini" aria-label="toggle sound">♪ ON</button></div>
+  </header>
+
+  <div id="scorecard" class="hidden"></div>
+  <div id="toast"></div>
+  <div id="banner"><div id="bannerMain"></div><div id="bannerSub"></div></div>
+
+  <section id="startScreen" class="overlay">
+    <div class="card">
+      <div class="iconrow">
+        <svg width="74" height="74" viewBox="0 0 72 72" aria-hidden="true">
+          <circle cx="36" cy="38" r="30" fill="#1d6a48"/><circle cx="36" cy="38" r="30" fill="none" stroke="#f2e9cf" stroke-width="3"/>
+          <line x1="36" y1="38" x2="36" y2="10" stroke="#f2e9cf" stroke-width="3"/><path d="M36 10 L55 16.5 L36 23 Z" fill="#e8543f"/>
+          <ellipse cx="27" cy="52" rx="6.5" ry="2.6" fill="rgba(0,0,0,.3)"/><circle cx="27" cy="45" r="6.2" fill="#fff"/>
+        </svg>
+      </div>
+      <p class="kicker">A PUTTING PUZZLE IN NINE MAZES</p>
+      <h1 class="title">MAZE <em>GOLF</em></h1>
+      <p class="tagline">Every hole is a fresh labyrinth. Read the walls, set your line, and sink it in as few putts as you can.</p>
+      <div class="ctrls">
+        <div class="ctrlbox"><b>PUTTER · MOUSE / TOUCH</b>Press &amp; drag anywhere — the arrow aims toward your finger, pull farther for more power, release to putt. A dotted line previews up to two bounces.</div>
+        <div class="ctrlbox"><b>KEYS</b><kbd>←</kbd><kbd>→</kbd> aim &nbsp;·&nbsp; <kbd>↑</kbd><kbd>↓</kbd> power<br><kbd>Space</kbd> putt &nbsp;·&nbsp; <kbd>R</kbd> reset hole<br><kbd>P</kbd> pause &nbsp;·&nbsp; <kbd>M</kbd> sound &nbsp;·&nbsp; hold <kbd>Shift</kbd> for fine aim</div>
+      </div>
+      <p id="bestLine" class="best hidden"></p>
+      <button id="teeBtn" class="btn">TEE OFF</button>
+      <p class="hint">OR PRESS ENTER</p>
+    </div>
+  </section>
+
+  <section id="endScreen" class="overlay hidden">
+    <div class="card">
+      <p class="kicker">ROUND COMPLETE</p>
+      <h2 id="ratingTitle" class="title mid"></h2>
+      <p id="ratingSub" class="sub"></p>
+      <p id="totalLine" class="totalline"></p>
+      <div><span id="newBest" class="bestbadge hidden">★ NEW COURSE RECORD</span></div>
+      <table class="score" id="scoreTable"></table>
+      <button id="againBtn" class="btn">PLAY AGAIN</button>
+      <button id="menuBtn" class="btn ghost">MENU</button>
+      <p class="hint">ENTER TO PLAY AGAIN</p>
+    </div>
+  </section>
+
+  <section id="pauseScreen" class="overlay hidden">
+    <div class="card small">
+      <h2 class="title mid">PAUSED</h2>
+      <button id="resumeBtn" class="btn">RESUME</button>
+      <button id="restartHoleBtn" class="btn ghost">RESET HOLE</button>
+      <p class="hint">P OR ESC TO RESUME</p>
+    </div>
+  </section>
+</div>
+
+<script>
+(()=>{'use strict';
+/* ================= utils ================= */
+const TAU=Math.PI*2;
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+const rand=(a=1,b)=>b===undefined?Math.random()*a:a+Math.random()*(b-a);
+const irand=(a,b)=>a+Math.floor(Math.random()*(b-a+1));
+function mulberry(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function rr(c,x,y,w,h,r){r=Math.min(r,w/2,h/2);c.beginPath();c.moveTo(x+r,y);c.arcTo(x+w,y,x+w,y+h,r);c.arcTo(x+w,y+h,x,y+h,r);c.arcTo(x,y+h,x,y,r);c.arcTo(x,y,x+w,y,r);c.closePath();}
+const $=id=>document.getElementById(id);
+
+/* ================= audio ================= */
+const Snd={ctx:null,gain:null,muted:false,
+ ensure(){ if(this.ctx){if(this.ctx.state==='suspended')this.ctx.resume();return;}
+  const AC=window.AudioContext||window.webkitAudioContext; if(!AC)return;
+  this.ctx=new AC(); this.gain=this.ctx.createGain(); this.gain.gain.value=.45; this.gain.connect(this.ctx.destination);},
+ tone(f,dur,type,vol,slide,delay){ if(!this.ctx||this.muted)return; type=type||'sine'; vol=vol===undefined?.3:vol; slide=slide||0; delay=delay||0;
+  const t0=this.ctx.currentTime+delay,o=this.ctx.createOscillator(),g=this.ctx.createGain();
+  o.type=type;o.frequency.setValueAtTime(f,t0);
+  if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(30,f+slide),t0+dur);
+  g.gain.setValueAtTime(vol,t0);g.gain.exponentialRampToValueAtTime(.0001,t0+dur);
+  o.connect(g);g.connect(this.gain);o.start(t0);o.stop(t0+dur+.03);},
+ noise(dur,vol,freq,delay){ if(!this.ctx||this.muted)return; delay=delay||0;
+  const t0=this.ctx.currentTime+delay,n=Math.max(1,(this.ctx.sampleRate*dur)|0),buf=this.ctx.createBuffer(1,n,this.ctx.sampleRate),d=buf.getChannelData(0);
+  for(let i=0;i<n;i++)d[i]=(Math.random()*2-1)*(1-i/n);
+  const src=this.ctx.createBufferSource();src.buffer=buf;
+  const f=this.ctx.createBiquadFilter();f.type='lowpass';f.frequency.value=freq;
+  const g=this.ctx.createGain();g.gain.value=vol;
+  src.connect(f);f.connect(g);g.connect(this.gain);src.start(t0);},
+ putt(p){this.tone(120+p*95,.1,'sine',.5);this.noise(.07,.22+p*.35,1200);},
+ tick(v){v=clamp(v,0,1);this.tone(480+rand(320),.03,'square',.04+.2*v);this.noise(.03,.12*v,3200);},
+ sink(){this.tone(90,.2,'sine',.6,-40);[660,880,1320].forEach((f,i)=>this.tone(f,.18,'triangle',.24,0,.07+i*.09));},
+ lip(){this.tone(430,.12,'sawtooth',.15,-190);},
+ ui(){this.tone(440,.06,'triangle',.18);},
+ deny(){this.tone(160,.12,'square',.1,-40);},
+ fanfare(){[523,659,784,1046].forEach((f,i)=>this.tone(f,.22,'triangle',.2,0,i*.12));this.tone(1568,.5,'triangle',.14,0,.5);}
+};
+
+/* ================= dom refs ================= */
+const cv=$('game'),ctx=cv.getContext('2d');
+const hudEl=$('hud'),chipsEl=$('scorecard'),toastEl=$('toast'),bannerEl=$('banner'),
+ bannerMain=$('bannerMain'),bannerSub=$('bannerSub'),startEl=$('startScreen'),endEl=$('endScreen'),pauseEl=$('pauseScreen'),
+ holeNum=$('holeNum'),parVal=$('parVal'),strokesEl=$('strokes'),toparEl=$('topar'),muteBtn=$('muteBtn'),
+ bestLine=$('bestLine'),ratingTitle=$('ratingTitle'),ratingSub=$('ratingSub'),totalLine=$('totalLine'),newBest=$('newBest'),scoreTable=$('scoreTable');
+
+/* ================= constants ================= */
+const CS=100,WT=16,BR=26;
+const FA=520,FB=.8,REST=.75,STOPV=30,CAPTURE_V=500;
+const DIRS=[[0,-1,0,2],[1,0,1,3],[0,1,2,0],[-1,0,3,1]];
+const HOLES=[{c:5,r:5},{c:7,r:5},{c:7,r:7},{c:9,r:6},{c:9,r:8},{c:11,r:7},{c:11,r:9},{c:13,r:9},{c:13,r:11}];
+const BESTKEY='mazeGolfBest',MUTEKEY='mazeGolfMute';
+
+/* ================= state ================= */
+let DPR=1;
+const G={phase:'start',paused:false,holeIndex:0,strokes:0,results:[],pars:[],par:4,
+ maze:null,cup:{x:0,y:0,r:32},tee:{x:0,y:0},ball:{x:0,y:0,vx:0,vy:0},
+ aim:{ang:0,power:.5},dragging:false,dragPrev:null,
+ view:{scale:1,offX:0,offY:0,pad:34},time:0,shake:0,flash:0,lastTick:0,
+ trail:[],parts:[],texts:[],flagDown:0,sinkT:0,sinkDone:false,sinkFrom:{x:0,y:0},
+ bannerTimer:0,toastT:0,rollT:0,acc:0,aiT:1,maxShot:1400,attract:false,showNum:true};
+const bgC=document.createElement('canvas'),fieldC=document.createElement('canvas');
+let chips=[],lastStroke=-1;
+
+/* ================= persistence ================= */
+function loadBest(){try{const v=localStorage.getItem(BESTKEY);return v===null?null:parseInt(v,10);}catch(e){return null;}}
+function saveBest(d){try{localStorage.setItem(BESTKEY,String(d));}catch(e){}}
+function loadMute(){try{return localStorage.getItem(MUTEKEY)==='1';}catch(e){return false;}}
+function saveMute(){try{localStorage.setItem(MUTEKEY,Snd.muted?'1':'0');}catch(e){}}
+
+/* ================= maze gen ================= */
+function genMaze(c,r){
+ const cells=[];for(let i=0;i<c*r;i++)cells.push({x:i%c,y:(i/c)|0,w:[true,true,true,true],v:false});
+ const I=(x,y)=>y*c+x;
+ let si=irand(0,c*r-1);cells[si].v=true;const st=[si];
+ while(st.length){const cur=cells[st[st.length-1]];const opts=[];
+  for(const d of DIRS){const nx=cur.x+d[0],ny=cur.y+d[1];if(nx<0||ny<0||nx>=c||ny>=r)continue;if(cells[I(nx,ny)].v)continue;opts.push(d);}
+  if(opts.length){const d=opts[irand(0,opts.length-1)];const n=cells[I(cur.x+d[0],cur.y+d[1])];
+   cur.w[d[2]]=false;n.w[d[3]]=false;n.v=true;st.push(I(cur.x+d[0],cur.y+d[1]));}else st.pop();}
+ const W=c*CS,H=r*CS,walls=[];
+ for(let y=0;y<r;y++)for(let x=0;x<c;x++){const cl=cells[I(x,y)];
+  if(cl.w[1]&&x<c-1)walls.push({x:(x+1)*CS-WT/2,y:y*CS,w:WT,h:CS});
+  if(cl.w[3]&&y<r-1)walls.push({x:x*CS,y:(y+1)*CS-WT/2,w:CS,h:WT});}
+ walls.push({x:-WT/2,y:-WT/2,w:c*CS+WT,h:WT},{x:-WT/2,y:H-WT/2,w:c*CS+WT,h:WT},
+            {x:-WT/2,y:-WT/2,w:WT,h:H+WT},{x:c*CS-WT/2,y:-WT/2,w:WT,h:H+WT});
+ return{c,r,cells,walls,W,H};
+}
+function bfs(m,sx,sy){
+ const dist=new Int16Array(m.c*m.r).fill(-1),q=[[sx,sy]];dist[sy*m.c+sx]=0;let far=[sx,sy],fd=0;
+ while(q.length){const p=q.shift(),x=p[0],y=p[1],d0=dist[y*m.c+x];
+  if(d0>fd){fd=d0;far=[x,y];}
+  for(const d of DIRS){if(m.cells[y*m.c+x].w[d[2]])continue;const nx=x+d[0],ny=y+d[1];
+   if(nx<0||ny<0||nx>=m.c||ny>=m.r)continue;const i=ny*m.c+nx;if(dist[i]<0){dist[i]=d0+1;q.push([nx,ny]);}}}
+ return{far,dist};
+}
+
+/* ================= layout / prerender ================= */
+function layout(){
+ const w=innerWidth,h=innerHeight;DPR=Math.min(2.5,window.devicePixelRatio||1);
+ cv.width=w*DPR;cv.height=h*DPR;cv.style.width=w+'px';cv.style.height=h+'px';
+ ctx.setTransform(DPR,0,0,DPR,0,0);
+ const m=G.maze,topH=innerWidth<560?74:92,botH=innerWidth<560?56:66,pad=34;
+ const availW=w-24,availH=Math.max(180,h-topH-botH-10);
+ const scale=Math.min(availW/(m.W+pad*2),availH/(m.H+pad*2));
+ G.view={scale,offX:(w-m.W*scale)/2,offY:topH+(availH-m.H*scale)/2,pad};
+ buildBg(w,h);renderField();
+}
+function buildBg(w,h){
+ bgC.width=w*DPR;bgC.height=h*DPR;const b=bgC.getContext('2d');b.setTransform(DPR,0,0,DPR,0,0);
+ b.fillStyle='#07231b';b.fillRect(0,0,w,h);
+ let g=b.createRadialGradient(w/2,-h*.25,0,w/2,-h*.25,h*1.1);
+ g.addColorStop(0,'rgba(43,116,82,.5)');g.addColorStop(1,'rgba(43,116,82,0)');b.fillStyle=g;b.fillRect(0,0,w,h);
+ const D=Math.hypot(w,h);
+ b.save();b.translate(w/2,h/2);b.rotate(-.5);b.fillStyle='rgba(255,255,255,.018)';
+ for(let x=-D;x<D;x+=86)b.fillRect(x,-D,34,D*2);b.restore();
+ g=b.createRadialGradient(w/2,h*.45,Math.min(w,h)*.35,w/2,h/2,D*.62);
+ g.addColorStop(0,'rgba(0,0,0,0)');g.addColorStop(1,'rgba(2,12,8,.6)');b.fillStyle=g;b.fillRect(0,0,w,h);
+}
+function renderField(){
+ const m=G.maze,v=G.view,pad=v.pad,s=v.scale;
+ fieldC.width=Math.max(1,((m.W+pad*2)*s*DPR)|0);fieldC.height=Math.max(1,((m.H+pad*2)*s*DPR)|0);
+ const c=fieldC.getContext('2d');c.setTransform(s*DPR,0,0,s*DPR,0,0);c.translate(-pad,-pad);
+ c.fillStyle='#154e37';rr(c,-pad,-pad,m.W+pad*2,m.H+pad*2,18);c.fill();
+ const rnd=mulberry(1234+G.holeIndex*97+m.c*13+m.r*29);
+ for(let y=0;y<m.r;y++)for(let x=0;x<m.c;x++){
+  c.fillStyle=(x+y)%2?'#1a6142':'#1d6a48';c.fillRect(x*CS,y*CS,CS,CS);
+  for(let k=0;k<7;k++){c.fillStyle=rnd()<.5?'rgba(255,255,255,.05)':'rgba(0,0,0,.06)';
+   c.fillRect(x*CS+8+rnd()*(CS-14),y*CS+8+rnd()*(CS-14),3.5,3.5);}}
+ if(G.showNum){c.fillStyle='rgba(246,241,224,.07)';c.font='900 92px Impact,"Arial Black",sans-serif';
+  c.textAlign='left';c.textBaseline='alphabetic';c.fillText(String(G.holeIndex+1),10,96);}
+ // tee marker
+ c.strokeStyle='rgba(246,241,224,.5)';c.lineWidth=3;c.beginPath();c.arc(G.tee.x,G.tee.y,13,0,TAU);c.stroke();
+ c.fillStyle='rgba(246,241,224,.35)';c.beginPath();c.arc(G.tee.x,G.tee.y,4,0,TAU);c.fill();
+ // cup
+ const cp=G.cup;
+ let cg=c.createRadialGradient(cp.x,cp.y,2,cp.x,cp.y,cp.r);
+ cg.addColorStop(0,'#05130d');cg.addColorStop(.75,'#0a2018');cg.addColorStop(1,'#123629');
+ c.fillStyle=cg;c.beginPath();c.arc(cp.x,cp.y,cp.r,0,TAU);c.fill();
+ c.strokeStyle='rgba(255,215,94,.85)';c.lineWidth=3.5;c.beginPath();c.arc(cp.x,cp.y,cp.r,0,TAU);c.stroke();
+ // walls: shadow pass then body pass
+ c.fillStyle='rgba(0,0,0,.3)';
+ for(const w of m.walls){rr(c,w.x+4,w.y+6,w.w,w.h,5);c.fill();}
+ for(const w of m.walls){
+  c.fillStyle='#f2e9cf';rr(c,w.x,w.y,w.w,w.h,5);c.fill();
+  const vert=w.h>=w.w;
+  c.fillStyle='rgba(160,140,95,.5)';
+  if(vert){c.fillRect(w.x+w.w-3,w.y+2,3,w.h-4);c.fillRect(w.x+2,w.y+w.h-3,w.w-4,3);}
+  else{c.fillRect(w.x+2,w.y+w.h-3,w.w-4,3);c.fillRect(w.x+w.w-3,w.y+2,3,w.h-4);}
+  c.fillStyle='rgba(255,255,255,.55)';
+  if(vert)c.fillRect(w.x,w.y+2,3,w.h-4);else c.fillRect(w.x+2,w.y,w.w-4,3);}
+}
+
+/* ================= hole setup ================= */
+function setupHole(i){
+ const s=HOLES[i];G.maze=genMaze(s.c,s.r);const m=G.maze;
+ const cx=irand(0,m.c-1),cy=irand(0,m.r-1);
+ const {far,dist}=bfs(m,cx,cy);const d=dist[far[1]*m.c+far[0]];
+ G.holeIndex=i;G.par=Math.min(9,Math.max(3,2+Math.ceil(d/4)));G.pars[i]=G.par;
+ G.cup={x:(cx+.5)*CS,y:(cy+.5)*CS,r:32};
+ G.tee={x:(far[0]+.5)*CS,y:(far[1]+.5)*CS};
+ G.ball={x:G.tee.x,y:G.tee.y,vx:0,vy:0};
+ G.strokes=0;G.trail=[];G.parts=[];G.texts=[];G.flagDown=0;G.sinkT=0;G.sinkDone=false;G.attract=false;
+ G.maxShot=Math.min(2050,700+(m.c+m.r)*55);
+ G.aim={ang:Math.atan2(G.cup.y-G.ball.y,G.cup.x-G.ball.x),power:.5};
+ G.showNum=true;layout();G.phase='aim';refreshUI();updateHUD(true);
+ toast('HOLE '+(i+1)+' · PAR '+G.par,1600);
+}
+function setupAttract(){
+ const s=HOLES[irand(0,4)];G.maze=genMaze(s.c,s.r);const m=G.maze;
+ const cx=irand(0,m.c-1),cy=irand(0,m.r-1);const {far}=bfs(m,cx,cy);
+ G.cup={x:(cx+.5)*CS,y:(cy+.5)*CS,r:32};G.tee={x:(far[0]+.5)*CS,y:(far[1]+.5)*CS};
+ G.ball={x:G.tee.x,y:G.tee.y,vx:0,vy:0};
+ G.trail=[];G.parts=[];G.texts=[];G.flagDown=0;G.sinkT=0;G.sinkDone=false;G.attract=true;
+ G.maxShot=Math.min(2050,700+(m.c+m.r)*55);
+ G.aim={ang:Math.atan2(G.cup.y-G.ball.y,G.cup.x-G.ball.x),power:.6};
+ G.aiT=rand(.8,1.6);G.showNum=false;layout();G.phase='start';refreshUI();
+}
+
+/* ================= physics ================= */
+function collideWall(w){
+ const b=G.ball,cx=clamp(b.x,w.x,w.x+w.w),cy=clamp(b.y,w.y,w.y+w.h);
+ let dx=b.x-cx,dy=b.y-cy;const d2=dx*dx+dy*dy;if(d2>=BR*BR)return;
+ let nx,ny,pen;
+ if(d2>1e-9){const d=Math.sqrt(d2);nx=dx/d;ny=dy/d;pen=BR-d;}
+ else{const l=b.x-w.x,r=w.x+w.w-b.x,tp=b.y-w.y,bt=w.y+w.h-b.y,mn=Math.min(l,r,tp,bt);
+  if(mn===l){nx=-1;ny=0;pen=l+BR;}else if(mn===r){nx=1;ny=0;pen=r+BR;}
+  else if(mn===tp){nx=0;ny=-1;pen=tp+BR;}else{nx=0;ny=1;pen=bt+BR;}}
+ b.x+=nx*pen;b.y+=ny*pen;
+ const vn=b.vx*nx+b.vy*ny;
+ if(vn<0){b.vx-=(1+REST)*vn*nx;b.vy-=(1+REST)*vn*ny;const imp=-vn;
+  if(imp>90&&G.time-G.lastTick>.035){Snd.tick(imp/G.maxShot);G.lastTick=G.time;}
+  if(imp>620){G.shake=Math.min(13,G.shake+imp*.012);spawnDust(cx,cy,nx,ny,imp);}}}
+function stepBall(dt){
+ const b=G.ball;b.x+=b.vx*dt;b.y+=b.vy*dt;
+ for(const w of G.maze.walls)collideWall(w);
+ if(G.phase!=='rolling'&&G.phase!=='start')return;
+ const c=G.cup,dx=c.x-b.x,dy=c.y-b.y,d=Math.hypot(dx,dy)||1e-6;
+ let sp=Math.hypot(b.vx,b.vy);
+ if(d<c.r+46&&sp<CAPTURE_V*1.05&&sp>0){const pull=300*(1-d/(c.r+46));b.vx+=dx/d*pull*dt;b.vy+=dy/d*pull*dt;sp=Math.hypot(b.vx,b.vy);}
+ if(d<c.r-8&&sp<CAPTURE_V){startSink();return;}
+ if(d<c.r*1.5&&sp>CAPTURE_V+260&&G.time>G.lipCd){G.lipCd=G.time+.35;
+  const sgn=Math.random()<.5?-1:1,tx=-dy/d*sgn,ty=dx/d*sgn;
+  b.vx+=tx*140;b.vy+=ty*140;Snd.lip();addText('LIP!',c.x,c.y-64);}
+ if(sp>0){const dec=(FA+FB*sp)*dt;
+  if(dec>=sp){b.vx=0;b.vy=0;}else{const k=1-dec/sp;b.vx*=k;b.vy*=k;}}
+}
+function shotDist(p){const v=p*G.maxShot;if(v<5)return 0;return(v-(FA/FB)*Math.log(1+FB*v/FA))/FB;}
+
+/* ================= shooting / sinking ================= */
+function fireShot(){
+ const p=G.aim.power;if(p<.05)return;
+ if(G.phase!=='start')G.strokes++;
+ const v=p*G.maxShot;bvxSet(v);
+ G.trail=[];G.acc=0;Snd.putt(p);
+ if(G.phase!=='start'){G.phase='rolling';G.rollT=0;}
+ updateHUD(true);
+}
+function bvxSet(v){G.ball.vx=Math.cos(G.aim.ang)*v;G.ball.vy=Math.sin(G.aim.ang)*v;}
+function startSink(){
+ const b=G.ball;G.attract=(G.phase==='start');
+ G.sinkFrom={x:b.x,y:b.y};G.sinkT=0;G.sinkDone=false;b.vx=0;b.vy=0;
+ G.phase='sinking';Snd.sink();G.flash=.55;G.trail=[];
+ spawnConfetti(G.cup.x,G.cup.y,(!G.attract&&G.strokes===1)?72:38);
+ if(!G.attract&&G.strokes===1)Snd.fanfare();
+}
+function onSunk(){
+ if(G.attract){setupAttract();return;}
+ const i=G.holeIndex,s=G.strokes,p=G.pars[i];G.results[i]=s;
+ const word=scoreWord(s,p),d=s-p,cls=d<0||s===1?'good':(d>0?'bad':'');
+ showBanner(word,'HOLE '+(i+1)+' · PAR '+p,cls);
+ G.phase='banner';G.bannerTimer=1.8;updateHUD();
+}
+function advanceHole(){
+ if(G.holeIndex+1>=HOLES.length)endGame();else setupHole(G.holeIndex+1);
+}
+function scoreWord(s,p){if(s===1)return'HOLE-IN-ONE!';const d=s-p;
+ if(d<=-3)return'ALBATROSS!';if(d===-2)return'EAGLE!';if(d===-1)return'BIRDIE!';
+ if(d===0)return'PAR';if(d===1)return'BOGEY';if(d===2)return'DOUBLE BOGEY';return'+'+d;}
+const fmtDiff=d=>d===0?'E':(d>0?'+':'−')+Math.abs(d);
+
+/* ================= particles / texts ================= */
+function spawnConfetti(x,y,n){
+ const cols=['#ffd75e','#fff3c4','#7ee2a8','#e8543f','#f6f1e0'];
+ for(let i=0;i<n;i++){const a=rand(TAU),sp=rand(120,640);
+  G.parts.push({type:'conf',x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp-170,life:rand(.7,1.4),t:0,rot:rand(TAU),vr:rand(-9,9),s:rand(5,11),c:cols[irand(0,4)],grav:1});}}
+function spawnDust(x,y,nx,ny,imp){
+ const n=Math.min(8,3+((imp/260)|0));
+ for(let i=0;i<n;i++){const a=Math.atan2(ny,nx)+rand(-1.1,1.1),sp=rand(40,110+imp*.15);
+  G.parts.push({type:'dust',x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:rand(.3,.55),t:0,s:rand(3,7)});}}
+function addText(txt,x,y){G.texts.push({txt,x,y,t:0,life:1.1});}
+
+/* ================= update ================= */
+let G_lipCd=0;Object.defineProperty(G,'lipCd',{get(){return G_lipCd;},set(v){G_lipCd=v;}});
+function update(dt){
+ G.shake*=Math.exp(-7*dt);if(G.shake<.1)G.shake=0;
+ G.flash=Math.max(0,G.flash-3*dt);
+ if(G.toastT>0){G.toastT-=dt;if(G.toastT<=0)toastEl.classList.remove('show');}
+ // particles
+ for(let i=G.parts.length-1;i>=0;i--){const p=G.parts[i];p.t+=dt;
+  if(p.t>p.life){G.parts.splice(i,1);continue;}
+  p.x+=p.vx*dt;p.y+=p.vy*dt;if(p.grav)p.vy+=980*dt;p.vx*=(1-1.4*dt);p.rot+=p.vr*dt;}
+ for(let i=G.texts.length-1;i>=0;i--){const t=G.texts[i];t.t+=dt;if(t.t>t.life)G.texts.splice(i,1);}
+ const b=G.ball,moving=Math.abs(b.vx)>1||Math.abs(b.vy)>1;
+ if(G.phase==='rolling'||G.phase==='start'){
+  if(moving){
+   G.rollT+=dt;G.acc+=dt;const h=1/240;let n=0;
+   while(G.acc>=h&&n++<30&&(G.phase==='rolling'||G.phase==='start')){stepBall(h);G.acc-=h;}
+   if(moving&&Math.hypot(b.vx,b.vy)>80){G.trail.push({x:b.x,y:b.y});if(G.trail.length>22)G.trail.shift();}
+  }else{
+   if(G.phase==='start'){G.aiT-=dt;if(G.aiT<=0){
+     G.aim={ang:Math.atan2(G.cup.y-b.y,G.cup.x-b.x)+rand(-.45,.45),power:rand(.5,.95)};fireShot();}}
+   else{G.phase='aim';refreshUI();}
+  }
+  if(G.rollT>12){b.vx=0;b.vy=0;}
+ }else if(G.phase==='sinking'){
+  G.sinkT+=dt/.55;const t=Math.min(1,G.sinkT),e=t*t,sp2=G.sinkT*9;
+  b.x=lerp(G.sinkFrom.x,G.cup.x,e)+Math.cos(sp2)*(1-e)*30;
+  b.y=lerp(G.sinkFrom.y,G.cup.y,e)+Math.sin(sp2)*(1-e)*30;
+  G.flagDown=Math.min(1,G.flagDown+dt*2.2);
+  if(t>=1&&!G.sinkDone){G.sinkDone=true;onSunk();}
+ }else if(G.phase==='banner'){
+  G.bannerTimer-=dt;if(G.bannerTimer<=0){bannerEl.classList.remove('show');advanceHole();}
+ }
+}
+
+/* ================= render ================= */
+function render(){
+ const w=innerWidth,h=innerHeight,v=G.view,s=v.scale,m=G.maze;
+ ctx.drawImage(bgC,0,0,w,h);
+ const lx=w*(.5+.28*Math.sin(G.time*.13));
+ let g=ctx.createRadialGradient(lx,h*.3,0,lx,h*.3,w*.55);
+ g.addColorStop(0,'rgba(140,230,170,.09)');g.addColorStop(1,'rgba(140,230,170,0)');
+ ctx.fillStyle=g;ctx.fillRect(0,0,w,h);
+ ctx.save();
+ if(G.shake>0)ctx.translate(rand(-G.shake,G.shake),rand(-G.shake,G.shake));
+ ctx.drawImage(fieldC,v.offX-v.pad*s,v.offY-v.pad*s,(m.W+v.pad*2)*s,(m.H+v.pad*2)*s);
+ drawFlag();
+ // trail
+ G.trail.forEach((p,i)=>{const a=(i+1)/G.trail.length;
+  ctx.fillStyle='rgba(250,250,240,'+(a*.16).toFixed(3)+')';
+  ctx.beginPath();ctx.arc(p.x*s+v.offX,p.y*s+v.offY,BR*s*(.3+.5*a),0,TAU);ctx.fill();});
+ drawBall();
+ if(G.phase==='aim'&&!G.paused)drawAim();
+ // particles
+ for(const p of G.parts){const a=1-p.t/p.life,px=p.x*s+v.offX,py=p.y*s+v.offY;
+  if(p.type==='conf'){ctx.save();ctx.translate(px,py);ctx.rotate(p.rot);ctx.globalAlpha=a;
+   ctx.fillStyle=p.c;const ps=p.s*s;ctx.fillRect(-ps/2,-ps/4,ps,ps/2);ctx.restore();}
+  else{ctx.globalAlpha=a*.7;ctx.fillStyle='#d8ffe6';
+   ctx.beginPath();ctx.arc(px,py,p.s*s,0,TAU);ctx.fill();}}
+ ctx.globalAlpha=1;
+ // floating texts
+ for(const t of G.texts){const a=1-t.t/t.life;
+  ctx.font='700 '+Math.max(13,26*s)+'px Impact,"Arial Black",sans-serif';
+  ctx.textAlign='center';ctx.globalAlpha=a;
+  ctx.lineWidth=4;ctx.strokeStyle='rgba(0,0,0,.5)';
+  const tx=t.x*s+v.offX,ty=(t.y-t.t*34)*s+v.offY;
+  ctx.strokeText(t.txt,tx,ty);ctx.fillStyle='#ffd75e';ctx.fillText(t.txt,tx,ty);}
+ ctx.globalAlpha=1;
+ ctx.restore();
+ if(G.flash>0){ctx.fillStyle='rgba(255,246,214,'+(G.flash*.35).toFixed(3)+')';ctx.fillRect(0,0,w,h);}
+}
+function drawBall(){
+ const b=G.ball,v=G.view,s=v.scale;
+ let bs=1;if(G.phase==='sinking')bs=Math.max(.08,1-Math.min(1,G.sinkT)*.92);
+ const px=b.x*s+v.offX,py=b.y*s+v.offY,r=BR*s*bs;
+ ctx.fillStyle='rgba(0,0,0,.28)';ctx.beginPath();
+ ctx.ellipse(px+2*s*.4,py+6*s*.5,r*.95,r*.45,0,0,TAU);ctx.fill();
+ const g=ctx.createRadialGradient(px-r*.35,py-r*.4,r*.1,px,py,r);
+ g.addColorStop(0,'#ffffff');g.addColorStop(.72,'#eef0e6');g.addColorStop(1,'#c6ccbd');
+ ctx.fillStyle=g;ctx.beginPath();ctx.arc(px,py,r,0,TAU);ctx.fill();
+ ctx.strokeStyle='rgba(0,0,0,.14)';ctx.lineWidth=Math.max(1,1.5*s);ctx.stroke();
+ ctx.fillStyle='rgba(255,255,255,.85)';ctx.beginPath();ctx.arc(px-r*.35,py-r*.42,r*.2,0,TAU);ctx.fill();
+}
+function drawFlag(){
+ const c=G.cup,v=G.view,s=v.scale;
+ const hgt=lerp(96,22,G.flagDown),topY=c.y-hgt;
+ ctx.strokeStyle='#efe7d0';ctx.lineWidth=Math.max(2.5,4.5*s);ctx.lineCap='round';
+ ctx.beginPath();ctx.moveTo(c.x*s+v.offX,c.y*s+v.offY);ctx.lineTo(c.x*s+v.offX,topY*s+v.offY);ctx.stroke();
+ const L=48,wave=Math.sin(G.time*7)*4;
+ ctx.fillStyle='#e8543f';ctx.beginPath();
+ ctx.moveTo(c.x*s+v.offX,(topY)*s+v.offY);
+ ctx.quadraticCurveTo((c.x+L*.55)*s+v.offX,(topY-5+wave*.4)*s+v.offY,(c.x+L)*s+v.offX,(topY+10+wave)*s+v.offY);
+ ctx.lineTo(c.x*s+v.offX,(topY+18)*s+v.offY);ctx.closePath();ctx.fill();
+ ctx.fillStyle='#ffd75e';ctx.beginPath();ctx.arc(c.x*s+v.offX,topY*s+v.offY,Math.max(2,3.4*s),0,TAU);ctx.fill();
+}
+function rayAABB(px,py,dx,dy,r){
+ let tx1=-Infinity,tx2=Infinity;
+ if(Math.abs(dx)<1e-9){if(px<r.x||px>r.x+r.w)return null;}
+ else{tx1=(r.x-px)/dx;tx2=(r.x+r.w-px)/dx;if(tx1>tx2){const t=tx1;tx1=tx2;tx2=t;}}
+ let ty1=-Infinity,ty2=Infinity;
+ if(Math.abs(dy)<1e-9){if(py<r.y||py>r.y+r.h)return null;}
+ else{ty1=(r.y-py)/dy;ty2=(r.y+r.h-py)/dy;if(ty1>ty2){const t=ty1;ty1=ty2;ty2=t;}}
+ const tmin=Math.max(tx1,ty1),tmax=Math.min(tx2,ty2);
+ if(tmax<Math.max(tmin,0))return null;
+ let t;if(tmin>1e-4)t=tmin;else if(tmax>1e-4)t=tmax;else return null;
+ const n=tx1>=ty1?[dx>0?-1:1,0]:[0,dy>0?-1:1];
+ return{t,n};
+}
+function tracePath(ang,p){
+ const b=G.ball;let x=b.x,y=b.y,dx=Math.cos(ang),dy=Math.sin(ang);
+ const total=shotDist(p)*.95;let used=0;const out=[{x,y}];
+ for(let i=0;i<3;i++){
+  let bt=Infinity,bn=null;
+  for(const w of G.maze.walls){const r=rayAABB(x,y,dx,dy,w);if(r&&r.t>1e-4&&r.t<bt){bt=r.t;bn=r.n;}}
+  const rem=total-used;
+  if(!bn||bt>rem){out.push({x:x+dx*rem,y:y+dy*rem});break;}
+  x+=dx*bt;y+=dy*bt;used+=bt;out.push({x,y});
+  if(bn[0])dx=-dx;else dy=-dy;}
+ const res=[out[0]];
+ for(let i=1;i<out.length;i++){const a0=out[i-1],a1=out[i],d=Math.hypot(a1.x-a0.x,a1.y-a0.y);
+  const n=Math.max(1,Math.floor(d/18));
+  for(let k=1;k<=n;k++)res.push({x:lerp(a0.x,a1.x,k/n),y:lerp(a0.y,a1.y,k/n)});}
+ return res;
+}
+function drawAim(){
+ const b=G.ball,a=G.aim.ang,p=G.aim.power,v=G.view,s=v.scale;
+ const px=b.x*s+v.offX,py=b.y*s+v.offY;
+ if(p>.02){
+  const pts=tracePath(a,p);
+  for(let i=1;i<pts.length;i++){const f=1-i/pts.length;
+   ctx.globalAlpha=.14+.5*f;ctx.fillStyle='#fff7dc';
+   ctx.beginPath();ctx.arc(pts[i].x*s+v.offX,pts[i].y*s+v.offY,(2.6+1.6*f)*Math.max(.9,s),0,TAU);ctx.fill();}
+  ctx.globalAlpha=1;
+  const L=34+p*120,ex=b.x+Math.cos(a)*L,ey=b.y+Math.sin(a)*L;
+  ctx.strokeStyle='rgba(255,215,94,.95)';ctx.lineWidth=Math.max(2,6*s);ctx.lineCap='round';
+  ctx.beginPath();ctx.moveTo(b.x+Math.cos(a)*(BR+4))*0; // noop guard
+  ctx.moveTo((b.x+Math.cos(a)*(BR+4))*s+v.offX,(b.y+Math.sin(a)*(BR+4))*s+v.offY);
+  ctx.lineTo(ex*s+v.offX,ey*s+v.offY);ctx.stroke();
+  const hl=14*Math.max(1,s);
+  ctx.fillStyle='rgba(255,215,94,.95)';ctx.beginPath();
+  ctx.moveTo((ex+Math.cos(a)*hl)*s?0:0,0); // (kept simple below)
+  const hx=ex*s+v.offX,hy=ey*s+v.offY;
+  ctx.beginPath();
+  ctx.moveTo(hx+Math.cos(a)*hl,hy+Math.sin(a)*hl);
+  ctx.lineTo(hx+Math.cos(a+2.6)*hl*.7,hy+Math.sin(a+2.6)*hl*.7);
+  ctx.lineTo(hx+Math.cos(a-2.6)*hl*.7,hy+Math.sin(a-2.6)*hl*.7);
+  ctx.closePath();ctx.fill();
+  // power ring
+  ctx.beginPath();ctx.arc(px,py,(BR+11)*s,-Math.PI/2,-Math.PI/2+p*TAU);
+  ctx.strokeStyle='hsl('+(130-118*p)+',90%,56%)';ctx.lineWidth=Math.max(3,5.5*s);ctx.lineCap='round';ctx.stroke();
+  ctx.font=Math.max(11,14*s)+'px "Trebuchet MS",Verdana,sans-serif';
+  ctx.textAlign='center';ctx.fillStyle='rgba(246,241,224,.75)';
+  ctx.fillText(Math.round(p*100)+'%',px,py+(BR+30)*s);
+ }
+}
+
+/* ================= HUD / UI ================= */
+function buildChips(){
+ chipsEl.innerHTML='';chips=[];
+ for(let i=0;i<9;i++){const c=document.createElement('div');c.className='chip';
+  c.innerHTML='<span class="ci">'+(i+1)+'</span><span class="cv">–</span>';
+  chipsEl.appendChild(c);chips.push(c);}}
+function updateHUD(bump){
+ holeNum.textContent=(G.holeIndex+1)+' / 9';
+ parVal.textContent='PAR '+G.par;
+ if(bump&&lastStroke!==G.strokes){strokesEl.classList.remove('bump');void strokesEl.offsetWidth;strokesEl.classList.add('bump');}
+ lastStroke=G.strokes;strokesEl.textContent=G.strokes;
+ let done=0,pd=0;for(let i=0;i<G.holeIndex;i++){done+=G.results[i]||0;pd+=G.pars[i]||0;}
+ const tp=done+G.strokes-(pd+G.par);
+ toparEl.textContent=fmtDiff(tp);
+ toparEl.className='big val '+(tp<0?'good':tp>0?'bad':'');
+ chips.forEach((c,i)=>{c.classList.toggle('cur',i===G.holeIndex&&G.phase!=='end');
+  const cv2=c.querySelector('.cv');
+  if(G.results[i]!=null){c.classList.add('done');cv2.textContent=G.results[i]===1?'★':G.results[i];
+   const d=G.results[i]-G.pars[i];c.classList.toggle('win',d<0);c.classList.toggle('lose',d>0);}
+  else{cv2.textContent='–';}});
+}
+function refreshUI(){
+ const inPlay=['aim','rolling','sinking','banner'].includes(G.phase);
+ hudEl.classList.toggle('hidden',!inPlay);
+ chipsEl.classList.toggle('hidden',!inPlay&&G.phase!=='end');
+ startEl.classList.toggle('hidden',G.phase!=='start');
+ endEl.classList.toggle('hidden',G.phase!=='end');
+ pauseEl.classList.toggle('hidden',!G.paused);
+}
+function toast(txt,ms){toastEl.textContent=txt;toastEl.classList.add('show');G.toastT=(ms||1500)/1000;}
+function showBanner(main,sub,cls){
+ bannerMain.textContent=main;bannerSub.textContent=sub;bannerMain.className=cls||'';
+ bannerEl.classList.remove('show');void bannerEl.offsetWidth;bannerEl.classList.add('show');}
+
+/* ================= flow ================= */
+function startGame(){Snd.ensure();Snd.ui();G.results=[];G.pars=[];setupHole(0);}
+function playAgain(){Snd.ensure();Snd.ui();G.results=[];G.pars=[];setupHole(0);}
+function toMenu(){Snd.ui();G.results=[];G.pars=[];G.paused=false;setupAttract();updateBestLine();}
+function retryHole(){
+ if(G.phase==='start'||G.phase==='end')return;
+ G.strokes=0;G.ball={x:G.tee.x,y:G.tee.y,vx:0,vy:0};
+ G.trail=[];G.flagDown=0;G.phase='aim';Snd.ui();toast('HOLE RESET');updateHUD(true);refreshUI();}
+function setPaused(p){if(p&&!['aim','rolling','sinking'].includes(G.phase))return;G.paused=p;refreshUI();Snd.ui();}
+function endGame(){
+ const tot=G.results.reduce((a,b)=>a+b,0),parT=G.pars.reduce((a,b)=>a+b,0),diff=tot-parT;
+ const prev=loadBest(),isNew=prev===null||diff<prev;if(isNew)saveBest(diff);
+ const r=ratingOf(diff);
+ ratingTitle.textContent=r[0];ratingSub.textContent=r[1];
+ totalLine.innerHTML=tot+' STROKES · PAR '+parT+' · <b class="'+(diff<0?'good':diff>0?'lose':'')+'">'+fmtDiff(diff)+'</b>';
+ newBest.classList.toggle('hidden',!isNew);
+ let h='<thead><tr><th class="rowlbl">HOLE</th>';
+ for(let i=0;i<9;i++)h+='<th>'+(i+1)+'</th>';h+='<th>TOT</th></tr></thead><tbody>';
+ h+='<tr><th class="rowlbl">PAR</th>'+G.pars.map(p=>'<td>'+p+'</td>').join('')+'<td class="total">'+parT+'</td></tr>';
+ h+='<tr><th class="rowlbl">YOU</th>'+G.results.map((r2,i)=>'<td class="'+(r2<G.pars[i]?'good':r2>G.pars[i]?'lose':'')+'">'+(r2===1?'★':r2)+'</td>').join('')
+  +'<td class="total '+(diff<0?'good':diff>0?'lose':'')+'">'+tot+'</td></tr></tbody>';
+ scoreTable.innerHTML=h;
+ G.phase='end';refreshUI();updateHUD();Snd.fanfare();
+}
+function ratingOf(d){
+ if(d<=-5)return['TOUR PRO','Maze-shattering. The flag is in a state of panic.'];
+ if(d<=-1)return['SHARP PUTTER','Birdies, eagles and a very confident ball.'];
+ if(d===0)return['EVEN PAR','Dead even. Textbook maze work.'];
+ if(d<=4)return['FAIRWAY FINDER','A few bogeys, but the line was always there.'];
+ if(d<=9)return['ROUGH RIDER','The walls won a few of those.'];
+ return['MAZE ROOKIE','Every lollipop ball starts somewhere.'];}
+function updateBestLine(){const b=loadBest();
+ if(b===null){bestLine.classList.add('hidden');}else{bestLine.classList.remove('hidden');
+  bestLine.textContent='COURSE RECORD: '+fmtDiff(b);}}
+function toggleMute(){Snd.muted=!Snd.muted;saveMute();muteBtn.textContent=Snd.muted?'♪ OFF':'♪ ON';if(!Snd.muted)Snd.ui();}
+
+/* ================= input ================= */
+window.addEventListener('keydown',e=>{
+ Snd.ensure();const k=e.key;
+ if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(k))e.preventDefault();
+ if(G.phase==='start'){if(k==='Enter'||k===' ')startGame();return;}
+ if(G.phase==='end'){if(k==='Enter')playAgain();else if(k==='m'||k==='M')toggleMute();return;}
+ if(k==='m'||k==='M'){toggleMute();return;}
+ if(k==='p'||k==='P'||k==='Escape'){setPaused(!G.paused);return;}
+ if(G.paused)return;
+ if(k==='r'||k==='R'){retryHole();return;}
+ if(G.phase!=='aim')return;
+ const st=e.shiftKey?.5:1;
+ switch(k){
+  case 'ArrowLeft':case 'a':case 'A':G.aim.ang-=1.6*Math.PI/180*st;break;
+  case 'ArrowRight':case 'd':case 'D':G.aim.ang+=1.6*Math.PI/180*st;break;
+  case 'ArrowUp':case 'w':case 'W':G.aim.power=clamp(G.aim.power+.05*st,.05,1);break;
+  case 'ArrowDown':case 's':case 'S':G.aim.power=clamp(G.aim.power-.05*st,.05,1);break;
+  case ' ':case 'Enter':if(!e.repeat){if(G.aim.power<.05)Snd.deny();else fireShot();}break;}
+});
+function aimFromPointer(e){
+ const rect=cv.getBoundingClientRect(),v=G.view;
+ const wx=(e.clientX-rect.left-v.offX)/v.scale,wy=(e.clientY-rect.top-v.offY)/v.scale;
+ const dx=wx-G.ball.x,dy=wy-G.ball.y,d=Math.hypot(dx,dy);
+ if(d<2)return;
+ G.aim.ang=Math.atan2(dy,dx);
+ G.aim.power=clamp(Math.hypot(e.clientX-(G.dragStart?G.dragStart.x:e.clientX),e.clientY-(G.dragStart?G.dragStart.y:e.clientY))/170,0,1);
+}
+cv.addEventListener('pointerdown',e=>{
+ Snd.ensure();if(G.paused||G.phase!=='aim')return;
+ G.dragPrev={ang:G.aim.ang,power:G.aim.power};G.dragging=true;G.dragStart={x:e.clientX,y:e.clientY};
+ try{cv.setPointerCapture(e.pointerId);}catch(err){}
+ aimFromPointer(e);
+});
+cv.addEventListener('pointermove',e=>{if(G.dragging)aimFromPointer(e);});
+function endDrag(){
+ if(!G.dragging)return;G.dragging=false;
+ if(G.aim.power<.05)G.aim={ang:G.dragPrev.ang,power:G.dragPrev.power};
+ else fireShot();}
+cv.addEventListener('pointerup',endDrag);
+cv.addEventListener('lostpointercapture',endDrag);
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+
+$('teeBtn').addEventListener('click',function(){this.blur();startGame();});
+$('againBtn').addEventListener('click',function(){this.blur();playAgain();});
+$('menuBtn').addEventListener('click',function(){this.blur();toMenu();});
+$('resumeBtn').addEventListener('click',function(){this.blur();setPaused(false);});
+$('restartHoleBtn').addEventListener('click',function(){this.blur();setPaused(false);retryHole();});
+muteBtn.addEventListener('click',function(){this.blur();toggleMute();});
+document.addEventListener('visibilitychange',()=>{if(document.hidden)setPaused(true);});
+window.addEventListener('resize',layout);
+
+/* ================= boot ================= */
+Snd.muted=loadMute();muteBtn.textContent=Snd.muted?'♪ OFF':'♪ ON';
+buildChips();setupAttract();updateBestLine();refreshUI();
+let last=performance.now();
+function frame(now){
+ const dt=Math.min(.05,(now-last)/1000);last=now;
+ if(!G.paused){G.time+=dt;update(dt);}
+ render();requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+```
