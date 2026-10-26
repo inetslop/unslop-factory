@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sokoban Maze</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#12141c;font-family:'Courier New',monospace;}
+  #c{display:block;position:absolute;inset:0;}
+  .overlay{
+    position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    background:rgba(10,12,20,.86);color:#e8ecf5;text-align:center;z-index:10;padding:20px;box-sizing:border-box;
+  }
+  .hidden{display:none;}
+  h1{font-size:min(9vw,54px);letter-spacing:.12em;margin:0 0 10px;color:#ffd35c;text-shadow:0 3px 0 #7a5b10,0 6px 18px rgba(0,0,0,.6);}
+  .sub{font-size:min(4vw,18px);color:#9fb0cc;margin-bottom:26px;}
+  .controls{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.15);border-radius:10px;padding:16px 26px;line-height:1.9;font-size:min(3.4vw,16px);}
+  .controls b{color:#ffd35c;}
+  .go{margin-top:28px;font-size:min(4.5vw,20px);color:#7dffb0;animation:pulse 1.2s infinite;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  #hud{
+    position:absolute;top:0;left:0;right:0;display:flex;justify-content:space-between;align-items:center;
+    padding:10px 16px;color:#cdd8ee;font-size:min(3.4vw,15px);z-index:5;pointer-events:none;
+    background:linear-gradient(rgba(8,10,16,.75),transparent);
+  }
+  #hud .hint{color:#6f7f9d;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="hud" class="hidden">
+  <span id="hLevel">Level 1/5</span>
+  <span id="hBoxes">Boxes 0/0</span>
+  <span id="hMoves">Moves 0</span>
+  <span class="hint">R restart &middot; U undo</span>
+</div>
+
+<div id="start" class="overlay">
+  <h1>SOKOBAN MAZE</h1>
+  <div class="sub">Push every crate onto a glowing tile. Don't trap yourself!</div>
+  <div class="controls">
+    <b>Arrow keys / WASD</b> &mdash; move<br>
+    <b>R</b> &mdash; restart level<br>
+    <b>U</b> &mdash; undo move<br>
+    <b>Enter</b> &mdash; next level
+  </div>
+  <div class="go">Press ENTER or click to start</div>
+</div>
+
+<div id="msg" class="overlay hidden">
+  <h1 id="msgTitle">LEVEL COMPLETE</h1>
+  <div class="sub" id="msgSub"></div>
+  <div class="go" id="msgGo">Press ENTER for next level</div>
+</div>
+
+<script>
+(function(){
+'use strict';
+var LEVELS=[
+[
+"#####",
+"#@$.#",
+"#####"
+],
+[
+"######",
+"#    #",
+"# $  #",
+"# .@ #",
+"#    #",
+"######"
+],
+[
+"######",
+"#.   #",
+"# $  #",
+"# @$ #",
+"#  . #",
+"######"
+],
+[
+"########",
+"#      #",
+"# .$@$.#",
+"# $    #",
+"# .    #",
+"#      #",
+"########"
+],
+[
+"######",
+"#.  .#",
+"# $$ #",
+"# @  #",
+"#    #",
+"######"
+]
+];
+
+var canvas=document.getElementById('c'), ctx=canvas.getContext('2d');
+var hud=document.getElementById('hud'), hLevel=document.getElementById('hLevel'),
+    hBoxes=document.getElementById('hBoxes'), hMoves=document.getElementById('hMoves');
+var startScr=document.getElementById('start'), msgScr=document.getElementById('msg'),
+    msgTitle=document.getElementById('msgTitle'), msgSub=document.getElementById('msgSub'),
+    msgGo=document.getElementById('msgGo');
+
+var cur=0, player={x:1,y:1}, goals=new Set(), walls=new Set(), boxes=new Map();
+var moves=0, history=[], anim=null, state='start';
+var gridCols=5, gridRows=3, DUR=110;
+
+function K(x,y){return x+','+y;}
+
+function loadLevel(i){
+  var L=LEVELS[i], cols=0, y,x;
+  for(y=0;y<L.length;y++) cols=Math.max(cols,L[y].length);
+  walls.clear(); goals.clear(); boxes.clear(); history=[]; moves=0; anim=null;
+  gridCols=cols; gridRows=L.length;
+  for(y=0;y<L.length;y++){
+    var row=L[y];
+    for(x=0;x<row.length;x++){
+      var ch=row[x];
+      if(ch==='#') walls.add(K(x,y));
+      if(ch==='.'||ch==='*'||ch==='+') goals.add(K(x,y));
+      if(ch==='$'||ch==='*') boxes.set(K(x,y),{x:x,y:y});
+      if(ch==='@'||ch==='+') player={x:x,y:y};
+    }
+  }
+  updateHud();
+}
+
+function snap(){ return new Map(Array.from(boxes,function(e){return [e[0],{x:e[1].x,y:e[1].y}];})); }
+function boxesOnGoals(){ var n=0; boxes.forEach(function(v,k){ if(goals.has(k)) n++; }); return n; }
+
+/* ---------- audio ---------- */
+var AC=null;
+function ac(){
+  if(!AC){ try{ AC=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} }
+  if(AC && AC.state==='suspended'){ try{AC.resume();}catch(e){} }
+  return AC;
+}
+function beep(f,d,type,v,slide){
+  var a=ac(); if(!a) return;
+  type=type||'square'; v=v||0.12; slide=slide||0;
+  try{
+    var o=a.createOscillator(), g=a.createGain(), t=a.currentTime;
+    o.type=type; o.frequency.setValueAtTime(f,t);
+    if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(40,f+slide),t+d);
+    g.gain.setValueAtTime(v,t);
+    g.gain.exponentialRampToValueAtTime(0.001,t+d);
+    o.connect(g); g.connect(a.destination);
+    o.start(t); o.stop(t+d+0.02);
+  }catch(e){}
+}
+function sndStep(){ beep(320,0.05,'triangle',0.09); }
+function sndPush(){ beep(170,0.09,'square',0.12); }
+function sndBump(){ beep(90,0.12,'sawtooth',0.12,-40); }
+function sndGoal(){ beep(600,0.14,'sine',0.16,300); }
+function jingle(win){
+  var seq = win ? [523,659,784,1047] : [784,659,523,392];
+  for(var i=0;i<seq.length;i++) (function(f,i){ setTimeout(function(){beep(f,0.16,'triangle',0.15);},i*130); })(seq[i],i);
+}
+
+/* ---------- game logic ---------- */
+function tryMove(dx,dy){
+  if(state!=='play'||anim) return;
+  var nx=player.x+dx, ny=player.y+dy, k=K(nx,ny);
+  if(walls.has(k)){ sndBump(); return; }
+  history.push({p:{x:player.x,y:player.y}, b:snap()});
+  moves++;
+  var box=null, boxTo=null;
+  if(boxes.has(k)){
+    var bx=nx+dx, by=ny+dy, bk=K(bx,by);
+    if(walls.has(bk)||boxes.has(bk)){ history.pop(); sndBump(); return; }
+    box={x:nx,y:ny}; boxTo={x:bx,y:by};
+    boxes.delete(k); boxes.set(bk,{x:bx,y:by});
+    sndPush();
+    if(goals.has(bk)) setTimeout(sndGoal,60);
+  } else {
+    sndStep();
+  }
+  anim={t0:performance.now(), pFrom:{x:player.x,y:player.y}, box:box, boxTo:boxTo};
+  player.x=nx; player.y=ny;
+  updateHud();
+  if(boxesOnGoals()===goals.size) winLevel();
+}
+
+function undo(){
+  if(state!=='play'||anim||history.length===0) return;
+  var s=history.pop();
+  player={x:s.p.x,y:s.p.y};
+  boxes=new Map(Array.from(s.b,function(e){return [e[0],{x:e[1].x,y:e[1].y}];}));
+  moves=Math.max(0,moves-1);
+  beep(420,0.05,'sine',0.08);
+  updateHud();
+}
+
+function winLevel(){
+  if(cur===LEVELS.length-1){
+    state='victory'; jingle(true);
+    msgTitle.textContent='YOU WIN!';
+    msgTitle.style.color='#7dffb0';
+    msgSub.textContent='All '+LEVELS.length+' mazes cleared in '+moves+' moves this level. The warehouse is spotless.';
+    msgGo.textContent='Press ENTER to play again';
+    showMsg();
+  } else {
+    state='levelwin'; jingle(true);
+    msgTitle.textContent='LEVEL COMPLETE';
+    msgTitle.style.color='#ffd35c';
+    msgSub.textContent='Solved in '+moves+' moves.';
+    msgGo.textContent='Press ENTER for next level';
+    showMsg();
+  }
+}
+
+function startGame(){
+  cur=0; loadLevel(0); state='play';
+  hide(startScr); hide(msgScr); hud.classList.remove('hidden');
+  beep(440,0.08,'triangle',0.12); beep(660,0.1,'triangle',0.12);
+}
+function nextLevel(){ cur++; loadLevel(cur); state='play'; hide(msgScr); }
+
+function showMsg(){ msgScr.classList.remove('hidden'); }
+function hide(el){ el.classList.add('hidden'); }
+function updateHud(){
+  hLevel.textContent='Level '+(cur+1)+'/'+LEVELS.length;
+  hBoxes.textContent='Boxes '+boxesOnGoals()+'/'+goals.size;
+  hMoves.textContent='Moves '+moves;
+}
+
+/* ---------- input ---------- */
+window.addEventListener('keydown',function(e){
+  var k=e.key;
+  if(k==='ArrowUp'||k==='ArrowDown'||k==='ArrowLeft'||k==='ArrowRight'||k===' ') e.preventDefault();
+  ac();
+  if(state==='start'){
+    if(k==='Enter'||k===' ') startGame();
+  } else if(state==='play'){
+    if(k==='ArrowUp'||k==='w'||k==='W') tryMove(0,-1);
+    else if(k==='ArrowDown'||k==='s'||k==='S') tryMove(0,1);
+    else if(k==='ArrowLeft'||k==='a'||k==='A') tryMove(-1,0);
+    else if(k==='ArrowRight'||k==='d'||k==='D') tryMove(1,0);
+    else if(k==='r'||k==='R'){ loadLevel(cur); beep(300,0.08,'square',0.1,-100); }
+    else if(k==='u'||k==='U') undo();
+  } else if(state==='levelwin'){
+    if(k==='Enter'||k===' ') nextLevel();
+  } else if(state==='victory'){
+    if(k==='Enter'||k===' ') startGame();
+  }
+});
+startScr.addEventListener('click',function(){ if(state==='start') startGame(); });
+msgScr.addEventListener('click',function(){
+  if(state==='levelwin') nextLevel();
+  else if(state==='victory') startGame();
+});
+
+/* ---------- rendering ---------- */
+var W=0,H=0,DPR=1;
+function resize(){
+  DPR=Math.min(2,window.devicePixelRatio||1);
+  W=window.innerWidth; H=window.innerHeight;
+  canvas.width=W*DPR; canvas.height=H*DPR;
+  canvas.style.width=W+'px'; canvas.style.height=H+'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize',resize); resize();
+
+function ease(t){ return t<0.5 ? 2*t*t : 1-Math.pow(-2*t+2,2)/2; }
+
+function draw(now){
+  requestAnimationFrame(draw);
+  ctx.fillStyle='#12141c'; ctx.fillRect(0,0,W,H);
+  if(state==='start') return;
+
+  // finish animation
+  var t=1;
+  if(anim){
+    t=Math.min(1,(now-anim.t0)/DUR);
+    if(t>=1) anim=null; else t=ease(t);
+  }
+
+  var pad=46, topPad=54;
+  var tile=Math.floor(Math.min((W-pad*2)/gridCols,(H-topPad-pad)/gridRows));
+  tile=Math.max(8,tile);
+  var ox=Math.round((W-gridCols*tile)/2), oy=Math.round(topPad+(H-topPad-gridRows*tile)/2);
+
+  function px(gx){ return ox+gx*tile; }
+  function py(gy){ return oy+gy*tile; }
+
+  // floor & walls
+  for(var y=0;y<gridRows;y++)for(var x=0;x<gridCols;x++){
+    var k=K(x,y), X=px(x), Y=py(y);
+    if(walls.has(k)){
+      ctx.fillStyle='#3a4258';
+      ctx.fillRect(X,Y,tile,tile);
+      ctx.fillStyle='#4a5470';
+      ctx.fillRect(X+2,Y+2,tile-4,Math.max(3,tile*0.16));
+      ctx.strokeStyle='rgba(0,0,0,.25)'; ctx.strokeRect(X+.5,Y+.5,tile-1,tile-1);
+    } else {
+      ctx.fillStyle=((x+y)%2===0)?'#232838':'#202534';
+      ctx.fillRect(X,Y,tile,tile);
+    }
+  }
+
+  // goals
+  var pulse=0.7+0.3*Math.sin(now/300);
+  goals.forEach(function(k){
+    var p=k.split(','), gx=+p[0], gy=+p[1];
+    if(boxes.has(k)) return;
+    ctx.save();
+    ctx.translate(px(gx)+tile/2,py(gy)+tile/2);
+    ctx.rotate(Math.PI/4);
+    ctx.strokeStyle='rgba(255,211,92,'+pulse.toFixed(3)+')';
+    ctx.lineWidth=Math.max(2,tile*0.07);
+    var s=tile*0.16;
+    ctx.strokeRect(-s,-s,s*2,s*2);
+    ctx.restore();
+  });
+
+  // boxes (interpolate the one being pushed)
+  boxes.forEach(function(v,k){
+    var bx=v.x, by=v.y;
+    if(anim && anim.box && K(anim.box.x,anim.box.y)===k){
+      bx=anim.box.x+(anim.boxTo.x-anim.box.x)*t;
+      by=anim.box.y+(anim.boxTo.y-anim.box.y)*t;
+    }
+    var X=px(bx), Y=py(by);
+    var onGoal=goals.has(k);
+    var inset=tile*0.12, s=tile-inset*2, r=Math.max(3,s*0.18);
+    ctx.fillStyle=onGoal?'#3f9e5d':'#a4682a';
+    roundRect(X+inset,Y+inset,s,s,r); ctx.fill();
+    ctx.strokeStyle=onGoal?'#7dffb0':'#d99a4d';
+    ctx.lineWidth=Math.max(2,tile*0.05);
+    roundRect(X+inset,Y+inset,s,s,r); ctx.stroke();
+    // crate cross
+    ctx.strokeStyle=onGoal?'rgba(125,255,176,.5)':'rgba(217,154,77,.5)';
+    ctx.beginPath();
+    ctx.moveTo(X+inset,Y+inset); ctx.lineTo(X+tile-inset,Y+tile-inset);
+    ctx.moveTo(X+tile-inset,Y+inset); ctx.lineTo(X+inset,Y+tile-inset);
+    ctx.stroke();
+  });
+
+  // player (interpolated)
+  var ppx=player.x, ppy=player.y;
+  if(anim){
+    ppx=anim.pFrom.x+(player.x-anim.pFrom.x)*t;
+    ppy=anim.pFrom.y+(player.y-anim.pFrom.y)*t;
+  }
+  var cxp=px(ppx)+tile/2, cyp=py(ppy)+tile/2, rad=tile*0.34;
+  ctx.fillStyle='#ff9d4d';
+  ctx.beginPath(); ctx.arc(cxp,cyp,rad,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#ffd3a0'; ctx.lineWidth=Math.max(2,tile*0.05); ctx.stroke();
+  // eyes look toward facing (use last move direction)
+  var ex=0,ey=0;
+  if(anim){ ex=Math.sign(player.x-anim.pFrom.x)*rad*0.28; ey=Math.sign(player.y-anim.pFrom.y)*rad*0.28; }
+  ctx.fillStyle='#2b1a08';
+  ctx.beginPath(); ctx.arc(cxp-rad*0.35+ex,cyp-rad*0.15+ey,rad*0.14,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cxp+rad*0.35+ex,cyp-rad*0.15+ey,rad*0.14,0,Math.PI*2); ctx.fill();
+}
+
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
