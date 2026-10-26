@@ -1,0 +1,2751 @@
+<think>
+The user is asking for a "stealth 3D game." I'm an HTML5 game developer who builds single-file browser games. The request is "make a stealth 3d game."
+
+Constraints:
+- Single HTML file, inline CSS/JS only
+- No external scripts/fonts/images/audio — sounds via Web Audio API, starting after the first input
+- Runs in any-sized iframe: fill the window, resize-scale, no scrollbars
+- Start screen with game name and control instructions, restart without reload
+- Listen for keys on window
+- No alert/confirm/prompt
+- Wrap localStorage in try/catch
+- Put the game name in <title>
+
+So I need to build a 3D stealth game. Options:
+1. Three.js — not allowed (external script).
+2. Write my own software 3D renderer on Canvas 2D — this is feasible! I can write a simple perspective projection engine with painter's algorithm for boxes/polygons.
+
+A stealth game in 3D with a custom canvas renderer: think a top-down-ish or third-person view where you move around a facility, avoid guards with vision cones, collect data drives and reach the exit. Classic stealth:
+- Player moves (WASD/arrow keys)
+- Guards patrol on routes, with vision cones
+- Line-of-sight checks
+- Crouch/sneak mode (slower but harder to detect — smaller silhouette / lower noise)
+- Noise meter: running makes noise, guards investigate sound sources
+- Detection: if the guard's line of sight is clear and the player is in the cone, suspicion rises; when full → alarm → mission failed
+- Objective: collect N data drives, reach the extraction point
+
+3D rendering: I'll write a mini 3D engine:
+- World made of boxes (walls, crates), ground grid
+- Camera follows behind/above the player (third-person) or isometric-ish
+- Painter's algorithm: sort faces by depth
+- Perspective projection with a view matrix (rotation + translation)
+
+Let me design the engine:
+
+World: 2D floor plan extruded into 3D (z = height). Walls are boxes. Guards and the player are simple humanoids made of boxes (body, head) — or a capsule drawn as stacked boxes. Vision cones rendered as translucent polygons on the floor.
+
+Camera: follows behind/above the player at an angle, looking down about 45–55°. Third-person over-the-shoulder-ish. Camera position = player pos + offset rotated by camera yaw? Simpler: fixed camera orientation (e.g., looking from the southwest, isometric-ish) but following the player — like a classic 3D top-down stealth (Alien Breed-style, or old "Hitman" isometric). Actually a follow cam with fixed rotation is simpler and looks good. Let me use a camera that orbits: camera yaw fixed at some angle, position = target + R*(cos, sin) - height, looking at the target. This gives a nice 3/4 view.
+
+Could also allow rotating the camera with Q/E or mouse — but keep it simple: fixed diagonal follow cam, smooth lerp.
+
+Projection:
+- World coordinates: x (east), y (north), z (up).
+- Camera at C, yaw θ, pitch φ.
+- Transform world point p → camera space: translate by -C, rotate around Z? Let me define the view: forward direction in the XZ plane (y is up or z is up?)
+
+Let's use y as up to make rotation easy: world (x, y_up, z). Floor at y=0. Walls are boxes with height h.
+
+Camera position: target T (player x,z), camera at T + offset direction D * dist, y = T.y + height. Direction D is a fixed angle α: D = (cosα, sinα) in xz. Camera looks at T: view yaw = α + π. Pitch from height/dist.
+
+View transform:
+1. p' = p - C
+2. Rotate around Y axis by -viewYaw:
+   rx = p'.x * cos(vy) - p'.z * sin(vy)? Standard rotation around Y:
+   x' = x*cos + z*sin
+   z' = -x*sin + z*cos  (rotation by angle)
+Let's do it this way: rotate the world so that the camera faces -Z? Common approach:
+
+Given view yaw ψ (direction the camera looks, in xz), transform point:
+dx = p.x - C.x; dz = p.z - C.z; dy = p.y - C.y.
+// Rotate around Y by -ψ so forward becomes +Z or -Z:
+x1 = dx*cos(ψ) - dz*sin(ψ)? Let's do it carefully.
+
+The camera looks in direction (sinψ, 0, cosψ) — say ψ=0 means looking along +Z. To transform a world vector into camera space where forward = +Z_c? Or -Z_c. Let me set up the camera: forward F = (sinψ, 0, cosψ), right R = (cosψ, 0, -sinψ), up U = (0,1,0).
+
+Camera-space coordinates:
+cx = dot(p-C, R)
+cy = dot(p-C, U)
+cz = dot(p-C, F)
+Then perspective: screenX = cx * f / cz, screenY = cy * f / cz, with cz > near. Screen y is flipped (canvas y goes down): sy = cyH - cy*f/cz... actually since camera looks down, points below the horizon have negative cy and should appear at the top? No wait: a point on the floor in front of the camera has dot(p-C,U) < 0 because p.y < C.y. It should appear in the lower part of the screen (canvas y large). Screen mapping: sx = W/2 + cx*f/cz; sy = H/2 - cy*f/cz? If cy is negative → sy > H/2, i.e., below center. Yes correct: sy = H/2 - cy * (f/cz) gives floor points below center.
+
+f = focal length = (H/2) / tan(fovY/2).
+
+Painter's algorithm: collect all faces (quads), compute average camera-space z for depth, sort descending (far first), draw with clipping? Canvas can handle negative coordinates fine; only need to discard faces with cz <= near. For a quad where some vertices are behind the camera — since the map is bounded and the camera is outside the walls... hmm, walls could be between camera and player. To keep it simple: cull quads that have any vertex at cz < near (0.1)? That might pop weirdly but with the camera offset and small maps it's mostly OK. Better: clip against near plane. Implement Sutherland–Hodgman clipping for a quad against cz >= near — not too bad, handle convex polygons in general.
+
+Actually let me implement a general pipeline:
+- Each object → list of world-space quads with colors.
+- Transform all vertices to camera space.
+- Clip each polygon against the near plane (cz = NEAR).
+- Compute depth = average cz.
+- Painter sort by descending depth, draw.
+
+Shading: simple directional light — compute face normal in world space, dot with light direction → brightness. Plus per-face base color. This gives a strong 3D look.
+
+Floor: draw as a large quad (or grid of small quads for texture-like checkerboard). A single quad + grid lines drawn on top? Grid lines are separate line segments — painter sort complicates things (lines need depth too). Alternative: make the floor out of tiles (e.g., 1x1 or 2x2 unit cells), each a quad with alternating shading → nice checkerboard, sorts naturally. Map is like 30x24 units → 720 quads at 1x1... that's fine for canvas? 720 fill + walls ~100 faces + cones + entities. Sorting ~900 items per frame — no problem in JS.
+
+But floor tiles can be culled: skip if outside frustum (cz < near after transform, or off-screen). Simple cull: project and check bounding box on screen with margin; also skip if all 4 vertices cz < NEAR.
+
+Actually a simpler, more performant approach: draw the floor first as one big quad (it's always at the bottom so painter-wise it's fine to draw it first — everything is above the floor... except nothing below). Since nothing goes under the floor, I can just draw the floor (and grid lines) first without sorting! Then sort and draw all solid faces/entities. Grid lines on the floor: draw after the big floor quad but before solids — since they're coplanar with the floor, no overlap issue. This is a big simplification.
+
+Vision cones: translucent triangles/fans on the floor from the guard position to the FOV arc. These are also on the floor → drawn right after the floor grid, before solids. But walls should block them visually... they're on the floor; if we draw solids after, then walls drawn on top will cover the cone parts behind them — mostly correct! The cones could pass through walls (the arc extends past walls) — I'll clip the cone by line-of-sight: compute raycasts to wall segments and truncate at the nearest hit. Doable: for each guard, cast rays across FOV (e.g., 24 rays), find closest intersection with wall segments (2D segment–segment intersection), build a polygon of the visible range. This makes cones look professional (they stop at walls).
+
+Guard AI:
+- Patrol waypoints; move between them.
+- Vision: if player is within distance R, within FOV angle, and line-of-sight to walls is clear → suspiciousness rises (rate depends on crouch? crouching reduces effective detection radius / slows suspicion rise — "silhouette").
+- Suspicion decays when not visible.
+- On suspicion threshold: guard investigates last-seen position; if spotted there for a while → full detection → alarm.
+- Noise: running generates a noise event (position + radius). Guards within radius hear it, go investigate. Crouching = silent and slow; walking = quiet; running = noisy.
+
+Player states: walk (WASD), crouch (Shift held — or hold to sneak?), sprint? Let's do: default walk; Shift = crouch/sneak (silent, slower, lower detection); Ctrl or double-tap? Simpler: 3 states toggled by key? Hold Shift for stealth, Space? Hmm.
+
+Controls design:
+- WASD / arrow keys: move
+- Shift (hold): sneak — silent, slow; harder to spot (reduced vision radius, slower suspicion rise)
+- C (toggle): crouch? Too complex. Keep: Walk vs Sneak (Shift hold). Sprint? No sprint (stealth game — running is noisy; maybe add "Run" on Ctrl which is fast but loud, generating noise pings that guards hear). This adds a fun risk/reward: Run = fast + noisy.
+
+So: WASD move; Shift = sneak; Ctrl = run (noisy); E or Space = interact/pickup? Auto-pickup for drives on overlap — simpler and works fine. R = restart. P/Esc = pause. Camera rotation: Q/E to orbit camera 45°? Could be nice but adds complexity; a fixed follow cam is enough. Actually camera orbit is really useful in stealth (to see around corners). Let me add Q/E to rotate the view angle in 90° steps with smooth lerp. Hmm, lerping angles — wrap issues. Store target yaw and current yaw, lerp shortest path. Doable: normalize the diff to [-π, π].
+
+Let's include it: Q/E rotates camera by 90°.
+
+Game structure:
+- States: START, PLAYING, PAUSED, CAPTURED (mission failed), ESCAPED (win). Also "ALARM" phase? If detected → alarm triggers immediately → chase sequence? Classic: detection = mission failed with a short slow-mo / red flash. Let's do: when suspicion fills up → guard shouts ("SPOTTED!") → 1.5s alarm siren → then CAPTURED screen with stats (drives collected, time). Or instant fail screen with dramatic text. Instant fail is simpler; let's add a short "detected" animation: screen shake + red vignette flash, then fail overlay after ~1.2s.
+
+- Objective: collect 3 data drives scattered in the facility, then reach the marked extraction zone (activates only when all drives collected). Reach it → win screen with time and rank (S/A/B/C based on time & detection level?).
+
+- Level design: a 3D "facility" — outer walls, interior rooms/corridors, crates. Design a tile map? Or hand-placed boxes. Tile-based is easier for collisions and LOS: define a grid map (e.g., 26 x 20) with wall tiles; render each wall tile as a box with height ~3. Crates as separate boxes (also collidable — include in collision grid or as circles? Treat crates as wall cells in the collision grid but rendered lower (height 1.6) and a different color, so they look like stacks of boxes).
+
+Map: let me hand-design a string map. Legend: '#'=wall, '.'=floor, 'C'=crate (low box), 'P'=player start, 'G1'..'G4' guards with patrol routes defined separately (waypoint lists), 'D'=data drive, 'X'=exit.
+
+Guard patrols: define waypoint arrays in code (list of grid cells). Guards move at a constant speed between waypoints, facing movement direction. When investigating, they go to the last-seen/noise position, look around for a few seconds, then resume patrol from the nearest route point.
+
+Guard rendering: body = box (capsule-ish), head = smaller box, colored; suspicion indicator above head: small "!" or eye icon in 3D? Simpler: draw HUD indicators — when any guard has suspicion > 0, show a "detection meter" bar in the bottom-center of the screen (max across guards). Also, when visible to you, exclamation marks over suspicious/investigating guards' heads... simpler: draw an icon at the projected head position: ? for investigating, ! when suspicion is rising. These are 2D sprites drawn after solids (billboards) — need depth handling: if a guard is behind a wall, the icon would erroneously appear on top. Acceptable minor issue; or check LOS from player camera to the guard and skip icon if blocked. I can do a cheap check: raycast in 2D from player position to guard position against walls → only show icon if visible. Good.
+
+Player rendering: similar humanoid, different color (e.g., agent blue/cyan vs guards orange/red). Crouch: lower body height. Sneak: slightly darker/alpha? Keep colors.
+
+Shadow: draw a dark ellipse under entities on the floor for grounding.
+
+Additional HUD elements:
+- Objective text top-left: "Data drives 1/3" and exit status.
+- Detection meter bottom-center (segmented bar, green→yellow→red), with guard silhouette icon; pulses when rising.
+- Mode indicator: WALK/SNEAK/RUN chip.
+- Compass? Skip.
+- Timer top-right.
+- Message toasts center ("Data drive acquired", "Exit unlocked — reach the extraction point", "A guard heard something").
+
+Audio (Web Audio, after first input):
+- Footsteps (soft noise bursts; sneak is quieter/slower, run is louder/faster)
+- Pickup chime (2 rising sine notes)
+- Suspicion tick (rising pitch as suspicion grows?) — subtle beeps when >0.5? Or a heartbeat at high detection: low thumps with tempo scaling. Heartbeat = great tension mechanic. Implement a heartbeat scheduler in the update loop based on maxSuspicion.
+- Alarm siren (sweeping oscillator) on detection.
+- Ambient hum/drone for atmosphere (low sine + filtered noise, quiet). Start on game start (after user clicks start button / presses key).
+- Guard "!" shout: a quick two-tone blip? Or a synthetic "alert" sound.
+- Win: small arpeggio. Fail: descending tone.
+
+Audio implementation: create AudioContext on first user gesture (start click/keypress). Master gain. Functions: beep(freq, dur, type, vol, slide), noiseBurst(dur, vol, filterFreq), heartbeat via low sine thump with quick decay, 2 thumps per beat.
+
+Rendering details for polish:
+- Background: dark gradient sky (canvas fill) — deep navy → darker. Add distant "city" silhouette? I can draw a few far boxes behind the map as decoration (non-colliding), or just fog: fade faces by depth (mix color toward background by cz). Fog = easy and looks great: factor = clamp((cz - fogNear)/(fogFar-fogNear)), lerp color toward bg. Let's add fog.
+- Vignette: radial gradient overlay each frame (or a CSS overlay div — cheaper: a pre-rendered canvas or CSS radial-gradient overlay with pointer-events none). Use CSS overlay.
+- Red alert vignette when detection is high: another overlay whose opacity is controlled by JS style.
+- Screen shake on alarm.
+- Grid floor with subtle checker; extraction zone drawn as glowing animated quad (pulsing) — draw it in the floor pass with alpha pulsing; drives rendered as small floating diamonds (billboard sprites with bobbing + glow) — billboard: project center, draw rotating diamond at size ∝ 1/cz. Draw after solids (sprites on top) but they're above the floor... could be hidden behind walls incorrectly; check LOS from camera? Cheaper: include drive in depth sort as a "sprite" item with depth = its cz and drawn at that position in sorted order — sprites can participate in painter sort! Good: add to list of draw items {depth, kind:'quad'|'sprite', ...}.
+
+Guard face rendering: body box (0.5 wide), plus head box; 2 boxes → up to 8 faces each but cull backfaces (only draw faces with outward normal). Box generation: for each box, compute 6 faces, keep those facing away from camera (dot(normal, camPos - faceCenter) > 0? Keep if dot(normal, camPos - vertex) > 0 → front-facing visible). Cull per frame.
+
+Total face count: wall tiles — instead of a separate box per tile, I can merge collinear wall tiles into long boxes to reduce faces! Run-length encode rows: for each row, find runs of wall cells → one box each (width = run length, height 3, depth 1). Same for crates. This drastically reduces geometry. Let's do that.
+
+Also add some decorative tall pillars? The map design covers it.
+
+Collision: player as a circle r=0.35 vs grid walls (AABB per cell or slide along axes): move x, check collision with wall cells (cells where solid), if colliding revert x; same for z. Standard.
+
+LOS raycast: 2D segment against wall cells — use DDA grid traversal to find distance to first solid cell. Implement dda(from, to) → t in [0,1]. Use for vision and sound? Sound uses radius only (walls block? Simple: sound radius with falloff; walls attenuate if LOS blocked → half radius). Nice detail: heard = dist < noiseRadius * (losBlocked? 0.6 : 1).
+
+Vision check per guard per frame:
+- Vector to player, distance d.
+- FOV = 100°, range = 7 (sneak: 4.5; walk: 7; run: 8 but with noise).
+- Angle between guard facing and direction < FOV/2 (+ small tolerance if very close).
+- LOS clear via DDA (t threshold: player center is within d — check that the first hit distance > d - epsilon... actually check that wall hit t * d > d → no wall before player).
+- If visible: suspicion += dt * rate; rate base 1.4/s at full range, scaling up near (closer = faster): rate = lerp(0.5, 2.2, 1 - d/range) — wait, closer should be faster: factor = clamp(1 - (d-1)/range). Crouch reduces range and also rate *0.6.
+- Not visible: suspicion -= dt*0.8 (slower decay while investigating? Keep same).
+- If suspicion >= 1 → detected.
+
+Investigate: guard state 'patrol' | 'investigate'. On hearing noise or losing sight with suspicion > 0.35 → investigate last known position (player pos when lost, or noise source). Move there; on arrival, scan (rotate facing ±90° over ~2s), then resume patrol from nearest route point. If spotted while investigating and suspicion fills → detected.
+
+Detected: state ALARM for 1.4s: siren, red flash, guards turn to player and charge? Nice touch: they run toward you. Then CAPTURED overlay with stats + "Press R to retry".
+
+Win: reach exit zone (dist < 0.8) when all drives → ESCAPED overlay: time, rank, "R to play again".
+
+Rank: S < 90s, A < 150s, B < 240s, else C. Also count of "heard" events? Keep it to time + max detection experienced (if ever >70% → cap at B?). Keep simple: time-based; show "peak suspicion."
+
+Start screen: game title — let me name it: "BLACKOUT PROTOCOL"? "SILENT VECTOR"? Stealth 3D... "GHOSTWIRE FACILITY"? Let's call it **"NIGHTFALL PROTOCOL"** or shorter: **SHADOWFALL**. Or "OPERATION BLACKLINE". I like **"BLACKLINE"**, hmm. "NIGHT SHIFT" is a real game. **"SILENT BREACH"** — good, evocative. Title: SILENT BREACH — 3D stealth infiltration.
+
+Start screen design: it's the game start overlay. Let me make it distinctive: dark facility aesthetic, title with glitch/scanline effect, control list styled as a "mission briefing" panel (objective, controls grid), big "BEGIN INFILTRATION" button, plus "press ENTER". Left-aligned briefing layout rather than a generic centered hero — mission dossier style: top bar with classification ("TOP SECRET // EYES ONLY"), then title, then 2 columns: MISSION / CONTROLS. That's distinctive to the subject (stealth/military). Monospace-ish font? No external fonts allowed — use system stack: display could be "Impact/'Arial Black'"? Hmm, I want a distinctive display + readable body pairing without webfonts. System options: 'Consolas/Menlo/monospace' for terminal feel (fits spy tech), and something bold condensed for title: "Arial Black", Impact... Let me use monospace terminal aesthetic throughout with heavy weight contrast (title huge 900 weight letter-spacing, small caps labels). Terminal/hacker aesthetic fits stealth. Use ui-monospace stack. Add scanline overlay + subtle CRT flicker? Scanlines via CSS repeating-linear-gradient overlay — nice and cheap.
+
+In-game HUD: top-left mission panel; bottom-center detection meter; bottom-right controls hint chip; top-right timer + drives icons (3 diamonds filling as collected). All monospace, angular panels with clipped corners (clip-path polygon) — techy, not rounded-2xl. Colors: dark blue-black bg, cyan/green phosphor accents, amber warnings, red alerts. Palette: #05080f base, #7df9ff / #35e0a1? Let me pick: primary accent cyan #6ee7ff, success green #58ffa3, warning amber #ffc857, danger #ff4d5e. Multi-hue so it doesn't read as a single-neon-on-black cliché — plus the 3D scene itself is colorful (walls slate blue, crates tan/olive, guards orange, player cyan).
+
+Scene colors: floor dark slate checker (#1b2431/#182029), walls #3a4a5e with light shading variation by face orientation, crates #7a6a4a olive-tan, exit zone green glow, drives cyan diamond, guards amber/orange body + darker head? Guards: dark navy uniform with amber trim; player: teal.
+
+Lighting: directional from upper-left: L = normalize(-0.5, 1, -0.3)? Compute per-face brightness = ambient 0.45 + diffuse 0.55*max(0,dot(n,L)). Top faces brightest.
+
+Fog to background color #070b12.
+
+Camera: distance ~9 units, height ~6.5 → pitch ~35°. Follow player with lerp (pos lerp 8%/frame-ish dt-based). Camera yaw default α such that forward points... let's define camera position = target - F * dist + up*height where F=(sinψ,0,cosψ) is the view direction. Default ψ = π/4? Player moves in WASD world coords: W = +z? Let me map: screen-up (away from camera) should be W. If view direction F = (-0.707, 0, -0.707)?? Let's choose default: camera is at northeast of player looking southwest. Then W (forward on screen) = southwest = (-1,0,-1)/√2 in world... but WASD expects W to be "up" on the map. Simpler: define movement relative to camera yaw! Camera-relative movement: forward = F rotated by -90°? No — standard third-person: W moves along view forward (F), A/D strafe. That's natural for 3/4 cam and consistent when rotating with Q/E. Let's do that: move vector = F*(W-S) + R*(D-A), normalized.
+
+Default ψ: let's pick ψ = π/2? F=(sin,cos): ψ=π/2 → F=(1,0) i.e., +x... whatever, pick ψ0 = π*3/4? Let me just pick and verify visually in head: I want the classic look: camera behind top-right. Camera position C = T - F*d + h. If F = (sinψ, 0, cosψ), then C is at T - F*d → opposite side of F. Choose ψ = π/4*... let's pick F = normalize(-1, 0, -1) → sinψ=-√2/2, cosψ=-√2/2 → ψ = -3π/4 (or 5π/4). C = T + (1,0,1)*d/√2 → camera at southeast of player looking northwest. Screen up = NW. Then W moves to NW. Fine. Q/E rotates ψ by ±π/2 with smooth interpolation.
+
+Q rotation: targetYaw += π/2; lerp current shortest path.
+
+Minimap? A small 2D minimap in a corner would be great for stealth (shows walls, guards when close?, drives). This adds huge polish and is cheap: draw the grid once to an offscreen canvas, then blit + dots each frame. Guards shown only within "sensor range" of player or always? For stealth feel: show guards as amber dots always but with a small FOV wedge; exit green when active; drives cyan. Yes let's add minimap top-right under timer... actually place bottom-left? Let's do top-right column: [timer] [minimap]. Hmm, detection meter is bottom-center; mode chip bottom-right; mission top-left; minimap top-right. Good layout.
+
+Minimap size ~150px. Draw walls once (static). Player dot + heading, guard dots + cone wedge, drive diamonds, exit square. Rotate? Keep north-up static (simpler, fine).
+
+Performance: faces per frame: wall runs maybe ~40 boxes * 2 visible faces avg = 80; crates ~15 boxes*2=30; entities: player+4 guards ≈ 5*(body+head)=10 boxes*~2.5 faces = 25; sprites ~6; floor is separate. Total sort items ~150 — trivial.
+
+Floor grid lines: draw as lines after the big floor quad? If solids drawn later, lines near walls are fine. But grid lines should be occluded by crates/walls — they're on the floor so drawing them before all solids works (solids cover where needed). However, a vision cone polygon drawn on the floor could overlap with another guard's... whatever, alpha blend fine. Order for floor pass: big floor quad → grid lines → exit zone glow → cones → shadows (entity ellipses) — wait, shadows should be under entities but over grid; yes in the floor pass using projected positions.
+
+Edge case: vision cones are drawn before solids so walls occlude them — correct! But a cone near camera could extend toward camera and get "cut" at near plane while the wall is behind it... acceptable.
+
+Also draw a subtle outline on walls? Shading should be enough. Add top face slightly brighter + edge highlight line on top edges for crispness: after drawing each box's faces, stroke the top face with a light rgba. Keep simple: just strokes with low alpha for all drawn quads — adds definition. Let's do subtle strokes (rgba(0,0,0,0.25)) to separate adjacent boxes.
+
+Now detection meter UI: 10-segment bar; fill = maxSuspicion across guards; colors interpolate green→amber→red; label "DETECTION"; when a guard is actively seeing you, add pulsing red border + "CONTACT" text? Also show which mode.
+
+Heartbeat audio: interval scales from 1.2s (at s=0.3) to 0.35s (at s=1). Two thumps (lub-dub). Volume scales with s.
+
+Footsteps: timer based on movement speed; sneak: step every 0.55s, vol 0.08; walk: 0.42s, vol 0.15; run: 0.28s, vol 0.3 + occasional noise event (run generates a "noise ping" every ~0.9s at radius 6). Show expanding ripple on floor at player position when noise emitted (animated ring, drawn in floor pass) — nice feedback.
+
+Sound design functions with small helper: function tone({f, t=now, dur, type='sine', vol, slideTo}), using oscillator + gain envelope. Noise: buffer of random samples, bandpass filter.
+
+Alarm: siren = sawtooth sweeping 400→800Hz repeated, plus red strobe (CSS overlay pulsing via JS opacity), screen shake amplitude decaying.
+
+Pause: Esc or P toggles; overlay with controls + "resume" note. Restart: R (works from any state — restarts to PLAYING directly? Or R on start screen does nothing; R on fail/win → new run). Also on-screen buttons for mouse users (start, resume, retry). Keyboard listeners on window per requirement.
+
+localStorage: save best time + rank in try/catch; show "BEST: 01:23 (S)" on start & win screens. Key 'silentBreach.best'.
+
+Now the map design. Grid about 25 wide x 19 tall? Let me sketch a facility with rooms and corridors. Cells: 1 unit each. Map legend:
+- `#` wall (h=3)
+- `.` floor
+- `C` crate (h=1.5, collidable)
+- `P` player start
+- `D` drive (up to 3)
+- `X` exit zone
+
+Guards defined in JS with waypoint lists (grid coords). Let me draw the map (rows top = north; x is east):
+
+Width 26, height 19? Let's do:
+
+```
+##########################
+#......#..........#......#
+#.P....#..D.......#......#
+#......+..........+......#
+#......#..........#......#
+#..C...#....##....#..C...#
+#......#....##....#......#
+########....##....######.#
+#......#..........#......#
+#..C...+....CC....+..C...#
+#......#..........#......#
+#.D....#..........#......#
+#......#....##....#..C...#
+#......+....##....+......#
+#......#..........#......#
+#####.##..........##.#####
+#.....#....CC.....#......#
+#X....#............#..D..#
+##########################
+```
+
+Hmm `+` as floor (doorway). Let me clean up: use only # . C P D X and spaces? Let me write a proper 26x19 grid. Actually let me design more intentionally with corridors and a central server room holding drives. Let's do 27 cols x 19 rows.
+
+Let me build carefully, ensuring connectivity. Rows (each 27 chars):
+
+Row0:  ###########################
+Row1:  #.......#.........#.......#
+Row2:  #..P....#.....D...#.......#
+Row3:  #.......+.........+.......#
+Row4:  #.......#.........#.......#
+Row5:  #..C....#...####...#..C...#
+Row6:  #.......#...#..#...#......#
+Row7:  ####.###...#..#...###.#####
+Row8:  #........#.#..#.#.........#   <- hmm getting messy
+
+Simpler design: outer wall; interior: central block (server room) with 2 doorways; 4 corner rooms separated by partial walls; corridors between. Let me lay out a clean symmetric-ish plan, 25x17:
+
+```
+#########################
+#..........##...........#
+#..P.......##......D....#
+#..........##...........#
+#...CC.....++.....CC....#
+#..........##...........#
+####.#####.##.#####.#####
+#.................#.....#
+#..C...............#..D.#
+#........CC........+....#
+#..C...............#....#
+#.......................#
+####.#####.##.#####.#####
+#..........##...........#
+#...CC.....++.....CC....#
+#..........##...........#
+#.......D..##......X....#
+#########################
+```
+
+Let me count columns: "#########################" = 25. Row1: "#..........##..........."? Let me count each row carefully to exactly 25 chars. I'll do it systematically in code comments, but for the answer I need a valid string. Let me define width W=25, height H=17.
+
+Column indices 0..24. Central block at cols 11-12 (2 wide). Central vertical wall segments rows 1-5 and 11-15? With doorways ("++") on rows 4 and 12? Hmm wait, in the sketch above central ## is rows 1-5 with doorway row 4 (++), then a horizontal band rows 6-12 (corridor ring), then central block again rows 13-15 with doorway row 14.
+
+Let me write each row as exactly 25 chars:
+
+r0:  "#########################"  (25 #)
+r1:  "#..........##...........#": 1 + 10 dots? Count: #(1) + 10 dots(11) + ##(13) + 11 dots(24) + #(25). → 1+10+2+11+1 = 25 ✓ (cols 11,12 are #)
+r2:  "#..P.......##......D....#": 1+2+P+7? Let me count: chars: # . . P . . . . . . . ## ...... D .... # → 1 + 2dots(3) + P(4) + 7dots(11) + ##(13) + 6dots(19) + D(20) + 4dots(24) + #(25) ✓
+r3:  "#..........##...........#" same as r1 ✓
+r4:  "#...CC.....++.....CC....#": # (1) 3dots(4) CC(6) 5dots(11) ++(13) 5dots(18) CC(20) 4dots(24) #(25) ✓
+r5:  "#..........##...........#" ✓
+r6:  "####.#####.##.#####.#####" → 4#+.(5)+5#(10)+.(11)+##(13)+.(14)+5#(19)+.(20)+5#(25) ✓ — wait that's 4+1+5+1+2+1+5+1+5 = 25 ✓. This row: horizontal wall with doorways at col4, col10, col13, col19.
+
+Hmm r6 has .##. in middle meaning cols 11-12 continue as #? Actually the central block should span rows 1-6? Let me reconsider: simpler to have one big central server room (cols 8-16, rows 4-12) with wall ring and doorways on the sides; drives inside. And corner rooms.
+
+New plan — let me do this instead: central server room box from col 8..16, row 5..11 (walls), doorways at top-center (cols 11-12, row 5) and bottom-center (cols 11-12, row 11). Drives: one inside center, two in far corners. Player starts top-left. Exit bottom-right corner.
+
+Grid 25x17:
+r0:  #########################
+r1:  #.......................#
+r2:  #..P.....CC.............#
+r3:  #..........C............#
+r4:  #...................D...#   (drive top-right)
+r5:  #........###########....#   → wait, central room wall rows: left wall col8? Let me place the room walls: cols 8-16 with row 5 as top wall segment "#########" at cols 8..16, and col 8 & col 16 vertical down to row 11, row 11 bottom wall.
+
+Let me write rows:
+r0:  "#########################"
+r1:  "#.......................#"
+r2:  "#..P.....CC.............#"
+r3:  "#..........C............#"
+r4:  "#...................D...#"
+r5:  "#........###########....#" → count: # (1) 8dots(9) + 11#s(20) + 4dots(24) + #(25) ✓ — but that puts the top wall at cols 8-18, not centered. Let me center: room cols 8..16 → 9 wide, walls span cols 8..16 = 9 chars. Top wall row 5: cols 8..16 # with doorway at cols 11-12? Then: "#########" with dots at positions... let's do doorway at cols 11,12: so "#.......#"? Let me write r5 = "#" + 7dots (cols 1-7) + "###" (8,9,10) + ".." (11,12) + "####" (13-16) + 8 dots (17-24)? wait cols 17..24 = 8 dots + "#" col 25? Total: 1+7+3+2+4+8+1=26. Off by one — width 25 means cols 0..24, so after col16 we need cols 17..23 (7 dots) and col24 "#". r5 = "#" + "......."(7) + "###"(3) + ".."(2) + "####"(4) + "......."(7) + "#" = 1+7+3+2+4+7+1 = 25 ✓.
+
+r6:  "#........#.....#........#" → col8 #, cols 9-13 dots? Room interior cols 9..15. r6: "#" + 7dots + "#" (col8) + "......."(cols 9-15, 7 dots) + "#" (col16) + 7dots (17-23) + "#". = 1+7+1+7+1+7+1=25 ✓
+r7:  "#........#..D..#........#" → drive in center of room. Same counts, replace middle with "..D.." (cols 9-15: dot dot D dot dot) ✓
+r8:  "#........#.....#........#"
+r9:  "#...CC...#.....#...C....#" hmm let me add crates outside: col4-5 CC? r9: "#" + 3dots(1-3)? Let's do: cols: 1..7 area. "#"+ "..." (1-3) + "CC" (4,5) + "..." (6-8)? But col8 is # → so cols 6,7 dots then col8 #. So "#" + "..."(3) + "CC"(2) + ".."(2) = col7? Count: 1+3+2+2=8 chars → cols 0..7, next char col8 = "#". Then interior ".......", col16 "#", then outside right: cols 17-23: "..." + "C" + ... let's do "...C...": 7 chars? cols 17,18,19 dots, col20 C, 21,22,23 dots = 7 ✓. r9 total: 1+3+2+2+1+7+1+7+1 = 25 ✓ → "#...CC...#.....#...C....#" wait that string: # . . . C C . . . # . . . . . . . # . . . C . . . . # — count chars: let me recount the written string "#...CC...#.....#...C....#": #(1) ...(4) CC(6) ...(9) #(10) .....(15) #(16) ...C(20)? hmm "..." then C = 4 → cols 17-20, then "...." (21-24) then #? That's 25 chars but col 24 is "." and no closing wall. I'm confusing myself; let me be careful: positions 0..24.
+
+r9 target: pos0 '#', pos1 '.', pos2 '.', pos3 '.', pos4 'C', pos5 'C', pos6 '.', pos7 '.', pos8 '#', pos9-15 '.....' (7), pos16 '#', pos17 '.', pos18 '.', pos19 '.', pos20 'C', pos21 '.', pos22 '.', pos23 '.', pos24 '#'.
+String: "#" + "..." + "CC" + ".." + "#" + "......." + "#" + "..." + "C" + "..." + "#" = 1+3+2+2+1+7+1+3+1+3+1 = 25 ✓ → "#...CC..#.......#...C...#"
+
+Let me stop hand-building all rows in analysis text; I'll write the final map carefully inside the code block and double-check each row length = 25. Better approach: write a validation note? No — just be careful. Actually, I can make the engine robust: pad/trim rows to width W (use max row length). And treat out-of-range as walls. That prevents crash if any row is off by one. Good safety net.
+
+Full map (25x17), let me finalize with features:
+- Player start top-left area (r2,c3)
+- Drives: center room (r7,c12), top-right corner (r4,c20), bottom-left corner? and exit at bottom-right.
+- Crates scattered for cover.
+- Exit zone at bottom-right (r14,c21).
+
+Rows:
+r0:  #########################
+r1:  #.......................#
+r2:  #..P.....CC.............#
+r3:  #..........C............#
+r4:  #...................D...#
+r5:  #.......###..####.......#
+r6:  #........#.....#........#
+r7:  #........#..D..#........#
+r8:  #........#.....#........#
+r9:  #...CC..#.......#...C...#
+r10: #........#.....#........#
+r11: #.......###..####.......#
+r12: #.......................#
+r13: #..CC....C......C....C..#
+r14: #...........D.........X.#   wait exit X and drive both? Let me have drives total 3: r7 center, r4 top-right, r13 bottom-left area (c11). Exit r14 c21.
+
+Let me recount each row for length 25:
+
+r0: 25 #'s ✓
+r1: # + 23 dots + # = 25 ✓
+r2: "#..P.....CC.............#": # (1) ..(3) P(4) .....(9) CC(11) ...........? then #. After CC at pos 9,10: remaining pos 11..23 = 13 dots + pos24 #. So string: "#" + ".." + "P" + "....." + "CC" + "............." + "#" = 1+2+1+5+2+13+1=25 ✓
+r3: "#..........C............#": 1 + 10dots(11) + C(12) + 12dots(24) + # = 25 ✓
+r4: "#...................D...#": 1 + 19dots(20) + D(21) + 3dots(24) + # = 25 ✓ (drive at c20)
+r5: "#.......###..####.......#": 1 + 7(8) + ###(11) + ..(13) + ####(17) + 7(24) + # = 25 ✓ → walls cols 8-10, door cols 11-12, walls 13-16.
+r6: "#........#.....#........#": 1+8+1+5+1+8+1 = 25 ✓ (left wall col8, interior cols 9-13, right wall col14)
+
+Wait — I planned the room cols 8..16 earlier but now it's cols 8..14 (interior 9-13). Let me redo r5 to match: walls col8 and col14, top wall row 5 spans cols 8..14 with door at cols 11-12: "#........###..####......."? Count: 1 + 8dots(9) + ###(cols 8,9,10 → ends pos10)... ugh positions: after "#" (pos0) + 7 dots (pos1-7), then walls start pos8. r5 = "#" + "......."(pos1-7) + "###"(pos8-10) + ".."(pos11-12) + "####"(pos13-16)? That ends room at col16. I keep flip-flopping. Decision: room outer walls cols 8..16 (9 wide), interior cols 9..15 (7 wide). Door top and bottom at cols 11,12.
+
+r5 = pos0 '#', pos1-7 '.......' (7), pos8-10 '###', pos11-12 '..', pos13-16 '####', pos17-23 '.......' (7), pos24 '#'. String: "#.......###..####......." wait that ends with 7 dots + # → "#.......###..####......." is 24 chars; add final "#": "#.......###..####......." hmm let me just write it: "#" + "......." + "###" + ".." + "####" + "......." + "#" = 1+7+3+2+4+7+1 = 25. Written out: `#.......###..####.......#` ✓
+
+r6 = "#" + "........"(8) + "#"(pos8) + "......."(pos9-15) + "#"(pos16) + "......."(pos17-23) + "#" → 1+8+1+7+1+7+1=25: `#........#.......#.......#` ✓
+r7 = same with D at pos12: interior pos9-15 = "..D...."? center is pos12: pos9 '.',pos10 '.',pos11 '.',pos12 'D',pos13 '.',pos14 '.',pos15 '.' → "...D...". r7 = `#........#...D...#.......#` ✓
+r8 = `#........#.......#.......#`
+r9 = crates outside: pos1-3 dots? Let me put CC at pos4,5; C on right side pos20. r9 = "#" + "..."(1-3) + "CC"(4-5) + ".."(6-7) + "#"(8) + "......."(9-15) + "#"(16) + "..."(17-19) + "C"(20) + "..."(21-23) + "#" = 1+3+2+2+1+7+1+3+1+3+1=25: `#...CC..#.......#...C...#` ✓
+r10 = `#........#.......#.......#`
+r11 = mirror of r5: `#.......###..####.......#` (door cols 11-12) ✓
+r12 = `#.......................#`
+r13 = crates + drive bottom-left: D at pos11? and crates. r13 = "#" + ".."(1-2) + "CC"(3-4) + "....."(5-9) + "C"(10) + "...."(11-14)? I want a drive — let me put a 2nd... wait drives: center (r7c12), top-right (r4c20), and one more. Let's put the 3rd at r13 c6? Then exit at bottom right r14 c21.
+r13 = "#" + "....."(1-5) + "D"(6) + "...."(7-10) + "C"(11) + "......"(12-17) + "C"(18) + "...."(19-22) + "#"? count 1+5+1+4+1+6+1+4+1=24. Off by one; let me adjust: "#" + "....." + "D" + "....."(7-11) + "C"(12) + "....."(13-17) + "C"(18) + "...."(19-22) + "#" = 1+5+1+5+1+5+1+4+1 = 25 ✓ → `#.....D.....C.....C....#`
+r14 = "#...........D.........X.#"? no — only 3 drives total; r14 is just exit: X at pos21. r14 = "#" + "..................."(pos1-19, 19 dots) + "X"(20)? Let me put X at pos21: 1+20dots(21)+X? positions: pos1..20 = 20 dots, pos21 'X', pos22-23 "..", pos24 '#': 1+20+1+2+1=25 → `#....................X..#` ✓
+r15 = `#.......................#`
+r16 = `#########################`
+
+Total rows = 17 (r0..r16).
+
+Drive positions: (c12,r7) center, (c20,r4) top-right, (c6,r13) bottom-left. Player start (c3,r2). Exit (c21,r14).
+
+Connectivity check: center room reachable via doors at r5 c11-12 and r11 c11-12 — open corridors exist around ✓. All areas connected through the open ring rows 12 & 1, cols... yes open floor everywhere except room block & crates. Good.
+
+Guards (4):
+G1: top corridor patrol: waypoints [(3,2)?? that's player start... let me pick routes:
+- G1 top area: [(6,2), (19,2)] horizontal sweep? Passes near top-right drive — good tension. Actually the r2 row has crates at c9,10. Route [(4,2),(20,2)] straight line passes through crates? Crates are at r2 c9,c10 → path blocked! Guard movement should avoid crates (they're solid). Straight-line waypoint navigation with no obstacle avoidance could clip crates. Options: make guard routes follow clear lines, or treat crates as non-solid for guards (weird), or add simple steering: if next step is blocked, slide? Simplest: design routes along clear rows/cols.
+
+Clear rows: r1 (all dots), r3 (dot + C at c11 — blocked at 11!), r4 (dots except D at c20 which is not solid), r12 all dots, r15 all dots. Clear cols: col1 (r1-r15 dots? r13 c1 '.', yes; r9 c1 '.'... col1 clear from r1 to r15? Check each row for col1: r2 '.', r3 '.', r4 '.', r5 '.', r6 '.', r7 '.', r8 '.', r9 '.', r10 '.', r11 '.', r12 '.', r13 '.', r14 '.', r15 '.' ✓). Col 23 similarly? r4 c23 '.', r9 c23 '.', r13 c23 '.', r14 c23 '.'... but r14 = X at c21, c22-23 dots → col23 clear? r2 c23 '.', yes. Also cols 6,7 (left of room): rows 5-11 have col6,7 dots ✓ (r9 has CC at 4,5 so col6,7 clear). Cols 17,18: r9 c17-19 "...", c20 'C' → cols 17,18 clear; r13 c18 'C' → col18 blocked at r13. Col 17 clear? r13 pos17 '.', yes.
+
+Guard routes (axis-aligned segments through clear cells):
+- G1: top sweep: [(2,1)→(22,1)] row 1 — passes over everything at top; player starts just below at (3,2). Good pressure early. Maybe make it shorter: [(4,1),(20,1)].
+- G2: right side vertical: [(23,4)→(23,14)] col 23 clear ✓. Watch the exit area & top-right drive.
+- G3: bottom sweep: [(4,15)→(20,15)] row 15.
+- G4: center room! Patrol inside: waypoints around interior (interior cols 9-15, rows 6-10): loop [(10,7),(14,7),(14,9)? wait rows: interior rows 6..10? Room walls r5 & r11, so interior rows 6-10, cols 9-15. Loop: [(10,6.5)? let me use cell centers at integer+0.5. Waypoints (in units): (10.5,7.5)?? hmm coordinates: cell (c,r) center = (c+0.5, r+0.5). Interior loop corners: (9.5+? ) Let's do [(10.5,6.8),(14.2,6.8),(14.2,9.8),(10.5,9.8)] — inside interior (cols 9-15 → x 9..16; rows 6-10 → y(z) 6..11). Let's use grid z = row. So loop points: (10.5, 7), (14, 7), (14, 9.5)? hmm let me just keep it simple with cell coords: [(10,7),(14,7),(14,9),(10,9)] meaning centers (10.5,7.5) etc. Wait rows 6-10 → r=7,8,9 are safe middle rows; cols 9-15 → c=10..14 safe. Loop [(10,7),(14,7),(14,9),(10,9)] — but center drive is at (12,7) directly on path! Drive floats above floor; guard walking over it is fine (drive is a pickup for player only). Actually fun: guards patrol right past the data drive. But if a guard stands on the drive cell and player tries to grab → risky, that's good stealth design. Hmm but might be frustrating. Move center drive to (12,8)? r8 interior row... wait r7 has D at c12. Let me move to r8: r7 becomes `#........#.......#.......#` and r8 becomes `#........#...D...#.......#`. Then guard loop rows 7 & 9 avoids it? Loop (10,7)-(14,7) passes through (12,7) — drive now at (12,8), fine.
+
+Also G5: a 5th guard in the left-middle corridor vertical: col 6 or 7, rows 5..11: [(7,5),(7,11)]? Col 7 clear ✓ (r9 has CC at 4,5; c6,7 dots). Wait r9 = `#...CC..#...` → pos6 '.', pos7 '.' ✓. But does this column cross any room wall? Room left wall is col8 — col 7 is outside, rows 5-11 clear ✓. Add G5 route [(6,5),(6,11)] to guard the approach to center door & bottom-left drive.
+
+So 5 guards: top sweep (G1), right vertical (G2), bottom sweep (G3), center room loop (G4), left vertical (G5). Nice coverage.
+
+Guard speeds ~1.8 u/s patrol, 3.0 investigate/run. Player: walk 3.2, sneak 1.7, run 4.6. Hmm player walk should be slower than guard investigate speed so you can't outrun alerts easily... actually let's make it snappy: walk 3.4, sneak 1.8, run 5.0; guard patrol 1.7, chase 4.2.
+
+Vision range: walk 6.5, sneak 4.0, run 7.5. FOV 95°.
+
+Noise: run emits pings every 0.8s radius 5.5 (walls attenuate to ×0.55). Stepping on... skip surfaces.
+
+Now the code architecture:
+
+```html
+<!DOCTYPE html><html><head><meta charset=utf-8><title>SILENT BREACH</title>
+<style>...</style></head>
+<body>
+<canvas id=cv></canvas>
+<div id=vignette></div><div id=alertGlow></div><div id=scanlines></div>
+<div id=hud>... panels ...</div>
+<div id=startScreen>...</div>
+<div id=endScreen>...</div>  (shared for fail/win with dynamic content)
+<div id=pauseScreen>...</div>
+<script>...</script>
+```
+
+HUD as DOM (easy to style, cheap) + minimap canvas inside HUD. Detection meter as div segments or a single bar with width% — use a bar with gradient fill and a moving marker? Segments look techy: 12 <i> elements toggled by class... simpler: one bar div with width = pct and background color set via JS (hue shift). Plus label changes: "SCANNING…"/"CONTACT!". Let me do bar + pulsing text.
+
+Screen shake: apply to canvas ctx translate, or CSS transform on canvas? Use ctx.translate in render.
+
+Start screen content:
+- Top classification bar: "▚ CLASSIFIED // EYES ONLY — NODE 7 INTRUSION SIM" small monospace with blinking cursor
+- Title: "SILENT BREACH" big; subtitle "3D INFILTRATION PROTOCOL"
+- Layout: 2-column briefing: [MISSION BRIEF] objective list (steal 3 data drives, reach extraction, don't be seen — detection = failure) + [CONTROLS] key grid (WASD move / SHIFT sneak / CTRL run / Q·E rotate cam / P pause / R restart).
+- Footer: "ENTER — BEGIN INFILTRATION" pulsing + best time if any.
+Style: left-aligned panel with clipped corners, amber/cyan accents, dashed rule separators, small caps labels. Blinking block cursor ▮ animation.
+
+End screen (fail): big red "DETECTED // MISSION FAILED", stats line (drives x/3, time, peak detection), "R — RETRY".
+Win: green "EXTRACTION COMPLETE", rank letter huge, time, best updated notice.
+
+Pause: "PAUSED" + controls reminder + "P — RESUME · R — RESTART".
+
+Now the JS structure (~large but organized):
+
+1. Canvas setup & resize (devicePixelRatio aware).
+2. Audio module: init on first gesture; sfx functions.
+3. Map parsing → solid grid (walls=1, crates=2), wallRun boxes for rendering, crateBoxes.
+4. Entities: player {x,z, yaw(for facing), mode, susp? no}, guards[], drives[], exit.
+5. Input: keydown/keyup on window; keys map; prevent default for arrows/space maybe.
+6. Game state machine + reset().
+7. update(dt): player move & collision, footsteps/noise, guard AI, suspicion, drives pickup, exit check, alarm timer, camera follow, ripples update, heartbeat scheduler.
+8. render(): floor pass, world faces sort/draw, sprites, HUD DOM updates (cheap: only when changed? just set style/text each frame is fine), minimap.
+9. Loop with rAF and clamped dt.
+
+Math helpers: vec ops inline, lerp, angDiff, normalize.
+
+DDA LOS: function losClear(x0,z0,x1,z1): step through grid; return true if no solid before endpoint. Implement as segment vs cells via sampling? DDA is more robust; but sampling every 0.2 units works too (max dist ~30 → 150 samples * 5 guards = 750/frame — fine). Let me do proper DDA for cleanness... sampling is simpler and reliable enough at 0.15 steps. Use sampling with small step; also used for vision cones (many rays) — cone: 26 rays × max 40 samples × 5 guards = 5200 ops/frame — fine.
+
+Actually for cone rendering, I can cache the cone polygon and only recompute when guard's facing changes >~2° or every 100ms? Guards rotate smoothly while moving; recompute each frame is OK given the cost above. Keep per-frame but step 0.25 → ~4600 samples total. Fine.
+
+Box face generation: define box(cx, cz, w, d, h0, h1, color) → 8 corners, 6 faces with fixed normals. Precompute static boxes (walls/crates) once; entities generate per frame.
+
+Face draw pipeline per frame:
+```
+items = [] // {d: depth, kind, ...}
+for each box in allBoxes (static + dynamic):
+   compute 8 corners cam-space (transform once per corner? corners shared between faces — transform the 8 verts per box)
+   for each of 6 faces:
+      if all verts cz < NEAR skip; backface cull using world normal & camera pos
+      clip polygon against near plane → maybe 4-5 pts
+      depth = avg cz
+      shade = compute from world normal (precomputed per face) — but clipped poly keeps same color ✓
+      push item {d, pts: screen coords, fill, stroke?}
+sort desc by d; draw.
+```
+
+Backface cull: dot(normal_world, camWorld - faceCenterWorld) > 0 → visible. Need world positions too — compute per box cheaply (center = box center).
+
+Transform function: given camera C(ψ): precompute sin/cos of ψ and right vector. For point p: dx=p.x-C.x; dz=p.z-C.z; dy=p.y-C.y;
+cx = dx*rx + dz*rz where R=(cosψ, 0, -sinψ)? Let me verify: F=(sinψ,0,cosψ). R should be F × U? Cross(F,U) = (F.y*U.z - F.z*U.y, ..., ) with U=(0,1,0): F×U = (Fy*Uz - Fz*Uy, Fz*Ux - Fx*Uz, Fx*Uy - Fy*Ux) = (0*0 - cosψ*1, cosψ*0 - sinψ*0, sinψ*1 - 0) = (-cosψ, 0, sinψ). Hmm that gives R=(-cosψ,0,sinψ). Alternatively U×F = (cosψ,0,-sinψ). Right-handed: with F forward, U up, right = F × U? In a right-handed system with +x right, +y up, +z... let me just verify concretely. ψ=0 → F=(0,0,1) (looking +z). Camera at -z side looking toward +z. What's "right" on screen? If y is up and we look along +z in a standard right-handed coord system (x right, y up, z toward viewer), then looking along +z means... ugh. Let me just pick R = (cosψ, 0, -sinψ) and test mentally: ψ=0 → R=(1,0,0). Screen x = dot(p-C,R)=dx → point to the east appears on screen right. Camera looks north (+z) — is east on the right when facing north? If y is up and z is "north" (into scene), then looking north, east (+x) is... in a right-handed system (x=east, y=up, z=north), looking toward +z (north): screen right = ? Cross(up, forward)? Standard: right = normalize(cross(forward, up))? cross(F,U) with F=(0,0,1), U=(0,1,0): (Fy*Uz−Fz*Uy, Fz*Ux−Fx*Uz, Fx*Uy−Fy*Ux) = (0*0−1*1, 1*0−0*0, 0*1−0*0) = (−1,0,0). So right=−x. That means looking +z, east is on the left — that would be a left-handed feel. To avoid confusion: I'll use screenX = W/2 − cx*f/cz? No wait — simpler: define R = (cosψ, 0, −sinψ) [the U×F variant] and map sx = W/2 + cx*f/cz. Whatever the handedness, as long as it's consistent, the game works; if the view is mirrored, I'll flip A/D. Let me reason once more carefully with a concrete case to get chirality right:
+
+I want: default camera at southeast of player (C = T + (d/√2)(+x? ...)). Hmm let me pick ψ so that F points northwest: F = (−0.707, 0, −0.707) → sinψ=−0.707, cosψ=−0.707 → ψ = 225° (or −135°). Camera position C = T − F*dist + h = T + (0.707,0,0.707)*dist + h → southeast ✓.
+
+Now on screen: W key should move player along F (northwest) and appear to go "up" the screen — automatic since we project. A/D strafe: D should be rightward on screen. Right vector R = ? Take a world point p = T + R*1. If R=(cosψ,0,−sinψ) = (−0.707, 0, 0.707) → southeast... wait that's the camera direction, not right. Hmm cos(225°)=−0.707, sin(225°)=−0.707. R=(cosψ,0,−sinψ)=(−0.707, 0, +0.707) → points west+south?? (x=−0.707 = west, z=+0.707 = south if z is north). Camera looks NW, camera sits SE. Right of a person facing NW is NE. So R should be ≈ (+0.707 east? no—) facing NW: forward NW, right hand points NE = (+x? east +z? ) hmm let me define axes concretely: x = east, z = north (so "up on the map" = +z). Facing F = NW = (−1, 0, −1)/√2. Right = rotate F by −90° around Y (clockwise from top view): rotating vector (x,z) by −90°: (x,z) → (z, −x)? Rotation by θ in xz plane: x' = x cosθ + z sinθ? I keep going in circles. Let me use the screen projection directly to determine which of R candidates appears on the right.
+
+Projection: cx = dot(p−C, R); sx = W/2 + cx·f/cz (cz>0). For p = T + r where r is a unit horizontal vector with large distance in front: cz ≈ dot(r,F)·k > 0 for k big enough? Take r = R candidate; need cz = dot(R, F) = ? If R ⊥ F then cz≈0 → point at horizon, sx offset = ±f·(R·... ) hmm cx = dot(R,R)=1, cz = 0+ (height effect: dy = −h so cz also gets dot((0,h,0),F)=0). So cz=0 exactly → on the horizon line, sx = W/2 + f/cz → infinity. Not useful. Take p slightly in front: r = F*10 + R*1. cx = 10·dot(F,R)+dot(R,R) = 1 (if ⊥). cz = 10 + dot... dy: p−C has horizontal part F*10+R*1 and vertical −h: cz = dot(F*10 + R, F) = 10. sx = W/2 + f/10·1 → right of center ✓ if R is truly the screen-right direction. So by construction, whichever R I use will be *defined* as screen right; the question is only whether world motion feels natural (mirroring). If mirrored (east appears on left when facing north), A/D would feel swapped — and I can just swap D/A in input code. Honestly either works; players don't know the "correct" chirality, but a mirrored view looks weird relative to the minimap (north-up). To be safe let me make it non-mirrored: I want x=east on screen-right when camera faces north (F=(0,0,1), ψ=90°? F=(sinψ,cosψ): sinψ=0, cosψ=1 → ψ=0). At ψ=0: R candidate A = (cosψ, 0, −sinψ) = (1,0,0) → east on right ✓. So use R = (cosψ, 0, −sinψ), F=(sinψ,0,cosψ), C = T − F·dist + U·h. At ψ=0: C = T − (0,0,dist)+h → camera at south of player looking north, east on right ✓ non-mirrored.
+
+Default ψ: I want camera SE → F = NW = (−√2/2, 0, −√2/2) → sinψ=−√2/2, cosψ=−√2/2 → ψ = −135° (or 225°). Q/E: targetYaw ±= π/2.
+
+Movement: forward W: v += F; S: −F; D: +R; A: −R.
+
+Now guard facing angle: store guard.dir as angle in world (atan2 style, direction = (sin a, cos a) to match F convention? Let me just store the direction vector directly and faceAngle = atan2(dx, dz) so that dir=(sinθ, cosθ). FOV check: dot(dirToPlayer, dir) > cos(halfFov) adjusted for distance.
+
+Guard rendering orientation: body box rotated by facing angle — I can support rotated boxes in my box generator (corners computed from center + rotation). Yes: makeBox(cx, cz, w, d, y0, y1, rotY, color). Corners: local ±w/2,±d/2 rotated by rotY. Normals also rotated. Fine — I'll write a general helper that builds 8 world corners and 6 faces (with normals) from box params; compute per frame for entities (cheap), once for statics.
+
+Face index order (using corner indices):
+Corners: 0:(-w,-d,h0) 1:(w,-d,h0) 2:(w,d,h0) 3:(-w,d,h0) 4:(-w,-d,h1) 5:(w,-d,h1) 6:(w,d,h1) 7:(-w,d,h1) with local x,z,y.
+Faces: bottom [0,1,2,3] n=(0,-1,0); top [7,6,5,4]? Winding doesn't matter since I cull by normal·view — use normals explicitly (not from winding): top n=(0,1,0) verts [4,5,6,7]; front(+z) n=(0,0,1) verts [2,3,7,6]; back(−z) n=(0,0,-1) [1,0,4,5]; right(+x) n=(1,0,0) [1,2,6,5]; left(−x) [0,1,5,4] n=(-1,0,0).
+Rotate corners & normals by rotY: x' = x·cos + z·sin? Rotation around Y axis (y up): standard right-handed rotation θ around +y: x' = x cosθ + z sinθ, z' = −x sinθ + z cosθ. As long as I use it consistently for corners and normals, it's consistent.
+
+Shading per face: base color per box; light L = normalize(−0.45, 0.85, −0.35)? Let me pick a light from upper-left-front: L=(−0.4, 0.75, −0.5) normalized... brightness b = 0.42 + 0.58·max(0, dot(n,L)). Top face ~0.42+0.58*0.75≈0.86; vertical faces vary 0.42..~0.7. Then fog: mix toward bg by f = smoothstep(cz, fogNear=10, fogFar=34). Also slight distance darkening.
+
+Colors (rgb triples) precomputed as strings per frame? Compute fill string `rgb(r,g,b)` per face per frame — string GC pressure is fine at ~200 faces.
+
+Floor: single big quad covering map bounds + small margin (or whole world 0..W, 0..H). Draw first with color #141c26; then grid lines every 1 unit: project line endpoints (skip if either behind near plane → clip? Simple: draw only if both cz>near, and if partially behind... near plane at 0.15 with camera height 6.5 & dist 9 — floor points within ~? of camera could be behind. Grid lines near the player might pop; acceptable, or clip each line segment against near plane (2D in camera space: if cz0<near<cz1 compute intersection). Let me implement a small lineClip helper for polish.
+
+Actually simpler: draw grid as part of... no, keep lines with clipping helper. ~48 lines per frame × trivial math = fine.
+
+Exit zone: quad at exit cell (slightly inset), pulsing green alpha; plus animated chevrons? Draw 3 concentric quads with phase offsets — looks like an energy pad. Also a vertical beacon beam when active? A translucent tall quad pair crossing (like a light pillar) — draw as sprites after solids? Beam should be occluded by walls... make it a thin box (4 faces, alpha) in the sort list with additive-ish color. Translucent box in painter order works fine visually. Let me add: exit pad + rotating "gate" ring? Keep: pulsing pad + tall translucent beam (2 crossed planes forming an X when viewed from above — actually 1 plane through center + a perpendicular one, both double-sided (skip backface cull for these)). I'll make a special "plane" primitive with no culling & alpha.
+
+Drives: floating rotating diamond sprite (billboard) with glow (shadowBlur or radial gradient — shadowBlur is slow; use layered shapes: outer soft via globalAlpha circle + core diamond). Bob y = 1.0 + sin(t*2+phase)*0.15. Also a small floor ring beneath. When collected → removed + chime + toast.
+
+Ripples (noise): expanding circles on floor: draw as projected polygons? Project a circle of radius r at y=0: sample 20 points, project, path — cheap. Or just use the projected center with an ellipse scaled by screen-space scale f/cz — approximate circle→ellipse is wrong for perspective but OK... better to project 16-24 points; fine (few ripples).
+
+Shadows: ellipse under player/guards → same projection approach or simple: a dark quad on floor of size ~0.7×0.5 rotated by facing — draw in floor pass as projected polygon with rgba(0,0,0,0.35).
+
+Sprites in main sort (drives): item {d: cz of center, kind:'sprite', draw fn uses screen pos & scale f/cz}.
+
+Guard exclamation: if guard visible to player (2D LOS from player) and (susp>0.15 or investigating), draw "!" / "?" at head top — as a sprite in sort list with depth cz of head → correctly occluded by walls ✓. Text drawn with font size scaled by 1/cz.
+
+Minimap: offscreen canvas built once (walls gray, crates darker). Each frame: blit, then drives (cyan diamond), exit (green square, pulsing when active / dim when locked), guards: amber dot + small FOV wedge (only if within sensor radius of player? or always — decision: always show dots but cone only... for stealth tension let me show guards always (since it's a "facility map"), cones too. OK.) Player: cyan triangle pointing facing direction. Border frame around minimap.
+
+HUD DOM ids: hudObj (drives count), hudTimer, hudMode, detBar, detLabel, toast container, bestTime display on start/end.
+
+Toast system: div stack, fade in/out via CSS animation; JS adds element, removes after 2.6s.
+
+Detection meter: bar width = maxSusp*100%; color: hsl(140 - 140*s? green→red: hue 130→0). Label: s<0.15 "—" / <0.5 "SUSPICION" amber / <0.9 "ALERT" / ≥ "CONTACT!" red flashing. Also add a small guard icon.
+
+Alarm sequence: on detect → state=ALARM, alarmT=0; siren sound; guards set to chase (run toward player at 4.5); red overlay pulsing; screen shake; after 1.6s → state=FAILED, show end screen. During ALARM, ignore input? Movement still allowed but pointless. Show "DETECTED" big text center during alarm via DOM.
+
+Win: on reach exit with all drives → state=WON, play fanfare, confetti? Maybe simple green flash + end screen after 0.8s delay for satisfaction (state=WON_DELAY then show). Rank calc.
+
+Best time storage: {t, rank} if better (lower t). try/catch.
+
+Pause: freeze updates; rAF keeps rendering last frame + overlay. Timer excludes pause time (accumulate playTime only when PLAYING/ALARM).
+
+Restart R: reset() → state=PLAYING directly? Or back to start screen? From fail/win, R → straight to new run (fast retry is important for stealth games). From start screen R does nothing. Also allow Enter on start & end.
+
+Mouse support too: buttons clickable (start / retry / resume). Keyboard listeners on window per requirement.
+
+Edge: iframe focus — window keydown works if iframe has focus after user clicks/keys inside; clicking canvas focuses the iframe. Add tabindex? Iframe content is focused by default when clicked. Fine. Also prevent arrow/space scrolling: e.preventDefault() for game keys when state not typing (no inputs exist anyway).
+
+Resize: canvas = full window, ctx.setTransform(dpr...). Recompute f from fov on each resize. Use ResizeObserver? window resize event + initial. Since it's in an iframe of "any size", also listen to 'resize' and use clientWidth. Call resize() at start too.
+
+Now audio module details:
+```
+let AC=null, master;
+function initAudio(){ if(AC) return; try{ AC = new (window.AudioContext||window.webkitAudioContext)(); master=AC.createGain(); master.gain.value=0.5; master.connect(AC.destination); startAmbient(); }catch(e){} }
+```
+Call initAudio on first keydown/pointerdown (once). If suspended, resume() too.
+
+tone(f0,f1,dur,type,vol,delay=0): osc+gain envelope (attack 0.005, exp decay).
+noise(dur, vol, freqQ...): buffer source + biquad bandpass.
+Ambient: low sine 55Hz gain 0.05 + slow LFO on gain; plus filtered noise loop at very low volume (wind/hum). Create looping noise buffer (2s) through lowpass 300Hz, gain 0.02. Add a subtle "server room" hum: two detuned sines at 120/120.7 Hz, gain 0.02.
+
+Heartbeat: schedule in update: hbTimer -= dt; if maxS>0.25 && hbTimer<=0: thump(); thump scheduled +0.18s later (shorter); interval = lerp(1.1, 0.32, (maxS-0.25)/0.75). Thump = sine 55Hz, vol 0.25*intensity, decay .12.
+
+Footsteps: per-mode step interval; sound = short noise burst lowpass ~ (sneak: freq 400, vol .05; walk 600 .12; run 800 .22) + tiny pitch randomization.
+
+Pickup: two sines 660→990 (staggered) + sparkle.
+Exit unlock: chord? Low confirm: 330 & 495.
+Alarm: sawtooth osc with LFO freq 440↔780, 1.2s, vol .3 + noise crash.
+Fail sting: descending minor: 392→311→262 quick.
+Win: arpeggio 523,659,784,1047 with delays.
+Detected shout: quick square blip 880→440 ×2? Plus guard "!" — synth.
+
+Volume balance: master .5; keep individual modest.
+
+Now let me think about the update loop details.
+
+Player collision: solidAt(x,z) checks grid cell (walls & crates). Move:
+```
+tryMove(nx, nz): if free circle at (nx, pz) → x=nx else resolve? Simple axis separation with substeps: split move into 4 sub-steps of r/2 to reduce corner sticking. Circle vs cell AABB test: for cells overlapping [x-r,x+r]×[z-r,z+r], if solid: clamp point — compute closest point on box, if dist < r → collision.
+```
+Implement collideCircle(x,z,r): returns bool (colliding). Move x then z with substeps of 0.12 or less.
+
+Facing: player.yaw = atan2(vx, vz) when moving (dir=(sin,cos) convention).
+
+Guard update:
+```
+g.state: 'patrol' | 'investigate' | 'chase'
+target waypoint; move toward at speed; on arrival (<0.15): next wp (loop).
+Vision check each frame → if visible: g.susp += rate*dt; g.lastSeen = playerPos; g.alertT=0? if !visible: g.susp -= 0.55*dt; if g.susp < 0.02 → back to patrol (if was investigating & arrived, scan first).
+If hearing noise event (dist< radius*atten): g.investigate(noisePos); g.susp += 0.1? and toast "A guard heard something" once per cooldown.
+Investigate: move to lastSeen; on arrival → scanning: rotate facing back & forth for 2.4s; then patrol from nearest wp.
+Susp >= 1 → alarm.
+Facing while moving = movement direction (lerp angle smoothly). While scanning, oscillate.
+```
+Patrol speed 1.7; investigate 3.1; chase 4.6.
+
+Vision rate: base = clamp( (1 - d/range) , 0.15, 1 ) * 1.1 per second... plus if player mode is run → range larger and rate ×1.25. Crouch/sneak: range shrunk & rate ×0.75. Also "surprise" bonus: if guard was facing away (dot < -0.3) and suddenly sees → +0.25 instant? Nice detail, include.
+
+Suspicion decay 0.5/s; while investigating (at location), decay halved.
+
+Also guards in chase during ALARM: run straight at player with same collision (they might clip walls — acceptable for 1.5s drama; or keep simple move). Keep it simple.
+
+Drives pickup: dist<0.55 → collected, sfx, toast "DATA DRIVE ACQUIRED (n/3)"; when n==3: toast "EXTRACTION UNLOCKED — REACH THE EXIT", exit beam turns green, exit sfx.
+
+Exit check: dist to exit center < 0.7 && allCollected → win. If not all collected & near exit: hint toast once per approach "EXIT LOCKED — n DATA DRIVES REMAIN".
+
+Timer: playTime += dt while PLAYING (and ALARM).
+
+Camera: camTarget = player pos; camPos lerp toward desired at rate 1 - exp(-6dt) style; yaw lerp shortest. Also slight look-ahead in movement direction? Keep simple. Camera height 6.2, dist 8.5 → fov vertical ~40° → f = (H/2)/tan(20°) ≈ H*1.37. At small iframe heights it's fine.
+
+Screen shake: shakeAmp decays; offset = rand*amp.
+
+Render order summary per frame:
+1. Clear with bg gradient (cache gradient object on resize).
+2. ctx.save(); translate by shake.
+3. Floor quad → grid lines → exit pad → ripples → guard cones → shadows.
+4. Build & sort solid/sprite items; draw.
+5. Restore.
+6. HUD DOM updates + minimap.
+
+Cone drawing: polygon from guard pos to ray endpoints (y=0), fill amber rgba(255,170,60,0.13) normally; if that guard's susp>0.4 → red tint & higher alpha; stroke edge thin. Also draw a brighter "core" wedge? Keep single + pulsing alpha when suspicious.
+
+Now — the exclamation sprite: text "!" font bold 28px monospace, color amber→red by susp; "?" for investigating (cyan? white). Scale by f/cz *0.9. Draw with slight bobbing.
+
+DOM structure & CSS — let me write it out carefully but compactly. Palette:
+--bg:#04070c; --panel:rgba(10,18,28,.82); --line:#1d3247; --cyan:#5fd9ff; --green:#54f2a5; --amber:#ffb347; --red:#ff4757; text #cfe6f5.
+
+Font stack: `--mono: "Consolas", "Menlo", "SF Mono", "Cascadia Mono", ui-monospace, monospace`. Display same but weight 800 with wide letter-spacing — since I'm limited to system fonts, differentiate via size/spacing/case. Title in uppercase, tight tracking? Big condensed feel: use `font-stretch`? Not reliable. Use large size + letter-spacing .12em + heavy weight; add a subtle text-shadow glow (cyan) and a clipped "glitch" underline bar.
+
+Scanlines overlay: repeating-linear-gradient(transparent 0 2px, rgba(0,0,0,.14) 2px 3px)? Plus vignette radial. Both pointer-events:none, high z-index.
+
+Panels: clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px)) — angular corners.
+
+Start screen: full overlay flex; content max-width 760px, left-aligned, positioned slightly left of center (margin-left ~8vw) to be asymmetric. Structure:
+```
+<div class=tag>▚ TOP SECRET // EYES ONLY</div>
+<h1>SILENT<br>BREACH</h1>? or one line "SILENT BREACH"
+<p class=sub>OPERATION NIGHTGLASS — FACILITY 07 INFILTRATION SIM (3D)</p>
+<div class=cols>
+  <section MISSION: numbered list ▸ Extract 3 data drives from the server core and perimeter vaults ▸ Reach the extraction pad in SE corner ▸ Any guard spotting you ends the op — suspicion fills as you linger in their vision</section>
+  <section CONTROLS: rows of key caps: [W A S D] move · [SHIFT] sneak (silent, slow) · [CTRL] sprint (fast, loud) · [Q]/[E] rotate camera · [P] pause · [R] restart</section>
+</div>
+<div class=cta> PRESS <b>ENTER</b> TO INFILTRATE <span class=cursor>▮</span></div>
+<div class=best>BEST RUN — 01:42 · RANK A</div> (hidden if none)
+```
+Key caps styled as small bordered boxes. CTA pulses.
+
+End screen similar framing with big status word & stats table + "ENTER / R — REDEPLOY".
+
+Pause: minimal center panel.
+
+OK — also a small "objective chip" top-left in-game: "◈ DRIVES 1/3 · EXIT [LOCKED]" updates.
+
+Timer format mm:ss.
+
+Now let me think about the code size — this is going to be big (~900-1200 lines). That's fine. Let me write it out systematically, being careful with bugs:
+
+Key gotchas:
+- Angle conventions consistency (dir=(sin a, cos a)).
+- DDA sampling for LOS uses same coords (x,z).
+- Painter sort stability not required.
+- Near-plane clip of polygon: standard Sutherland–Hodgman against cz >= NEAR in camera space; then project points.
+- Backface cull with rotated normals.
+- Clamp dt to 0.05 max.
+- Avoid NaN when player stationary (no facing update).
+- Guard waypoint arrival loop index.
+- Q/E yaw wrap: targetYaw unbounded, current lerp via shortest diff — store cur as unbounded too: cur += angDiff(target-cur)*k.
+
+angDiff(a,b) = ((a-b+π)%(2π)+2π)%(2π)-π.
+
+Minimap scale: map 25×17 → canvas 170×119 (7px/cell). Position top-right. Draw player triangle rotated by facing — on minimap, north=+z up: screenY = (H_map - z)*s? If z is north and I draw with z increasing upward: y_px = (mapH - z) * s... cell (c,r): x=c*s, y=r*s if I treat r as "down on map" — but in world, is r (row) south or north? In my grid, row index increases downward in the sketch; in world coords let me set z = row (i.e., +z = "south"/toward bottom of sketch). Doesn't matter for gameplay; minimap: x=c*s, y=r*s with player facing angle a → heading vector (sin a, cos a) in (x,z) → on map px=(sin a, cos a)*len → pointing down when a=0. Consistent. The 3D default camera looks toward −x,−z (northwest of the map = top-left of sketch). So screen-up ≈ up & left of minimap — acceptable (minimap is north-up by row index; fine).
+
+Wait let me double-check the default view: F = (sinψ, cosψ) with ψ=225° → sin=−0.707, cos=−0.707 → F=(−0.707, 0, −0.707): looking toward −x,−z = west & north (row decreasing). Sketch top-left = player start area — camera looks that way from SE of player... camera at T + (0.707,0,0.707)*d → +x,+z = east-south = bottom-right of sketch. So view: map's top-left is "up" on screen ✓ feels right with W going to top-left? Hmm W moves along F = toward top-left of minimap. Slightly diagonal but consistent; Q/E lets you rotate to axis-aligned. Good enough — actually let me make default ψ=180°? F=(0,−1) → looking −z (up on map), camera at +z (below player). Then W = up on map, A/D align with minimap axes. Cleaner for beginners! But less dynamic 3/4 angle... the 3/4-ness comes from height anyway. Hmm — an axis-aligned view is cleaner & matches minimap; diagonal feels more "3D game." Let me go with diagonal default (ψ=225°) — looks better, and movement is camera-relative so intuitive.
+
+Vision cone rays: N=27 rays across FOV 95°, range depends on player mode? Cone visual should reflect what the guard can actually see → use current effective range (based on player mode). That's a nice touch: cones shrink when you sneak! Definitely include — great feedback loop.
+
+Sound attenuation through walls: losClear(player→guard) ? full : *0.55.
+
+One more mechanic for depth of stealth: crouch also reduces cone? Already via range. And running pings show as ripples + guards hear. Good kit: vision (cone), noise (sprint pings), suspicion meter, investigate AI, 5 guards, 3 objectives, exit gate. Solid scope.
+
+Guard drawing details: body box w0.42 d0.42 h from 0 to 1.35 (stand) — head box 0.34² at y 1.35..1.7 with facing rotation. Color: guard body #b96a2e? Let me make guards dark slate with amber vest: body color [86,98,120]? Hmm guards should read as "threat" — warm palette: body [196,120,54] (orange-brown), head [230,190,150] (skin-ish)? Skin tone might look weird on a box... let me do uniform: dark navy body [70,84,110], amber helmet/head [255,164,49]? Head as amber "helmet" reads well and matches cone color. Player: teal body [64,196,190], head [210,240,255] cyan-white visor. Crouch: body height 0.85, head 0.85..1.15.
+
+Sneak visual: player slightly lower + darker? Just crouch height is enough + mode chip shows SNEAK. Run: slight bob? Skip.
+
+Drive sprite: diamond (rotated square) cyan #6ef3ff with white core, glow via 2 concentric strokes alpha; rotate over time (scale x by cos(t*3)). Floor ring beneath.
+
+Exit pad: green when active: quad fill rgba(84,242,165, .18+.1*sin) + border; beam: 2 vertical planes height 4.5, width cell, alpha .10 green (active) / locked: dim blue-gray, no pulse? Locked = faint red? Let me do locked: dark slate, no pulse; active: pulsing green + brighter beam.
+
+Now the alarm "DETECTED" center text: big red DOM with letter-spacing animation (scale/flash). Add class to body for strobe overlay (CSS keyframes on #alertGlow opacity) — JS toggles class & removes after fail screen shows? Keep strobing during ALARM; then end screen has static red tint.
+
+Toasts: position top-center below objective? Center-top (y ~18%). Queue max 3.
+
+Now the minimap guard cones: small wedge from dot, length = range*0.5*s... draw with low alpha amber. And "heard" ripples on minimap too? Skip.
+
+Performance check per frame: transform ~ (static boxes after run-length encode: let me count wall runs from map: rows 0 & 16 full (2), col edges handled by row runs; central room adds ~6 runs; total maybe ~25 wall boxes + ~8 crate boxes = 33 static → 33×8=264 corner transforms + 33×6 faces cull → ~66 candidate faces, ~40 visible. Dynamic: 6 entities × 2 boxes × 8 = 96 transforms. Trivial. Floor lines 42 segments. Cones 5×27 rays × ~20 samples. All fine at 60fps.
+
+Memory: build items array each frame — GC churn OK.
+
+Let me also add a subtle idle animation for guards (head scan) and player walk bob (body height ±0.03 sin(t*speed)) — nice life feel. Bob via y offset of boxes? Simpler: vary body h slightly with sin — do it.
+
+Also "breathing" on suspicion: guard head turns toward player when susp>0.5 (lerp facing) — juicy! Implement: if visible, face the player directly (overrides movement dir lerp).
+
+Now let me write the map data as an array of strings and validate lengths in code (pad with # if short? pad with '.' risks holes; pad with '#' is safer? A shorter row padded with '#' closes off the right side — but my exit is on the right... I've been careful; still, defensive padding with '#' plus assert-like console is fine).
+
+Guards waypoint lists (cell centers):
+G1 top: [(4.5,1.5),(20.5,1.5)] ping-pong.
+G2 right: [(23.5,4.5),(23.5,14.5)].
+G3 bottom: [(3.5,15.5),(20.5,15.5)] — wait row 15 all dots ✓ (c3..c20).
+G4 center loop: [(10.5,7.5),(14.5,7.5),(14.5,9.5),(10.5,9.5)]. Wait interior cols 9-15 → x in [9,16]; c14.5 OK (col 14). Rows 6-10 → z in [6,11]; r7.5 & 9.5 OK. But door is at row 5/11 — G4 stays inside ✓.
+G5 left: [(6.5,5.5),(6.5,11.5)] col 6 clear? Check each row for c6: r2 '.', r3 '.', r4 '.', r5 '.'(pos6), r6 '.', r7 '.', r8 '.', r9 '.', r10 '.', r11 '.', r12 '.' ✓.
+
+Player start (3.5, 2.5) — just below G1's path at row 1; immediate tension ✓. Actually player at r2 c3; G1 patrols row 1 above — passes right over you. 
+
+Drives: (12.5,8.5) center [moved to r8], (20.5,4.5) top-right (G2's column passes at c23 nearby), (6.5,13.5) bottom-left (near G5's end & G3's path row 15).
+
+Exit: (21.5,14.5).
+
+Hmm wait r14: `#....................X..#` → X at pos 21 ✓ exit cell (21,14) center (21.5,14.5). G2 patrols col 23 rows 4-14 — passes within ~2 units of exit → tense extraction ✓.
+
+Verify r9 string once more: `#...CC..#.......#...C...#`
+positions: 0#,1.,2.,3.,4C,5C,6.,7.,8#,9.,10.,11.,12.,13.,14.,15.,16#,17.,18.,19.,20C,21.,22.,23.,24# ✓ length 25.
+
+r13: `#.....D.....C.....C....#` → 0#,1-5 dots(5),6D,7-11 dots(5),12C,13-17 dots(5),18C,19-22 dots(4),23? wait that's 1+5+1+5+1+5+1+4 = 23 + '#'= 24. Off by one! Let me recount target: drive at c6, crates at c12 & c18, need 25 total: pos0 '#', pos1-5 '.....'(5), pos6 'D', pos7-11 '.....'(5), pos12 'C', pos13-17 '.....'(5), pos18 'C', pos19-23 '.....'(5), pos24 '#' → 1+5+1+5+1+5+1+5+1 = 25 ✓ string: `#.....D.....C.....C....` no wait pos19-23 is 5 dots: "....." then '#'. Full: "#" + "....." + "D" + "....." + "C" + "....." + "C" + "....." + "#" = 25 ✓ → `#.....D.....C.....C....` hmm that shows 4 dots after last C? Let me write it out: # . . . . . D . . . . . C . . . . . C . . . . . # — count: 1+5+1+5+1+5+1+5+1=25. As a string literal: "#.....D.....C.....C...." + "#" → I need to make sure I type exactly `#.....D.....C.....C.....#`? That's # + 5dots + D + 5dots + C + 5dots + C + 5dots + # = 25 chars. In the literal: "#.....D.....C.....C.....#" — wait that's 5+... let me count the literal characters: `#`(1) `.....`(5→6) `D`(7) `.....`(12) `C`(13) `.....`(18) `C`(19) `.....`(24) `#`(25) ✓. Good: r13 = "#.....D.....C.....C.....#" — hmm that literal has 5 dots groups × 3? Between D and C: 5 dots ✓; between C and C: 5 dots ✓; after last C: 5 dots ✓.
+
+r4: drive at c20: pos1-19 dots(19), pos20 'D', pos21-23 dots(3): "#" + 19dots + "D" + "..." + "#" = 1+19+1+3+1=25 ✓ → "#...................D...#" (count: 19 dots then D) — literal: '#' + '...................' (19) + 'D' + '...' + '#'.
+
+r2: "#..P.....CC.............#": #, .., P, .....(5), CC, ............?(need pos11-23 = 13 dots), # → 1+2+1+5+2+13+1=25 ✓. Literal: `#..P.....CC.............#` — after CC: 13 dots. When I type it in the code, I'll count carefully.
+
+r3: C at c11: "#" + 10dots + "C" + 12dots + "#" = 25 ✓ → `#..........C............#`.
+
+r5: `#.......###..####.......#` (verified above).
+r6/r8/r10: `#........#.......#.......#` — count: 1+8+1+7+1+7+1=25 ✓.
+r7: same as r6 (drive moved to r8): `#........#.......#.......#`.
+r8: drive at c12: interior pos9-15: "..D...."? pos9 '.',pos10 '.',pos11 '.',pos12 'D',pos13..15 '...' → "...D...". So r8 = "#" + 8dots + "#" + "...D..." + "#" + 7dots + "#" = `#........#...D...#.......#` ✓.
+r11: `#.......###..####.......#`.
+r14: X at c21: pos1-20 dots(20), X, pos22-23 dots(2): "#" + 20dots + "X" + ".." + "#" = 25 ✓ → `#....................X..#`.
+
+Great. Map rows list (17):
+```
+"#########################",
+"#.......................#",
+"#..P.....CC.............#",
+"#..........C............#",
+"#...................D...#",
+"#.......###..####.......#",
+"#........#.......#.......#",
+"#........#.......#.......#",
+"#........#...D...#.......#",
+"#...CC..#.......#...C...#",
+"#........#.......#.......#",
+"#.......###..####.......#",
+"#.......................#",
+"#.....D.....C.....C.....#",
+"#....................X..#",
+"#.......................#",
+"#########################"
+```
+Wait r2: `#..P.....CC.............#` — count: #, ., ., P(4th char=idx3) ✓ player at (3,2) → center (3.5,2.5). CC at idx9,10 → cells (9,2),(10,2). Dots after CC: idx11..23 = 13 dots + # at idx24. Literal `#..P.....CC.............#`: chars: #(0) .(1) .(2) P(3) .(4-8: 5 dots) C(9) C(10) then 13 dots (11-23) #(24). I wrote "....." after P (5) ✓ and need to ensure exactly 13 dots before final #. In the code I'll type it carefully; also add runtime normalization: rows = MAP.map(r => r.padEnd(W, '#').slice(0,W)).
+
+Wait — padEnd with '#' will close gaps on the right if a row is short; all my rows are 25 but safety. 
+
+Also ensure crates don't block required paths: (9,2),(10,2) top-left corridor — G1 patrols row 1 so unaffected ✓ player can go around (row 3). C at (11,3): near center door approach; fine.
+
+Now let me write the guard vision "lastSeen" & investigate logic concretely:
+
+```
+function updateGuard(g, dt){
+  if(state===ALARM || state===FAILED){ chase: move toward player at g.chaseSpd; face; return }
+  // hearing handled in noise event dispatch (set g.task)
+  const dx=player.x-g.x, dz=player.z-g.z, d=hypot(dx,dz);
+  let range = mode==='sneak'?4.2: mode==='run'?7.6:6.4;
+  if(mode==='run') range*=1; // run also louder
+  const halfFov = fov/2;
+  const dot = (dx/d)*g.dirx + (dz/d)*g.dirz;
+  let visible = d < range && dot > cos(halfFov) && losClear(g.x,g.z,player.x,player.z);
+  // close-range blind spot: if d<0.5 always visible? no — sneak up behind is a thing; keep as-is but also if d < 1.2 → wider fov (peripheral): dot > cos(140°)
+  if(d < 1.6) visible = d<range*... hmm simplify: if d<1.4 && losClear → visible regardless of angle (they can see you at point blank). Include — prevents cheese of walking behind within 1m? Actually that *prevents* the "hide behind guard" cheese. Yes include.
+  
+  if(visible){
+     const prevFacingAway = dot < -0.2;
+     g.susp += dt * (0.55 + 1.3*(1 - d/range)) * (mode==='sneak'?0.7: mode==='run'?1.3:1);
+     if(prevFacingAway) g.susp += 0.28; // jump scare
+     g.lastSeen = {x:player.x, z:player.z};
+     g.dirTarget = angle to player (face you)
+     if(g.state!=='chase'){ g.state='investigate'; }? — no: keep state machine but set investigating flag when lost sight. Let me define: g.mode: 'patrol'|'toPoint'. On visible → remember; on losing sight with susp>0.3 → toPoint(lastSeen).
+  } else {
+     g.susp = max(0, g.susp - dt*0.5);
+     if(g.susp > 0.3 && g.mode==='patrol'){ g.mode='toPoint'; g.target=g.lastSeen; g.scanAfter=true; }
+  }
+  // movement
+  speed: patrol 1.7 | toPoint 3.2
+  move toward target with collision (simple: same circle collide, may stick — guards can path via waypoints that are clear; investigation point might be behind a wall → guard sticks. Mitigation: if stuck (moved < 0.02 for >1.2s) → give up: mode='patrol', pick nearest wp, susp decays faster. Implement with g.stuckT accumulation.
+  
+  Facing: lerp angle toward dirTarget (movement dir or player).
+  Scan phase: when toPoint & arrived (<0.3): g.scanT=2.6; during scan: stay, rotate facing ±75° sweep; then mode='patrol', wpIndex = nearest, susp decays ×1.5 after.
+}
+```
+
+Also multiple guards can investigate the same noise — fine.
+
+Noise event dispatch: on player sprint ping at (x,z) radius R: for each guard: dist<R*(los?1:0.55) → g.mode='toPoint', target=ping, scanAfter=true, plus toast once per 4s "A GUARD HEARD SOMETHING". Also small susp bump +0.05.
+
+Player collision helper shared with guards: moveEntity(e, dx, dz, r): substeps.
+
+Now the render pipeline code sketch:
+
+```
+const NEAR=0.12;
+function camInit(){ // per frame
+  cs=sin(camYaw), cc=cos(camYaw);
+  F=(cs,cc) [sinψ, cosψ]; R=(cc,-cs)?? 
+```
+Wait earlier I derived R=(cosψ, 0, −sinψ): with ψ=225°: cos=−0.707, sin=−0.707 → R=(−0.707, 0, 0.707) = west+south?? Camera faces NW; right should be NE. Hmm (−x,+z): x=east so −x=west, +z is... if +z = north then R points west-north?? |R|: (−0.707, 0.707) → that's a 45° NW-ish direction — perpendicular to F ✓ but which side? F=(−0.707,−0.707) (NW). Perpendiculars are NE (−0.707? no: NE = (+x,+z)=(+0.707,+0.707)) and SW ((−0.707,−0.707)... that's F itself). Wait perpendicular to NW is NE/SW: NE=(0.707, 0.707)?? x=east,z=north → NE = (+east,+north) = (0.707, 0.707). SW = (−0.707, −0.707)... but F is NW=(−0.707, +? ). Hmm I'm confusing myself: NW = west+north = (−east,+north) = (−0.707, +0.707)! Let me redo: F at ψ=225°: sin225=−0.707, cos225=−0.707 → F=(−0.707, −0.707) = west+south = SW (if +z=north). So camera faces SW; camera position C = T − F*d = T + (0.707,0.707)*d = NE of player. Right vector R=(cosψ,−sinψ)=(−0.707, +0.707) = west+north = NW. Facing SW with right hand pointing NW ✓ correct (facing SW, right is NW).
+
+So default: camera sits NE looking SW; W key moves player toward SW (bottom-right of the map sketch since rows increase downward and z=row... wait I set z = row index → +z = down on the sketch = "south" if sketch top=north ✓ consistent). So screen-up ≈ direction of decreasing x & z = top-left of sketch. The minimap's north-up will show heading toward bottom-right (SW). Fine — it's coherent, no mirroring: verify at ψ=0: F=(0,1)=+z (sketch down), camera at −z (up in sketch) looking down... R=(1,0)=+x = sketch right. Facing south (down the map), right hand points west?? Facing south your right is west ✓ correct!
+
+So default ψ=225°: player's W moves toward SW on minimap — acceptable and looks 3D. Alternatively ψ=270° → F=(−1,0)=west, camera east looking west; W = left on minimap. Meh. Keep 225°.
+
+Actually hmm let me reconsider: many players will first glance at the minimap to orient. Diagonal is fine — games like this all have diagonal cams. Moving on.
+
+Projection function:
+```
+function project(px,py,pz){ // world y up
+  const dx=px-camX, dy=py-camY, dz=pz-camZ;
+  const cx = dx*rcx + dz*rcz;   // R=(rcx,0,rcz)
+  const cy = dy;
+  const cz = dx*fcx + dz*fcz;   // F=(fcx,0,fcz)
+  return {cx,cy,cz};
+}
+screen: sx=W/2+cx*f/cz; sy=H/2 - cy*f/cz;
+```
+camX etc: C = T + (−F)*dist → camX = tx − fcx*dist, camZ = tz − fcz*dist, camY = 6.3.
+
+Box corners: local (±w/2, y0..y1, ±d/2) rotated by rotY: wx = x*cosR + z*sinR; wz = −x*sinR + z*cosR (consistent rotation). Add center.
+
+Face visibility: v = dot(n, C − faceCenter). Use box center as proxy for face center (slightly off for long boxes but fine... actually for very long wall runs the proxy can mis-cull end caps — end caps rarely matter; acceptable).
+
+Shading: precompute per static box & face: base color rgb + shade factor. Dynamic entities compute per frame.
+
+Fog: t = clamp((cz−12)/(30), 0, 1) smooth; mix toward (7,11,18).
+
+Draw quad path: moveTo pts... fill; stroke with rgba(4,8,14,0.5) lineWidth 1 for definition? Strokes on every face might look busy at distance — use very subtle alpha 0.35 & only if face screen-size > few px? Just keep thin stroke always; looks crisp.
+
+Sprites (drives, icons): item {d, fn}. In draw loop after sorted quads — but they must interleave by depth! So include them in the same items array with their own draw closure. Closures per frame ×~10 — fine.
+
+Floor pass helpers:
+```
+function floorPoly(ptsWorld, fill, stroke?){ project each; if any cz<NEAR → clip polygon against near (reuse polyClip); then path & fill }
+```
+Reuse polyClip for cones/shadows/pad/ripples ✓.
+
+polyClip(vertsCam): Sutherland–Hodgman against cz>=NEAR:
+```
+out=[]; for each edge a→b: ain=a.cz>=NEAR, bin=b.cz>=NEAR; if ain out.push(a); t=(NEAR-a.cz)/(b.cz-a.cz) if crossing push lerp.
+```
+
+Grid lines: for x in 0..W: seg (x,0,0)-(x,0,H) etc, project both ends; clip by near with same logic (point version); draw thin rgba(120,160,200,0.07). Maybe every 1 unit but lighter; plus every 5 stronger? Keep uniform subtle + a border around map slightly brighter.
+
+Exit pad drawn as floorPoly of the cell inset by 0.15.
+
+Ripples: circle → 24-gon at y=0.01, radius = r0 + t*speed, alpha (1−t)*0.5 amber. Also minimap? No.
+
+Cone polygon: [guardPos] + arc points; fill by guard state: normal rgba(255,168,70, .12); susp>0.3 → lerp toward red, alpha .12+.15*susp; investigate (not currently seeing) → cyan-white? Distinguish: patrol=amber low alpha; investigating = pulsing white/amber; high susp = red. Implement color pick by susp & mode.
+
+Shadows: quad 0.75×0.55 rotated to facing at y=0.02, rgba(0,0,0,.38). Player + guards.
+
+Now HUD DOM updates each frame (cheap enough):
+- detBar.style.width = (s*100)+'%'; background color hsl; label text/class when changed; timer text (update only when second changes? just set, fine); drives count on change; mode chip on change; exit status on change.
+
+Minimap: ctx2.drawImage(staticMap) + dots. Precompute static map canvas at init with scale S=7 → 175×119. Draw walls #33465c, crates #6b5a3a, floor #0d1520, exit cell marker base.
+
+End screen stats: time, drives, peak susp %, rank (win only). Peak detection tracked as max of maxSusp.
+
+Rank thresholds: <75s S, <120 A, <180 B, else C. (A decent run: 3 drives + exit... map is small; ~60-90s skilled.)
+
+Best time: store JSON {t, rank} — compare by t only.
+
+Let me also handle "state=WON" celebration: brief green flash overlay + player runs into pad? Just show end screen after 0.9s with a fanfare & maybe expanding ring at exit (add a ripple in green). Good.
+
+Pause implementation: state PAUSED — skip update, keep rendering scene (frozen) + overlay. rAF continues.
+
+Restart from any key R (except start screen? allow there too → starts game). Enter: start / retry / resume.
+
+First input audio init: on keydown or pointerdown once → initAudio(). All sfx guard `if(!AC) return`.
+
+Edge: Ctrl+W closes tab! Using Ctrl for sprint is risky in browser — user pressing Ctrl might accidentally... Ctrl alone (no letter) does nothing in browsers, but if they hold Ctrl and press W → close tab! That's a real footgun. Alternative sprint key: Shift = sneak, Space = ? Let me reassign: SHIFT = SNEAK (hold), C or SPACE = SPRINT? Space is safe (preventDefault). But space often means... nothing here. Use **SPACE = SPRINT (hold)**, prevent default to avoid page scroll. Hmm but holding space for sprint while moving with WASD — fine. Or double-tap W to dash — complex. Decision: SHIFT sneak, SPACE sprint. Document clearly. Also add X as alternate sprint? Keep just Space, plus note in controls "SPACE — SPRINT (LOUD)".
+
+Hmm one more consideration: some users will hold Shift and expect it... fine.
+
+Prevent default on: Space, arrows (unused but safe), maybe not others.
+
+Now let me write the audio functions concretely:
+
+```
+function tone(o){ if(!AC)return; const t0=AC.currentTime+(o.at||0);
+ const osc=AC.createOscillator(), g=AC.createGain();
+ osc.type=o.type||'sine'; osc.frequency.setValueAtTime(o.f,t0);
+ if(o.f2) osc.frequency.exponentialRampToValueAtTime(Math.max(1,o.f2), t0+o.dur);
+ g.gain.setValueAtTime(0.0001,t0); g.gain.linearRampToValueAtTime(o.vol||0.2, t0+0.01);
+ g.gain.exponentialRampToValueAtTime(0.0001, t0+o.dur);
+ osc.connect(g).connect(master); osc.start(t0); osc.stop(t0+o.dur+0.05);}
+```
+
+noiseBurst(dur,vol,freq,type='bandpass'): create 0.3s buffer? Precompute a shared noiseBuffer (1s) once; source.playbackRate random 0.9-1.1; filter.
+
+Heartbeat thump: tone({f:52,dur:.14,vol:v}) + at .16: tone({f:44,dur:.18,vol:v*0.8}).
+
+Siren (alarm): osc sawtooth with LFO on frequency:
+```
+const o=AC.createOscillator(); o.type='sawtooth'; const l=AC.createOscillator(); l.frequency.value=2.2; const lg=AC.createGain(); lg.gain.value=180; o.frequency.value=560; l.connect(lg).connect(o.frequency); g envelope 1.3s vol .25;
+```
+
+Ambient: two sines (48Hz, 96.5Hz) gains .04/.02 + looped noise lowpass 240 gain .018 + slow LFO on master? Keep constant quiet. Also a subtle "beacon" blip every ~7s? Skip.
+
+Footstep: noiseBurst(0.07, vol, freq) with slight random freq.
+
+Pickup: tone 620→? two quick sines (740, 1108) + tiny noise shimmer.
+Unlock: tone({f:392,dur:.5,vol:.18}) + at .12 {f:587} + at .24 {f:784} triangle — ascending resolve.
+Fail sting: tones 330→262→196 staggered .12 sawtooth low vol + noise crash.
+Win fanfare: 523,659,784,1046 at 0,.12,.24,.42 sine/triangle + soft noise sweep.
+"Spotted" shout: square 880→440 .18 vol .3 ×2 staggered .1 — reads as alarm blip.
+
+OK let me write the HTML/CSS now.
+
+CSS plan:
+```
+html,body{margin:0;height:100%;overflow:hidden;background:#04070c}
+canvas#cv{position:fixed;inset:0;display:block}
+.overlay (shared): position fixed inset 0, display flex, pointer-events auto for buttons.
+#scan: repeating-linear-gradient + opacity .5; mix-blend? keep normal.
+#vig: radial-gradient(ellipse at center, transparent 55%, rgba(2,4,8,.55) 100%); plus inner glow on edges? fine.
+#alertGlow: red radial edges, opacity controlled by JS (detection high / alarm).
+HUD panels .panel{position:fixed;...;clip-path:...;background:var(--panel);border? clip-path kills border visibility on clipped corners — use outline via inset box-shadow: box-shadow: inset 0 0 0 1px var(--line)}.
+```
+
+Detection meter: container width 260px; bar track with tick marks (background repeating-linear-gradient for segment gaps); fill div absolute. Label above.
+
+Mode chip bottom-right: three chips WALK/SNEAK/SPRINT, active highlighted + key hint.
+
+Objective top-left: "MISSION ▸ DRIVES [icons ◈◈◈] · EXIT LOCKED" — use 3 diamond spans that light up when collected.
+
+Timer top-right above minimap: big monospace.
+
+Toast center-top.
+
+Big center text (#bigMsg) for DETECTED / EXTRACTION COMPLETE flashes before end screen? End screens themselves cover it; keep #bigMsg only during ALARM ("DETECTED").
+
+Start screen layout (as planned). Buttons: .btn with hover invert + focus-visible outline. Also "click to begin" anywhere? Enter key or button click. Add a small footer line "AUDIO ON — headphones recommended" note.
+
+Also add subtle animated background on start screen: CSS gradient shift? Canvas behind already renders the scene? Nice touch: render the 3D scene in idle (camera slow orbit around facility) behind translucent start panel → shows the game, alive! Implement: state=START → update camera orbit (target = map center, yaw slowly rotating), guards patrol (ambient life!), player hidden or standing. That's a strong "alive" feel. Guards move on the start screen — cool. Player entity: hide it until run starts (or show standing at spawn). Let me show it standing.
+
+So loop always runs; update() branches: START → only guard AI (no suspicion? guards still see player... player is visible in scene; make them not detect during START: skip vision when state!=PLAYING/ALARM). Camera orbit around center. On game start, camera snaps to follow (lerp handles the transition smoothly — nice swoop!).
+
+FAILED/WON: freeze world updates (or keep guards wandering? freeze + overlay). Keep rendering last frame with slight camera drift? Freeze is fine; add slow zoom-out? Keep simple: freeze.
+
+OK also "restart without reload" ✓ R key & button.
+
+One more: "listen for keys on window" ✓ window.addEventListener('keydown').
+
+Let me now write the code. I'll aim for clean, organized sections with comments. Let me draft key tricky functions fully in my head as I write.
+
+Constants:
+```
+const MAPW=25, MAPH=17;
+const WALL_H=3.0, CRATE_H=1.5;
+player r .34; guard r .34.
+```
+
+solid(x,z): cx=floor(x), cz=floor(z); if out of range → true (treat outside as wall); return grid[cz][cx]>=1.
+circleHits(x,z,r): loop cells in [floor(x-r)..floor(x+r)] etc: if solid cell: closest point clamp; dist2 < r² → true.
+
+moveCircle(e, dx, dz, r): 
+```
+const steps = Math.max(1, Math.ceil(Math.hypot(dx,dz)/ (r*0.5)));
+for i in steps: try x then z with circleHits check, revert component if hit.
+```
+Simpler: attempt full move per axis with substeps; implement:
+```
+function slide(e,dx,dz,r){
+  let nx=e.x+dx; if(!hit(nx,e.z,r)) e.x=nx; else { // step-by-step for sliding along wall
+     const s=Math.sign(dx), n=Math.abs(dx)/(r*0.5); for(i=0;i<n;i++){const t=e.x+s*r*0.5; if(!hit(t,e.z,r))e.x=t; else break;} }
+  same z.
+}
+```
+Good enough (substep ≤ r/2 so can't tunnel).
+
+losClear(x0,z0,x1,z1): n = ceil(d/0.18); for i in 1..n-1: if solid(x0+dx*i/n, ...) return false. Also check near player center — fine.
+
+Cone ray: similar sampling until hit → t fraction.
+
+Camera follow in update:
+```
+const k=1-Math.exp(-5*dt);
+camTX = player.x + lookAhead? camTX=player.x; camTZ=player.z;
+targetPos computed from yaw & target each frame: desiredCamX = camTX - sin(yaw)*DIST ...
+lerp camX toward desired.
+```
+Store camYawCur (unbounded) lerp to camYawTarget via angDiff.
+
+In START state: camYawTarget += dt*0.15 (slow orbit), target = map center (12.5,8.5).
+
+Render function as planned.
+
+Guard head turn toward player when visible: dirTargetAngle = atan2(dx,dz) with dir=(sin,cos) convention → angle a where sin a=dx/d, cos a=dz/d → a=Math.atan2(dx,dz) ✓.
+
+Entity facing stored as ang; dirx=sin(ang), dirz=cos(ang).
+
+Now DOM ids:
+cv, vig, alertGlow, scan, hud (container), objPanel (drives diamonds + exit status), timerBox, mapBox(canvas#mm), modeChips, detBox(detLabel, detTrack>detFill), toasts, bigMsg, scrStart, scrEnd(endTitle,endStats,rankBig,btnRetry,bestLine), scrPause.
+
+Write updateHUD with cached last values to avoid layout thrash (text changes). Trivial.
+
+Toast: function toast(msg, cls) → div.toast added, auto-removed 2.8s; stack max 3 (remove oldest).
+
+Now the end screen stats markup built by JS:
+```
+endTitle.textContent = won? 'EXTRACTION COMPLETE' : 'DETECTED — MISSION FAILED';
+stats rows: TIME, DATA DRIVES x/3, PEAK DETECTION %, RANK (if won) big letter.
+bestLine: "BEST RUN 01:23 · S" or "NEW BEST!" flag.
+```
+
+Rank letter styling: huge display with color per rank (S cyan, A green, B amber, C gray).
+
+OK — I also want a small "objective complete" flash when grabbing the last drive: pulse exit pad + toast + sfx ✓.
+
+Potential bug areas to double-check as I write:
+1. polyClip correctness.
+2. Painter depth for sprites vs quads (sprite d = center cz; fine).
+3. Cone drawn in floor pass but guard body drawn later → cone appears under guard ✓.
+4. Guard at edge of map with camera behind wall: near-plane clip handles.
+5. angDiff lerp for yaw.
+6. dt clamp; first frame AC null.
+7. localStorage try/catch.
+8. No external anything ✓.
+
+Minimap heading triangle: player faces ang → on map, dir (sin a, cos a) with y-down = +z down ✓ so px direction = (sin a, cos a). Draw triangle rotated by a? Canvas rotate uses standard; angle for ctx.rotate should equal atan2(dy,dx) of heading in map pixels = atan2(cos a, sin a) = π/2 − a. Just compute directly with the two vectors — draw via manual points: tip = pos + dir*4, base corners ±perp*2.5. Manual, no rotate call confusion.
+
+Guard cone on minimap: wedge: arc from ang−fov/2 to ... in map pixels angle = atan2(dz,dx)?? Map pixel coords: px=x*S, py=z*S (z down). Heading vector in px = (sin a *S? just (sin a, cos a)) → pixelAngle = atan2(cos a, sin a). ctx.arc(x,y,len, pixelAngle−halfFov, pixelAngle+halfFov) ✓.
+
+Detection meter color: fill.style.background = `hsl(${120-120*s},95%,55%)`? hue 120 (green) → 0 (red): hsl(120*(1-s)). At s=0 green — but bar is empty then; fine.
+
+AlertGlow opacity: base = clamp(maxSusp*0.9,0,0.8) during play; alarm → strobe via CSS class .strobe toggling opacity keyframes; JS sets style.opacity otherwise (remove class when not alarming).
+
+BigMsg "DETECTED" shown during ALARM with CSS animation (scale-in + flicker).
+
+Footstep timing: stepT -= dt*speedFactor; when <=0 && moving: play & reset interval by mode. Sprint ping: pingT similar 0.85s → spawn ripple {x,z,t:0,maxR} + noise dispatch + soft thud sfx (louder than steps).
+
+Ripple update t+=dt/1.1; remove when t>1.
+
+Also add subtle idle sway on drives ✓ and rotating.
+
+Player walk bob: bodyH = base + sin(t*10)*0.03*(moving? speedFactor:0).
+
+Guard bob similarly with their speed.
+
+Now — start screen "controls" must be visible: include in briefing panel ✓ and pause screen.
+
+Let me also think about the initial camera before the first frame: set camYawCur = target 225° etc to avoid a swoop from origin on load. Initialize cam at center orbit.
+
+I think the design is solid. Let me write it. I'll keep functions compact but readable. Roughly:
+
+- ~120 lines CSS
+- ~90 lines HTML
+- ~700-800 lines JS
+
+Let me write the final code carefully now.
+
+Details to nail in code:
+
+Resize:
+```
+function resize(){ dpr=Math.min(2,devicePixelRatio||1); W=innerWidth; H=innerHeight; cv.width=W*dpr; cv.height=H*dpr; cv.style.width=W+'px'; ... ctx.setTransform(dpr,0,0,dpr,0,0); f=(H*0.5)/Math.tan(FOVY/2); }
+```
+FOVY ~ 46° → rad .803.
+
+Bg gradient cached per resize: linear top #0a1220? Let me do a vertical: '#0b1526' → '#04070c'. Also maybe a faint horizontal glow line (horizon) — skip, fog blends.
+
+Floor quad corners: (-0.5,-0.5,MAPH+0.5,MAPW+0.5)? World x in [0,MAPW], z in [0,MAPH]. Extend 1 unit outward for margin: [-1, MAPW+1] × [-1, MAPH+1], color #101823.
+
+Grid lines inside [0..MAPW]×[0..MAPH].
+
+Static boxes build:
+```
+grid from strings; also mark drives/exit/playerStart/guards spawn positions and remove markers from grid (they become floor).
+Wall runs: for each row r: c=0; while c<MAPW: if grid[r][c]===1: find run end → box(x=c+run/2, z=r+0.5, w=run, d=1, h=WALL_H, color wallC). Else crate(2) runs similarly with CRATE_H & crate color.
+```
+Wall color base [96,116,142]? A bit muted steel blue: [88,104,128]. Crates: olive tan [150,132,92] / alternate [136,120,84] by index for variety.
+
+Also add a slightly brighter "cap" — top face gets the same color but shading handles it (top brightest) ✓. Maybe give walls a different base per orientation? No — normal-based shading covers.
+
+Entity boxes: buildBox(cx,cz,rot,w,d,y0,y1,color) returns {corners[8] world, faces:[{idx[4], n}]}. Per frame for player & guards (2 boxes each). Face shade computed at draw time using precomputed L.
+
+Draw item construction per box:
+```
+boxCorners → transform 8 to cam space once (array t[8]).
+for each face f: 
+  const vis = dot(n, camPos − center) > 0 (world)
+  if(!vis) continue;
+  let poly = f.idx.map(i=>t[i]);
+  if(poly.every(p=>p.cz<NEAR)) continue;
+  poly = clipNear(poly); if(poly.length<3) continue;
+  d = avg cz;
+  shade: b = amb + dif*max(0, dot(n,L)); color = base*b → fog mix by d.
+  items.push({d, pts: poly.map(p=>[sx,sy]), fill})
+```
+Sprites push {d, draw}.
+
+Sort items.sort((a,b)=>b.d-a.d); iterate: if quad → path fill + stroke; else item.draw().
+
+Note: sprites drawn after all quads with smaller d — correct painter.
+
+Drive sprite draw fn closure capturing screen pos & scale: compute inside at build time (project center) — but camera doesn't change during frame ✓.
+
+Icon "!" same mechanism at guard head top y+0.5.
+
+Beam planes for exit: 2 boxes? Use plane primitive: quad with 4 world corners, no cull, alpha color; transform & clip & push item with d=avg cz. Two planes crossing → looks like a light pillar ✓. When locked: color faint blue-gray alpha .06 height 3; active: green alpha .12+.05*sin(t*4) + taller? Keep h 4.
+
+Exit pad floorPoly with pulsing.
+
+Cone color logic:
+```
+if(g.susp>0.55) red rgba(255,70,80, .16+.1*s) else if investigating (mode toPoint/scan) whitish amber rgba(255,205,120,.14) pulsing else rgba(255,168,70,.11)
+```
+
+OK and "heard" ripples on world: amber rings.
+
+Now the suspicion → UI & audio heartbeat uses maxSusp = max of guards' susp (and during ALARM = 1).
+
+Track peak for stats.
+
+Timer display update per frame is fine.
+
+Let me also make sure guards don't overlap each other — they might; ignore (different routes mostly).
+
+Player spawn: (3.5,2.5), facing south? Initial ang = π/4 whatever; set to face away from G1 (down the map): F... set ang so dir=(0,1) → a=atan2(0,1)=0 ✓ (dir=(sin0,cos0)=(0,1) = +z = down map).
+
+Now let me write it all out. I'll also add `user-select:none` and cursor default; buttons cursor pointer.
+
+Start screen HTML:
+
+```
+<div id="scrStart" class="screen">
+  <div class="frame">
+    <div class="classbar"><span>▚▚ CLASSIFIED</span><span>EYES ONLY — SIM v2.7</span></div>
+    <h1 class="title">SILENT<span>BREACH</span></h1>
+    <p class="sub">3D INFILTRATION PROTOCOL · FACILITY 07</p>
+    <div class="cols">
+      <section class="brief panel">
+        <h2>// MISSION BRIEF</h2>
+        <ol>
+          <li>Steal the <b class=cy>3 data drives</b> — server core & perimeter vaults.</li>
+          <li>Reach the <b class=gr>extraction pad</b> (SE corner) to complete the op.</li>
+          <li>Guards have vision cones. Linger in sight and <b class=rd>suspicion fills</b> — full = mission over.</li>
+          <li>Sprinting is loud. Guards hear it through walls (faintly).</li>
+        </ol>
+      </section>
+      <section class="brief panel">
+        <h2>// CONTROLS</h2>
+        <div class="keys">
+          <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></span><span>MOVE</span>
+          <span><kbd>SHIFT</kbd></span><span>SNEAK — SLOW · SILENT · HARD TO SPOT</span>
+          <span><kbd>SPACE</kbd></span><span>SPRINT — FAST · LOUD</span>
+          <span><kbd>Q</kbd><kbd>E</kbd></span><span>ROTATE CAMERA</span>
+          <span><kbd>P</kbd></span><span>PAUSE</span>
+          <span><kbd>R</kbd></span><span>RESTART</span>
+        </div>
+      </section>
+    </div>
+    <button id="btnStart" class="btn">▶ BEGIN INFILTRATION</button>
+    <div class="cta">or press <b>ENTER</b><span class="cur">▮</span></div>
+    <div id="startBest" class="bestline"></div>
+  </div>
+</div>
+```
+
+Title styling: "SILENT" small on top? Big two-line with second word offset & cyan — a distinctive lockup:
+```
+h1.title{font-size:clamp(40px,9vw,84px); line-height:.9; letter-spacing:.06em}
+h1 span{display:block; color:var(--cyan); text-shadow:0 0 24px rgba(95,217,255,.45); margin-left:.35em? }
+```
+Left-aligned within frame (frame width ~min(860px, 92vw), positioned with margin:auto but content left aligned; the frame itself centered — that's fine, it's a briefing card not a hero trio. Actually to be more distinctive: pin the frame toward top-left? On small screens center is safer. Let me center the frame vertically/horizontally but keep interior left-aligned with the classbar strip on top — reads as a dossier, good.
+
+End screen similar panel with status word + stats grid + rank + button.
+
+Pause: minimal.
+
+kbd styling: inline-block, border 1px, padding 2px 7px, monospace, bg #0d1826, box-shadow inset for depth.
+
+Colors: cyan #5fd9ff, green #54f2a5, amber #ffb347, red #ff5566, text #cfe2f2, dim #7d93ab.
+
+Now let me write the JS in full. Let me draft it here to catch errors:
+
+```js
+'use strict';
+// ---------- dom / canvas
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+let W=0,H=0,DPR=1,F=800;
+function resize(){ DPR=Math.min(2,window.devicePixelRatio||1); W=window.innerWidth; H=window.innerHeight; cv.width=Math.max(1,W*DPR); cv.height=Math.max(1,H*DPR); ctx.setTransform(DPR,0,0,DPR,0,0); F=(H*0.5)/Math.tan(FOVY*0.5); }
+window.addEventListener('resize',resize);
+```
+
+Map parse:
+```js
+const MAPSTR=[ ...17 strings... ];
+const MW=25,MH=17;
+let grid, staticBoxes=[], drives=[], exitCell={x:21.5,z:14.5};
+function parseMap(){ grid=[]; drives=[]; for(let r=0;r<MH;r++){ let row=(MAPSTR[r]||'').padEnd(MW,'#').slice(0,MW); const line=[]; for(let c=0;c<MW;c++){ let ch=row[c]; let s=0;
+   if(ch==='#')s=1; else if(ch==='C')s=2;
+   if(ch==='P'){playerSpawn={x:c+0.5,z:r+0.5};}
+   if(ch==='D'){drives.push({x:c+0.5,z:r+0.5,got:false,ph:Math.random()*6});}
+   if(ch==='X'){exitCell={x:c+0.5,z:r+0.5};}
+   line.push(s);} grid.push(line);} }
+function buildStatics(){ staticBoxes=[]; for(let r=0;r<MH;r++){ let c=0; while(c<MW){ const s=grid[r][c]; if(!s){c++;continue;} let e=c; while(e<MW&&grid[r][e]===s)e++; const len=e-c;
+   if(s===1) staticBoxes.push(mkBox(c+len/2, r+0.5, 0, len, 1, 0, WALL_H, [88,104,128]));
+   else staticBoxes.push(mkBox(c+len/2, r+0.5, 0, len, 1, 0, CRATE_H, (c%2? [139,121,86]:[152,134,95])));
+   c=e; } } }
+```
+mkBox precomputes world corners & face normals once:
+```js
+function mkBox(cx,cz,rot,w,d,y0,y1,col){
+  const cs=Math.cos(rot), sn=Math.sin(rot), hw=w/2, hd=d/2;
+  const loc=[[-hw,-hd],[hw,-hd],[hw,hd],[-hw,hd]];
+  const corners=[]; for(let k=0;k<4;k++){ const x=rot? ... } 
+```
+Corners: bottom = [x,z] rotated + center at y0; top same at y1.
+```js
+  const P=(lx,lz,y)=>[cx+lx*cs+lz*sn, y, cz - lx*sn + lz*cs];
+```
+Wait rotation: wx = cx + lx*cs + lz*sn; wz = cz − lx*sn + lz*cs ✓ (matches earlier).
+```js
+  const c=[P(-hw,-hd,y0),P(hw,-hd,y0),P(hw,hd,y0),P(-hw,hd,y0),P(-hw,-hd,y1),P(hw,-hd,y1),P(hw,hd,y1),P(-hw,hd,y1)];
+  const N=(nx,nz)=>[nx*cs+nz*sn, 0? ...] 
+```
+Normals: rotate (nx, nz) same way: [nx*cs + nz*sn, ny, −nx*sn + nz*cs]. For vertical faces ny=0; top/bottom n=(0,1,0)/(0,-1,0) unchanged.
+Faces:
+```js
+  const faces=[ {i:[0,3,2,1], n:nrm(0,-1,0)},  // bottom (rarely seen)
+    {i:[4,5,6,7], n:nrm(0,1,0)},
+    {i:[2,3,7,6], n:nrm(0,0,1)},
+    {i:[1,0,4,5], n:nrm(0,0,-1)},
+    {i:[1,2,6,5], n:nrm(1,0,0)},
+    {i:[0,1,5,4], n:nrm(-1,0,0)} ];
+```
+Hmm wait the corner mapping: indices 0..3 bottom in local order [(-hw,-hd),(hw,-hd),(hw,hd),(-hw,hd)] → so 0=(-x,-z),1=(+x,-z),2=(+x,+z),3=(-x,+z); top 4..7 same. Faces:
+- +z face (local z=+hd): corners 2,3 bottom & 6,7 top → [2,3,7,6] ✓ n=(0,0,1).
+- −z: 0,1,5,4? corners 0,1 bottom & 4,5 top → [0,1,5,4]... I wrote [1,0,4,5] — same set, winding irrelevant (I cull by normal) ✓.
+- +x: corners 1,2,6,5 ✓ n=(1,0,0).
+- −x: 0,3,7,4 → I wrote [0,1,5,4]? No that's wrong — let me list: −x face local x=−hw: corners 0(−hw,−hd),3(−hw,hd),7(top −hw,hd),4(top −hw,−hd) → [0,3,7,4]. Fix.
+- top: 4,5,6,7 ✓; bottom: 0,1,2,3 (n down).
+
+So faces = [top[4,5,6,7] n(0,1,0), bot[0,1,2,3] n(0,-1,0), fz+[2,3,7,6], fz-[0,1,5,4], fx+[1,2,6,5], fx-[0,3,7,4].
+
+Return {c, faces, col, cx, cy:(y0+y1)/2? center=[cx,(y0+y1)/2,cz]}.
+
+Dynamic entities: rebuild each frame with same mkBox (cheap enough: 6 entities × 2 boxes).
+
+Transform to camera:
+```js
+function tCam(p){ const dx=p[0]-camX, dy=p[1]-camY, dz=p[2]-camZ; return {x: dx*rcx + dz*rcz, y: dy, z: dx*fcx + dz*fcz}; }
+```
+where (fcx,fcz)=(sin yaw, cos yaw), (rcx,rcz)=(cos yaw, −sin yaw).
+
+project → [W/2 + x*k, H/2 − y*k] where k=F/z.
+
+clipNear(poly of {x,y,z}):
+```js
+function clipNear(p){ const out=[]; for(let i=0;i<p.length;i++){ const a=p[i], b=p[(i+1)%p.length]; const ain=a.z>=NEAR, bin=b.z>=NEAR; if(ain) out.push(a); if(ain!==bin){ const t=(NEAR-a.z)/(b.z-a.z); out.push({x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t, z:NEAR}); } } return out; }
+```
+
+Floor poly helper (world pts → cam → clip → path):
+```js
+function floorPath(pts, y=0.02){ let p=pts.map(w=>tCam([w[0],y,w[1]])); p=clipNear(p); if(p.length<3)return null; ctx.beginPath(); const k=F/p[0].z ... each: sx=W/2+p.x*F/p.z, sy=H/2−p.y*F/p.z; lineTo... closePath; return true }
+```
+
+Grid lines with point clip:
+```js
+function line3(x0,z0,x1,z1,y){ const a=tCam([x0,y,z0]), b=tCam([x1,y,z1]); let done=false; if(a.z<NEAR&&b.z<NEAR)return; if(a.z<NEAR){const t=(NEAR-a.z)/(b.z-a.z); a={x:a.x+(b.x-a.x)*t,...}} ... then moveTo/lineTo stroke }
+```
+
+Shading:
+```js
+const LX=-0.42, LY=0.86, LZ=-0.34; const Ll=hypot → normalize precomputed.
+shade(col,n): b=0.4+0.6*Math.max(0,n[0]*LXn+n[1]*LYn+n[2]*LZn); fog t=clamp((d-11)/26,0,1); t=t*t*(3-2t)? mix each channel to (7,11,18).
+```
+
+Now the update loop:
+
+```js
+let state='START', last=0, playT=0, alarmT=0, maxSusp=0, peakSusp=0, collected=0, exitOpen=false;
+const player={x:3.5,z:2.5,ang:0,r:0.34,mode:'walk',moving:false};
+let guards=[]; const GUARD_ROUTES=[ [[4.5,1.5],[20.5,1.5]], [[23.5,4.5],[23.5,14.5]], [[3.5,15.5],[20.5,15.5]], [[10.5,7.5],[14.5,7.5],[14.5,9.5],[10.5,9.5]], [[6.5,5.5],[6.5,11.5]] ];
+function reset(){ parseMap(); buildStatics(); // drives fresh from parse
+  player.x=playerSpawn... collected=0; exitOpen=false; playT=0; peakSusp=0; maxSusp=0; ripples.length=0; toastsClear?
+  guards=GUARD_ROUTES.map((r,i)=>({x:r[0][0],z:r[0][1],ang:Math.atan2(?,?), wp:1, mode:'patrol', susp:0, lastSeen:null, scanT:0, stuck:0, ph:i*1.7}));
+```
+Wait parseMap resets drives — but the playerSpawn constant is from first parse; store globally in parse.
+
+Guards initial ang: toward waypoint 1: atan2(tx−x, tz−z).
+
+update(dt):
+```js
+if(state==='PLAYING'||state==='ALARM'){
+  // input movement
+  let mx=0,mz=0; if(k['KeyW']||k['ArrowUp'])mz+=? 
+```
+Camera-relative: forward F=(fcx,fcz) uses camYawCur. move = F*(W−S) + R*(D−A).
+```js
+  const fvx=FCX, fvz=FCZ, rvx=RCX, rvz=RCZ; // computed this frame from camYawCur
+  let vx=(k.W?-k.S:0)*fvx + (k.D?-k.A:0)*rvx ... careful with booleans → use (k.KeyW?1:0) etc.
+  normalize if len>1.
+  player.mode = k.Space? 'sprint' : k.Shift? 'sneak':'walk';
+  speed per mode; if(vx||vz){ slide(player,vx*spd*dt, vz*spd*dt, r); player.ang=lerpAng(player.ang, Math.atan2(vx,vz), 1-exp(-12dt)); moving=true } 
+  footsteps & pings...
+  drives pickup loop; exit check.
+  guards update (vision only in PLAYING; during ALARM chase).
+  maxSusp = max(g.susp); peak=max(peak,maxSusp);
+  heartbeat scheduling.
+  if(state==='ALARM'){ alarmT+=dt; camera shake decay; if(alarmT>1.7) endGame(false); }
+  playT+=dt (PLAYING only? include ALARM — yes include, it's part of the run).
+}
+if(state==='START'){ guards update no vision (pass flag), camera orbit }
+camera follow per state.
+```
+
+Guard vision disabled in START: pass `see = state==='PLAYING'`.
+
+endGame(won): state = won?'WON':'FAILED'; sfx; fill end screen; show after slight delay for WON? Immediate overlay with CSS fade-in is fine (0.5s). During ALARM we already had 1.7s drama. For win: add small delay 0.6s — implement via state='WON' but show screen after t? Simpler: show immediately; player reached pad, sfx plays under overlay ✓.
+
+Save best on win:
+```js
+try{ const b=JSON.parse(localStorage.getItem('sb_best')||'null'); if(!b || playT<b.t) localStorage.setItem('sb_best', JSON.stringify({t:playT, r:rank})); }catch(e){}
+```
+
+Rank: t<75 'S', <120 'A', <180 'B', else 'C'.
+
+Input handling:
+```js
+const k={};
+window.addEventListener('keydown',e=>{ initAudio(); const c=e.code; if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(c)) e.preventDefault();
+ if(k[c]) ... for Q/E & P & R & Enter use keydown edge (not repeat): if(e.repeat) skip for those.
+ k[c]=true;
+ if(e.repeat)return;
+ switch: 'KeyQ': yawT-=Math.PI/2? which direction — Q rotate left: targetYaw += π/2 (left = counterclockwise from top?). Either, consistent. Let me do Q → +π/2, E → −π/2.
+ 'KeyP'/'Escape': toggle pause (only PLAYING<->PAUSED).
+ 'KeyR': if(state!=='START'){ reset(); state='PLAYING'; hideScreens(); } — also allow from PAUSED ✓.
+ 'Enter': START→begin; FAILED/WON→restart; PAUSED→resume.
+});
+window.addEventListener('keyup',e=>{k[e.code]=false;});
+```
+Buttons: btnStart.onclick=begin; btnRetry.onclick=restart; btnResume...
+
+blur → auto-pause if PLAYING (nice touch): window 'blur' listener.
+
+begin(): reset(); state='PLAYING'; hide start screen; toast "INFILTRATION STARTED — FIND THE DATA DRIVES".
+
+Now the render() full:
+
+```js
+function render(t){ // t seconds
+  // camera vectors
+  const yaw=camYawCur; FCX=Math.sin(yaw),FCZ=Math.cos(yaw); RCX=Math.cos(yaw),RCZ=-Math.sin(yaw);
+  // cam pos from target (camTX,TZ) with smoothing done in update
+  // bg
+  ctx.fillStyle=bgGrad (recreate per frame? create on resize: but gradient tied to H — cache on resize ✓)
+  fillRect.
+  ctx.save(); translate(shakeX,shakeY);
+  drawFloorPass(t);
+  const items=[];
+  for(box of staticBoxes) collectBox(box, items, t);
+  player dynamic boxes (skip if state FAILED? keep showing), guards.
+  drives sprites; icons; exit beam planes.
+  sort & draw.
+  ctx.restore();
+  updateHUD(); drawMinimap();
+}
+```
+
+collectBox:
+```js
+function collectBox(b, items){
+  const tc=b.c.map(tCam); // 8
+  for(const f of b.faces){
+    if(f.n[0]*(camX-b.cx)+f.n[1]*0+f.n[2]*(camZ-b.cz) <= 0) continue; // use horizontal only? include y: camY - (b.cy) * n.y — top face n=(0,1,0): dot = camY−cy >0 ✓ visible from above always. Include full 3D: f.n·(C − center).
+    let poly=tc[f.i[0]]... build array of 4.
+    if(poly.every(p=>p.z<NEAR)) continue;
+    poly=clipNear(poly); if(poly.length<3)continue;
+    const d=(poly[0].z+poly[1].z+poly[2].z+poly[3].z)/4? average over all pts.
+    // shade
+    let bgt=0.40+0.60*Math.max(0, f.n·L);
+    fog...
+    const col = mix(b.col*bgt, FOG, fogT) → 'rgb(...)'
+    items.push({d, q:poly.map(p=>[W/2+p.x*F/p.z, H/2-p.y*F/p.z]), f:col});
+  }
+}
+```
+Cull check: dot(n, C − center): n·(camX−b.cx, camY−b.cy, camZ−b.cz).
+
+Draw loop:
+```js
+items.sort((a,b)=>b.d-a.d);
+for(it of items){ if(it.q){ ctx.beginPath(); moveTo...; ctx.fillStyle=it.f; ctx.fill(); ctx.strokeStyle='rgba(5,9,16,.35)'; ctx.lineWidth=1; ctx.stroke(); } else it.fn(); }
+```
+
+Draw floor pass:
+```js
+floorQuad big → fill #0f1722? then grid lines stroke.
+Exit pad (pulsing), ripples, cones, shadows.
+```
+Order within floor pass — all coplanar-ish; fine.
+
+Guard cone polygon build:
+```js
+function conePoly(g){ const range=effRange(g); const pts=[[g.x,g.z]]; const N=25; for(i=0..N){ a=g.ang - FOV/2 + FOV*i/N; let t=1; // cast ray until wall
+   const dx=Math.sin(a)*range, dz=Math.cos(a)*range; steps... find first solid sample → t
+   pts.push([g.x+Math.sin(a)*range*t, g.z+Math.cos(a)*range*t]); } return pts }
+```
+Ray sampling step 0.22.
+
+effRange: based on player mode & state (START → use walk range for visuals).
+
+Shadows: rotated quad under entity:
+```js
+function shadowQuad(x,z,ang,w,d){ const cs=cos(ang),sn=sin(ang); corners local [(±w/2,±d/2)] rotated same convention; floorPath(pts) fill rgba(0,0,0,.35) }
+```
+
+Drive sprite:
+```js
+function driveSprite(dr){ const p=tCam([dr.x, 1.05+Math.sin(t*2+dr.ph)*0.12, dr.z]); if(p.z<NEAR)return; const s=F/p.z; push item {d:p.z, fn(){ const x=W/2+p.x*F/p.z, y=H/2-p.y*F/p.z; const r=s*0.34; const w=Math.cos(t*3+dr.ph)*r; // rotating diamond
+   glow: ctx.globalAlpha=.25; fillCircle cyan radius r*1.9? use radial? keep: alpha circle + core diamond path (moveTo(x,y-r) lineTo(x+w,y) lineTo(x,y+r) lineTo(x-w,y)) fill #bff4ff stroke cyan; restore alpha } }
+```
+Also a small floor ring for drives in floor pass ✓.
+
+Guard "!" icon: if state PLAYING && (g.susp>0.12 || g.mode!=='patrol') && losClear(player→guard): char = g.susp>0.6? '!' : (g.mode==='patrol'?'?':'?')... let me do: seeing you (susp rising) → red '!'; investigating/scanning → amber '?'. y above head 2.15. Size s*0.5 font bold monospace; also slight bob.
+
+Beam planes (exit):
+```js
+function beamPlane(cx,cz,rot,h,col,a){ corners: local x ±(cellW/2 - .1), z ±0.03 thin? plane through center with width ~0.9 in one axis & 0.06 thickness? A zero-thickness plane viewed edge-on disappears — that's why 2 crossed planes work (one always has area). Use w=0.85, d=0.85?? that's a box top... for the pillar use 2 quads: quad A: points (cx±w/2, cz) vertical; quad B: (cz±w/2 along z axis). Each is a single planar quad (4 corners):
+A: [(cx−w/2,0,cz),(cx+w/2,0,cz),(cx+w/2,h,cz),(cx−w/2,h,cz)] — plane at z=cz.
+No cull; alpha fill both sides ✓.
+```
+Push as item with avg cz & draw path with globalAlpha.
+
+Exit pad floor: inset quad + inner ring quad (two nested, second smaller with different alpha) + when active chevron arrows? Keep 2 rings pulsing offset.
+
+Ripples: floorPath(24-gon radius r(t)) stroke amber alpha (1−t)*0.6 lineWidth 2; plus a faint fill.
+
+Minimap draw:
+```js
+mm ctx: clear, drawImage(staticCanvas), then per drive !got → diamond cyan pulse; exit square green if open else slate; guards: wedge + dot; player triangle; 
+```
+static canvas built in buildStatics (floor bg #0c141f? walls #3a4d63, crates #77683f, faint grid).
+
+HUD updates:
+```js
+function updateHUD(){ timerEl.textContent=fmt(playT); mode chips class; detFill width & color; detLabel; drives diamonds classes; exit status text; alertGlow opacity }
+```
+
+AlertGlow: if ALARM → add strobe class (CSS animates), else style.opacity = clamp(maxSusp*0.85,0,1) * 0.6? Also brief flash on pickup? No.
+
+BigMsg: shown during ALARM with text "DETECTED". CSS animation restart trick: toggle class.
+
+Now the heartbeat scheduler in update:
+```js
+hbT-=dt; const ms=maxSusp; if(ms>0.3 && hbT<=0){ const inten=(ms-0.3)/0.7; thump(0.16+0.2*inten); tone at .15 delay lower; hbT = 1.15 - 0.75*inten; }
+```
+thump(f,vol): tone({f:50,dur:.16,type:'sine',vol}) etc via 'at' param.
+
+Footsteps:
+```js
+if(moving){ stepT-=dt; if(stepT<=0){ const m=player.mode; stepT = m==='sneak'?0.62: m==='walk'?0.45:0.3; noiseBurst(0.06, m==='sneak'?0.05:m==='walk'?0.1:0.2, m==='sneak'?380:m==='walk'?600:900); }
+ if(m==='sprint'){ pingT-=dt; if(pingT<=0){ pingT=0.9; ripples.push({x:player.x,z:player.z,t:0}); noiseBurst(0.12,0.3,500,'lowpass'); hearCheck(player.x,player.z,5.5); } }
+} else { stepT=0.3? reset to small so first step is quick; pingT unchanged }
+```
+
+hearCheck(x,z,R): for each guard: d=hypot; att = losClear(g→p)?1:0.55; if(d < R*att){ g.mode='toPoint'; g.tx=x;g.tz=z; g.scanAfter=true; g.susp=Math.min(0.9? no just keep); toastThrottle "A GUARD HEARD SOMETHING" (4s cooldown, amber). }
+
+Guard update detail (final):
+```js
+function updGuard(g,dt,see){
+  const p=player;
+  if(state==='ALARM'||state==='FAILED'){ // chase
+    moveToward(g,p.x,p.z,(g.spd? )4.6*dt,g.r); g.ang=lerpAng(g.ang,Math.atan2(p.x-g.x,p.z-g.z),1-exp(-8dt)); return; }
+  // perception
+  const dx=p.x-g.x, dz=p.z-g.z, d=Math.hypot(dx,dz)||0.0001;
+  let range = p.mode==='sneak'?4.3 : p.mode==='sprint'?7.4 : 6.3;
+  const dot=(dx/d)*Math.sin(g.ang)+(dz/d)*Math.cos(g.ang);
+  let vis=false;
+  if(see && losClear(g.x,g.z,p.x,p.z)){
+    if(d<1.5) vis=true; else if(d<range && dot>Math.cos(FOV/2)) vis=true;
+  }
+  if(vis){
+    const prev=g.susp; g.dirFace=Math.atan2(dx,dz);
+    let rate=(0.5+1.4*(1-d/range))*(p.mode==='sneak'?0.7:p.mode==='sprint'?1.3:1);
+    if(dot<-0.25) g.susp+=0.3; // surprise from behind
+    g.susp=Math.min(1,g.susp+rate*dt);
+    g.lastSeen={x:p.x,z:p.z};
+  } else {
+    const dec = (g.mode==='scan')?0.25:0.5;
+    g.susp=Math.max(0,g.susp-dec*dt);
+    if(g.mode==='patrol' && g.susp>0.3){ g.mode='toPoint'; g.tx=g.lastSeen.x; g.tz=g.lastSeen.z; }
+  }
+  if(g.susp>=1 && state==='PLAYING'){ triggerAlarm(g); return; }
+  // movement by mode
+  let spd=1.7, tx=null,tz=null;
+  if(g.mode==='patrol'){ const wp=g.route[g.wp]; tx=wp[0];tz=wp[1]; if(dist<0.18){ g.wp=(g.wp+1)%g.route.length; } }
+  else if(g.mode==='toPoint'){ spd=3.2; tx=g.tx; tz=g.tz; if(Math.hypot(tx-g.x,tz-g.z)<0.25){ g.mode='scan'; g.scanT=2.6; g.faceBase=g.ang; } }
+  else if(g.mode==='scan'){ g.scanT-=dt; g.ang = g.faceBase + Math.sin((2.6-g.scanT)*3.1)*1.0? sweep; if(g.scanT<=0){ g.mode='patrol'; pick nearest wp: g.wp = argmin dist(g, route) } }
+  // face target while moving
+  if(tx!=null){ const ma=Math.atan2(tx-g.x,tz-g.z); moveToward(g,tx,tz,spd*dt,g.r); 
+     const want = (vis && see)? Math.atan2(dx,dz) : ma; g.ang=lerpAng(g.ang,want,1-exp(-9dt));
+     // stuck detect
+     if(movedLess...) — track g.px/g.pz before move; if moved < spd*dt*0.25 → g.stuck+=dt else 0; if(g.stuck>1.4){ g.mode='patrol'; g.wp=nearest; g.stuck=0; }
+  }
+}
+```
+moveToward uses slide() with collision (guard r .34).
+
+triggerAlarm(g): state='ALARM'; alarmT=0; shake=1; siren + shout; bigMsg show; toast? none.
+
+Camera in ALARM: continue follow ✓ (dramatic orbit as guards close in).
+
+After alarmT>1.7 → endGame(false).
+
+Now WON flow: exit check: if(collected===3 && dist(player,exit)<0.8) { state='WON'; winSfx; bigMsg "EXTRACTION COMPLETE" green? show end screen after 0.5s: implement via wonT timer in update (state 'WON' waits 0.7 then shows DOM). Simpler: show immediately with fade-in CSS .6s — acceptable, fanfare plays under it. Let me add a small delay: state='WON', wonT=0; in update if WON: wonT+=dt; camera zoom-out slightly (dist +=); when wonT>0.8 showEnd(true) once. During this 0.8s guards keep patrolling (see=false so no detection — pass see = state==='PLAYING'). Player auto-walks into pad? Keep player standing; add green ripple at exit. Good.
+
+Similarly FAILED: after ALARM, endGame(false) → showEnd immediately (drama already done).
+
+showEnd(won): fill DOM, show #scrEnd, hide HUD? Keep HUD visible behind overlay (overlay is semi-dark). Fine.
+
+Also handle "exit locked" hint: if(!exitOpen && dist<2.2) toastThrottle("EXTRACTION LOCKED — n DRIVES REMAIN").
+
+Toast throttle map: {key: lastShown}.
+
+Now the minimap static build:
+```js
+mmS=7; mmc=document.createElement('canvas'); w=MW*7=175,h=MH*7=119; fill bg #0a121d; for cells: wall→#3c4f66, crate→#7c6b45; faint grid lines rgba(255,255,255,.03); border.
+```
+
+Draw minimap per frame (cheap at 175×119).
+
+HUD DOM: build in HTML:
+```html
+<div id="hud">
+ <div id="objPanel" class="panel hud-panel tl">
+   <div class="lbl">MISSION</div>
+   <div id="drvRow"><span class="drv" id=d0>◈</span><span id=d1>◈</span><span id=d2>◈</span><span id="exitStat" class="dim">· EXIT LOCKED</span></div>
+ </div>
+ <div id="timerPanel" class="panel hud-panel tr"><div class=lbl>RUN TIME</div><div id="timeVal">00:00</div></div>
+ <div id="mapPanel" class="panel hud-panel tr2"><canvas id="mm"></canvas></div>
+ <div id="detBox" class="hud-panel bc">
+   <div id="detLabel" class="lbl dim">—</div>
+   <div id="detTrack"><div id="detFill"></div></div>
+ </div>
+ <div id="modeBox" class="hud-panel br"> chips </div>
+</div>
+<div id="toasts"></div>
+<div id="bigMsg"></div>
+```
+
+CSS positions: .tl{top:14px;left:14px} .tr{top:14px;right:14px} .tr2{top:~90px;right:14px} (below timer) — measure: timer panel height ~54 → map top 78px. .bc bottom 18 center. .br bottom 14 right 14.
+
+Mode chips: `<span class=chip data-m=walk>WALK</span>...` with key hints in title attr; active class cyan border.
+
+detTrack width 240 height 10, ticks via background-image repeating-linear-gradient(90deg, transparent 0 20px, rgba(0,0,0,.6) 20px 22px)? Simpler: an overlay of segment divs? Use a CSS gradient for the ticks on top of the fill — fill underneath, ticks overlay via ::after. ok:
+```
+#detTrack{position:relative;width:240px;height:10px;background:#0a141f;box-shadow:inset 0 0 0 1px var(--line)}
+#detFill{position:absolute;left:0;top:0;bottom:0;width:0%;background:#54f2a5;transition:width .08s linear}
+#detTrack::after{content:'';position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent 0 calc(10%/1 - 1px), rgba(4,8,14,.7) calc(10%/1 - 1px) 10%)}? 
+```
+Hmm repeating with %: use `background-image: linear-gradient(90deg, rgba(4,8,14,.75) 2px, transparent 2px); background-size: 10% 100%;` → tick every 10% ✓.
+
+detBox gets .hot class when s>0.5 (pulsing red border via animation).
+
+bigMsg CSS: fixed center, font huge, letter-spacing, hidden by default; .show with animation pop + flicker; color set inline (red/green).
+
+Now let me finalize the alarm strobe: #alertGlow base style: radial-gradient(ellipse at 50% 50%, transparent 40%, rgba(255,40,60,.5) 100%); opacity 0; .strobe → animation strobeA .5s infinite alternate (opacity .15↔.7). JS: on ALARM add class & force via anim; else remove class and set style.opacity = maxSusp>0.3? ((maxSusp-0.3)/0.7)*0.5 : 0.
+
+Shake: shake variable decays *= exp(-3dt); offset random each frame ×shake*8.
+
+I think we're ready to write the final file. Also remember: no external font — use system monospace stack. Title in same mono but huge + tracking gives terminal vibe; add a second typeface for contrast? I could use `font-family:'Arial Black', 'Avenir Next Condensed', Impact, sans-serif` for the big title → distinctive display vs mono body ✓ good pairing (display condensed-ish + mono body).
+
+Let me write it all out now. Length will be substantial; I'll keep comments brief.
+
+One more check — "restart without reload" ✓; "start screen with game name & controls" ✓; "sound only after first input" ✓ (initAudio on keydown/pointerdown; ambient starts there).
+
+Potential runtime pitfalls to double-check as I write:
+- `k.Shift` — e.code for shift is 'ShiftLeft'/'ShiftRight'. Use e.key==='Shift'? Mixed. Let me track by e.code and map shift: k['Shift']= (e.code==='ShiftLeft'||e.code==='ShiftRight'). Handle in keydown/keyup: if(e.code.startsWith('Shift')) k.Shift=true/false. Same for Space ('Space'), arrows separate codes fine.
+- preventDefault on Space to avoid scroll & button re-trigger when focused (after clicking Start, button retains focus → Space would "click" it again! → blur active element on game start: document.activeElement.blur() ✓ important).
+- R during START: ignore (or allow begin? keep ignore).
+- Escape: also used for pause; in iframe Esc may exit fullscreen of parent — fine.
+- Ensure reset clears toasts & bigMsg & detBox class & ripples.
+
+Minimap guard wedge length = 5 units * S? use range*0.4*S... let me do fixed 6*S=42px? Range ~6 → 42px on a 175px map is reasonable. Use (range)*S*0.8.
+
+Also draw exit & drives on minimap with pulse using time.
+
+Player triangle size 5px.
+
+Time format mm:ss.
+
+fmt(t){m=floor(t/60);s=floor(t%60);return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')}
+
+Rank colors: S #5fd9ff, A #54f2a5, B #ffb347, C #8fa3b8.
+
+Best line on start: if best exists "BEST RUN — 01:23 · RANK A".
+
+Edge: localStorage in sandboxed iframe may throw → try/catch ✓.
+
+Audio init also on pointerdown (for button clicks) ✓ attach once listener with {once:false} but guard AC null.
+
+Let me write the noise buffer:
+```js
+let nbuf=null;
+function getNBuf(){ if(nbuf)return nbuf; const len=AC.sampleRate*1; nbuf=AC.createBuffer(1,len,AC.sampleRate); const d=nbuf.getChannelData(0); for(i) d[i]=Math.random()*2-1; return nbuf }
+function noiseBurst(dur,vol,freq,type='bandpass',at=0){ if(!AC)return; const t0=AC.currentTime+at; const s=AC.createBufferSource(); s.buffer=getNBuf(); s.playbackRate.value=0.8+Math.random()*0.4; const f=AC.createBiquadFilter(); f.type=type; f.frequency.value=freq; f.Q.value=1.2; const g=AC.createGain(); g.gain.setValueAtTime(vol,t0); g.gain.exponentialRampToValueAtTime(0.0001,t0+dur); s.connect(f).connect(g).connect(master); s.start(t0); s.stop(t0+dur+0.02); }
+```
+
+Ambient:
+```js
+function startAmbient(){ const mk=(f,v,ty='sine')=>{const o=AC.createOscillator();o.type=ty;o.frequency.value=f;const g=AC.createGain();g.gain.value=v;o.connect(g).connect(master);o.start();return{o,g}};
+ mk(48,0.035); mk(96.7,0.016); 
+ const s=AC.createBufferSource(); s.buffer=getNBuf(); s.loop=true; const f=AC.createBiquadFilter(); f.type='lowpass'; f.frequency.value=220; const g=AC.createGain(); g.gain.value=0.02; s.connect(f).connect(g).connect(master); s.start();
+ // slow LFO on master? skip
+}
+```
+
+Siren:
+```js
+function siren(){ if(!AC)return; const t0=AC.currentTime; const o=AC.createOscillator(); o.type='sawtooth'; o.frequency.value=520; const l=AC.createOscillator(); l.frequency.value=2.6; const lg=AC.createGain(); lg.gain.value=170; l.connect(lg).connect(o.frequency); const g=AC.createGain(); g.gain.setValueAtTime(0.0001,t0); g.gain.linearRampToValueAtTime(0.22,t0+0.05); g.gain.setValueAtTime(0.22,t0+1.0); g.gain.exponentialRampToValueAtTime(0.0001,t0+1.6); o.connect(g).connect(master); o.start(t0); l.start(t0); o.stop(t0+1.7); l.stop(t0+1.7); }
+```
+
+OK. "shout" too: 2 square blips.
+
+Win fanfare & fail sting sequences via tone with 'at'.
+
+Now let me write the HTML skeleton in full, then CSS, then JS. Also `<meta name=viewport>` not needed for iframe but harmless; include charset.
+
+Also `touch`? Not required (keyboard game); add a note "KEYBOARD REQUIRED" on start screen footer. Fine.
+
+Let me also double-check guard G4 loop in center room: route cells (10,7),(14,7),(14,9),(10,9) → centers (10.5,7.5),(14.5,7.5),(14.5,9.5),(10.5,9.5). Interior x∈[9,16], z∈[6,11] ✓ all inside. Path from (10.5,7.5) to (14.5,7.5): straight, passes over drive at (12.5,8.5)? No — z=7.5 row, drive at z=8.5 → clear ✓.
+
+G1 route (4.5,1.5)→(20.5,1.5): row 1 all floor ✓.
+G2 (23.5,4.5)→(23.5,14.5): col 23 rows 4-14: check r5 pos23 '.'? r5 = `#.......###..####.......#`: pos17-23 dots ✓; r9 pos23 '.' ✓ (C at 20); r13 pos23 '.' ✓ (dots 19-23); r11 similar to r5 ✓. All clear ✓.
+G3 (3.5,15.5)→(20.5,15.5): row 15 all dots ✓.
+G5 (6.5,5.5)→(6.5,11.5): col 6 rows 5-11: r5 pos6 '.'? r5 pos1-7 dots ✓; r9 pos6 '.' ✓ (CC at 4,5); ✓.
+
+Player start (3.5,2.5) is not on any route cell directly (G1 row 1 above — 1 unit away vertically). Good tension: G1 passes overhead every ~9s.
+
+Drive top-right (20.5,4.5): near G2's column (c23, 2.5 away) & G1's row (row 1, 3.5 away). Reasonable risk.
+Bottom-left drive (6.5,13.5): near G5 end (6.5,11.5 → 2 away, G5 turns around there!) & G3's row 15 (1.5 away). Spicy ✓.
+Center drive (12.5,8.5): guarded by G4 loop 1 unit away. Very spicy but player can time it or bait others... maybe too hard? G4 passes (10.5→14.5 at z=7.5) — drive at z=8.5 is 1 unit below that path; and z=9.5 path is 1 above. Player standing on drive has ~1m gap to either path. With suspicion decay & scan behavior, grabbing it takes a few seconds of risk — good game feel. Keep.
+
+Vision range vs map scale: FOV 95°, range 6.3 walk. Room interior width 7 → G4 can see whole room from center ✓.
+
+Now the "sneak reduces range to 4.3" — cones visibly shrink when you sneak ✓ juicy.
+
+I'm confident in the design. Let me write the final file now, carefully. I'll keep comments brief. Estimated ~1000 lines.
+
+For the title lockup:
+```css
+.title{font-family:'Arial Black','Franklin Gothic Medium',Impact,sans-serif; font-size:clamp(42px,8.5vw,86px); letter-spacing:.04em; line-height:.92; color:#eaf6ff; text-shadow:0 0 30px rgba(95,217,255,.25)}
+.title em{display:block;font-style:normal;color:var(--cyan);text-shadow:0 0 26px rgba(95,217,255,.55); letter-spacing:.14em; margin-left:.28em}
+```
+"SILENT" then <em>BREACH</em>.
+
+Classbar: flex space-between, tiny mono, border-block dashed.
+
+Panel clip-path corners: `clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px)` (chop two opposite corners — techy).
+
+kbd: `background:#0e1a29;border:1px solid #2b4258;border-bottom-width:2px;padding:2px 7px;font-size:12px;color:#cfe6f5`.
+
+btn: mono bold, letter-spacing, bg transparent border 1px cyan, hover → bg cyan color #04121a + glow shadow; transition .15s. focus-visible outline.
+
+Toast: `position:absolute;top:16%;left:50%;transform:translateX(-50%);` stacked via container flex column gap 8; each toast: panel style, animation slideIn .3s, fadeOut at 2.4s (CSS animation with delay forwards) → JS removes at 2.8s.
+
+bigMsg: font display huge clamp(40px,10vw,96px), letter-spacing .3em, animation msgPop .5s + msgFlicker? keep pop + glow.
+
+End screen rank: giant 120px with color class.
+
+Stats grid: 2-col mono rows with dotted leaders? simple flex space-between rows with border-bottom dashed.
+
+Also — one subtle thing: while state is START, the camera orbits center; guards patrol; cones render (range for walk since player.mode='walk' & see=false → vis never true so susp stays 0 ✓). Player stands at spawn visible in scene ✓ nice preview.
+
+On begin(): reset() re-parses map (fresh drives) & guards; camera lerps from orbit pos to follow — swoop ✓.
+
+Also ensure updateHUD guards against elements before defined — all DOM at top of script? Script at end of body ✓.
+
+Minimap canvas element sized 175×119 attr + CSS same.
+
+OK writing final answer now. I'll be extra careful with:
+- All template literals & quotes
+- No stray commas
+- Consistent variable names (camX, camY, camZ, camYawCur, camYawT, FCX/FCZ/RCX/RCZ computed in render and also needed in update for movement — compute from camYawCur at top of frame tick before both update & render: do it in tick()).
+
+Frame tick:
+```js
+function tick(ts){ requestAnimationFrame(tick); const now=ts/1000; let dt=Math.min(0.05, now-last||0.016); last=now; T=now;
+ // camera vectors from current yaw
+ FCX=Math.sin(camYawCur);FCZ=Math.cos(camYawCur);RCX=Math.cos(camYawCur);RCZ=-Math.sin(camYawCur);
+ update(dt); render(); }
+```
+But cam pos smoothing also in update. Movement uses FCX etc of this frame ✓ (slight 1-frame lag is fine).
+
+camPos: maintain camX,camY,camZ; compute desired each update from target & yaw, lerp.
+
+In START: orbit: camYawT += dt*0.22; target=(12.5,8.5); dist=10, height 7.
+PLAYING/ALARM/WON: target=player (+ small lead: + F*0.6? add look-ahead in movement direction — nice: tx = player.x + sin(player.ang)*0.5 etc), dist 8.4, height 6.2. WON: dist += wonT*2 (pull back).
+FAILED: freeze (no update) — but keep vectors for render ✓ just skip lerp.
+
+camYawCur += angDiff(camYawT,camYawCur)*(1-exp(-7dt)).
+
+angDiff(a,b)=((a-b+PI)%TAU+TAU)%TAU-PI.
+
+Q/E: camYawT += PI/2 etc (any state except START? allow always — harmless; but in START the orbit adds continuously; user Q would fight it. Restrict to PLAYING/PAUSED).
+
+Shake: shakeV decays in update; render offset = (Math.random()*2-1)*shakeV*7.
+
+I think that's everything. Let me write it out.
+
+Also — drives collected count & diamonds UI: drvRow spans get .on class → color cyan with glow, else dim outline (use ◈ char, off state color #35506b).
+
+Exit status text: `EXIT · LOCKED` amber? locked = dim red; open = green pulsing.
+
+Mode chips: WALK active by default; SNEAK cyan; SPRINT red-ish. Show key hints small under? Chip label with tiny kbd inside: e.g., `<span class="chip" id="chipWalk">WALK</span>` and a static hint row below "SHIFT SNEAK · SPACE SPRINT". Keep chips minimal + a hint line.
+
+detLabel states: '—' / 'SUSPICION RISING' (amber) / 'ALERT' (orange-red) / 'CONTACT!' (red, .hot pulse on box).
+
+Let me write the code now, final pass. I'll number sections with comments for my own sanity.
+
+While writing render floor: bg gradient — create in resize: `bgGrad=ctx.createLinearGradient(0,0,0,H); stops '#0d1a2e'? top slightly lighter (sky) → base. Top #10203a? Let me do: 0:'#0e1c33', .55:'#081120', 1:'#04070c'. Plus a faint horizon glow line drawn in scene? skip.
+
+Fog color must match lower bg: FOG=[6,10,17].
+
+Floor base color [16,24,35]; grid lines 'rgba(125,170,215,.05)' every 1u; border rect around map slightly brighter stroke rgba(125,170,215,.12).
+
+Also draw a subtle "map bounds" glow under everything? skip.
+
+Let me verify sy formula once more: camY≈6.2 above floor. Point on floor in front: dy = 0−6.2 = −6.2 → cy=−6.2 (negative) → sy = H/2 − (cy*F/cz) = H/2 + 6.2*F/cz > H/2 → below center ✓ correct (floor appears in lower half).
+
+Sky above horizon: bg gradient covers ✓.
+
+Cone fill near guard base... fine.
+
+One risk: painter sort with translucent cones drawn in floor pass but a wall behind the player (far) might be drawn later covering a cone that is *in front* of that wall? Floor-pass items are all at y≈0; any wall face that intersects the floor plane region between camera and guard... A tall wall near the camera could have its base below where a far guard's cone lies on screen, and the wall (drawn later) would cover the cone — correct occlusion! And the reverse error: cone drawn over a wall? No — cones are always before walls in draw order, so walls can only ever cover cones → always safe direction (cones might be *under-occluded* in weird cases where a low crate is between... crates also drawn after → they cover cones ✓). The only wrong case would be if a floor cone should occlude something — nothing on the floor needs to occlude solids. 
+
+Shadows same reasoning ✓. Ripples ✓. Exit pad ✓ (beam pillars are in the solid pass, drawn over the pad ✓ fine).
+
+Great — writing now for real. I'll keep the code tight but complete. Let me also make sure I don't use `??` or optional chaining excessively for older iframe browsers? Modern is fine; still avoid exotic syntax. Use const/let, arrow functions — fine.
+
+Final check of required deliverables:
+- Single HTML ✓
+- Inline CSS/JS ✓ no network ✓
+- WebAudio after first input ✓
+- Fills window, resizes, no scrollbars (overflow hidden) ✓
+- Start screen with name + controls ✓ restart w/o reload (R + button) ✓ keys on window ✓
+- No alert/confirm/prompt ✓
+- localStorage try/catch ✓
+- <title> has name ✓
+
+Writing the file.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SILENT BREACH — 3D Stealth</title>
+<style>
+:root{
+  --bg:#04070c; --panel:rgba(9,17,28,.86); --line:#1e3550; --line2:#2b4a6b;
+  --cy:#5fd9ff; --gr:#54f2a5; --am:#ffb347; --rd:#ff5566;
+  --tx:#cfe2f2; --dim:#7d93ab;
+  --mono:"Consolas","Menlo","SF Mono","Cascadia Mono",ui-monospace,Menlo,monospace;
+  --disp:"Arial Black","Franklin Gothic Medium",Impact,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;background:var(--bg)}
+body{font-family:var(--mono);color:var(--tx);user-select:none;-webkit-user-select:none}
+#cv{position:fixed;inset:0;display:block}
+/* ---------- atmosphere overlays ---------- */
+#vig{position:fixed;inset:0;pointer-events:none;z-index:5;
+  background:radial-gradient(ellipse at 50% 46%,transparent 52%,rgba(2,5,10,.62) 100%)}
+#scan{position:fixed;inset:0;pointer-events:none;z-index:6;opacity:.34;
+  background:repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.16) 2px 3px)}
+#alertGlow{position:fixed;inset:0;pointer-events:none;z-index:7;opacity:0;
+  background:radial-gradient(ellipse at 50% 50%,transparent 42%,rgba(255,42,64,.55) 100%)}
+#alertGlow.strobe{animation:str .45s infinite alternate}
+@keyframes str{from{opacity:.12}to{opacity:.7}}
+/* ---------- shared panel / buttons ---------- */
+.panel{background:var(--panel);box-shadow:inset 0 0 0 1px var(--line);
+  clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px)}
+.btn{font-family:var(--mono);font-weight:700;letter-spacing:.14em;font-size:15px;
+  color:var(--cy);background:rgba(95,217,255,.06);border:1px solid var(--cy);
+  padding:13px 26px;cursor:pointer;transition:all .15s;
+  clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px)}
+.btn:hover,.btn:focus-visible{background:var(--cy);color:#04121c;box-shadow:0 0 26px rgba(95,217,255,.5);outline:none}
+kbd{display:inline-block;background:#0e1a29;border:1px solid #2b4258;border-bottom-width:2px;
+  padding:2px 7px;font-family:var(--mono);font-size:11px;color:var(--tx);margin-right:3px}
+.lbl{font-size:10px;letter-spacing:.28em;color:var(--dim)}
+.cy{color:var(--cy)} .gr{color:var(--gr)} .am{color:var(--am)} .rd{color:var(--rd)}
+/* ---------- HUD ---------- */
+#hud{position:fixed;inset:0;pointer-events:none;z-index:10;display:none}
+.hud-panel{position:absolute;padding:9px 12px}
+#objPanel{top:14px;left:14px;min-width:190px}
+#drvRow{margin-top:6px;font-size:17px;letter-spacing:.18em;display:flex;align-items:center;gap:6px}
+.drv{color:#33506e;text-shadow:none;transition:all .25s}
+.drv.on{color:var(--cy);text-shadow:0 0 10px rgba(95,217,255,.9)}
+#exitStat{font-size:10px;letter-spacing:.18em;color:#5b7188;margin-left:8px}
+#exitStat.open{color:var(--gr);animation:blink 1s infinite}
+@keyframes blink{50%{opacity:.35}}
+#timerPanel{top:14px;right:14px;text-align:right}
+#timeVal{font-size:22px;font-weight:700;letter-spacing:.1em;margin-top:3px;color:#eaf6ff}
+#mapPanel{top:86px;right:14px;padding:6px}
+#mm{display:block;width:175px;height:119px}
+#detBox{bottom:16px;left:50%;transform:translateX(-50%);text-align:center;width:300px}
+#detLabel{font-size:10px;letter-spacing:.3em;color:var(--dim);margin-bottom:6px;height:12px}
+#detTrack{position:relative;height:10px;background:#0a141f;box-shadow:inset 0 0 0 1px var(--line)}
+#detFill{position:absolute;left:0;top:0;bottom:0;width:0%;background:var(--gr)}
+#detTrack::after{content:"";position:absolute;inset:0;
+  background-image:linear-gradient(90deg,rgba(4,8,14,.8) 2px,transparent 2px);background-size:10% 100%}
+#detBox.hot{animation:hotP .5s infinite alternate}
+@keyframes hotP{from{box-shadow:inset 0 0 0 1px var(--line)}to{box-shadow:inset 0 0 0 2px var(--rd),0 0 22px rgba(255,85,102,.45)}}
+#modeBox{bottom:16px;right:14px;text-align:right}
+.chips{display:flex;gap:6px;justify-content:flex-end;margin-bottom:5px}
+.chip{font-size:10px;letter-spacing:.2em;padding:4px 9px;color:#4e6larger? #4e6780;color:#4e6780;box-shadow:inset 0 0 0 1px var(--line);transition:all .15s}
+.chip.act{color:var(--cy);box-shadow:inset 0 0 0 1px var(--cy);text-shadow:0 0 8px rgba(95,217,255,.7)}
+.chip.act.sp{color:var(--rd);box-shadow:inset 0 0 0 1px var(--rd);text-shadow:0 0 8px rgba(255,85,102,.7)}
+.hint{font-size:9px;letter-spacing:.14em;color:#4e6780}
+/* ---------- toasts ---------- */
+#toasts{position:fixed;top:13%;left:50%;transform:translateX(-50%);z-index:11;
+  display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none}
+.toast{padding:8px 20px;font-size:12px;letter-spacing:.2em;background:var(--panel);
+  box-shadow:inset 0 0 0 1px var(--line2);animation:tIn .25s ease-out, tOut .4s ease-in 2.3s forwards}
+@keyframes tIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1}}
+@keyframes tOut{to{opacity:0;transform:translateY(-8px)}}
+/* ---------- big message ---------- */
+#bigMsg{position:fixed;inset:0;z-index:12;display:none;align-items:center;justify-content:center;
+  font-family:var(--disp);font-size:clamp(38px,9vw,92px);letter-spacing:.3em;text-align:center;
+  pointer-events:none;color:var(--rd);text-shadow:0 0 40px rgba(255,60,80,.8)}
+#bigMsg.show{display:flex;animation:mPop .45s cubic-bezier(.2,1.6,.4,1)}
+@keyframes mPop{from{transform:scale(1.7);opacity:0}to{transform:scale(1);opacity:1}}
+/* ---------- screens ---------- */
+.screen{position:fixed;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;
+  background:rgba(3,6,11,.55);backdrop-filter:none;padding:16px}
+.frame{width:min(880px,94vw);max-height:94vh;overflow:auto;padding:26px 30px 24px}
+.classbar{display:flex;justify-content:space-between;font-size:10px;letter-spacing:.3em;
+  color:var(--am);border-top:1px dashed #5a4626;border-bottom:1px dashed #5a4626;padding:7px 2px;margin-bottom:20px}
+.title{font-family:var(--disp);font-size:clamp(40px,8vw,82px);line-height:.92;letter-spacing:.03em;color:#eaf6ff;text-shadow:0 0 34px rgba(95,217,255,.22)}
+.title em{display:block;font-style:normal;color:var(--cy);letter-spacing:.16em;margin-left:.3em;
+  text-shadow:0 0 28px rgba(95,217,255,.6)}
+.sub{margin:10px 0 22px;font-size:11px;letter-spacing:.34em;color:var(--dim)}
+.cols{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:22px}
+.brief{flex:1 1 300px;padding:14px 16px}
+.brief h2{font-size:11px;letter-spacing:.3em;color:var(--cy);margin-bottom:11px;font-weight:700}
+.brief ol{list-style:none;font-size:12.5px;line-height:1.75}
+.brief li{padding-left:18px;position:relative;margin-bottom:4px;color:#b9cfdf}
+.brief li::before{content:"▸";position:absolute;left:0;color:var(--am)}
+.keys{display:grid;grid-template-columns:auto 1fr;gap:7px 14px;font-size:11px;letter-spacing:.08em;align-items:center;color:#b9cfdf}
+.cta{margin-top:14px;font-size:12px;letter-spacing:.26em;color:var(--dim)}
+.cta b{color:#eaf6ff}
+.cur{display:inline-block;color:var(--cy);animation:blink .8s steps(1) infinite;margin-left:6px}
+.bestline{margin-top:10px;font-size:11px;letter-spacing:.24em;color:var(--am)}
+.row{display:flex;align-items:center;gap:22px;flex-wrap:wrap}
+/* end screen */
+.endTitle{font-family:var(--disp);font-size:clamp(30px,6vw,58px);letter-spacing:.1em;line-height:1.05;margin-bottom:6px}
+.rankWrap{display:flex;align-items:center;gap:26px;margin:20px 0 14px;flex-wrap:wrap}
+#rankBig{font-family:var(--disp);font-size:110px;line-height:1;text-shadow:0 0 40px currentColor}
+.stats{min-width:300px;flex:1}
+.srow{display:flex;justify-content:space-between;font-size:12.5px;letter-spacing:.14em;padding:7px 2px;border-bottom:1px dashed #24405e;color:#b9cfdf}
+.srow b{color:#eaf6ff;font-weight:700}
+#newBest{display:none;margin-top:12px;color:var(--gr);font-size:12px;letter-spacing:.3em;animation:blink 1s infinite}
+/* pause */
+.pauseBox{text-align:center;padding:34px 46px}
+.pauseBox h2{font-family:var(--disp);font-size:40px;letter-spacing:.3em;color:#eaf6ff;margin-bottom:18px}
+.pauseBox .keys{grid-template-columns:auto 1fr;text-align:left;width:320px;margin:0 auto 22px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="vig"></div><div id="scan"></div><div id="alertGlow"></div>
+
+<div id="hud">
+  <div id="objPanel" class="panel hud-panel">
+    <div class="lbl">MISSION</div>
+    <div id="drvRow"><span class="drv" id="d0">◈</span><span class="drv" id="d1">◈</span><span class="drv" id="d2">◈</span><span id="exitStat">EXIT · LOCKED</span></div>
+  </div>
+  <div id="timerPanel" class="panel hud-panel">
+    <div class="lbl">RUN TIME</div><div id="timeVal">00:00</div>
+  </div>
+  <div id="mapPanel" class="panel hud-panel"><canvas id="mm" width="175" height="119"></canvas></div>
+  <div id="detBox" class="panel hud-panel">
+    <div id="detLabel">—</div>
+    <div id="detTrack"><div id="detFill"></div></div>
+  </div>
+  <div id="modeBox" class="hud-panel panel">
+    <div class="chips"><span class="chip act" id="cWalk">WALK</span><span class="chip" id="cSneak">SNEAK</span><span class="chip sp" id="cSprint">SPRINT</span></div>
+    <div class="hint">SHIFT SNEAK · SPACE SPRINT · Q/E CAMERA</div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+<div id="bigMsg">DETECTED</div>
+
+<!-- START -->
+<div id="scrStart" class="screen">
+  <div class="frame panel">
+    <div class="classbar"><span>▚▚ CLASSIFIED // EYES ONLY</span><span>FACILITY 07 · SIM v2.7</span></div>
+    <h1 class="title">SILENT<em>BREACH</em></h1>
+    <p class="sub">3D INFILTRATION PROTOCOL — SECTOR NIGHTGLASS</p>
+    <div class="cols">
+      <section class="brief panel">
+        <h2>// MISSION BRIEF</h2>
+        <ol>
+          <li>Steal the <b class="cy">3 data drives</b> — server core &amp; perimeter vaults.</li>
+          <li>Reach the <b class="gr">extraction pad</b> (SE corner) to complete the op.</li>
+          <li>Guards have vision cones. Linger in sight and <b class="rd">suspicion fills</b> — full means mission over.</li>
+          <li>Sprinting is loud. Guards hear it, even through walls.</li>
+        </ol>
+      </section>
+      <section class="brief panel">
+        <h2>// CONTROLS</h2>
+        <div class="keys">
+          <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></span><span>MOVE (camera-relative)</span>
+          <span><kbd>SHIFT</kbd></span><span>SNEAK — slow · silent · hard to spot</span>
+          <span><kbd>SPACE</kbd></span><span>SPRINT — fast · loud</span>
+          <span><kbd>Q</kbd><kbd>E</kbd></span><span>ROTATE CAMERA</span>
+          <span><kbd>P</kbd></span><span>PAUSE</span>
+          <span><kbd>R</kbd></span><span>RESTART RUN</span>
+        </div>
+      </section>
+    </div>
+    <div class="row">
+      <button id="btnStart" class="btn">▶ BEGIN INFILTRATION</button>
+      <div class="cta">OR PRESS <b>ENTER</b><span class="cur">▮</span></div>
+    </div>
+    <div id="startBest" class="bestline"></div>
+  </div>
+</div>
+
+<!-- END -->
+<div id="scrEnd" class="screen" hidden>
+  <div class="frame panel">
+    <div class="classbar"><span>▚▚ OPERATION REPORT</span><span>FACILITY 07</span></div>
+    <h1 id="endTitle" class="endTitle">EXTRACTION COMPLETE</h1>
+    <div class="rankWrap">
+      <div id="rankBig" hidden>S</div>
+      <div class="stats">
+        <div class="srow"><span>RUN TIME</span><b id="stTime">00:00</b></div>
+        <div class="srow"><span>DATA DRIVES</span><b id="stDrv">0 / 3</b></div>
+        <div class="srow"><span>PEAK DETECTION</span><b id="stPeak">0%</b></div>
+      </div>
+    </div>
+    <div id="newBest">★ NEW BEST RUN ★</div>
+    <div class="row">
+      <button id="btnRetry" class="btn">↻ REDEPLOY</button>
+      <div class="cta">OR PRESS <b>R / ENTER</b></div>
+    </div>
+  </div>
+</div>
+
+<!-- PAUSE -->
+<div id="scrPause" class="screen" hidden>
+  <div class="frame panel pauseBox">
+    <h2>PAUSED</h2>
+    <div class="keys">
+      <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></span><span>MOVE</span>
+      <span><kbd>SHIFT</kbd> / <kbd>SPACE</kbd></span><span>SNEAK / SPRINT</span>
+      <span><kbd>R</kbd></span><span>RESTART RUN</span>
+    </div>
+    <button id="btnResume" class="btn">▶ RESUME (P)</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* =============================================================
+   SILENT BREACH — single-file 3D stealth (software renderer)
+   ============================================================= */
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+const $=id=>document.getElementById(id);
+let W=0,H=0,DPR=1,F=800,bgGrad=null;
+const FOVY=0.80, NEAR=0.14, TAU=Math.PI*2, PI=Math.PI;
+const FOGC=[6,10,17];
+
+function resize(){
+  DPR=Math.min(2,window.devicePixelRatio||1);
+  W=window.innerWidth; H=window.innerHeight;
+  cv.width=Math.max(1,W*DPR); cv.height=Math.max(1,H*DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  F=(H*0.5)/Math.tan(FOVY*0.5);
+  bgGrad=ctx.createLinearGradient(0,0,0,H);
+  bgGrad.addColorStop(0,'#10203a'); bgGrad.addColorStop(.55,'#081120'); bgGrad.addColorStop(1,'#04070c');
+}
+window.addEventListener('resize',resize);
+
+/* ---------------- map ---------------- */
+const MAPSTR=[
+"#########################",
+"#.......................#",
+"#..P.....CC.............#",
+"#..........C............#",
+"#...................D...#",
+"#.......###..####.......#",
+"#........#.......#.......#",
+"#........#.......#.......#",
+"#........#...D...#.......#",
+"#...CC..#.......#...C...#",
+"#........#.......#.......#",
+"#.......###..####.......#",
+"#.......................#",
+"#.....D.....C.....C.....#",
+"#....................X..#",
+"#.......................#",
+"#########################"];
+const MW=25,MH=17,WALL_H=3.0,CRATE_H=1.5;
+let grid,playerSpawn={x:3.5,z:2.5},exitCell={x:21.5,z:14.5};
+
+function parseMap(){
+  grid=[]; drives.length=0;
+  for(let r=0;r<MH;r++){
+    const row=(MAPSTR[r]||'').padEnd(MW,'#').slice(0,MW);
+    const line=[];
+    for(let c=0;c<MW;c++){
+      const ch=row[c]; let s=0;
+      if(ch==='#')s=1; else if(ch==='C')s=2;
+      if(ch==='P')playerSpawn={x:c+.5,z:r+.5};
+      if(ch==='D')drives.push({x:c+.5,z:r+.5,got:false,ph:Math.random()*6});
+      if(ch==='X')exitCell={x:c+.5,z:r:.0? r+.5 : r+.5};
+      line.push(s);
+    }
+    grid.push(line);
+  }
+}
+function solid(x,z){
+  const c=Math.floor(x),r=Math.floor(z);
+  if(c<0||r<0||c>=MW||r>=MH)return true;
+  return grid[r][c]>=1;
+}
+function circleHits(x,z,r){
+  for(let c=Math.floor(x-r);c<=Math.floor(x+r);c++)
+    for(let rr=Math.floor(z-r);rr<=Math.floor(z+r);rr++){
+      if(c<0||rr<0||c>=MW||rr>=MH)return true;
+      if(!grid[rr][c])continue;
+      const px=Math.max(c,Math.min(x,c+1)), pz=Math.max(rr,Math.min(z,rr+1));
+      if((x-px)*(x-px)+(z-pz)*(z-pz)<r*r)return true;
+    }
+  return false;
+}
+function slide(e,dx,dz,r){
+  const doAxis=(nx,nz,axis)=>{
+    if(!circleHits(nx,nz,r)){e[axis]=nx;}
+    else{
+      const s=Math.sign(dx||dz); const n=Math.ceil(Math.abs(axis==='x'?dx:dz)/(r*.5));
+      for(let i=0;i<n;i++){const t=e[axis]+s*r*.5; if(circleHits(t,axis==='x'?e.z:e.x,r))break; e[axis]=t;}
+    }
+  };
+  doAxis(e.x+dx,e.z,'x');
+  doAxis(e.x,e.z+dz,'z');
+}
+function losClear(x0,z0,x1,z1){
+  const d=Math.hypot(x1-x0,z1-z0), n=Math.max(2,Math.ceil(d/0.18));
+  for(let i=1;i<n;i++){const t=i/n; if(solid(x0+(x1-x0)*t, z0+(z1-z0)*t))return false;}
+  return true;
+}
+
+/* ---------------- geometry ---------------- */
+function mkBox(cx,cz,rot,w,d,y0,y1,col){
+  const cs=Math.cos(rot),sn=Math.sin(rot),hw=w/2,hd=d/2;
+  const P=(lx,lz,y)=>[cx+lx*cs+lz*sn, y, cz-lx*sn+lz*cs];
+  const c=[P(-hw,-hd,y0),P(hw,-hd,y0),P(hw,hd,y0),P(-hw,hd,y0),
+           P(-hw,-hd,y1),P(hw,-hd,y1),P(hw,hd,y1),P(-hw,hd,y1)];
+  const N=(nx,nz)=>[nx*cs+nz*sn, nz===0&&nx===0?0:0, -nx*sn+nz*cs];
+  const faces=[
+    {i:[4,5,6,7], n:[0,1,0]},   {i:[0,1,2,3], n:[0,-1,0]},
+    {i:[2,3,7,6], n:N(0,1)},    {i:[0,1,5,4], n:N(0,-1)},
+    {i:[1,2,6,5], n:N(1,0)},    {i:[0,3,7,4], n:N(-1,0)}];
+  return {c,faces,col,cx,cy:(y0+y1)/2,cz};
+}
+let staticBoxes=[];
+function buildStatics(){
+  staticBoxes.length=0;
+  for(let r=0;r<MH;r++){
+    let c=0;
+    while(c<MW){
+      const s=grid[r][c];
+      if(!s){c++;continue;}
+      let e=c; while(e<MW&&grid[r][e]===s)e++;
+      const len=e-c, mid=c+len/2;
+      staticBoxes.push(mkBox(mid,r+.5,0,len,1,0,s===1?WALL_H:CRATE_H,
+        s===1?[86,103,127]:(c%2?[138,120,85]:[154,135,96])));
+      c=e;
+    }
+  }
+}
+
+/* ---------------- camera / projection ---------------- */
+let camX=12.5,camY=7,camZ=12.5+10, camYawCur=-PI*0.75, camYawT=-PI*0.75;
+let FCX=0,FCZ=1,RCX=1,RCZ=0, shakeV=0, T=0;
+const angDiff=(a,b)=>((a-b+PI)%TAU+TAU)%TAU-PI;
+
+function tCam(p){
+  const dx=p[0]-camX, dy=p[1]-camY, dz=p[2]-camZ;
+  return {x:dx*RCX+dz*RCZ, y:dy, z:dx*FCX+dz*FCZ};
+}
+function clipNear(p){
+  const out=[];
+  for(let i=0;i<p.length;i++){
+    const a=p[i], b=p[(i+1)%p.length];
+    const ain=a.z>=NEAR, bin=b.z>=NEAR;
+    if(ain)out.push(a);
+    if(ain!==bin){const t=(NEAR-a.z)/(b.z-a.z);
+      out.push({x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t, z:NEAR});}
+  }
+  return out;
+}
+function floorPath(pts,y){
+  let p=pts.map(w=>tCam([w[0],y,w[1]]));
+  if(p.every(q=>q.z<NEAR))return false;
+  p=clipNear(p); if(p.length<3)return false;
+  ctx.beginPath();
+  for(let i=0;i<p.length;i++){const k=F/p[i].z;
+    const x=W/2+p[i].x*k, yy=H/2-p[i].y*k;
+    i?ctx.lineTo(x,yy):ctx.moveTo(x,yy);}
+  ctx.closePath(); return true;
+}
+function line3(x0,z0,x1,z1,y){
+  let a=tCam([x0,y,z0]), b=tCam([x1,y,z1]);
+  if(a.z<NEAR&&b.z<NEAR)return;
+  if(a.z<NEAR){const t=(NEAR-a.z)/(b.z-a.z);a={x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t,z:NEAR};}
+  if(b.z<NEAR){const t=(NEAR-b.z)/(a.z-b.z);b={x:b.x+(a.x-b.x)*t,y:b.y+(a.y-b.y)*t,z:NEAR};}
+  const ka=F/a.z,kb=F/b.z;
+  ctx.beginPath();ctx.moveTo(W/2+a.x*ka,H/2-a.y*ka);ctx.lineTo(W/2+b.x*kb,H/2-b.y*kb);ctx.stroke();
+}
+
+/* lighting */
+const L0=[-0.42,0.86,-0.34], Ll=Math.hypot(...L0), LX=L0[0]/Ll,LY=L0[1]/Ll,LZ=L0[2]/Ll;
+function shadeStr(col,n,d){
+  let b=0.40+0.62*Math.max(0,n[0]*LX+n[1]*LY+n[2]*LZ);
+  let t=Math.min(1,Math.max(0,(d-11)/26)); t=t*t*(3-2*t);
+  const r=col[0]*b+(FOGC[0]-col[0]*b)*t, g=col[1]*b+(FOGC[1]-col[1]*b)*t, bl=col[2]*b+(FOGC[2]-col[2]*b)*t;
+  return 'rgb('+(r|0)+','+(g|0)+','+(bl|0)+')';
+}
+
+/* ---------------- audio ---------------- */
+let AC=null,master=null,nbuf=null;
+function initAudio(){
+  if(AC){if(AC.state==='suspended')AC.resume();return;}
+  try{
+    AC=new (window.AudioContext||window.webkitAudioContext)();
+    master=AC.createGain(); master.gain.value=0.5; master.connect(AC.destination);
+    ambient();
+  }catch(e){}
+}
+function getNBuf(){
+  if(nbuf)return nbuf;
+  const n=AC.sampleRate|0; nbuf=AC.createBuffer(1,n,AC.sampleRate);
+  const d=nbuf.getChannelData(0); for(let i=0;i<n;i++)d[i]=Math.random()*2-1;
+  return nbuf;
+}
+function tone(o){
+  if(!AC)return;
+  const t0=AC.currentTime+(o.at||0);
+  const os=AC.createOscillator(), g=AC.createGain();
+  os.type=o.type||'sine'; os.frequency.setValueAtTime(o.f,t0);
+  if(o.f2)os.frequency.exponentialRampToValueAtTime(Math.max(1,o.f2),t0+o.dur);
+  g.gain.setValueAtTime(0.0001,t0);
+  g.gain.linearRampToValueAtTime(o.vol||0.2,t0+0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001,t0+o.dur);
+  os.connect(g).connect(master); os.start(t0); os.stop(t0+o.dur+0.06);
+}
+function noiseBurst(dur,vol,freq,type,at){
+  if(!AC)return;
+  const t0=AC.currentTime+(at||0);
+  const s=AC.createBufferSource(); s.buffer=getNBuf(); s.playbackRate.value=0.8+Math.random()*0.4;
+  const f=AC.createBiquadFilter(); f.type=type||'bandpass'; f.frequency.value=freq; f.Q.value=1.1;
+  const g=AC.createGain(); g.gain.setValueAtTime(vol,t0);
+  g.gain.exponentialRampToValueAtTime(0.0001,t0+dur);
+  s.connect(f).connect(g).connect(master); s.start(t0); s.stop(t0+dur+0.03);
+}
+function ambient(){
+  const mk=(f,v)=>{const o=AC.createOscillator();o.frequency.value=f;const g=AC.createGain();g.gain.value=v;o.connect(g).connect(master);o.start();};
+  mk(48,0.035); mk(96.7,0.015);
+  const s=AC.createBufferSource(); s.buffer=getNBuf(); s.loop=true;
+  const f=AC.createBiquadFilter(); f.type='lowpass'; f.frequency.value=230;
+  const g=AC.createGain(); g.gain.value=0.02;
+  s.connect(f).connect(g).connect(master); s.start();
+}
+const sfx={
+  step(v,f){noiseBurst(0.06,v,f,'bandpass');},
+  ping(){noiseBurst(0.14,0.3,480,'lowpass');tone({f:70,dur:.12,vol:.18});},
+  pickup(){tone({f:740,dur:.12,vol:.2});tone({f:1108,dur:.18,vol:.2,at:.09});noiseBurst(.2,.06,3200,'highpass',.05);},
+  unlock(){tone({f:392,dur:.4,vol:.16,type:'triangle'});tone({f:587,dur:.4,vol:.14,type:'triangle',at:.13});tone({f:784,dur:.6,vol:.16,type:'triangle',at:.26});},
+  heard(){tone({f:520,f2:390,dur:.14,vol:.12,type:'square'});},
+  shout(){tone({f:880,f2:440,dur:.16,vol:.26,type:'square'});tone({f:880,f2:440,dur:.16,vol:.22,type:'square',at:.17});},
+  siren(){
+    if(!AC)return; const t0=AC.currentTime;
+    const o=AC.createOscillator();o.type='sawtooth';o.frequency.value=520;
+    const l=AC.createOscillator();l.frequency.value=2.6;const lg=AC.createGain();lg.gain.value=170;
+    l.connect(lg).connect(o.frequency);
+    const g=AC.createGain();g.gain.setValueAtTime(.0001,t0);g.gain.linearRampToValueAtTime(.2,t0+.05);
+    g.gain.setValueAtTime(.2,t0+1.05);g.gain.exponentialRampToValueAtTime(.0001,t0+1.6);
+    o.connect(g).connect(master);o.start(t0);l.start(t0);o.stop(t0+1.7);l.stop(t0+1.7);
+  },
+  thump(v){tone({f:52,dur:.15,vol:v});tone({f:43,dur:.18,vol:v*.75,at:.16});},
+  fail(){tone({f:330,f2:262,dur:.25,vol:.2,type:'sawtooth'});tone({f:262,f2:196,dur:.4,vol:.2,type:'sawtooth',at:.22});noiseBurst(.5,.2,300,'lowpass');},
+  win(){[523,659,784,1046].forEach((f,i)=>tone({f,dur:i===3?.5:.16,vol:.2,type:'triangle',at:i*.12}));noiseBurst(.4,.08,2400,'highpass',.1);}
+};
+
+/* ---------------- state ---------------- */
+let state='START', playT=0, alarmT=0, wonT=0, maxSusp=0, peakSusp=0, collected=0, exitOpen=false;
+let hbT=0, stepT=0.4, pingT=0.9, heardToastT=0, lockHintT=0;
+const player={x:3.5,z:2.5,ang:0,r:0.34,mode:'walk'};
+const drives=[]; const ripples=[];
+const GUARD_ROUTES=[
+  [[4.5,1.5],[20.5,1.5]],
+  [[23.5,4.5],[23.5,14.5]],
+  [[3.5,15.5],[20.5,15.5]],
+  [[10.5,7.5],[14.5,7.5],[14.5,9.5],[10.5,9.5]],
+  [[6.5,5.5],[6.5,11.5]]];
+let guards=[];
+const FOV=PI*0.53; // ~95°
+
+function reset(){
+  parseMap(); buildStatics();
+  player.x=playerSpawn.x; player.z=playerSpawn.z; player.ang=0; player.mode='walk';
+  collected=0; exitOpen=false; playT=0; peakSusp=0; maxSusp=0;
+  alarmT=0; wonT=0; shakeV=0; hbT=0; stepT=.4; pingT=.9; ripples.length=0;
+  guards=GUARD_ROUTES.map((rt,i)=>{
+    const a=Math.atan2(rt[1][0]-rt[0][0], rt[1][1]-rt[0][1]);
+    return {x:rt[0][0],z:rt[0][1],ang:a,route:rt,wp:1,mode:'patrol',susp:0,
+            tx:0,tz:0,lastSeen:null,scanT:0,faceBase:0,stuck:0,ph:i*1.7,r:0.34};
+  });
+  $('detBox').classList.remove('hot');
+  $('alertGlow').classList.remove('strobe'); $('alertGlow').style.opacity=0;
+  $('bigMsg').classList.remove('show');
+  $('toasts').innerHTML='';
+}
+
+/* ---------------- toasts / messages ---------------- */
+const toastLock={};
+function toast(msg,cls,key,cd){
+  if(key){ const n=T; if(toastLock[key]&&n-toastLock[key]<cd)return; toastLock[key]=n; }
+  const t=document.createElement('div'); t.className='toast '+(cls||''); t.textContent=msg;
+  const box=$('toasts'); box.appendChild(t);
+  while(box.children.length>3)box.removeChild(box.firstChild);
+  setTimeout(()=>{if(t.parentNode)t.parentNode.removeChild(t);},2800);
+}
+
+/* ---------------- gameplay ---------------- */
+function effRange(){
+  if(state==='START')return 6.3;
+  return player.mode==='sneak'?4.3 : player.mode==='sprint'?7.4 : 6.3;
+}
+function hearCheck(x,z,R){
+  for(const g of guards){
+    const d=Math.hypot(g.x-x,g.z-z);
+    const att=losClear(g.x,g.z,x,z)?1:0.55;
+    if(d<R*att){
+      g.mode='toPoint'; g.tx=x; g.tz=z; g.stuck=0;
+      sfx.heard();
+      toast('A GUARD HEARD SOMETHING','am','heard',4);
+    }
+  }
+}
+function triggerAlarm(){
+  state='ALARM'; alarmT=0; shakeV=1;
+  sfx.shout(); sfx.siren();
+  const bm=$('bigMsg'); bm.textContent='DETECTED'; bm.style.color='var(--rd)';
+  void bm.offsetWidth; bm.classList.add('show');
+  $('alertGlow').classList.add('strobe');
+}
+function showEnd(won){
+  const t=playT, m=t/60|0, s=t%60|0;
+  const fmt=(x=>String(x).padStart(2,'0'));
+  $('endTitle').textContent=won?'EXTRACTION COMPLETE':'DETECTED — MISSION FAILED';
+  $('endTitle').style.color=won?'var(--gr)':'var(--rd)';
+  $('stTime').textContent=fmt(m)+':'+fmt(s);
+  $('stDrv').textContent=collected+' / 3';
+  $('stPeak').textContent=Math.round(peakSusp*100)+'%';
+  const rb=$('rankBig');
+  let bestLine='';
+  if(won){
+    const rank=t<75?'S':t<120?'A':t<180?'B':'C';
+    rb.hidden=false; rb.textContent=rank;
+    rb.style.color={S:'var(--cy)',A:'var(--gr)',B:'var(--am)',C:'#8fa3b8'}[rank];
+    let nb=false;
+    try{
+      const b=JSON.parse(localStorage.getItem('sb_best')||'null');
+      if(!b||t<b.t){localStorage.setItem('sb_best',JSON.stringify({t:Math.round(t*10),r:rank}));nb=true;}
+      else bestLine='BEST RUN — '+fmt(b.t/60|0)+':'+fmt(b.t%60|0)+' · '+b.r;
+    }catch(e){}
+    $('newBest').style.display=nb?'block':'none';
+  }else{ rb.hidden=true; $('newBest').style.display='none'; }
+  if(bestLine)$('startBest').textContent=bestLine;
+  $('scrEnd').hidden=false;
+}
+function beginRun(){
+  reset(); state='PLAYING';
+  $('scrStart').hidden=true; $('scrEnd').hidden=true; $('hud').style.display='block';
+  if(document.activeElement)document.activeElement.blur();
+  toast('INFILTRATION STARTED — FIND THE DATA DRIVES','cy');
+}
+
+function updGuard(g,dt,see){
+  const p=player;
+  if(state==='ALARM'||state==='FAILED'){
+    const d=Math.hypot(p.x-g.x,p.z-g.z)||.001;
+    g.x+=(p.x-g.x)/d*4.6*dt; g.z+=(p.z-g.z)/d*4.6*dt;
+    g.ang+=angDiff(Math.atan2(p.x-g.x,p.z-g.z),g.ang)*(1-Math.exp(-8*dt));
+    return;
+  }
+  const dx=p.x-g.x,dz=p.z-g.z,d=Math.hypot(dx,dz)||.0001;
+  const range=effRange();
+  const dot=(dx/d)*Math.sin(g.ang)+(dz/d)*Math.cos(g.ang);
+  let vis=false;
+  if(see&&losClear(g.x,g.z,p.x,p.z)){
+    if(d<1.5)vis=true; else if(d<range&&dot>Math.cos(FOV/2))vis=true;
+  }
+  if(vis){
+    if(dot<-0.25)g.susp=Math.min(1,g.susp+0.3);
+    const rate=(0.5+1.4*(1-d/range))*(p.mode==='sneak'?0.7:p.mode==='sprint'?1.3:1);
+    g.susp=Math.min(1,g.susp+rate*dt);
+    g.lastSeen={x:p.x,z:p.z};
+  }else{
+    g.susp=Math.max(0,g.susp-(g.mode==='scan'?0.25:0.5)*dt);
+    if(g.mode==='patrol'&&g.susp>0.3&&g.lastSeen){g.mode='toPoint';g.tx=g.lastSeen.x;g.tz=g.lastSeen.z;g.stuck=0;}
+  }
+  if(g.susp>=1&&state==='PLAYING'){triggerAlarm();return;}
+
+  let spd=1.7,tx=null,tz=null;
+  if(g.mode==='patrol'){
+    const wp=g.route[g.wp]; tx=wp[0]; tz=wp[1];
+    if(Math.hypot(tx-g.x,tz-g.z)<0.2)g.wp=(g.wp+1)%g.route.length;
+  }else if(g.mode==='toPoint'){
+    spd=3.2; tx=g.tx; tz=g.tz;
+    if(Math.hypot(tx-g.x,tz-g.z)<0.3){g.mode='scan';g.scanT=2.6;g.faceBase=g.ang;}
+  }else if(g.mode==='scan'){
+    g.scanT-=dt;
+    g.ang=g.faceBase+Math.sin((2.6-g.scanT)*3.0)*1.05;
+    if(g.susp<0.05)g.scanT=0;
+    if(g.scanT<=0){
+      let bi=0,bd=1e9;
+      for(let i=0;i<g.route.length;i++){const dd=(g.x-g.route[i][0])**2+(g.z-g.route[i][1])**2;if(dd<bd){bd=dd;bi=i;}}
+      g.wp=bi; g.mode='patrol';
+    }
+  }
+  if(tx!=null){
+    const ox=g.x,oz=g.z;
+    slide(g,(tx-g.x)*spd*dt,(tz-g.z)*spd*dt,g.r);
+    if(Math.hypot(g.x-ox,g.z-oz)<spd*dt*0.25)g.stuck+=dt; else g.stuck=0;
+    if(g.stuck>1.4){let bi=0,bd=1e9;for(let i=0;i<g.route.length;i++){const dd=(g.x-g.route[i][0])**2+(g.z-g.route[i][1])**2;if(dd<bd){bd=dd;bi=i;}}g.wp=bi;g.mode='patrol';g.stuck=0;}
+    const want=(vis&&see)?Math.atan2(dx,dz):Math.atan2(tx-g.x,tz-g.z);
+    g.ang+=angDiff(want,g.ang)*(1-Math.exp(-9*dt));
+  }
+}
+
+function update(dt){
+  T+=0; // (T set in tick)
+  if(state==='PAUSED'||state==='FAILED')return;
+
+  const see=state==='PLAYING';
+
+  /* --- player --- */
+  if(see){
+    let vx=((k.KeyW||k.ArrowUp)?1:0)-((k.KeyS||k.ArrowDown)?1:0);
+    let vz=((k.KeyD||k.ArrowRight)?1:0)-((k.KeyA||k.ArrowLeft)?1:0);
+    const mvx=vx*FCX+vz*RCX, mvz=vx*FCZ+vz*RCZ;
+    const len=Math.hypot(mvx,mvz);
+    player.mode=k.Space?'sprint':(k.ShiftLeft||k.ShiftRight)?'sneak':'walk';
+    const spd=player.mode==='sneak'?1.8:player.mode==='sprint'?5.0:3.4;
+    if(len>0){
+      slide(player,mvx/len*spd*dt,mvz/len*spd*dt,player.r);
+      player.ang+=angDiff(Math.atan2(mvx,mvz),player.ang)*(1-Math.exp(-12*dt));
+      stepT-=dt;
+      if(stepT<=0){
+        const m=player.mode;
+        stepT=m==='sneak'?0.6:m==='walk'?0.44:0.3;
+        sfx.step(m==='sneak'?0.05:m==='walk'?0.11:0.2, m==='sneak'?380:m==='walk'?620:900);
+      }
+      if(player.mode==='sprint'){
+        pingT-=dt;
+        if(pingT<=0){pingT=0.9;ripples.push({x:player.x,z:player.z,t:0});sfx.ping();hearCheck(player.x,player.z,5.6);}
+      }
+    } else { stepT=Math.min(stepT,0.25); }
+
+    /* drives */
+    for(const dr of drives){
+      if(dr.got)continue;
+      if(Math.hypot(player.x-dr.x,player.z-dr.z)<0.55){
+        dr.got=true; collected++; sfx.pickup();
+        toast('DATA DRIVE ACQUIRED — '+collected+'/3','cy');
+        if(collected===3){exitOpen=true;sfx.unlock();toast('EXTRACTION UNLOCKED — REACH THE EXIT PAD','gr');}
+      }
+    }
+    /* exit */
+    const dE=Math.hypot(player.x-exitCell.x,player.z-exitCell.z);
+    if(exitOpen&&dE<0.8){
+      state='WON'; wonT=0; ripples.push({x:exitCell.x,z:exitCell.z,t:0,g:true});
+      sfx.win(); shakeV=0.25;
+      const bm=$('bigMsg'); bm.textContent='EXTRACTION COMPLETE'; bm.style.color='var(--gr)';
+      void bm.offsetWidth; bm.classList.add('show');
+    } else if(!exitOpen&&dE<2.3){
+      lockHintT-=dt;
+      if(lockHintT<=0){lockHintT=4;toast('EXTRACTION LOCKED — '+(3-collected)+' DRIVE'+(3-collected>1?'S':'')+' REMAIN','rd');}
+    }
+  }
+
+  /* --- guards --- */
+  for(const g of guards)updGuard(g,dt,see);
+  maxSusp=0; for(const g of guards)if(g.susp>maxSusp)maxSusp=g.susp;
+  if(see||state==='ALARM')peakSusp=Math.max(peakSusp,maxSusp);
+
+  /* heartbeat */
+  hbT-=dt;
+  if(maxSusp>0.3&&hbT<=0){
+    const it=(maxSusp-0.3)/0.7;
+    sfx.thump(0.14+0.2*it);
+    hbT=1.15-0.78*it;
+  }
+
+  if(state==='ALARM'){
+    alarmT+=dt; playT+=dt;
+    if(alarmT>1.7){state='FAILED';$('bigMsg').classList.remove('show');sfx.fail();showEnd(false);}
+  }
+  if(state==='PLAYING')playT+=dt;
+  if(state==='WON'){
+    wonT+=dt;
+    if(wonT>0.9&&!$('scrEnd').hidden===false){state='DONE';$('bigMsg').classList.remove('strobe');showEnd(true);}
+  }
+
+  /* ripples */
+  for(let i=ripples.length-1;i>=0;i--){ripples[i].t+=dt/1.1;if(ripples[i].t>1)ripples.splice(i,1);}
+  heardToastT-=dt;
+
+  /* --- camera --- */
+  let tx,tz,dist,hgt;
+  if(state==='START'){
+    camYawT+=dt*0.22; tx=MW/2; tz=MH/2-0.5; dist=10.5; hgt=7.2;
+  }else{
+    tx=player.x+Math.sin(player.ang)*0.5; tz=player.z+Math.cos(player.ang)*0.5;
+    dist=state==='WON'?8.4+wonT*2.2:8.4; hgt=6.3;
+  }
+  camYawCur+=angDiff(camYawT,camYawCur)*(1-Math.exp(-7*dt));
+  FCX=Math.sin(camYawCur);FCZ=Math.cos(camYawCur);RCX=Math.cos(camYawCur);RCZ=-Math.sin(camYawCur);
+  const k2=1-Math.exp(-5.5*dt);
+  camX+=(tx-FCX*dist-camX)*k2;
+  camZ+=(tz-FCZ*dist-camZ)*k2;
+  camY+=(hgt-camY)*k2;
+  shakeV*=Math.exp(-3*dt);
+}
+
+/* ---------------- render ---------------- */
+function conePts(g){
+  const range=effRange(), pts=[[g.x,g.z]], N=25, base=g.ang-FOV/2;
+  for(let i=0;i<=N;i++){
+    const a=base+FOV*i/N, dx=Math.sin(a),dz=Math.cos(a);
+    let t=1;
+    for(let s=0.3;s<range;s+=0.24){ if(solid(g.x+dx*s,g.z+dz*s)){t=s/range;break;} }
+    pts.push([g.x+dx*range*t, g.z+dz*range*t]);
+  }
+  return pts;
+}
+function shadowQuad(x,z,ang,w,d){
+  const cs=Math.cos(ang),sn=Math.sin(ang);
+  const c=[[w/2,d/2],[w/2,-d/2],[-w/2,-d/2],[-w/2,d/2]]
+    .map(p=>[x+p[0]*cs+p[1]*sn, z-p[0]*sn+p[1]*cs]);
+  if(floorPath(c,0.03)){ctx.fillStyle='rgba(0,0,0,.34)';ctx.fill();}
+}
+function collectBox(b,items){
+  const tc=b.c.map(tCam);
+  for(const f of b.faces){
+    if(f.n[0]*(camX-b.cx)+f.n[1]*(camY-b.cy)+f.n[2]*(camZ-b.cz)<=0)continue;
+    let poly=[tc[f.i[0]],tc[f.i[1]],tc[f.i[2]],tc[f.i[3]]];
+    if(poly.every(p=>p.z<NEAR))continue;
+    poly=clipNear(poly); if(poly.length<3)continue;
+    let d=0; for(const p of poly)d+=p.z; d/=poly.length;
+    const q=poly.map(p=>[W/2+p.x*F/p.z, H/2-p.y*F/p.z]);
+    items.push({d,q,f:shadeStr(b.col,f.n,d)});
+  }
+}
+function drawFloorPass(){
+  /* base slab */
+  if(floorPath([[-1,-1],[MW+1,-1],[MW+1,MH+1],[-1,MH+1]],0)){
+    ctx.fillStyle='#101823';ctx.fill();
+  }
+  /* grid */
+  ctx.strokeStyle='rgba(125,170,215,.06)';ctx.lineWidth=1;
+  for(let x=0;x<=MW;x++)line3(x,0,x,MH,0.01);
+  for(let z=0;z<=MH;z++)line3(0,z,MW,z,0.01);
+  ctx.strokeStyle='rgba(125,170,215,.16)';
+  line3(0,0,MW,0,0.01);line3(MW,0,MW,MH,0.01);line3(MW,MH,0,MH,0.01);line3(0,MH,0,0,0.01);
+
+  /* exit pad */
+  const ex=exitCell, ins=[[ex.x-.42,ex.z-.42],[ex.x+.42,ex.z-.42],[ex.x+.42,ex.z+.42],[ex.x-.42,ex.z+.42]];
+  if(floorPath(ins,0.03)){
+    const pulse=exitOpen?0.5+0.5*Math.sin(T*5):0;
+    ctx.fillStyle=exitOpen?'rgba(84,242,165,'+(0.16+0.14*pulse)+')':'rgba(90,110,140,.12)';
+    ctx.fill();
+    ctx.strokeStyle=exitOpen?'rgba(84,242,165,'+(0.5+0.4*pulse)+')':'rgba(90,110,140,.35)';
+    ctx.lineWidth=1.5;ctx.stroke();
+  }
+  if(floorPath([[ex.x-.24,ex.z-.24],[ex.x+.24,ex.z-.24],[ex.x+.24,ex.z+.24],[ex.x-.24,ex.z+.24]],0.05)){
+    ctx.strokeStyle=exitOpen?'rgba(180,255,220,.8)':'rgba(120,140,170,.3)';ctx.stroke();
+  }
+  /* drive floor rings */
+  for(const dr of drives){
+    if(dr.got)continue;
+    const pts=[];for(let i=0;i<16;i++){const a=i/16*TAU;pts.push([dr.x+Math.cos(a)*0.3,dr.z+Math.sin(a)*0.3]);}
+    if(floorPath(pts,0.04)){ctx.strokeStyle='rgba(95,217,255,.35)';ctx.lineWidth=1;ctx.stroke();}
+  }
+  /* noise ripples */
+  for(const rp of ripples){
+    const r=0.3+rp.t*5.2, pts=[];
+    for(let i=0;i<22;i++){const a=i/22*TAU;pts.push([rp.x+Math.cos(a)*r,rp.z+Math.sin(a)*r]);}
+    if(floorPath(pts,0.05)){
+      ctx.strokeStyle=rp.g?'rgba(84,242,165,'+(0.7*(1-rp.t))+')':'rgba(255,179,71,'+(0.6*(1-rp.t))+')';
+      ctx.lineWidth=2;ctx.stroke();
+    }
+  }
+  /* guard vision cones */
+  for(const g of guards){
+    const pts=conePts(g);
+    if(!floorPath(pts,0.04))continue;
+    let fill,lw=1;
+    if(g.susp>0.55)fill='rgba(255,70,85,'+(0.16+0.13*g.susp)+')';
+    else if(g.mode!=='patrol')fill='rgba(255,205,120,'+(0.13+0.05*Math.sin(T*6))+')';
+    else fill='rgba(255,168,70,.11)';
+    ctx.fillStyle=fill;ctx.fill();
+    ctx.strokeStyle=g.susp>0.55?'rgba(255,90,105,.5)':'rgba(255,178,84,.3)';
+    ctx.lineWidth=lw;ctx.stroke();
+  }
+  /* shadows */
+  if(state!=='START'||true){
+    shadowQuad(player.x,player.z,player.ang,0.8,0.6);
+    for(const g of guards)shadowQuad(g.x,g.z,g.ang,0.8,0.6);
+  }
+}
+function render(){
+  ctx.fillStyle=bgGrad; ctx.fillRect(0,0,W,H);
+  const shx=(Math.random()*2-1)*shakeV*7, shy=(Math.random()*2-1)*shakeV*5;
+  ctx.save(); ctx.translate(shx,shy);
+
+  drawFloorPass();
+
+  const items=[];
+  for(const b of staticBoxes)collectBox(b,items);
+
+  /* player body */
+  const crouch=player.mode==='sneak';
+  const bob=(state==='PLAYING'?Math.sin(T*10)*0.035:0)*(crouch?0.4:1);
+  const pH=crouch?0.85+Math.max(0,bob):1.32+bob;
+  collectBox(mkBox(player.x,player.z,player.ang,0.42,0.42,0,pH,[62,196,190]),items);
+  collectBox(mkBox(player.x,player.z,player.ang,0.34,0.34,pH,pH+0.34,[205,240,255]),items);
+
+  /* guards */
+  for(const g of guards){
+    const gb=Math.sin(T*7+g.ph)*0.03;
+    const gh=1.32+Math.max(0,gb);
+    collectBox(mkBox(g.x,g.z,g.ang,0.42,0.42,0,gh,[196,120,54]),items);
+    collectBox(mkBox(g.x,g.z,g.ang,0.34,0.34,gh,gh+0.34,[255,178,84]),items);
+    /* suspicion icon */
+    if(state==='PLAYING'&&(g.susp>0.12||g.mode!=='patrol')&&losClear(player.x,player.z,g.x,g.z)){
+      const p=tCam([g.x,gh+0.95,g.z]);
+      if(p.z>NEAR){
+        items.push({d:p.z,fn(){
+          const k=F/p.z, x=W/2+p.x*k, y=H/2-p.y*k;
+          const hot=g.susp>0.55;
+          ctx.font='bold '+Math.max(10,k*(hot?0.62:0.5))+'px '+'Consolas,monospace';
+          ctx.textAlign='center';ctx.textBaseline='middle';
+          ctx.fillStyle=hot?'rgba(255,70,85,.95)':'rgba(255,196,110,.9)';
+          ctx.fillText(hot&&!g.mode.startsWith('s')?'!':(g.mode==='patrol'?'?':'?'),x,y+Math.sin(T*5)*k*0.04);
+        }});
+      }
+    }
+  }
+
+  /* drives (sprites) */
+  for(const dr of drives){
+    if(dr.got)continue;
+    const p=tCam([dr.x,1.05+Math.sin(T*2+dr.ph)*0.12,dr.z]);
+    if(p.z<NEAR)continue;
+    items.push({d:p.z,fn(){
+      const k=F/p.z, x=W/2+p.x*k, y=H/2-p.y*k, r=Math.max(3,k*0.34);
+      ctx.globalAlpha=.22;ctx.fillStyle='#6ef3ff';
+      ctx.beginPath();ctx.arc(x,y,r*1.9,0,TAU);ctx.fill();ctx.globalAlpha=1;
+      const w=Math.cos(T*3+dr.ph)*r;
+      ctx.beginPath();ctx.moveTo(x,y-r);ctx.lineTo(x+w,y);ctx.lineTo(x,y+r);ctx.lineTo(x-w,y);ctx.closePath();
+      ctx.fillStyle='#bff4ff';ctx.fill();
+      ctx.strokeStyle='#5fd9ff';ctx.lineWidth=1.5;ctx.stroke();
+    }});
+  }
+
+  /* exit beacon beams */
+  if(state!=='START'||true){
+    const hgt=exitOpen?4.6:2.8, cx0=exitCell.x, cz0=exitCell.z, w=0.85;
+    const aA=exitOpen?(0.10+0.05*Math.sin(T*4)):0.05;
+    const beam=(pts)=>{
+      let pc=pts.map(tCam);
+      if(pc.every(q=>q.z<NEAR))return;
+      pc=clipNear(pc); if(pc.length<3)return;
+      let d=0;for(const q of pc)d+=q.z;d/=pc.length;
+      items.push({d,fn(){
+        ctx.globalAlpha=aA;ctx.beginPath();
+        for(let i=0;i<pc.length;i++){const k=F/pc[i].z;i?ctx.lineTo(W/2+pc[i].x*k,H/2-pc[i].y*k):ctx.moveTo(W/2+pc[i].x*k,H/2-pc[i].y*k);}
+        ctx.closePath();
+        ctx.fillStyle=exitOpen?'#54f2a5':'#7d93ab';ctx.fill();ctx.globalAlpha=1;
+      }});
+    };
+    beam([[cx0-w/2,0,cz0],[cx0+w/2,0,cz0],[cx0+w/2,hgt,cz0],[cx0-w/2,hgt,cz0]]);
+    beam([[cx0,0,cz0-w/2],[cx0,0,cz0+w/2],[cx0,hgt,cz0+w/2],[cx0,hgt,cz0-w/2]]);
+  }
+
+  items.sort((a,b)=>b.d-a.d);
+  for(const it of items){
+    if(it.q){
+      ctx.beginPath();
+      for(let i=0;i<it.q.length;i++)i?ctx.lineTo(it.q[i][0],it.q[i][1]):ctx.moveTo(it.q[i][0],it.q[i][1]);
+      ctx.closePath();
+      ctx.fillStyle=it.f;ctx.fill();
+      ctx.strokeStyle='rgba(5,9,16,.35)';ctx.lineWidth=1;ctx.stroke();
+    } else it.fn();
+  }
+  ctx.restore();
+
+  updateHUD(); drawMinimap();
+}
+
+/* ---------------- HUD ---------------- */
+const fmtT=t=>{const m=t/60|0,s=t%60|0;return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');};
+let hudCache={};
+function setTxt(id,v){if(hudCache[id]!==v){hudCache[id]=v;$(id).textContent=v;}}
+function updateHUD(){
+  setTxt('timeVal',fmtT(playT));
+  const m=player.mode;
+  $('cWalk').classList.toggle('act',m==='walk');
+  $('cSneak').classList.toggle('act',m==='sneak');
+  $('cSprint').classList.toggle('act',m==='sprint');
+  for(let i=0;i<3;i++)$('d'+i).classList.toggle('on',i<collected);
+  const es=$('exitStat');
+  setTxt('exitStat',exitOpen?'EXIT · OPEN':'EXIT · LOCKED');
+  es.classList.toggle('open',exitOpen);
+  /* detection */
+  const s=maxSusp;
+  $('detFill').style.width=(s*100).toFixed(1)+'%';
+  $('detFill').style.background='hsl('+Math.round(120*(1-s))+',95%,55%)';
+  setTxt('detLabel', s<0.12?'—': s<0.5?'SUSPICION RISING': s<0.85?'ALERT':'CONTACT!');
+  $('detBox').classList.toggle('hot',s>0.55&&state==='PLAYING');
+  if(state!=='ALARM'){
+    $('alertGlow').classList.remove('strobe');
+    $('alertGlow').style.opacity=(s>0.3?((s-0.3)/0.7)*0.5:0).toFixed(2);
+  }
+}
+
+/* ---------------- minimap ---------------- */
+const mmS=7, mmc=document.createElement('canvas'), mctx=mmc.getContext('2d');
+mmc.width=MW*mmS; mmc.height=MH*mmS;
+function buildMinimap(){
+  mctx.fillStyle='#0a121d';mctx.fillRect(0,0,mmc.width,mmc.height);
+  for(let r=0;r<MH;r++)for(let c=0;c<MW;c++){
+    const s=grid[r][c];
+    if(s===1){mctx.fillStyle='#3c4f66';mctx.fillRect(c*mmS,r*mmS,mmS,mmS);}
+    else if(s===2){mctx.fillStyle='#7c6b45';mctx.fillRect(c*mmS+1,r*mmS+1,mmS-2,mmS-2);}
+  }
+}
+function drawMinimap(){
+  const mc=$('mm').getContext('2d');
+  mc.clearRect(0,0,mmc.width,mmc.height);
+  mc.drawImage(mmc,0,0);
+  /* drives */
+  for(const dr of drives){
+    if(dr.got)continue;
+    const x=dr.x*mmS,y=dr.z*mmS,p=1+0.25*Math.sin(T*4+dr.ph);
+    mc.fillStyle='#6ef3ff';mc.beginPath();
+    mc.moveTo(x,y-3*p);mc.lineTo(x+3*p,y);mc.lineTo(x,y+3*p);mc.lineTo(x-3*p,y);mc.closePath();mc.fill();
+  }
+  /* exit */
+  const ex=exitCell.x*mmS, ez=exitCell.z*mmS;
+  mc.fillStyle=exitOpen?(Math.sin(T*5)>0?'#54f2a5':'#1d6b47'):'#33475e';
+  mc.fillRect(ex-3,ez-3,6,6);
+  /* guards */
+  for(const g of guards){
+    const x=g.x*mmS,y=g.z*mmS;
+    const pa=Math.atan2(Math.cos(g.ang),Math.sin(g.ang));
+    mc.fillStyle='rgba(255,178,84,.16)';
+    mc.beginPath();mc.moveTo(x,y);
+    mc.arc(x,y,rangeMM(),pa-FOV/2,pa+FOV/2);mc.closePath();mc.fill();
+    mc.fillStyle=g.susp>0.55?'#ff5566':'#ffb347';
+    mc.beginPath();mc.arc(x,y,2.2,0,TAU);mc.fill();
+  }
+  /* player */
+  const px=player.x*mmS,pz=player.z*mmS;
+  const dx=Math.sin(player.ang),dz=Math.cos(player.ang);
+  mc.fillStyle='#5fd9ff';mc.beginPath();
+  mc.moveTo(px+dx*5,pz+dz*5);mc.lineTo(px-dx*3-dz*2.6,pz-dz*3+dx*2.6);mc.lineTo(px-dx*3+dz*2.6,pz-dz*3-dx*2.6);
+  mc.closePath();mc.fill();
+}
+function rangeMM(){return effRange()*mmS*0.75;}
+
+/* ---------------- input ---------------- */
+const k={};
+window.addEventListener('keydown',e=>{
+  initAudio();
+  const c=e.code;
+  if(c==='Space'||c==='ArrowUp'||c==='ArrowDown'||c==='ArrowLeft'||c==='ArrowRight')e.preventDefault();
+  if(c==='ShiftLeft'||c==='ShiftRight')k.Shift=true; else k[c]=true;
+  if(e.repeat)return;
+  if(c==='KeyQ'&&state!=='START')camYawT+=PI/2;
+  if(c==='KeyE'&&state!=='START')camYawT-=PI/2;
+  if(c==='KeyP'||c==='Escape'){
+    if(state==='PLAYING'){state='PAUSED';$('scrPause').hidden=false;}
+    else if(state==='PAUSED'){state='PLAYING';$('scrPause').hidden=true;}
+  }
+  if(c==='KeyR'&&state!=='START')beginRun();
+  if(c==='Enter'){
+    if(state==='START')beginRun();
+    else if(state==='FAILED'||state==='DONE')beginRun();
+    else if(state==='PAUSED'){state='PLAYING';$('scrPause').hidden=true;}
+  }
+});
+window.addEventListener('keyup',e=>{
+  if(e.code==='ShiftLeft'||e.code==='ShiftRight')k.Shift=false; else k[e.code]=false;
+});
+window.addEventListener('blur',()=>{if(state==='PLAYING'){state='PAUSED';$('scrPause').hidden=false;}});
+window.addEventListener('pointerdown',initAudio);
+
+$('btnStart').addEventListener('click',()=>{initAudio();beginRun();});
+$('btnRetry').addEventListener('click',()=>{initAudio();beginRun();});
+$('btnResume').addEventListener('click',()=>{state='PLAYING';$('scrPause').hidden=true;});
+
+/* ---------------- boot / loop ---------------- */
+function loadBest(){
+  try{
+    const b=JSON.parse(localStorage.getItem('sb_best')||'null');
+    if(b){const m=b.t/60|0,s=(b.t%60)|0;
+      $('startBest').textContent='BEST RUN — '+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')+' · RANK '+b.r;}
+  }catch(e){}
+}
+resize(); reset(); buildMinimap(); loadBest();
+let last=0;
+function tick(ts){
+  requestAnimationFrame(tick);
+  const now=ts/1000;
+  let dt=Math.min(0.05,now-last||0.016); last=now; T=now;
+  update(dt); render();
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
+```
