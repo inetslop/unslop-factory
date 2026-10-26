@@ -1,0 +1,559 @@
+<think>
+Create a single HTML file: a typing game where you type words displayed on incoming asteroids to destroy them. Canvas game, ship at the bottom, asteroids fall toward the ship with words attached; type the word to shoot/destroy. If an asteroid reaches the ship, lose a life. Score, levels, restart, start screen, sound via Web Audio.
+
+Let's write it compactly and completely.
+
+Features:
+- Fullscreen canvas, resize handler.
+- Start screen overlay showing title "TypeBlasters"/"Typing Asteroids" and control instructions; Enter/click to start.
+- Game: ship at bottom center. Asteroids spawn from the top with random x-coordinate, move downward + drift. Each asteroid has a word (random from a list, difficulty-based length). The current input is displayed above the ship; typing the correct letters makes the asteroid flash; completing it destroys the asteroid (explosion particles, sound), and if it's near the target... actually, any asteroid with a matching word? Simpler: does input apply to the lowest/closest asteroid whose word matches the prefix? Or: the player types freely; on each keypress, check all asteroids for ones where the currently typed string is a complete match against that word — destroy. If the typed string becomes a non-prefix of any word, clear it. This works well and is fun.
+
+Targeting: highlight the asteroid whose word starts with the current input.
+
+Lives: 3. Asteroid reaches ship's y-coordinate → lose a life, clear it (or bounce). Game over screen with score, high score in localStorage, Enter to restart.
+
+Word list: short words for early game, longer ones later. Speed increases over time.
+
+Sound: WebAudio beeps — typing blip, explosion noise, hit sound. Initialize on first input.
+
+Rendering: canvas, stars in the background, asteroids as polygons with word text.
+
+Let's write the code.
+
+Word list: e.g., 3-letter words, 4-letter, 5-letter, 6-letter. Use an array of common words.
+
+Input handling: keydown on window; ignore if not playing. Backspace to delete. Only accept a-z.
+
+Mechanics details:
+- state: 'start', 'playing', 'gameover'
+- asteroids: {x,y,vx,vy,word,verts,r}
+- spawn interval decreases with score/time.
+- input string; on each keypress: input += ch; check if any asteroid's word === input → destroy (score += word length * 10). Otherwise, if no asteroid's word startsWith(input) → reset input = '' (with a small error shake/sound?). Actually, better to keep the prefix check: if input is not a prefix of any asteroid's word, clear.
+- Highlight: asteroid with word.startsWith(input) && input.length>0 → glow.
+
+Ship hit: when asteroid.y > shipY - r → lose life, remove, screen shake, red flash.
+
+Game over overlay: score, best, "Press Enter to restart".
+
+Canvas scaling: use device pixel ratio? Simply set canvas width/height to window size and scale by dpr for sharpness. Use ctx.setTransform(dpr,0,0,dpr,0,0).
+
+Stars: array of stars with parallax.
+
+Let's write it.
+
+</think>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Typing Asteroids</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #05060f; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    font-family: 'Courier New', monospace; color: #cfe8ff; z-index: 10;
+    background: radial-gradient(ellipse at center, rgba(10,15,40,.85), rgba(2,3,10,.95));
+  }
+  .hidden { display: none; }
+  h1 {
+    font-size: clamp(2rem, 7vw, 4.5rem); letter-spacing: .12em;
+    color: #7fd6ff; text-shadow: 0 0 18px #3aa9ff, 0 0 40px #1a5cff;
+    margin-bottom: 1rem;
+  }
+  .sub { font-size: clamp(.8rem, 2.2vw, 1.1rem); line-height: 1.7; max-width: 640px; padding: 0 1rem; }
+  .keys { margin: 1.2rem 0; font-size: clamp(.85rem, 2.4vw, 1.15rem); color: #ffd97a; }
+  kbd {
+    background: #16233f; border: 1px solid #3a5c9e; border-bottom-width: 3px;
+    border-radius: 4px; padding: .1em .5em; margin: 0 .1em; color: #cfe8ff;
+  }
+  .blink { animation: blink 1.2s infinite; margin-top: 1.6rem; font-size: clamp(.9rem, 2.5vw, 1.3rem); color: #7dffab; }
+  @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+  .bigscore { font-size: clamp(1.4rem, 5vw, 2.6rem); color: #fff; margin: .8rem 0; }
+  .best { color: #ffd97a; font-size: clamp(.9rem, 2.5vw, 1.2rem); }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="startScreen" class="overlay">
+  <h1>TYPING ASTEROIDS</h1>
+  <div class="sub">Alien rocks are falling toward your ship, each carrying a word.<br>
+  Type the words to vaporize them before they hit you!</div>
+  <div class="keys">
+    Type the word shown on an asteroid &mdash; it glows when targeted<br>
+    <kbd>A</kbd>&hellip;<kbd>Z</kbd> type &nbsp;&nbsp; <kbd>&larr;</kbd> delete letter
+  </div>
+  <div class="blink">PRESS ENTER TO LAUNCH</div>
+</div>
+
+<div id="gameOverScreen" class="overlay hidden">
+  <h1 style="color:#ff7f6e; text-shadow:0 0 18px #ff3a2a, 0 0 40px #a00;">SHIP DESTROYED</h1>
+  <div class="bigscore" id="finalScore">SCORE: 0</div>
+  <div class="best" id="bestScore">BEST: 0</div>
+  <div class="blink">PRESS ENTER TO RESTART</div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+var canvas = document.getElementById('game');
+var ctx = canvas.getContext('2d');
+var startScreen = document.getElementById('startScreen');
+var gameOverScreen = document.getElementById('gameOverScreen');
+var finalScoreEl = document.getElementById('finalScore');
+var bestScoreEl = document.getElementById('bestScore');
+
+var W = 0, H = 0, DPR = 1;
+function resize(){
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------- Audio ---------- */
+var AC = null, masterGain = null;
+function initAudio(){
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  try {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = AC.createGain();
+    masterGain.gain.value = 0.35;
+    masterGain.connect(AC.destination);
+  } catch(e){ AC = null; }
+}
+function blip(freq, dur, type, vol){
+  if (!AC) return;
+  var t = AC.currentTime;
+  var o = AC.createOscillator(), g = AC.createGain();
+  o.type = type || 'square';
+  o.frequency.setValueAtTime(freq, t);
+  g.gain.setValueAtTime(vol || .25, t);
+  g.gain.exponentialRampToValueAtTime(.001, t + dur);
+  o.connect(g); g.connect(masterGain);
+  o.start(t); o.stop(t + dur + .02);
+}
+function noiseBurst(dur, vol){
+  if (!AC) return;
+  var len = Math.floor(AC.sampleRate * dur);
+  var buf = AC.createBuffer(1, len, AC.sampleRate);
+  var d = buf.getChannelData(0);
+  for (var i = 0; i < len; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/len, 2);
+  var src = AC.createBufferSource(); src.buffer = buf;
+  var g = AC.createGain(); g.gain.value = vol || .5;
+  var f = AC.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 900;
+  src.connect(f); f.connect(g); g.connect(masterGain);
+  src.start();
+}
+var sfx = {
+  type: function(){ blip(520 + Math.random()*120, .06, 'square', .12); },
+  destroy: function(){ noiseBurst(.35, .6); blip(90, .3, 'sawtooth', .3); blip(600, .15, 'triangle', .2); },
+  hit: function(){ noiseBurst(.5, .8); blip(70, .4, 'sawtooth', .4); },
+  error: function(){ blip(140, .09, 'sawtooth', .1); },
+  start: function(){ blip(330,.1,'square',.2); setTimeout(function(){blip(440,.1,'square',.2);},110); setTimeout(function(){blip(660,.15,'square',.2);},220); }
+};
+
+/* ---------- Words ---------- */
+var WORDS = {
+  3: ["the","and","for","are","big","red","sun","sky","sea","run","fly","war","ice","fire".slice(0,3),"map","jet","bug","net","gap","top"],
+  4: ["ship","rock","star","moon","wave","laser","beam","core","grid","void","nova","puls","dust","crash","blast","power","drive","orbit","space","alien","planet".slice(0,4),"comet".slice(0,4)],
+  5: ["space","metal","hyper","quant","plasma".slice(0,5),"rocket","engine","shield","signal","galaxy".slice(0,5),"meteor","circuit","nebul","photon".slice(0,5),"vector"],
+  6: ["planet","comet","lunar","solar","orbit","radar","turbo","cosmic","static","binary","matrix","piston","thrust","module","sensor","rocket"]
+};
+function pickWord(){
+  var len;
+  if (score < 150) len = Math.random() < .6 ? 3 : 4;
+  else if (score < 400) len = Math.random() < .3 ? 3 : (Math.random() < .7 ? 4 : 5);
+  else len = Math.random() < .15 ? 4 : (Math.random() < .6 ? 5 : 6);
+  var list = WORDS[len];
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+/* ---------- Game state ---------- */
+var state = 'start'; // start | playing | gameover
+var asteroids = [], particles = [], stars = [], floatTexts = [];
+var input = "", lives = 3, score = 0, best = 0, elapsed = 0;
+var spawnTimer = 0, shake = 0, flash = 0, shipY = 0;
+var lastTime = 0;
+
+try { best = parseInt(localStorage.getItem('typingAsteroidsBest') || '0', 10) || 0; } catch(e){}
+
+for (var i = 0; i < 90; i++){
+  stars.push({ x: Math.random(), y: Math.random(), s: Math.random()*1.6 + .4, v: Math.random()*.02 + .005 });
+}
+
+function makeAsteroid(){
+  var word = pickWord();
+  var r = 34 + word.length * 7;
+  var pad = r + 10;
+  var x = pad + Math.random() * Math.max(1, W - pad*2);
+  var verts = [];
+  var n = 9 + Math.floor(Math.random()*4);
+  for (var i = 0; i < n; i++){
+    var ang = (i/n) * Math.PI * 2;
+    var rr = r * (0.78 + Math.random()*0.35);
+    verts.push([Math.cos(ang)*rr, Math.sin(ang)*rr]);
+  }
+  var speed = (45 + Math.min(160, elapsed * 2.2) + Math.random()*30) * (1 + word.length*0.03);
+  return {
+    x: x, y: -r - 20, r: r, word: word, verts: verts,
+    vx: (Math.random()-.5) * 40, vy: speed,
+    rot: Math.random()*Math.PI*2, vr: (Math.random()-.5)*1.2,
+    glow: 0
+  };
+}
+
+function spawnBurst(x, y, color, count){
+  for (var i = 0; i < count; i++){
+    var a = Math.random()*Math.PI*2, sp = 40 + Math.random()*260;
+    particles.push({ x:x, y:y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp, life:.5+Math.random()*.6, max:1, color:color, size:2+Math.random()*3 });
+  }
+}
+
+function resetGame(){
+  asteroids = []; particles = []; floatTexts = [];
+  input = ""; lives = 3; score = 0; elapsed = 0; spawnTimer = .5; shake = 0; flash = 0;
+}
+
+function startGame(){
+  initAudio(); sfx.start();
+  resetGame();
+  state = 'playing';
+  startScreen.classList.add('hidden');
+  gameOverScreen.classList.add('hidden');
+}
+
+function endGame(){
+  state = 'gameover';
+  spawnBurst(W/2, shipY, '#ff7f5a', 60);
+  spawnBurst(W/2, shipY, '#ffd97a', 40);
+  sfx.hit();
+  if (score > best){
+    best = score;
+    try { localStorage.setItem('typingAsteroidsBest', String(best)); } catch(e){}
+  }
+  finalScoreEl.textContent = 'SCORE: ' + score;
+  bestScoreEl.textContent = 'BEST: ' + best;
+  setTimeout(function(){ gameOverScreen.classList.remove('hidden'); }, 700);
+}
+
+function destroyAsteroid(a, idx){
+  var pts = a.word.length * 10 + Math.max(0, Math.floor((shipY - a.y) / 40)) * 2;
+  score += pts;
+  floatTexts.push({ x:a.x, y:a.y, text:'+'+pts, life:1, color:'#7dffab' });
+  spawnBurst(a.x, a.y, '#9fd8ff', 26);
+  spawnBurst(a.x, a.y, '#ffffff', 12);
+  sfx.destroy();
+  asteroids.splice(idx, 1);
+}
+
+/* ---------- Input ---------- */
+window.addEventListener('keydown', function(e){
+  if (e.key === 'Enter'){
+    if (state === 'start') startGame();
+    else if (state === 'gameover' && !gameOverScreen.classList.contains('hidden')) startGame();
+    return;
+  }
+  if (state !== 'playing') return;
+  initAudio();
+  var k = e.key;
+  if (k === 'Backspace'){
+    e.preventDefault();
+    input = input.slice(0, -1);
+    return;
+  }
+  if (/^[a-z]$/i.test(k)){
+    e.preventDefault();
+    var ch = k.toLowerCase();
+    input += ch;
+    sfx.type();
+    // completed a word?
+    for (var i = asteroids.length - 1; i >= 0; i--){
+      if (asteroids[i].word === input){ destroyAsteroid(asteroids[i], i); input = ''; break; }
+    }
+    // invalid prefix -> clear
+    if (input){
+      var match = false;
+      for (var j = 0; j < asteroids.length; j++){
+        if (asteroids[j].word.indexOf(input) === 0){ match = true; break; }
+      }
+      if (!match){ input = ''; sfx.error(); shake = Math.max(shake, 4); }
+    }
+  }
+});
+
+/* ---------- Update ---------- */
+function update(dt){
+  elapsed += dt;
+  shipY = H - 70;
+
+  // stars drift always
+  for (var i = 0; i < stars.length; i++){
+    var s = stars[i];
+    s.y += s.v * dt * (state === 'playing' ? 1 : .3);
+    if (s.y > 1){ s.y = 0; s.x = Math.random(); }
+  }
+
+  // particles & texts always update
+  for (var p = particles.length - 1; p >= 0; p--){
+    var pt = particles[p];
+    pt.life -= dt;
+    if (pt.life <= 0){ particles.splice(p,1); continue; }
+    pt.x += pt.vx * dt; pt.y += pt.vy * dt;
+    pt.vx *= .98; pt.vy *= .98;
+  }
+  for (var f = floatTexts.length - 1; f >= 0; f--){
+    floatTexts[f].life -= dt;
+    floatTexts[f].y -= 40 * dt;
+    if (floatTexts[f].life <= 0) floatTexts.splice(f,1);
+  }
+
+  shake = Math.max(0, shake - dt * 30);
+  flash = Math.max(0, flash - dt * 2);
+
+  if (state !== 'playing') return;
+
+  // spawning
+  spawnTimer -= dt;
+  if (spawnTimer <= 0){
+    asteroids.push(makeAsteroid());
+    var base = Math.max(.55, 1.6 - elapsed * .015);
+    spawnTimer = base * (.7 + Math.random()*.6);
+  }
+
+  // highlight targets
+  for (var a = 0; a < asteroids.length; a++){
+    asteroids[a].target = input && asteroids[a].word.indexOf(input) === 0;
+  }
+
+  for (var b = asteroids.length - 1; b >= 0; b--){
+    var ast = asteroids[b];
+    ast.x += ast.vx * dt;
+    ast.y += ast.vy * dt;
+    ast.rot += ast.vr * dt;
+    if (ast.x < ast.r) { ast.x = ast.r; ast.vx *= -1; }
+    if (ast.x > W - ast.r){ ast.x = W - ast.r; ast.vx *= -1; }
+    if (ast.target) ast.glow = Math.min(1, ast.glow + dt*8); else ast.glow = Math.max(0, ast.glow - dt*8);
+
+    if (ast.y + ast.r * .5 > shipY - 26){
+      asteroids.splice(b,1);
+      spawnBurst(ast.x, shipY - 20, '#ff5a3a', 24);
+      lives--; shake = 14; flash = 1; sfx.hit();
+      input = '';
+      if (lives <= 0){ endGame(); return; }
+    }
+  }
+}
+
+/* ---------- Draw ---------- */
+function drawShip(){
+  var x = W/2, y = shipY;
+  ctx.save();
+  ctx.translate(x, y);
+  // engine flame
+  if (state === 'playing'){
+    var fl = 14 + Math.random()*10;
+    var grad = ctx.createLinearGradient(0, 18, 0, 18+fl);
+    grad.addColorStop(0, 'rgba(120,220,255,.9)');
+    grad.addColorStop(1, 'rgba(60,120,255,0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(-7, 18); ctx.lineTo(7, 18); ctx.lineTo(0, 18+fl);
+    ctx.closePath(); ctx.fill();
+  }
+  // hull
+  ctx.fillStyle = '#bfe3ff';
+  ctx.strokeStyle = '#5aa9e6';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, -24);
+  ctx.lineTo(18, 16); ctx.lineTo(8, 10); ctx.lineTo(0, 18);
+  ctx.lineTo(-8, 10); ctx.lineTo(-18, 16);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  // cockpit
+  ctx.fillStyle = '#3a7bd5';
+  ctx.beginPath(); ctx.arc(0, -4, 5, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+
+  // input display above ship
+  if (state === 'playing' && input){
+    ctx.font = 'bold 26px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#eaffff';
+    ctx.shadowColor = '#4fc3ff'; ctx.shadowBlur = 14;
+    ctx.fillText(input, x, y - 52);
+    ctx.shadowBlur = 0;
+    // cursor
+    var wdt = ctx.measureText(input).width;
+    if (Math.floor(performance.now()/400) % 2 === 0){
+      ctx.fillRect(x + wdt/2 + 4, y - 72, 3, 26);
+    }
+  }
+
+  // lives
+  ctx.textAlign = 'left';
+  ctx.font = '18px "Courier New", monospace';
+  for (var i = 0; i < lives; i++){
+    ctx.fillStyle = '#7fd6ff';
+    ctx.beginPath();
+    var lx = 24 + i * 30, ly = 28;
+    ctx.moveTo(lx, ly - 9); ctx.lineTo(lx + 8, ly + 7); ctx.lineTo(lx - 8, ly + 7);
+    ctx.closePath(); ctx.fill();
+  }
+}
+
+function draw(){
+  ctx.clearRect(0, 0, W, H);
+  var sx = (Math.random()-.5) * shake, sy = (Math.random()-.5) * shake;
+  ctx.save();
+  ctx.translate(sx, sy);
+
+  // background
+  var bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#04051a'); bg.addColorStop(.6, '#081030'); bg.addColorStop(1, '#0b0f2e');
+  ctx.fillStyle = bg;
+  ctx.fillRect(-20, -20, W+40, H+40);
+
+  // stars
+  for (var i = 0; i < stars.length; i++){
+    var s = stars[i];
+    ctx.globalAlpha = .3 + s.s * .35;
+    ctx.fillStyle = '#cfe8ff';
+    ctx.fillRect(s.x * W, s.y * H, s.s, s.s);
+  }
+  ctx.globalAlpha = 1;
+
+  // asteroids
+  for (var a = 0; a < asteroids.length; a++){
+    var ast = asteroids[a];
+    ctx.save();
+    ctx.translate(ast.x, ast.y);
+    ctx.rotate(ast.rot);
+    if (ast.glow > 0){
+      ctx.shadowColor = '#5aff9d';
+      ctx.shadowBlur = 24 * ast.glow;
+    }
+    var g = ctx.createRadialGradient(-ast.r*.3, -ast.r*.3, ast.r*.1, 0, 0, ast.r);
+    if (ast.target){
+      g.addColorStop(0, '#7affb2'); g.addColorStop(.5, '#2e8a5c'); g.addColorStop(1, '#123d28');
+    } else {
+      g.addColorStop(0, '#9aa7bd'); g.addColorStop(.5, '#5b6478'); g.addColorStop(1, '#2a2f40');
+    }
+    ctx.fillStyle = g;
+    ctx.strokeStyle = ast.target ? 'rgba(120,255,180,.9)' : 'rgba(180,200,230,.4)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (var v = 0; v < ast.verts.length; v++){
+      var pt = ast.verts[v];
+      if (v === 0) ctx.moveTo(pt[0], pt[1]); else ctx.lineTo(pt[0], pt[1]);
+    }
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    // craters
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(20,25,40,.35)';
+    for (var c = 0; c < 3; c++){
+      var ca = ast.verts[c*2 % ast.verts.length];
+      ctx.beginPath();
+      ctx.arc(ca[0]*.4, ca[1]*.4, ast.r*.14, 0, Math.PI*2);
+      ctx.fill();
+    }
+    // word (keep upright)
+    ctx.rotate(-ast.rot);
+    var fs = Math.min(26, Math.max(15, ast.r * .45));
+    ctx.font = 'bold ' + fs + 'px "Courier New", monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    // word: typed part in green
+    var w = ast.word;
+    var typedLen = (ast.target && input) ? Math.min(input.length, w.length) : 0;
+    if (typedLen > 0){
+      var fullW = ctx.measureText(w).width;
+      var typedW = ctx.measureText(w.slice(0, typedLen)).width;
+      var startX = -fullW/2;
+      ctx.fillStyle = '#eaffb0';
+      ctx.fillText(w.slice(0, typedLen), startX + typedW/2, 0);
+      if (typedLen < w.length){
+        ctx.fillStyle = 'rgba(10,15,25,.85)';
+        ctx.fillRect(startX + typedW - 1, -fs*.6, fullW - typedW + 2, fs*1.2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(w.slice(typedLen), startX + typedW + (fullW - typedW)/2, 0);
+      }
+    } else {
+      ctx.fillStyle = 'rgba(10,15,25,.8)';
+      var fw = ctx.measureText(w).width;
+      ctx.fillRect(-fw/2 - 6, -fs*.6, fw + 12, fs*1.2);
+      ctx.fillStyle = '#eaf4ff';
+      ctx.fillText(w, 0, 0);
+    }
+    ctx.restore();
+  }
+
+  // particles
+  for (var p = 0; p < particles.length; p++){
+    var pt = particles[p];
+    ctx.globalAlpha = Math.max(0, pt.life / pt.max);
+    ctx.fillStyle = pt.color;
+    ctx.fillRect(pt.x - pt.size/2, pt.y - pt.size/2, pt.size, pt.size);
+  }
+  ctx.globalAlpha = 1;
+
+  // float texts
+  for (var f = 0; f < floatTexts.length; f++){
+    var ft = floatTexts[f];
+    ctx.globalAlpha = Math.max(0, ft.life);
+    ctx.font = 'bold 22px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = ft.color;
+    ctx.fillText(ft.text, ft.x, ft.y);
+  }
+  ctx.globalAlpha = 1;
+
+  if (state === 'playing' || state === 'gameover') drawShip();
+
+  // danger flash
+  if (flash > 0){
+    ctx.fillStyle = 'rgba(255,60,40,' + (flash * .25) + ')';
+    ctx.fillRect(-20, -20, W+40, H+40);
+  }
+
+  // HUD score
+  if (state === 'playing'){
+    ctx.font = 'bold 24px "Courier New", monospace';
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#eaffff';
+    ctx.shadowColor = '#3aa9ff'; ctx.shadowBlur = 10;
+    ctx.fillText('SCORE ' + score, W - 20, 40);
+    ctx.shadowBlur = 0;
+  }
+
+  ctx.restore();
+}
+
+/* ---------- Loop ---------- */
+function loop(t){
+  var dt = Math.min(.05, (t - lastTime) / 1000 || .016);
+  lastTime = t;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// click/tap to start too (also unlocks audio)
+startScreen.addEventListener('click', function(){ if (state === 'start') startGame(); });
+gameOverScreen.addEventListener('click', function(){ if (state === 'gameover') startGame(); });
+
+})();
+</script>
+</body>
+</html>
+```
